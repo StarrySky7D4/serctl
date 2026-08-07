@@ -111,6 +111,8 @@ cargo build
 cargo build --release
 ```
 
+构建脚本会把源代码 Git commit 写入程序；使用 `serctl --version` 可核对二进制来源。工作树不干净时版本后缀会显示 `-dirty`。`target` 构建产物不提交到 Git，发布时应结合 commit、二进制 SHA-256 和签名/制品仓库记录进行追踪。
+
 本地验证：
 
 ```powershell

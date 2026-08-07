@@ -19,10 +19,18 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 
+const BUILD_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (git ",
+    env!("SERCTL_BUILD_COMMIT"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(
     name = "serctl",
-    version,
+    version = BUILD_VERSION,
+    long_version = BUILD_VERSION,
     about = "Persistent SSH control suite: encrypted creds + long-lived daemon + IPC"
 )]
 struct Cli {
