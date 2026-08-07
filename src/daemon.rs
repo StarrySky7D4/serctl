@@ -1,12 +1,12 @@
 //! Daemon: loads a profile, holds one long-lived SSH session, serves IPC.
 use crate::vault::{self, now_unix, Creds, LockInfo};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use russh::ChannelMsg;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use zeroize::Zeroizing;
 
 use crate::ipc;
@@ -25,6 +25,47 @@ struct RuntimeLockGuard {
     profile: String,
     token: String,
     _lease: std::fs::File,
+}
+
+/// Holds the current authenticated SSH session and serializes reconnects.
+/// Operations clone the current Arc, so an in-flight request is never moved
+/// out from under another request while a replacement connection is created.
+struct SessionManager {
+    creds: Creds,
+    current: RwLock<Arc<SshSession>>,
+    reconnect: Mutex<()>,
+}
+
+impl SessionManager {
+    fn new(creds: Creds, session: SshSession) -> Self {
+        Self {
+            creds,
+            current: RwLock::new(Arc::new(session)),
+            reconnect: Mutex::new(()),
+        }
+    }
+
+    async fn current(&self) -> Result<Arc<SshSession>> {
+        let current = self.current.read().await.clone();
+        if !current.is_closed() {
+            return Ok(current);
+        }
+
+        // Multiple IPC requests may observe the disconnect together. Only the
+        // first performs network authentication; the others reuse its result.
+        let _reconnect = self.reconnect.lock().await;
+        let current = self.current.read().await.clone();
+        if !current.is_closed() {
+            return Ok(current);
+        }
+
+        let (replacement, _) = SshSession::connect(&self.creds, self.creds.host_key.clone())
+            .await
+            .context("reconnect SSH session")?;
+        let replacement = Arc::new(replacement);
+        *self.current.write().await = replacement.clone();
+        Ok(replacement)
+    }
 }
 
 impl Drop for RuntimeLockGuard {
@@ -60,13 +101,17 @@ pub async fn run_with_ready(
         }
     }
     let master = Zeroizing::new(master);
+    let mut creds = creds;
     let expect = creds.host_key.clone();
     let (session, fp) = SshSession::connect(&creds, expect).await?;
     if creds.host_key.is_none() && !fp.is_empty() {
         vault::set_pinned_fp(profile, fp.clone(), &master)?;
         eprintln!("[serctl] pinned host key {fp}");
+        creds.host_key = Some(fp);
     }
-    let session = Arc::new(session);
+    let host = creds.host.clone();
+    let user = creds.user.clone();
+    let session = Arc::new(SessionManager::new(creds, session));
 
     let token = vault::new_ipc_token();
     let mut listener = ipc::LocalListener::bind(profile, &token)?;
@@ -94,16 +139,16 @@ pub async fn run_with_ready(
 
     eprintln!(
         "[serctl] daemon up: profile={profile}  {host}:{ssh} as {user}  ipc={kind}:{endpoint}  (Ctrl-C to stop)",
-        host = creds.host,
-        ssh = creds.port,
-        user = creds.user,
+        host = host,
+        ssh = session.creds.port,
+        user = user,
         kind = ipc::endpoint_kind(),
     );
 
     let info = ConnInfo {
         profile: profile.to_string(),
-        host: creds.host.clone(),
-        user: creds.user.clone(),
+        host,
+        user,
         started: now_unix(),
         token,
     };
@@ -166,7 +211,7 @@ async fn existing_daemon_is_live(lock: &LockInfo) -> bool {
 }
 
 async fn handle_conn<S>(
-    session: Arc<SshSession>,
+    sessions: Arc<SessionManager>,
     stream: S,
     info: ConnInfo,
     shutdown: watch::Sender<bool>,
@@ -201,6 +246,19 @@ where
             ipc::Frame::Exec { cmd, timeout_ms } => {
                 let timeout = match validated_exec_timeout(timeout_ms) {
                     Ok(timeout) => timeout,
+                    Err(error) => {
+                        ipc::write_frame(
+                            &mut wr,
+                            &ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                let session = match sessions.current().await {
+                    Ok(session) => session,
                     Err(error) => {
                         ipc::write_frame(
                             &mut wr,
@@ -252,6 +310,19 @@ where
                 }
             }
             ipc::Frame::Shell { cols, rows } => {
+                let session = match sessions.current().await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        ipc::write_frame(
+                            &mut wr,
+                            &ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 match session.pty_shell("xterm-256color", cols, rows).await {
                     Ok(mut ch) => {
                         let mut writer = ch.make_writer();
@@ -290,6 +361,16 @@ where
                 }
             }
             ipc::Frame::Status => {
+                if let Err(error) = sessions.current().await {
+                    ipc::write_frame(
+                        &mut wr,
+                        &ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
                 ipc::write_frame(
                     &mut wr,
                     &ipc::Frame::StatusInfo {
@@ -302,6 +383,19 @@ where
                 .await?;
             }
             ipc::Frame::ListDir { path, timeout_ms } => {
+                let session = match sessions.current().await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        ipc::write_frame(
+                            &mut wr,
+                            &ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 let result = run_sftp_deadline(timeout_ms, session.list_dir(&path)).await;
                 match result {
                     Ok((path, entries)) => {
@@ -319,6 +413,19 @@ where
                 }
             }
             ipc::Frame::CreateDir { path, timeout_ms } => {
+                let session = match sessions.current().await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        ipc::write_frame(
+                            &mut wr,
+                            &ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 let result = run_sftp_deadline(timeout_ms, session.create_dir(&path)).await;
                 match result {
                     Ok(()) => ipc::write_frame(&mut wr, &ipc::Frame::Ack).await?,
@@ -334,6 +441,19 @@ where
                 }
             }
             ipc::Frame::Download { path, timeout_ms } => {
+                let session = match sessions.current().await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        ipc::write_frame(
+                            &mut wr,
+                            &ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 if let Err(error) = serve_download(&session, &mut wr, &path, timeout_ms).await {
                     ipc::write_frame(
                         &mut wr,
@@ -349,6 +469,19 @@ where
                 size,
                 timeout_ms,
             } => {
+                let session = match sessions.current().await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        ipc::write_frame(
+                            &mut wr,
+                            &ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 if let Err(error) =
                     serve_upload(&session, &mut rd, &mut wr, &path, size, timeout_ms).await
                 {

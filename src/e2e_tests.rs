@@ -2,7 +2,7 @@ use crate::{client, daemon, ipc, vault};
 use rand::rngs::OsRng;
 use russh::keys::{ssh_key, Algorithm, PrivateKey};
 use russh::server::{Auth, Msg, Session};
-use russh::{Channel, ChannelId, CryptoVec};
+use russh::{Channel, ChannelId, CryptoVec, Disconnect};
 use russh_sftp::protocol::{
     Attrs, Data, FileAttributes, Handle, OpenFlags, Status, StatusCode, Version,
 };
@@ -63,6 +63,9 @@ impl russh::server::Handler for TestSsh {
                 session.exit_status_request(channel, 0)?;
                 session.eof(channel)?;
                 session.close(channel)?;
+            }
+            b"disconnect" => {
+                session.disconnect(Disconnect::ByApplication, "test disconnect", "en-US")?;
             }
             b"hang" => {}
             _ => {
@@ -364,6 +367,28 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .unwrap();
     assert_eq!(output.stdout, b"evidence\n");
     assert_eq!(output.code, Some(0));
+
+    let disconnected =
+        client::exec_capture_with_timeout("e2e", "disconnect", None, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+    assert!(
+        disconnected.to_string().contains("exit status")
+            || disconnected.to_string().contains("disconnected")
+    );
+    let reconnected = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match client::exec_capture_with_timeout("e2e", "ok", None, Duration::from_secs(1)).await
+            {
+                Ok(output) => break output,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("daemon did not reconnect after the SSH transport closed");
+    assert_eq!(reconnected.stdout, b"evidence\n");
+    assert_eq!(reconnected.code, Some(0));
 
     let timeout = client::exec_capture_with_timeout("e2e", "hang", None, Duration::from_millis(50))
         .await

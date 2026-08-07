@@ -5,6 +5,7 @@ use russh::{client, keys::ssh_key, ChannelMsg};
 use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::vault::Creds;
 
@@ -70,7 +71,14 @@ impl SshSession {
     /// (caller pins it into the vault on first contact).
     pub async fn connect(creds: &Creds, expect: Option<String>) -> Result<(SshSession, String)> {
         let seen = Arc::new(Mutex::new(None));
-        let cfg = Arc::new(client::Config::default());
+        // Detect half-open sessions instead of leaving a daemon that still
+        // answers local IPC while every SSH operation fails with SendError.
+        let cfg = client::Config {
+            keepalive_interval: Some(Duration::from_secs(30)),
+            keepalive_max: 3,
+            ..Default::default()
+        };
+        let cfg = Arc::new(cfg);
         let handler = SshHandler {
             expect: expect.clone(),
             seen: seen.clone(),
@@ -84,6 +92,10 @@ impl SshSession {
         }
         let fp = seen.lock().unwrap().clone().unwrap_or_default();
         Ok((SshSession { handle }, fp))
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_closed()
     }
 
     pub async fn start_exec(&self, cmd: &str) -> Result<RunningCommand> {
