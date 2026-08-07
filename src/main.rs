@@ -72,12 +72,18 @@ enum Cmd {
         name: String,
         local: PathBuf,
         remote: String,
+        /// Hard deadline for the complete SFTP operation.
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
     },
     /// Download a remote file without overwriting an existing local file.
     Download {
         name: String,
         remote: String,
         local: PathBuf,
+        /// Hard deadline for the complete SFTP operation.
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
     },
     /// Open an interactive PTY shell (reuses the daemon if up).
     Shell { name: Option<String> },
@@ -198,16 +204,30 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
             name,
             local,
             remote,
+            timeout_secs,
         } => {
-            let bytes = client::upload(&name, &local, &remote).await?;
+            let bytes = client::upload_with_timeout(
+                &name,
+                &local,
+                &remote,
+                std::time::Duration::from_secs(timeout_secs),
+            )
+            .await?;
             println!("uploaded {bytes} bytes to {remote}");
         }
         Cmd::Download {
             name,
             remote,
             local,
+            timeout_secs,
         } => {
-            let bytes = client::download(&name, &remote, &local).await?;
+            let bytes = client::download_with_timeout(
+                &name,
+                &remote,
+                &local,
+                std::time::Duration::from_secs(timeout_secs),
+            )
+            .await?;
             println!("downloaded {bytes} bytes to {}", local.display());
         }
         Cmd::Shell { name } => {

@@ -10,9 +10,15 @@ pub const MAX_AUTH_FRAME: usize = 4 * 1024;
 pub const MAX_COMMAND_OUTPUT: usize = 8 * 1024 * 1024;
 pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 pub const MAX_EXEC_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+pub const DEFAULT_SFTP_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+pub const MAX_SFTP_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 
 fn default_exec_timeout_ms() -> u64 {
     DEFAULT_EXEC_TIMEOUT_MS
+}
+
+fn default_sftp_timeout_ms() -> u64 {
+    DEFAULT_SFTP_TIMEOUT_MS
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -38,16 +44,24 @@ pub enum Frame {
     Shutdown,
     ListDir {
         path: String,
+        #[serde(default = "default_sftp_timeout_ms")]
+        timeout_ms: u64,
     },
     CreateDir {
         path: String,
+        #[serde(default = "default_sftp_timeout_ms")]
+        timeout_ms: u64,
     },
     Download {
         path: String,
+        #[serde(default = "default_sftp_timeout_ms")]
+        timeout_ms: u64,
     },
     UploadBegin {
         path: String,
         size: u64,
+        #[serde(default = "default_sftp_timeout_ms")]
+        timeout_ms: u64,
     },
     UploadChunk {
         data: Vec<u8>,

@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use fs2::FileExt;
 use russh::ChannelMsg;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -293,168 +294,66 @@ async fn handle_conn(
                 )
                 .await?;
             }
-            ipc::Frame::ListDir { path } => match session.list_dir(&path).await {
-                Ok((path, entries)) => {
-                    ipc::write_frame(&mut wr, &ipc::Frame::DirList { path, entries }).await?;
-                }
-                Err(e) => {
-                    ipc::write_frame(&mut wr, &ipc::Frame::Error { msg: e.to_string() }).await?;
-                }
-            },
-            ipc::Frame::CreateDir { path } => match session.create_dir(&path).await {
-                Ok(()) => ipc::write_frame(&mut wr, &ipc::Frame::Ack).await?,
-                Err(e) => {
-                    ipc::write_frame(&mut wr, &ipc::Frame::Error { msg: e.to_string() }).await?;
-                }
-            },
-            ipc::Frame::Download { path } => match session.sftp().await {
-                Ok(sftp) => match sftp.open(&path).await {
-                    Ok(mut file) => {
-                        let mut transferred = 0_u64;
-                        let mut buffer = vec![0_u8; 32 * 1024];
-                        loop {
-                            match file.read(&mut buffer).await {
-                                Ok(0) => {
-                                    ipc::write_frame(
-                                        &mut wr,
-                                        &ipc::Frame::TransferDone { bytes: transferred },
-                                    )
-                                    .await?;
-                                    break;
-                                }
-                                Ok(read) => {
-                                    transferred += read as u64;
-                                    ipc::write_frame(
-                                        &mut wr,
-                                        &ipc::Frame::FileChunk {
-                                            data: buffer[..read].to_vec(),
-                                        },
-                                    )
-                                    .await?;
-                                }
-                                Err(e) => {
-                                    ipc::write_frame(
-                                        &mut wr,
-                                        &ipc::Frame::Error { msg: e.to_string() },
-                                    )
-                                    .await?;
-                                    break;
-                                }
-                            }
-                        }
+            ipc::Frame::ListDir { path, timeout_ms } => {
+                let result = run_sftp_deadline(timeout_ms, session.list_dir(&path)).await;
+                match result {
+                    Ok((path, entries)) => {
+                        ipc::write_frame(&mut wr, &ipc::Frame::DirList { path, entries }).await?;
                     }
-                    Err(e) => {
-                        ipc::write_frame(&mut wr, &ipc::Frame::Error { msg: e.to_string() })
-                            .await?;
-                    }
-                },
-                Err(e) => {
-                    ipc::write_frame(&mut wr, &ipc::Frame::Error { msg: e.to_string() }).await?;
-                }
-            },
-            ipc::Frame::UploadBegin { path, size } => match session.sftp().await {
-                Ok(sftp) => {
-                    let partial = temporary_remote_path(&path);
-                    let prepared: Result<_> = async {
-                        if path.is_empty() || path.len() > 4096 {
-                            bail!("remote destination is empty or exceeds 4096 bytes");
-                        }
-                        if sftp.try_exists(&path).await? {
-                            bail!("remote destination already exists: {path}");
-                        }
-                        if sftp.try_exists(&partial).await? {
-                            bail!("temporary remote destination unexpectedly exists");
-                        }
-                        Ok(sftp.create(&partial).await?)
-                    }
-                    .await;
-                    match prepared {
-                        Ok(mut file) => {
-                            ipc::write_frame(&mut wr, &ipc::Frame::Ack).await?;
-                            let mut transferred = 0_u64;
-                            let mut failed = None;
-                            loop {
-                                match ipc::read_frame(&mut rd).await {
-                                    Ok(Some(ipc::Frame::UploadChunk { data })) => {
-                                        if failed.is_none() {
-                                            let next = transferred.checked_add(data.len() as u64);
-                                            if next.is_none()
-                                                || next.is_some_and(|value| value > size)
-                                            {
-                                                failed = Some(
-                                                    "upload exceeded its declared size".into(),
-                                                );
-                                            } else if let Err(e) = file.write_all(&data).await {
-                                                // Keep draining until UploadEnd so a large
-                                                // sender cannot deadlock against our error reply.
-                                                failed = Some(e.to_string());
-                                            } else {
-                                                transferred = next.unwrap_or(transferred);
-                                            }
-                                        }
-                                    }
-                                    Ok(Some(ipc::Frame::UploadEnd)) => {
-                                        if transferred != size {
-                                            failed = Some(format!(
-                                            "upload size mismatch: expected {size}, received {transferred}"
-                                        ));
-                                        } else if let Err(e) = file.flush().await {
-                                            failed = Some(e.to_string());
-                                        }
-                                        break;
-                                    }
-                                    Ok(Some(_)) => {
-                                        failed = Some("unexpected frame during upload".into());
-                                        break;
-                                    }
-                                    Ok(None) => {
-                                        failed = Some("client disconnected during upload".into());
-                                        break;
-                                    }
-                                    Err(error) => {
-                                        failed = Some(error.to_string());
-                                        break;
-                                    }
-                                }
-                            }
-                            drop(file);
-                            if failed.is_none() {
-                                match sftp.try_exists(&path).await {
-                                    Ok(true) => {
-                                        failed = Some(format!(
-                                            "remote destination was created during upload: {path}"
-                                        ));
-                                    }
-                                    Ok(false) => {}
-                                    Err(error) => failed = Some(error.to_string()),
-                                }
-                            }
-                            if failed.is_none() {
-                                if let Err(error) = sftp.rename(&partial, &path).await {
-                                    failed = Some(error.to_string());
-                                }
-                            }
-                            if let Some(msg) = failed {
-                                let _ = sftp.remove_file(&partial).await;
-                                ipc::write_frame(&mut wr, &ipc::Frame::Error { msg }).await?;
-                            } else {
-                                ipc::write_frame(
-                                    &mut wr,
-                                    &ipc::Frame::TransferDone { bytes: transferred },
-                                )
-                                .await?;
-                            }
-                        }
-                        Err(e) => {
-                            ipc::write_frame(&mut wr, &ipc::Frame::Error { msg: e.to_string() })
-                                .await?;
-                        }
+                    Err(error) => {
+                        ipc::write_frame(
+                            &mut wr,
+                            &ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                        )
+                        .await?;
                     }
                 }
-                Err(e) => {
-                    ipc::write_frame(&mut wr, &ipc::Frame::Error { msg: e.to_string() }).await?;
+            }
+            ipc::Frame::CreateDir { path, timeout_ms } => {
+                let result = run_sftp_deadline(timeout_ms, session.create_dir(&path)).await;
+                match result {
+                    Ok(()) => ipc::write_frame(&mut wr, &ipc::Frame::Ack).await?,
+                    Err(error) => {
+                        ipc::write_frame(
+                            &mut wr,
+                            &ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                        )
+                        .await?;
+                    }
                 }
-            },
+            }
+            ipc::Frame::Download { path, timeout_ms } => {
+                if let Err(error) = serve_download(&session, &mut wr, &path, timeout_ms).await {
+                    ipc::write_frame(
+                        &mut wr,
+                        &ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+            ipc::Frame::UploadBegin {
+                path,
+                size,
+                timeout_ms,
+            } => {
+                if let Err(error) =
+                    serve_upload(&session, &mut rd, &mut wr, &path, size, timeout_ms).await
+                {
+                    ipc::write_frame(
+                        &mut wr,
+                        &ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
             ipc::Frame::Shutdown => {
                 ipc::write_frame(&mut wr, &ipc::Frame::Ack).await?;
                 let _ = shutdown.send(true);
@@ -474,6 +373,149 @@ async fn handle_conn(
     Ok(())
 }
 
+async fn run_sftp_deadline<T>(
+    timeout_ms: u64,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let timeout = validated_sftp_timeout(timeout_ms)?;
+    match tokio::time::timeout(timeout, operation).await {
+        Ok(result) => result,
+        Err(_) => bail!("SFTP operation exceeded its deadline of {timeout_ms} ms"),
+    }
+}
+
+async fn serve_download(
+    session: &SshSession,
+    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    path: &str,
+    timeout_ms: u64,
+) -> Result<()> {
+    let timeout = validated_sftp_timeout(timeout_ms)?;
+    let operation = async {
+        let sftp = session.sftp().await?;
+        let mut file = sftp.open(path).await?;
+        let mut transferred = 0_u64;
+        let mut buffer = vec![0_u8; 32 * 1024];
+        loop {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                ipc::write_frame(writer, &ipc::Frame::TransferDone { bytes: transferred }).await?;
+                return Ok(());
+            }
+            transferred = transferred
+                .checked_add(read as u64)
+                .ok_or_else(|| anyhow::anyhow!("download size overflow"))?;
+            ipc::write_frame(
+                writer,
+                &ipc::Frame::FileChunk {
+                    data: buffer[..read].to_vec(),
+                },
+            )
+            .await?;
+        }
+    };
+    match tokio::time::timeout(timeout, operation).await {
+        Ok(result) => result,
+        Err(_) => bail!("SFTP download exceeded its deadline of {timeout_ms} ms"),
+    }
+}
+
+async fn serve_upload(
+    session: &SshSession,
+    reader: &mut tokio::io::ReadHalf<TcpStream>,
+    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    path: &str,
+    size: u64,
+    timeout_ms: u64,
+) -> Result<()> {
+    let timeout = validated_sftp_timeout(timeout_ms)?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let sftp = match tokio::time::timeout_at(deadline, session.sftp()).await {
+        Ok(result) => result?,
+        Err(_) => bail!("SFTP upload exceeded its deadline of {timeout_ms} ms"),
+    };
+    let partial = temporary_remote_path(path);
+    let operation: Result<()> = match tokio::time::timeout_at(deadline, async {
+        if path.is_empty() || path.len() > 4096 {
+            bail!("remote destination is empty or exceeds 4096 bytes");
+        }
+        if sftp.try_exists(path).await? {
+            bail!("remote destination already exists: {path}");
+        }
+        if sftp.try_exists(&partial).await? {
+            bail!("temporary remote destination unexpectedly exists");
+        }
+        let mut file = sftp.create(&partial).await?;
+        ipc::write_frame(writer, &ipc::Frame::Ack).await?;
+        let mut transferred = 0_u64;
+        let mut failed = None;
+        loop {
+            match ipc::read_frame(reader).await {
+                Ok(Some(ipc::Frame::UploadChunk { data })) => {
+                    if failed.is_none() {
+                        let next = transferred.checked_add(data.len() as u64);
+                        if next.is_none() || next.is_some_and(|value| value > size) {
+                            failed = Some("upload exceeded its declared size".to_owned());
+                        } else if let Err(error) = file.write_all(&data).await {
+                            // Drain until UploadEnd so sender and receiver cannot
+                            // deadlock while the deadline is still active.
+                            failed = Some(error.to_string());
+                        } else if let Some(next) = next {
+                            transferred = next;
+                        }
+                    }
+                }
+                Ok(Some(ipc::Frame::UploadEnd)) => {
+                    if transferred != size {
+                        failed = Some(format!(
+                            "upload size mismatch: expected {size}, received {transferred}"
+                        ));
+                    } else if let Err(error) = file.flush().await {
+                        failed = Some(error.to_string());
+                    }
+                    break;
+                }
+                Ok(Some(_)) => {
+                    failed = Some("unexpected frame during upload".into());
+                    break;
+                }
+                Ok(None) => {
+                    failed = Some("client disconnected during upload".into());
+                    break;
+                }
+                Err(error) => {
+                    failed = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        drop(file);
+        if failed.is_none() && sftp.try_exists(path).await? {
+            failed = Some(format!(
+                "remote destination was created during upload: {path}"
+            ));
+        }
+        if let Some(message) = failed {
+            bail!(message);
+        }
+        sftp.rename(&partial, path).await?;
+        ipc::write_frame(writer, &ipc::Frame::TransferDone { bytes: transferred }).await?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "SFTP upload exceeded its deadline of {timeout_ms} ms"
+        )),
+    };
+
+    if operation.is_err() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), sftp.remove_file(&partial)).await;
+    }
+    operation
+}
+
 fn constant_time_token_eq(actual: &str, expected: &str) -> bool {
     use subtle::ConstantTimeEq;
     actual.as_bytes().ct_eq(expected.as_bytes()).into()
@@ -489,9 +531,19 @@ fn validated_exec_timeout(timeout_ms: u64) -> Result<std::time::Duration> {
     Ok(std::time::Duration::from_millis(timeout_ms))
 }
 
+fn validated_sftp_timeout(timeout_ms: u64) -> Result<std::time::Duration> {
+    if !(1..=ipc::MAX_SFTP_TIMEOUT_MS).contains(&timeout_ms) {
+        bail!(
+            "SFTP timeout must be between 1 and {} ms",
+            ipc::MAX_SFTP_TIMEOUT_MS
+        );
+    }
+    Ok(std::time::Duration::from_millis(timeout_ms))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_token_eq, validated_exec_timeout};
+    use super::{constant_time_token_eq, validated_exec_timeout, validated_sftp_timeout};
 
     #[test]
     fn ipc_tokens_require_an_exact_match() {
@@ -505,5 +557,12 @@ mod tests {
         assert!(validated_exec_timeout(0).is_err());
         assert!(validated_exec_timeout(1).is_ok());
         assert!(validated_exec_timeout(crate::ipc::MAX_EXEC_TIMEOUT_MS + 1).is_err());
+    }
+
+    #[test]
+    fn sftp_timeout_is_bounded() {
+        assert!(validated_sftp_timeout(0).is_err());
+        assert!(validated_sftp_timeout(1).is_ok());
+        assert!(validated_sftp_timeout(crate::ipc::MAX_SFTP_TIMEOUT_MS + 1).is_err());
     }
 }

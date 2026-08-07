@@ -282,10 +282,45 @@ fn extend_command_output(target: &mut Vec<u8>, data: &[u8], other_len: usize) ->
     Ok(())
 }
 
+fn validated_sftp_timeout_ms(timeout: Duration) -> Result<u64> {
+    u64::try_from(timeout.as_millis())
+        .ok()
+        .filter(|value| (1..=ipc::MAX_SFTP_TIMEOUT_MS).contains(value))
+        .ok_or_else(|| anyhow!("SFTP timeout is outside the supported range"))
+}
+
 pub async fn list_dir(
     profile: &str,
     path: &str,
     master: Option<&str>,
+) -> Result<(String, Vec<RemoteEntry>)> {
+    list_dir_with_timeout(
+        profile,
+        path,
+        master,
+        Duration::from_millis(ipc::DEFAULT_SFTP_TIMEOUT_MS),
+    )
+    .await
+}
+
+pub async fn list_dir_with_timeout(
+    profile: &str,
+    path: &str,
+    master: Option<&str>,
+    timeout: Duration,
+) -> Result<(String, Vec<RemoteEntry>)> {
+    let timeout_ms = validated_sftp_timeout_ms(timeout)?;
+    match tokio::time::timeout(timeout, list_dir_inner(profile, path, master, timeout_ms)).await {
+        Ok(result) => result,
+        Err(_) => bail!("SFTP directory listing exceeded its deadline of {timeout_ms} ms"),
+    }
+}
+
+async fn list_dir_inner(
+    profile: &str,
+    path: &str,
+    master: Option<&str>,
+    timeout_ms: u64,
 ) -> Result<(String, Vec<RemoteEntry>)> {
     if let Some(daemon) = connect_daemon(profile).await? {
         let mut stream = daemon.stream;
@@ -293,6 +328,7 @@ pub async fn list_dir(
             &mut stream,
             &ipc::Frame::ListDir {
                 path: path.to_owned(),
+                timeout_ms,
             },
         )
         .await?;
@@ -312,12 +348,41 @@ pub async fn list_dir(
 }
 
 pub async fn create_dir(profile: &str, path: &str, master: Option<&str>) -> Result<()> {
+    create_dir_with_timeout(
+        profile,
+        path,
+        master,
+        Duration::from_millis(ipc::DEFAULT_SFTP_TIMEOUT_MS),
+    )
+    .await
+}
+
+pub async fn create_dir_with_timeout(
+    profile: &str,
+    path: &str,
+    master: Option<&str>,
+    timeout: Duration,
+) -> Result<()> {
+    let timeout_ms = validated_sftp_timeout_ms(timeout)?;
+    match tokio::time::timeout(timeout, create_dir_inner(profile, path, master, timeout_ms)).await {
+        Ok(result) => result,
+        Err(_) => bail!("SFTP create-directory exceeded its deadline of {timeout_ms} ms"),
+    }
+}
+
+async fn create_dir_inner(
+    profile: &str,
+    path: &str,
+    master: Option<&str>,
+    timeout_ms: u64,
+) -> Result<()> {
     if let Some(daemon) = connect_daemon(profile).await? {
         let mut stream = daemon.stream;
         ipc::write_frame(
             &mut stream,
             &ipc::Frame::CreateDir {
                 path: path.to_owned(),
+                timeout_ms,
             },
         )
         .await?;
@@ -342,6 +407,42 @@ pub async fn upload_file(
     remote: &str,
     master: Option<&str>,
 ) -> Result<u64> {
+    upload_file_with_timeout(
+        profile,
+        local,
+        remote,
+        master,
+        Duration::from_millis(ipc::DEFAULT_SFTP_TIMEOUT_MS),
+    )
+    .await
+}
+
+pub async fn upload_file_with_timeout(
+    profile: &str,
+    local: &Path,
+    remote: &str,
+    master: Option<&str>,
+    timeout: Duration,
+) -> Result<u64> {
+    let timeout_ms = validated_sftp_timeout_ms(timeout)?;
+    match tokio::time::timeout(
+        timeout,
+        upload_file_inner(profile, local, remote, master, timeout_ms),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => bail!("SFTP upload exceeded its deadline of {timeout_ms} ms"),
+    }
+}
+
+async fn upload_file_inner(
+    profile: &str,
+    local: &Path,
+    remote: &str,
+    master: Option<&str>,
+    timeout_ms: u64,
+) -> Result<u64> {
     let mut source = tokio::fs::File::open(local)
         .await
         .with_context(|| format!("open local file {}", local.display()))?;
@@ -355,6 +456,7 @@ pub async fn upload_file(
             &ipc::Frame::UploadBegin {
                 path: remote.to_owned(),
                 size,
+                timeout_ms,
             },
         )
         .await?;
@@ -424,14 +526,17 @@ pub async fn upload_file(
     transfer
 }
 
-/// CLI upload entry point: reuse an authenticated daemon without prompting,
-/// otherwise decrypt the profile for a direct SSH connection.
-pub async fn upload(profile: &str, local: &Path, remote: &str) -> Result<u64> {
+pub async fn upload_with_timeout(
+    profile: &str,
+    local: &Path,
+    remote: &str,
+    timeout: Duration,
+) -> Result<u64> {
     if connect_daemon(profile).await?.is_some() {
-        upload_file(profile, local, remote, None).await
+        upload_file_with_timeout(profile, local, remote, None, timeout).await
     } else {
         let master = ask_master()?;
-        upload_file(profile, local, remote, Some(&master)).await
+        upload_file_with_timeout(profile, local, remote, Some(&master), timeout).await
     }
 }
 
@@ -440,6 +545,45 @@ pub async fn download_file(
     remote: &str,
     local: &Path,
     master: Option<&str>,
+) -> Result<u64> {
+    download_file_with_timeout(
+        profile,
+        remote,
+        local,
+        master,
+        Duration::from_millis(ipc::DEFAULT_SFTP_TIMEOUT_MS),
+    )
+    .await
+}
+
+pub async fn download_file_with_timeout(
+    profile: &str,
+    remote: &str,
+    local: &Path,
+    master: Option<&str>,
+    timeout: Duration,
+) -> Result<u64> {
+    let timeout_ms = validated_sftp_timeout_ms(timeout)?;
+    match tokio::time::timeout(
+        timeout,
+        download_file_inner(profile, remote, local, master, timeout_ms),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(partial_download_path(local)).await;
+            bail!("SFTP download exceeded its deadline of {timeout_ms} ms");
+        }
+    }
+}
+
+async fn download_file_inner(
+    profile: &str,
+    remote: &str,
+    local: &Path,
+    master: Option<&str>,
+    timeout_ms: u64,
 ) -> Result<u64> {
     if tokio::fs::try_exists(local).await? {
         bail!("local destination already exists: {}", local.display());
@@ -460,6 +604,7 @@ pub async fn download_file(
                 &mut stream,
                 &ipc::Frame::Download {
                     path: remote.to_owned(),
+                    timeout_ms,
                 },
             )
             .await?;
@@ -533,13 +678,17 @@ pub async fn download_file(
     }
 }
 
-/// CLI download entry point matching [`upload`].
-pub async fn download(profile: &str, remote: &str, local: &Path) -> Result<u64> {
+pub async fn download_with_timeout(
+    profile: &str,
+    remote: &str,
+    local: &Path,
+    timeout: Duration,
+) -> Result<u64> {
     if connect_daemon(profile).await?.is_some() {
-        download_file(profile, remote, local, None).await
+        download_file_with_timeout(profile, remote, local, None, timeout).await
     } else {
         let master = ask_master()?;
-        download_file(profile, remote, local, Some(&master)).await
+        download_file_with_timeout(profile, remote, local, Some(&master), timeout).await
     }
 }
 
@@ -789,7 +938,7 @@ fn key_to_bytes(ev: &Event) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_exec_response;
+    use super::{read_exec_response, validated_sftp_timeout_ms};
     use crate::ipc::{self, Frame};
 
     #[tokio::test]
@@ -817,5 +966,15 @@ mod tests {
             .unwrap();
         let error = read_exec_response(&mut reader).await.unwrap_err();
         assert!(error.to_string().contains("without an exit status"));
+    }
+
+    #[test]
+    fn client_rejects_unbounded_sftp_timeouts() {
+        assert!(validated_sftp_timeout_ms(std::time::Duration::ZERO).is_err());
+        assert!(validated_sftp_timeout_ms(std::time::Duration::from_millis(1)).is_ok());
+        assert!(validated_sftp_timeout_ms(std::time::Duration::from_millis(
+            crate::ipc::MAX_SFTP_TIMEOUT_MS + 1
+        ))
+        .is_err());
     }
 }

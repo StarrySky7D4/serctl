@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 struct TestState {
     files: Mutex<HashMap<String, Vec<u8>>>,
     cancelled: AtomicBool,
+    sftp_hang: AtomicBool,
 }
 
 struct TestSsh {
@@ -150,6 +151,9 @@ impl russh_sftp::server::Handler for MemorySftp {
         flags: OpenFlags,
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
+        if self.state.sftp_hang.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         let mut files = self.state.files.lock().await;
         if flags.contains(OpenFlags::CREATE) {
             files.entry(filename.clone()).or_default();
@@ -211,6 +215,9 @@ impl russh_sftp::server::Handler for MemorySftp {
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        if self.state.sftp_hang.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         let files = self.state.files.lock().await;
         let file = files.get(&path).ok_or(StatusCode::NoSuchFile)?;
         let attrs = FileAttributes {
@@ -402,6 +409,39 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         15
     );
     assert_eq!(std::fs::read(&download_target).unwrap(), b"server evidence");
+
+    state.sftp_hang.store(true, Ordering::SeqCst);
+    let upload_timeout = client::upload_file_with_timeout(
+        "e2e",
+        &upload_source,
+        "/hung-upload.txt",
+        None,
+        Duration::from_millis(50),
+    )
+    .await
+    .unwrap_err();
+    assert!(upload_timeout.to_string().contains("deadline"));
+
+    let timed_download = test_home.join("timed-download.txt");
+    let download_timeout = client::download_file_with_timeout(
+        "e2e",
+        "/evidence.txt",
+        &timed_download,
+        None,
+        Duration::from_millis(50),
+    )
+    .await
+    .unwrap_err();
+    assert!(download_timeout.to_string().contains("deadline"));
+    assert!(!timed_download.exists());
+    assert!(!test_home.join("timed-download.txt.serctl-part").exists());
+
+    state.sftp_hang.store(false, Ordering::SeqCst);
+    let after_timeout =
+        client::exec_capture_with_timeout("e2e", "ok", None, Duration::from_secs(1))
+            .await
+            .unwrap();
+    assert_eq!(after_timeout.code, Some(0));
 
     assert!(client::down_quiet("e2e").await.unwrap());
     daemon_task.await.unwrap().unwrap();

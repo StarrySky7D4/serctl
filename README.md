@@ -51,8 +51,8 @@ $exe = ".\target\debug\serctl.exe"
 & $exe shell prod
 
 # 上传证据，再从服务器拉取 M7 evidence
-& $exe upload prod .\request.json /tmp/request.json
-& $exe download prod /tmp/server-evidence.json .\server-evidence.json
+& $exe upload prod .\request.json /tmp/request.json --timeout-secs 120
+& $exe download prod /tmp/server-evidence.json .\server-evidence.json --timeout-secs 120
 
 # 为可能挂起的命令设置更短的硬超时（默认 300 秒）
 & $exe exec prod --timeout-secs 30 -- "collect-evidence"
@@ -70,8 +70,8 @@ $exe = ".\target\debug\serctl.exe"
 | `remove NAME` | 删除配置 |
 | `up [NAME]` | 前台启动持久连接 |
 | `exec NAME [--timeout-secs N] -- <CMD...>` | 执行远程命令，优先复用连接；默认硬超时 300 秒 |
-| `upload NAME LOCAL REMOTE` | 原子上传文件，不覆盖已有远程文件 |
-| `download NAME REMOTE LOCAL` | 拉取服务器 evidence，不覆盖已有本地文件 |
+| `upload NAME LOCAL REMOTE [--timeout-secs N]` | 原子上传文件，不覆盖已有远程文件；默认硬超时 300 秒 |
+| `download NAME REMOTE LOCAL [--timeout-secs N]` | 拉取服务器 evidence，不覆盖已有本地文件；默认硬超时 300 秒 |
 | `shell [NAME]` | 打开交互式 PTY shell |
 | `status [NAME]` | 查看守护状态 |
 | `down [NAME]` | 停止守护连接 |
@@ -89,6 +89,7 @@ $exe = ".\target\debug\serctl.exe"
 - 守护进程只监听 `127.0.0.1`，每次启动生成 256 位随机能力令牌。客户端必须先通过常量时间令牌校验，之后才能执行命令、传输文件或请求关闭。
 - IPC 认证设有超时、帧大小和并发连接上限；单次命令输出限制为 8 MiB，避免本机或远端无限输出耗尽内存。
 - 每个远程命令都有由 daemon 执行的硬 deadline；客户端在结果返回前断开时，daemon 会主动向对应 SSH channel 发送 EOF/Close。只有收到明确退出状态才会把命令视为完成，IPC 中断不会再被误判为退出码 0。
+- 目录浏览、建目录、上传和下载也具有 client/daemon 双层总硬 deadline，默认 300 秒、最大 24 小时；上传超时会尝试清理远端随机临时文件，下载超时会清理本地 `.serctl-part`。
 - 运行锁文件使用配置名的 SHA-256 作为文件名，新格式不再明文写入远程主机和用户名；每个配置具有 OS 级生命周期租约，防止重复守护进程和陈旧锁竞态。
 - 首次固定主机指纹时采用只写一次语义；并发连接不能用不同指纹覆盖已经固定的结果。
 - 首次 SSH 连接采用 TOFU；第一次连接若遭中间人攻击，错误公钥仍可能被固定。高安全环境应通过独立渠道核对首次显示的指纹。
