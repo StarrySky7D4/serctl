@@ -113,8 +113,13 @@ impl Default for VaultFile {
 pub struct LockInfo {
     pub profile: String,
     pub pid: u32,
+    /// Legacy loopback TCP port. New daemons leave this at zero.
+    #[serde(default, skip_serializing_if = "is_zero_port")]
     pub port: u16,
-    /// Kept for reading v1 lock files. New lock files omit endpoint metadata.
+    /// Platform-local endpoint: Windows named pipe or Unix socket path.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint: String,
+    /// Kept for reading v1 lock files. New lock files omit remote metadata.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -123,6 +128,10 @@ pub struct LockInfo {
     /// Random capability required before any IPC command is accepted.
     #[serde(default)]
     pub token: String,
+}
+
+fn is_zero_port(port: &u16) -> bool {
+    *port == 0
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -594,6 +603,9 @@ pub fn write_lock(info: &LockInfo) -> Result<()> {
     if B64.decode(&info.token).map(|v| v.len()).unwrap_or(0) != 32 {
         bail!("IPC token must contain 32 random bytes");
     }
+    if info.endpoint.is_empty() {
+        bail!("local IPC endpoint cannot be empty");
+    }
     let path = lock_path(&info.profile)?;
     let mut file = AtomicWriteFile::open(&path)?;
     file.write_all(&serde_json::to_vec_pretty(info)?)?;
@@ -713,6 +725,16 @@ mod tests {
         assert!(!filename.contains('/'));
         assert!(!filename.contains('\\'));
         assert!(!filename.contains("escape"));
+    }
+
+    #[test]
+    fn legacy_tcp_lock_remains_detectable() {
+        let lock: LockInfo = serde_json::from_str(
+            r#"{"profile":"prod","pid":7,"port":4321,"host":"","user":"","started_unix":1,"token":""}"#,
+        )
+        .unwrap();
+        assert_eq!(lock.port, 4321);
+        assert!(lock.endpoint.is_empty());
     }
 
     #[test]

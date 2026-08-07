@@ -28,9 +28,9 @@ cargo run
 
 ```text
 Winit / Egui UI ─┐
-                 ├─ client（命令、SFTP、PTY）─ authenticated IPC ─ daemon ─ russh
-CLI ─────────────┘                                      └─────── russh-sftp
-                 └─ vault（Argon2id + ChaCha20-Poly1305）
+                 ├─ client（命令、SFTP、PTY）─ authenticated local IPC ─ daemon ─ russh
+CLI ─────────────┘        │ Windows Named Pipe / Unix Domain Socket       └─ russh-sftp
+                         └─ vault（Argon2id + ChaCha20-Poly1305）
 ```
 
 UI 与 CLI 复用同一组核心接口。守护进程关闭通过 Tokio 通知通道协调，不会调用 `process::exit`，因此可以安全嵌入桌面进程。
@@ -86,7 +86,8 @@ $exe = ".\target\debug\serctl.exe"
 - 凭证库包含加密校验器，错误主口令或校验器篡改会在写入前被拒绝。随机盐和 nonce 长度均严格校验。
 - 凭证更新使用进程间互斥锁和同目录原子替换，降低并发更新丢失与崩溃截断风险。
 - Windows 上凭证目录和文件使用禁止继承的 DACL，仅保留文件所有者、SYSTEM 和 Administrators；Unix 上目录为 `0700`、文件为 `0600`。权限设置失败时保存操作失败关闭。
-- 守护进程只监听 `127.0.0.1`，每次启动生成 256 位随机能力令牌。客户端必须先通过常量时间令牌校验，之后才能执行命令、传输文件或请求关闭。
+- 守护进程不再开放 TCP 端口：Windows 使用拒绝远程客户端的 Named Pipe，Unix 使用位于 `0700` 运行目录且权限为 `0600` 的 Unix Domain Socket。两端复用同一套长度前缀帧协议和异步读写接口。
+- 每次启动生成 256 位随机能力令牌，平台端点名称由配置名和令牌散列得到。客户端必须先通过常量时间令牌校验，之后才能执行命令、传输文件或请求关闭。
 - IPC 认证设有超时、帧大小和并发连接上限；单次命令输出限制为 8 MiB，避免本机或远端无限输出耗尽内存。
 - 每个远程命令都有由 daemon 执行的硬 deadline；客户端在结果返回前断开时，daemon 会主动向对应 SSH channel 发送 EOF/Close。只有收到明确退出状态才会把命令视为完成，IPC 中断不会再被误判为退出码 0。
 - 目录浏览、建目录、上传和下载也具有 client/daemon 双层总硬 deadline，默认 300 秒、最大 24 小时；上传超时会尝试清理远端随机临时文件，下载超时会清理本地 `.serctl-part`。
@@ -94,7 +95,7 @@ $exe = ".\target\debug\serctl.exe"
 - 首次固定主机指纹时采用只写一次语义；并发连接不能用不同指纹覆盖已经固定的结果。
 - 首次 SSH 连接采用 TOFU；第一次连接若遭中间人攻击，错误公钥仍可能被固定。高安全环境应通过独立渠道核对首次显示的指纹。
 
-旧凭证库可继续读取，并在使用正确主口令修改记录时升级为新格式。旧版守护进程没有 IPC 令牌；新版客户端会拒绝连接并提示重启，而不会静默降级。升级程序后应在方便时重启旧守护进程。
+旧凭证库可继续读取，并在使用正确主口令修改记录时升级为新格式。旧版守护进程没有 IPC 令牌或仍使用 loopback TCP；新版客户端会拒绝连接并提示重启，而不会静默降级。升级程序后应在方便时重启旧守护进程。
 
 本模型不防御已获得同一 Windows/Unix 用户身份、管理员权限、调试权限、内存转储或键盘记录能力的攻击者。主口令强度仍直接决定离线破解成本，建议使用长且唯一的口令。
 
@@ -123,4 +124,4 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-测试套件除单元测试外，还会在随机本地端口启动临时 SSH/SFTP 服务和真实 daemon，覆盖 authenticated IPC、错误令牌拒绝、exec 正常退出、deadline、客户端断连取消，以及上传/下载内容往返。所有状态写入 `target` 下的隔离临时目录，不读取或修改真实凭证库；外部服务器兼容性验证仍需要可访问的测试服务器。
+测试套件除单元测试外，还会在随机本地端口启动临时 SSH/SFTP 服务和真实 daemon；daemon IPC 使用当前平台的 Named Pipe/Unix Socket，覆盖认证、错误令牌拒绝、exec 正常退出、deadline、客户端断连取消，以及上传/下载内容往返。所有状态写入 `target` 下的隔离临时目录，不读取或修改真实凭证库；外部服务器兼容性验证仍需要可访问的测试服务器。

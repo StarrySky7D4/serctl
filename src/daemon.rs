@@ -5,8 +5,7 @@ use fs2::FileExt;
 use russh::ChannelMsg;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{watch, Semaphore};
 use zeroize::Zeroizing;
 
@@ -46,12 +45,15 @@ pub async fn run_with_ready(
     profile: &str,
     creds: Creds,
     master: String,
-    ready: Option<std::sync::mpsc::Sender<u16>>,
+    ready: Option<std::sync::mpsc::Sender<()>>,
 ) -> Result<()> {
     let lease = vault::acquire_runtime_lease(profile)?;
     if let Some(existing) = vault::read_lock(profile)? {
         if existing.token.is_empty() {
             bail!("a legacy daemon lock exists for '{profile}'; stop the old daemon first");
+        }
+        if existing.endpoint.is_empty() {
+            bail!("a legacy TCP daemon lock exists for '{profile}'; restart it first");
         }
         if existing_daemon_is_live(&existing).await {
             bail!("a daemon is already running for '{profile}'");
@@ -66,13 +68,14 @@ pub async fn run_with_ready(
     }
     let session = Arc::new(session);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
     let token = vault::new_ipc_token();
+    let mut listener = ipc::LocalListener::bind(profile, &token)?;
+    let endpoint = listener.endpoint().to_owned();
     vault::write_lock(&LockInfo {
         profile: profile.to_string(),
         pid: std::process::id(),
-        port,
+        port: 0,
+        endpoint: endpoint.clone(),
         // Endpoint/user data is returned only after authentication. Keeping
         // it out of the runtime lock reduces plaintext metadata exposure.
         host: String::new(),
@@ -86,14 +89,15 @@ pub async fn run_with_ready(
         _lease: lease,
     };
     if let Some(ready) = ready {
-        let _ = ready.send(port);
+        let _ = ready.send(());
     }
 
     eprintln!(
-        "[serctl] daemon up: profile={profile}  {host}:{ssh} as {user}  ipc=127.0.0.1:{port}  (Ctrl-C to stop)",
+        "[serctl] daemon up: profile={profile}  {host}:{ssh} as {user}  ipc={kind}:{endpoint}  (Ctrl-C to stop)",
         host = creds.host,
         ssh = creds.port,
-        user = creds.user
+        user = creds.user,
+        kind = ipc::endpoint_kind(),
     );
 
     let info = ConnInfo {
@@ -109,12 +113,12 @@ pub async fn run_with_ready(
     loop {
         tokio::select! {
             res = listener.accept() => {
-                let (stream, peer) = res?;
+                let stream = res?;
                 let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
                     log::warn!("rejecting IPC connection: connection limit reached");
                     continue;
                 };
-                log::debug!("ipc conn from {peer}");
+                log::debug!("local IPC connection accepted");
                 let s = session.clone();
                 let i = info.clone();
                 let shutdown = shutdown_tx.clone();
@@ -142,7 +146,7 @@ pub async fn run_with_ready(
 
 async fn existing_daemon_is_live(lock: &LockInfo) -> bool {
     let probe = async {
-        let mut stream = TcpStream::connect(("127.0.0.1", lock.port)).await?;
+        let mut stream = ipc::connect(&lock.endpoint).await?;
         ipc::write_frame(
             &mut stream,
             &ipc::Frame::Authenticate {
@@ -161,12 +165,15 @@ async fn existing_daemon_is_live(lock: &LockInfo) -> bool {
     )
 }
 
-async fn handle_conn(
+async fn handle_conn<S>(
     session: Arc<SshSession>,
-    stream: TcpStream,
+    stream: S,
     info: ConnInfo,
     shutdown: watch::Sender<bool>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut rd, mut wr) = tokio::io::split(stream);
     let authentication = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -384,12 +391,15 @@ async fn run_sftp_deadline<T>(
     }
 }
 
-async fn serve_download(
+async fn serve_download<W>(
     session: &SshSession,
-    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    writer: &mut W,
     path: &str,
     timeout_ms: u64,
-) -> Result<()> {
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let timeout = validated_sftp_timeout(timeout_ms)?;
     let operation = async {
         let sftp = session.sftp().await?;
@@ -420,14 +430,18 @@ async fn serve_download(
     }
 }
 
-async fn serve_upload(
+async fn serve_upload<R, W>(
     session: &SshSession,
-    reader: &mut tokio::io::ReadHalf<TcpStream>,
-    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    reader: &mut R,
+    writer: &mut W,
     path: &str,
     size: u64,
     timeout_ms: u64,
-) -> Result<()> {
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let timeout = validated_sftp_timeout(timeout_ms)?;
     let deadline = tokio::time::Instant::now() + timeout;
     let sftp = match tokio::time::timeout_at(deadline, session.sftp()).await {

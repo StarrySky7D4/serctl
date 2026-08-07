@@ -7,8 +7,7 @@ use crossterm::{
 use russh::ChannelMsg;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
@@ -22,7 +21,7 @@ pub struct DaemonStatus {
     pub host: String,
     pub user: String,
     pub started_unix: i64,
-    pub port: u16,
+    pub endpoint: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -45,7 +44,7 @@ pub struct GuiShell {
 }
 
 struct DaemonConnection {
-    stream: TcpStream,
+    stream: ipc::ClientStream,
     lock: LockInfo,
 }
 
@@ -56,11 +55,11 @@ async fn connect_daemon(profile: &str) -> Result<Option<DaemonConnection>> {
     if lock.token.is_empty() {
         bail!("legacy daemon has no IPC authentication; restart it with the updated serctl");
     }
-    let connected = tokio::time::timeout(
-        Duration::from_millis(400),
-        TcpStream::connect(("127.0.0.1", lock.port)),
-    )
-    .await;
+    if lock.endpoint.is_empty() {
+        bail!("legacy TCP daemon is incompatible with native local IPC; restart it with the updated serctl");
+    }
+    let connected =
+        tokio::time::timeout(Duration::from_millis(400), ipc::connect(&lock.endpoint)).await;
     let Ok(Ok(mut stream)) = connected else {
         let _ = vault::remove_lock_if_token(profile, &lock.token);
         return Ok(None);
@@ -201,8 +200,12 @@ pub async fn status(profile: &str) -> Result<()> {
     if let Some(info) = daemon_status(profile).await? {
         let up = now_unix() - info.started_unix;
         println!(
-            "daemon: ACTIVE  profile={}  {} as {}  uptime={up}s  ipc=127.0.0.1:{}",
-            info.profile, info.host, info.user, info.port
+            "daemon: ACTIVE  profile={}  {} as {}  uptime={up}s  ipc={}:{}",
+            info.profile,
+            info.host,
+            info.user,
+            ipc::endpoint_kind(),
+            info.endpoint
         );
     } else {
         println!("daemon: not running for profile '{profile}'");
@@ -212,7 +215,7 @@ pub async fn status(profile: &str) -> Result<()> {
 
 pub async fn daemon_status(profile: &str) -> Result<Option<DaemonStatus>> {
     if let Some(daemon) = connect_daemon(profile).await? {
-        let port = daemon.lock.port;
+        let endpoint = daemon.lock.endpoint.clone();
         let mut s = daemon.stream;
         ipc::write_frame(&mut s, &ipc::Frame::Status).await?;
         match ipc::read_frame(&mut s).await? {
@@ -226,7 +229,7 @@ pub async fn daemon_status(profile: &str) -> Result<Option<DaemonStatus>> {
                 host,
                 user,
                 started_unix,
-                port,
+                endpoint,
             })),
             _ => bail!("daemon responded with an unexpected frame"),
         }
@@ -811,7 +814,7 @@ pub async fn shell(profile: &str) -> Result<()> {
     }
 }
 
-async fn shell_via_ipc(stream: TcpStream) -> Result<()> {
+async fn shell_via_ipc(stream: ipc::ClientStream) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(stream);
     let (cols, rows) = term_size();
     ipc::write_frame(&mut wr, &ipc::Frame::Shell { cols, rows }).await?;
@@ -827,10 +830,11 @@ async fn shell_via_ipc(stream: TcpStream) -> Result<()> {
     res
 }
 
-async fn shell_loop_ipc(
-    rd: &mut tokio::io::ReadHalf<TcpStream>,
-    wr: &mut tokio::io::WriteHalf<TcpStream>,
-) -> Result<()> {
+async fn shell_loop_ipc<R, W>(rd: &mut R, wr: &mut W) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut kbrx = spawn_stdin_pump();
     let mut out = tokio::io::stdout();
     loop {

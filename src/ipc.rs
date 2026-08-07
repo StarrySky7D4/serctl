@@ -1,5 +1,6 @@
-//! Length-prefixed JSON framing for the daemon IPC protocol (127.0.0.1 only).
-use anyhow::{bail, Result};
+//! Authenticated local IPC with one framing protocol over Windows named pipes
+//! or Unix domain sockets.
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -19,6 +20,134 @@ fn default_exec_timeout_ms() -> u64 {
 
 fn default_sftp_timeout_ms() -> u64 {
     DEFAULT_SFTP_TIMEOUT_MS
+}
+
+fn endpoint_id(profile: &str, token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    // 128 bits keeps the platform endpoint compact (Unix socket paths have a
+    // small OS-defined limit) while the full 256-bit capability is still
+    // required by the framing protocol.
+    hex::encode(Sha256::digest(format!("{profile}\0{token}").as_bytes()))[..32].to_owned()
+}
+
+#[cfg(windows)]
+pub type ClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
+#[cfg(unix)]
+pub type ClientStream = tokio::net::UnixStream;
+
+#[cfg(windows)]
+pub struct LocalListener {
+    endpoint: String,
+    pending: tokio::net::windows::named_pipe::NamedPipeServer,
+}
+
+#[cfg(unix)]
+pub struct LocalListener {
+    endpoint: String,
+    listener: tokio::net::UnixListener,
+}
+
+#[cfg(windows)]
+impl LocalListener {
+    pub fn bind(profile: &str, token: &str) -> Result<Self> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let endpoint = format!(r"\\.\pipe\serctl-{}", endpoint_id(profile, token));
+        let pending = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create(&endpoint)
+            .with_context(|| format!("create named pipe {endpoint}"))?;
+        Ok(Self { endpoint, pending })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub async fn accept(&mut self) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        self.pending.connect().await?;
+        let next = ServerOptions::new()
+            .reject_remote_clients(true)
+            .create(&self.endpoint)
+            .with_context(|| format!("create next named pipe instance {}", self.endpoint))?;
+        Ok(std::mem::replace(&mut self.pending, next))
+    }
+}
+
+#[cfg(unix)]
+impl LocalListener {
+    pub fn bind(profile: &str, token: &str) -> Result<Self> {
+        let endpoint = crate::vault::run_dir()?
+            .join(format!("{}.sock", endpoint_id(profile, token)))
+            .to_string_lossy()
+            .into_owned();
+        let path = std::path::Path::new(&endpoint);
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove stale Unix socket"),
+        }
+        let listener = tokio::net::UnixListener::bind(path)
+            .with_context(|| format!("bind Unix socket {endpoint}"))?;
+        crate::security::harden_file(path)?;
+        Ok(Self { endpoint, listener })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub async fn accept(&mut self) -> Result<tokio::net::UnixStream> {
+        Ok(self.listener.accept().await?.0)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LocalListener {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.endpoint);
+    }
+}
+
+#[cfg(windows)]
+pub async fn connect(endpoint: &str) -> Result<ClientStream> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
+
+    loop {
+        match ClientOptions::new().open(endpoint) {
+            Ok(client) => return Ok(client),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code)
+                        if code == ERROR_PIPE_BUSY as i32 || code == ERROR_FILE_NOT_FOUND as i32
+                ) =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error).with_context(|| format!("open named pipe {endpoint}")),
+        }
+    }
+}
+
+#[cfg(unix)]
+pub async fn connect(endpoint: &str) -> Result<ClientStream> {
+    tokio::net::UnixStream::connect(endpoint)
+        .await
+        .with_context(|| format!("connect Unix socket {endpoint}"))
+}
+
+pub fn endpoint_kind() -> &'static str {
+    #[cfg(windows)]
+    return "named-pipe";
+    #[cfg(unix)]
+    return "unix-socket";
+    #[allow(unreachable_code)]
+    "unsupported"
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 #[derive(Default)]
@@ -253,8 +253,8 @@ impl russh_sftp::server::Handler for MemorySftp {
     }
 }
 
-async fn authenticated_stream(port: u16, token: &str) -> anyhow::Result<TcpStream> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+async fn authenticated_stream(endpoint: &str, token: &str) -> anyhow::Result<ipc::ClientStream> {
+    let mut stream = ipc::connect(endpoint).await?;
     ipc::write_frame(
         &mut stream,
         &ipc::Frame::Authenticate {
@@ -324,16 +324,18 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         "unused-test-master".into(),
         Some(ready_tx),
     ));
-    let daemon_port =
-        tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(5)).unwrap())
-            .await
-            .unwrap();
-    let lock = vault::read_lock("e2e").unwrap().unwrap();
-    assert_eq!(daemon_port, lock.port);
-
-    let mut rejected = TcpStream::connect(("127.0.0.1", daemon_port))
+    tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(5)).unwrap())
         .await
         .unwrap();
+    let lock = vault::read_lock("e2e").unwrap().unwrap();
+    assert_eq!(lock.port, 0);
+    assert!(!lock.endpoint.is_empty());
+    #[cfg(windows)]
+    assert!(lock.endpoint.starts_with(r"\\.\pipe\serctl-"));
+    #[cfg(unix)]
+    assert!(lock.endpoint.ends_with(".sock"));
+
+    let mut rejected = ipc::connect(&lock.endpoint).await.unwrap();
     ipc::write_frame(
         &mut rejected,
         &ipc::Frame::Authenticate {
@@ -366,7 +368,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     .unwrap();
 
     state.cancelled.store(false, Ordering::SeqCst);
-    let mut disconnected = authenticated_stream(daemon_port, &lock.token)
+    let mut disconnected = authenticated_stream(&lock.endpoint, &lock.token)
         .await
         .unwrap();
     ipc::write_frame(
