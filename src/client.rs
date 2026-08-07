@@ -111,8 +111,7 @@ async fn direct_connect(profile: &str, creds: &Creds, master: &str) -> Result<Ss
 pub async fn exec_with_timeout(profile: &str, cmd: &str, timeout: Duration) -> Result<i32> {
     if connect_daemon(profile).await?.is_some() {
         let result = exec_capture_with_timeout(profile, cmd, None, timeout).await?;
-        tokio::io::stdout().write_all(&result.stdout).await?;
-        tokio::io::stderr().write_all(&result.stderr).await?;
+        write_command_output(&result).await?;
         return result
             .code
             .ok_or_else(|| anyhow!("remote command completed without an exit status"));
@@ -120,11 +119,35 @@ pub async fn exec_with_timeout(profile: &str, cmd: &str, timeout: Duration) -> R
 
     let master = ask_master()?;
     let result = exec_capture_with_timeout(profile, cmd, Some(&master), timeout).await?;
-    tokio::io::stdout().write_all(&result.stdout).await?;
-    tokio::io::stderr().write_all(&result.stderr).await?;
+    write_command_output(&result).await?;
     result
         .code
         .ok_or_else(|| anyhow!("remote command completed without an exit status"))
+}
+
+async fn write_command_output(result: &CommandOutput) -> Result<()> {
+    // The CLI exits with the remote status immediately after this function.
+    // Explicit flushes are therefore required for Tokio's blocking stdio
+    // adapters; relying on destructor-based flushing loses short outputs.
+    let mut stdout = tokio::io::stdout();
+    let mut stderr = tokio::io::stderr();
+    write_command_output_to(result, &mut stdout, &mut stderr).await
+}
+
+async fn write_command_output_to<W, E>(
+    result: &CommandOutput,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    stdout.write_all(&result.stdout).await?;
+    stdout.flush().await?;
+    stderr.write_all(&result.stderr).await?;
+    stderr.flush().await?;
+    Ok(())
 }
 
 /// Execute a command without touching process stdio. UI callers provide the
@@ -1021,8 +1044,62 @@ fn key_to_bytes(ev: &Event) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_exec_response, validated_sftp_timeout_ms};
+    use super::{
+        read_exec_response, validated_sftp_timeout_ms, write_command_output_to, CommandOutput,
+    };
     use crate::ipc::{self, Frame};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    #[derive(Default)]
+    struct FlushTrackingWriter {
+        bytes: Vec<u8>,
+        flushed: bool,
+    }
+
+    impl AsyncWrite for FlushTrackingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushed = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn command_output_is_flushed_before_the_cli_exits() {
+        let output = CommandOutput {
+            stdout: b"short stdout".to_vec(),
+            stderr: b"short stderr".to_vec(),
+            code: Some(0),
+        };
+        let mut stdout = FlushTrackingWriter::default();
+        let mut stderr = FlushTrackingWriter::default();
+
+        write_command_output_to(&output, &mut stdout, &mut stderr)
+            .await
+            .unwrap();
+
+        assert_eq!(stdout.bytes, output.stdout);
+        assert_eq!(stderr.bytes, output.stderr);
+        assert!(stdout.flushed);
+        assert!(stderr.flushed);
+    }
 
     #[tokio::test]
     async fn exec_disconnect_before_exit_status_is_an_error() {
