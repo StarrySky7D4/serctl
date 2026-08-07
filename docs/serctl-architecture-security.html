@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>serctl 架构、安全与运维说明</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --panel-2: #eef3f9;
+      --ink: #182230;
+      --muted: #5f6b7a;
+      --line: #d9e1eb;
+      --brand: #0f6b62;
+      --brand-2: #174e7a;
+      --ok: #16794b;
+      --warn: #9a6200;
+      --risk: #a33a35;
+      --code: #102031;
+      --code-ink: #eaf2f8;
+      --shadow: 0 12px 36px rgba(29, 44, 64, .08);
+      --radius: 16px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0c1219;
+        --panel: #141d27;
+        --panel-2: #1a2633;
+        --ink: #e7edf4;
+        --muted: #a8b5c4;
+        --line: #2b3a49;
+        --brand: #5dc7b8;
+        --brand-2: #78b9ee;
+        --ok: #67d69d;
+        --warn: #f2bd62;
+        --risk: #ff9289;
+        --code: #070c12;
+        --code-ink: #eaf2f8;
+        --shadow: 0 14px 40px rgba(0, 0, 0, .28);
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--bg);
+      font: 15px/1.72 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    a { color: var(--brand-2); text-decoration-thickness: .08em; text-underline-offset: .18em; }
+    a:hover { text-decoration-thickness: .14em; }
+    code, pre { font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; }
+    code { font-size: .92em; overflow-wrap: anywhere; word-break: break-word; }
+    pre code { overflow-wrap: normal; word-break: normal; }
+    .skip {
+      position: absolute; left: -9999px; top: 8px; z-index: 20;
+      padding: 10px 14px; background: var(--panel); border: 1px solid var(--line);
+    }
+    .skip:focus { left: 8px; }
+    .hero {
+      color: #f4fffd;
+      background:
+        radial-gradient(circle at 82% 18%, rgba(109, 215, 199, .25), transparent 30%),
+        linear-gradient(128deg, #0b3f43, #12385c 68%, #1b2c43);
+      padding: 54px max(24px, calc((100vw - 1240px) / 2));
+    }
+    .eyebrow { margin: 0 0 8px; color: #a6ddd5; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(2rem, 4vw, 3.5rem); line-height: 1.1; letter-spacing: -.035em; }
+    .lede { max-width: 860px; margin: 20px 0 0; color: #d7e5ee; font-size: 1.08rem; }
+    .meta-row, .chip-row { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 22px; }
+    .meta, .chip {
+      display: inline-flex; align-items: center; gap: 7px; border-radius: 999px;
+      padding: 7px 11px; border: 1px solid rgba(255,255,255,.18); background: rgba(255,255,255,.08);
+      font-size: .88rem;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #74e1b0; box-shadow: 0 0 0 3px rgba(116,225,176,.15); }
+    .layout { max-width: 1240px; margin: 0 auto; padding: 28px 24px 80px; display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 28px; }
+    nav {
+      position: sticky; top: 18px; align-self: start; max-height: calc(100vh - 36px); overflow: auto;
+      padding: 18px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow);
+    }
+    nav strong { display: block; margin: 0 0 9px; }
+    nav a { display: block; padding: 5px 8px; border-radius: 8px; color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--ink); background: var(--panel-2); }
+    main { min-width: 0; }
+    section { scroll-margin-top: 18px; margin-bottom: 28px; padding: 27px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); }
+    h2 { margin: 0 0 16px; font-size: 1.55rem; line-height: 1.25; letter-spacing: -.018em; }
+    h3 { margin: 25px 0 9px; font-size: 1.12rem; }
+    p { margin: 10px 0; }
+    ul, ol { padding-left: 1.45rem; }
+    li + li { margin-top: 5px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card { padding: 17px; border: 1px solid var(--line); border-radius: 13px; background: var(--panel-2); }
+    .card h3 { margin-top: 0; }
+    .kpi { font-size: 1.65rem; font-weight: 760; line-height: 1.1; color: var(--brand); }
+    .label { margin-top: 6px; color: var(--muted); font-size: .88rem; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-weight: 700; font-size: .78rem; vertical-align: .08em; }
+    .good { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+    .caution { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+    .open { color: var(--risk); background: color-mix(in srgb, var(--risk) 13%, transparent); }
+    .callout { margin: 16px 0; padding: 14px 16px; border-left: 4px solid var(--brand); border-radius: 9px; background: var(--panel-2); }
+    .callout.warn { border-left-color: var(--warn); }
+    .callout.risk { border-left-color: var(--risk); }
+    table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: .93rem; }
+    th, td { padding: 10px 11px; text-align: left; vertical-align: top; border: 1px solid var(--line); }
+    th { background: var(--panel-2); }
+    .table-wrap { overflow-x: auto; }
+    pre { overflow: auto; margin: 14px 0; padding: 16px; border-radius: 12px; color: var(--code-ink); background: var(--code); line-height: 1.55; }
+    .flow { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); align-items: stretch; gap: 8px; margin: 18px 0; }
+    .node { position: relative; display: grid; place-items: center; min-height: 78px; padding: 11px; text-align: center; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); font-weight: 700; }
+    .node:not(:last-child)::after { content: "→"; position: absolute; right: -13px; top: 50%; transform: translateY(-50%); z-index: 2; color: var(--brand); font-size: 1.2rem; }
+    details { margin: 12px 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-2); }
+    summary { cursor: pointer; font-weight: 700; }
+    .risk-list { display: grid; gap: 12px; }
+    .risk-item { padding: 16px; border: 1px solid var(--line); border-radius: 12px; }
+    .risk-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+    .risk-head h3 { margin: 0; }
+    .small { color: var(--muted); font-size: .88rem; }
+    footer { max-width: 1240px; margin: -50px auto 0; padding: 0 24px 48px 312px; color: var(--muted); font-size: .87rem; }
+    @media (max-width: 940px) {
+      .layout { grid-template-columns: 1fr; }
+      nav { position: static; max-height: none; columns: 2; }
+      nav strong { column-span: all; }
+      .grid.three { grid-template-columns: 1fr 1fr; }
+      footer { margin-top: -50px; padding-left: 24px; }
+    }
+    @media (max-width: 660px) {
+      .hero { padding: 36px 20px; }
+      .layout { padding: 18px 12px 70px; }
+      section { padding: 20px 16px; }
+      nav { columns: 1; }
+      .grid, .grid.three { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; }
+      .node:not(:last-child)::after { content: "↓"; right: 50%; top: auto; bottom: -18px; transform: translateX(50%); }
+    }
+    @media print {
+      :root { color-scheme: light; }
+      body { background: #fff; font-size: 11pt; }
+      .hero { color: #111; background: none; padding: 24px 0; }
+      .eyebrow, .lede { color: #333; }
+      .layout { display: block; max-width: none; padding: 0; }
+      nav { display: none; }
+      section { break-inside: avoid; box-shadow: none; border-color: #bbb; }
+      details { break-inside: avoid; }
+      details > * { display: block; }
+      footer { margin: 0; padding: 10px 0; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#content">跳到正文</a>
+  <header class="hero">
+    <p class="eyebrow">Implementation review · architecture · security · operations</p>
+    <h1>serctl 架构、安全与运维说明</h1>
+    <p class="lede">面向开发、审计与运行人员的实现级说明。内容以源码和本机验证结果为准，覆盖 Winit/Egui UI、CLI、原生本机 IPC、SSH 会话管理、SFTP 原子传输、凭证保护、deadline/cancel 语义和发布追踪。</p>
+    <div class="meta-row">
+      <span class="meta"><span class="dot"></span>检查通过：30 / 30 tests</span>
+      <span class="meta">基线 commit：<code>81f8d395e2e1</code></span>
+      <span class="meta">版本：<code>serctl 0.1.0</code></span>
+      <span class="meta">检查日期：2026-08-07</span>
+      <span class="meta">验证平台：Windows x86_64 MSVC</span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav aria-label="文档目录">
+      <strong>目录</strong>
+      <a href="#summary">1. 执行摘要</a>
+      <a href="#scope">2. 检查范围与证据</a>
+      <a href="#architecture">3. 总体架构</a>
+      <a href="#components">4. 组件职责</a>
+      <a href="#flows">5. 关键流程</a>
+      <a href="#cli">6. CLI 参考</a>
+      <a href="#ui">7. 桌面 UI</a>
+      <a href="#credentials">8. 凭证保存安全</a>
+      <a href="#ipc">9. 本机 IPC</a>
+      <a href="#timeouts">10. Deadline 与取消</a>
+      <a href="#transfer">11. 文件传输完整性</a>
+      <a href="#reconnect">12. SSH 存活与重连</a>
+      <a href="#tests">13. 测试与验证</a>
+      <a href="#risks">14. 残余风险</a>
+      <a href="#operations">15. 运维手册</a>
+      <a href="#release">16. 构建与来源</a>
+      <a href="#files">17. 源码索引</a>
+    </nav>
+
+    <main id="content">
+      <section id="summary">
+        <h2>1. 执行摘要</h2>
+        <div class="grid three">
+          <div class="card"><div class="kpi">Native IPC</div><div class="label">Windows Named Pipe / Unix Domain Socket，不开放 daemon TCP 端口</div></div>
+          <div class="card"><div class="kpi">300 s</div><div class="label">exec 与 SFTP 默认 deadline；输入范围 1 ms 至 24 h</div></div>
+          <div class="card"><div class="kpi">8 MiB</div><div class="label">单次远程命令 stdout + stderr 的联合内存上限</div></div>
+          <div class="card"><div class="kpi">256 bit</div><div class="label">daemon 每次启动生成的 IPC capability token</div></div>
+          <div class="card"><div class="kpi">64 MiB × 3</div><div class="label">默认 Argon2id 内存与迭代参数，输出 32 字节密钥</div></div>
+          <div class="card"><div class="kpi">30 / 30</div><div class="label">本次单元与真实 daemon/SSH/SFTP E2E 测试全部通过</div></div>
+        </div>
+        <div class="callout">
+          <strong>总体结论：</strong>当前实现已具备可用的本机认证 IPC、明确退出码语义、daemon 端命令取消、SFTP 双层 deadline、原子上传/下载、取消后残片清理、SSH keepalive 与断线重连，以及 Git commit 嵌入式来源标识。它适合受信任单用户主机上的 SSH 控制工作流，但不是针对已取得同用户权限或管理员权限攻击者的隔离边界。
+        </div>
+        <p><span class="badge caution">需要继续修补</span> 新增的 SSH 重连发生在 daemon 业务 deadline 启动之前；若网络连接阶段长时间不返回，IPC 请求可能占用并发槽超过用户指定的命令/SFTP deadline。详见“残余风险”。</p>
+      </section>
+
+      <section id="scope">
+        <h2>2. 检查范围与证据</h2>
+        <p>本说明不是从 README 二次转述，而是基于当前工作树逐项核对以下实现与验证结果：</p>
+        <ul>
+          <li>CLI 参数、默认值、命令路由与退出行为；</li>
+          <li>Winit/Egui 前端与 Tokio 后台任务的边界；</li>
+          <li>Windows Named Pipe / Unix Socket 条件编译实现及 IPC 帧限制；</li>
+          <li>daemon 生命周期租约、锁文件、能力令牌认证与并发上限；</li>
+          <li>SSH TOFU、keepalive、断线检测、单飞重连和远端 channel 取消；</li>
+          <li>SFTP 上传/下载的临时文件、字节数检查、rename、deadline 与取消清理；</li>
+          <li>Argon2id、ChaCha20-Poly1305、AEAD AAD、文件权限与原子写；</li>
+          <li>30 项测试、严格 Clippy、全 target 本机检查、release 版本标识与 SHA-256。</li>
+        </ul>
+        <div class="callout warn"><strong>验证边界：</strong>本机仅安装并执行了 <code>x86_64-pc-windows-msvc</code> 目标。Windows Named Pipe 路径经过真实 E2E；Unix Socket 分支经过源码与条件编译结构检查，但本次没有 Linux/macOS 运行时证据。临时 SSH/SFTP 服务可验证协议行为，不等价于对所有外部服务器实现的兼容性认证。</div>
+      </section>
+
+      <section id="architecture">
+        <h2>3. 总体架构</h2>
+        <div class="flow" aria-label="serctl 核心数据流">
+          <div class="node">Winit / Egui UI<br>或 CLI</div>
+          <div class="node">client<br>统一业务接口</div>
+          <div class="node">原生本机 IPC<br>或无 daemon 直连</div>
+          <div class="node">daemon +<br>SessionManager</div>
+          <div class="node">russh / SFTP<br>远端服务器</div>
+        </div>
+        <p>UI 和 CLI 共用 <code>client</code> 层。存在可认证 daemon 时，命令、目录、文件和 PTY 请求通过平台原生 IPC 复用持久 SSH 会话；否则需要主口令解密凭证并建立临时 SSH 连接。凭证库独立于 IPC 数据流，daemon 启动后只在内存中保留当前配置所需的认证材料。</p>
+        <pre><code>UI / CLI
+  ├── client ── Authenticate(token) ── Native IPC ── daemon
+  │                                                └── SessionManager ── SSH
+  ├── client ── no daemon + master passphrase ───────── direct SSH
+  └── vault ── Argon2id ── ChaCha20-Poly1305 ── vault.json</code></pre>
+      </section>
+
+      <section id="components">
+        <h2>4. 组件职责</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>组件</th><th>职责</th><th>关键边界</th></tr></thead>
+            <tbody>
+              <tr><td><a href="../src/main.rs"><code>main.rs</code></a></td><td>Clap 命令、口令输入、runtime 启动、远端退出码映射</td><td><code>exec</code> 使用远端退出码结束进程；口令不进入命令行参数</td></tr>
+              <tr><td><a href="../src/ui.rs"><code>ui.rs</code></a></td><td>Winit/Egui 工作台、主机编辑、命令、目录、传输与 Bash UI</td><td>派生与网络任务放入后台 Tokio runtime，避免阻塞事件循环</td></tr>
+              <tr><td><a href="../src/client.rs"><code>client.rs</code></a></td><td>daemon 探测/认证、直连回退、命令输出、文件传输与 shell</td><td>负责客户端外层 deadline、明确退出状态和本地临时文件</td></tr>
+              <tr><td><a href="../src/daemon.rs"><code>daemon.rs</code></a></td><td>持久 SSH、IPC 服务、业务 deadline、取消、SFTP 服务</td><td>64 个 IPC 连接槽；认证前帧限制；单飞 SSH 重连</td></tr>
+              <tr><td><a href="../src/ipc.rs"><code>ipc.rs</code></a></td><td>平台端点、长度前缀 JSON 帧、消息类型和协议限制</td><td>Windows Named Pipe / Unix Socket 共用 AsyncRead/AsyncWrite 协议</td></tr>
+              <tr><td><a href="../src/ssh.rs"><code>ssh.rs</code></a></td><td>russh 认证、TOFU、命令 channel、PTY、SFTP、keepalive</td><td>命令输出 8 MiB；取消发送 EOF/Close；30 秒 keepalive</td></tr>
+              <tr><td><a href="../src/vault.rs"><code>vault.rs</code></a></td><td>加密凭证库、主口令校验、锁文件、生命周期租约</td><td>格式/大小/KDF 参数校验；原子写；并发互斥</td></tr>
+              <tr><td><a href="../src/security.rs"><code>security.rs</code></a></td><td>Windows DACL 与 Unix 权限收紧</td><td>权限设置失败时保存失败关闭</td></tr>
+              <tr><td><a href="../src/e2e_tests.rs"><code>e2e_tests.rs</code></a></td><td>临时真实 SSH/SFTP 服务和真实 daemon E2E</td><td>隔离测试 home，不读取用户真实凭证库</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="flows">
+        <h2>5. 关键流程</h2>
+        <details open>
+          <summary>daemon 启动与认证</summary>
+          <ol>
+            <li>获取按 profile 划分的 OS 级生命周期租约，防止重复 daemon。</li>
+            <li>拒绝无令牌旧锁和 loopback TCP 旧锁；对新格式锁执行带 800 ms 上限的认证探测。</li>
+            <li>解密凭证并连接 SSH；首次连接采用 TOFU，成功后只写一次固定主机指纹。</li>
+            <li>创建 256 位随机 IPC token；用 <code>SHA-256(profile || NUL || token)</code> 的前 128 位构造紧凑端点名。</li>
+            <li>写入受保护锁文件。锁中保留 profile、PID、端点、启动时间、token；新格式不写远端 host/user。</li>
+            <li>客户端连接后必须在 2 秒内发送不超过 4 KiB 的认证帧；令牌用常量时间比较。</li>
+          </ol>
+        </details>
+        <details>
+          <summary>远程命令</summary>
+          <ol>
+            <li>客户端验证 timeout 范围并发送 <code>Exec { cmd, timeout_ms }</code>。</li>
+            <li>daemon 获取当前 SSH 会话；会话已关闭时由单飞锁创建替代连接。</li>
+            <li>命令 channel 在 daemon deadline、完成、IPC 断开三者之间竞争。</li>
+            <li>deadline 或客户端断开时发送 EOF/Close；只有明确收到 SSH ExitStatus 才返回成功。</li>
+            <li>stdout/stderr 总量超过 8 MiB 即失败；CLI 在使用远端退出码结束前显式 flush 两个输出流。</li>
+          </ol>
+        </details>
+        <details>
+          <summary>原子上传与取消清理</summary>
+          <ol>
+            <li>拒绝空路径、超长路径和已存在的最终目标。</li>
+            <li>在同目录写入 <code>目标.serctl-part-&lt;128-bit random&gt;</code>，以便最终 rename 保持同文件系统原子性。</li>
+            <li>按 32 KiB 分块传输，核对声明字节数，并在 rename 前再次检查目标是否并发出现。</li>
+            <li>成功后 rename 到最终路径；失败时清理临时路径。</li>
+            <li>无 daemon 直连上传若被外层 timeout 取消，Drop 守卫保留 SSH 会话，在新 SFTP channel 上做最多 2 秒的后台清理，并短暂重试以覆盖 CREATE 与取消竞态。</li>
+          </ol>
+        </details>
+        <details>
+          <summary>原子下载</summary>
+          <ol>
+            <li>本地最终文件已存在时拒绝覆盖。</li>
+            <li>以 <code>create_new</code> 创建 <code>.serctl-part</code>，流式写入并累计字节数。</li>
+            <li>daemon 模式核对 <code>TransferDone.bytes</code>；成功后 flush、<code>sync_all</code> 并 rename。</li>
+            <li>超时或错误时删除本地部分文件。最终目标不会被半成品覆盖。</li>
+          </ol>
+        </details>
+      </section>
+
+      <section id="cli">
+        <h2>6. CLI 参考</h2>
+        <pre><code># 默认打开 UI
+serctl
+serctl ui
+
+# 配置；密码与主口令交互输入
+serctl add prod --host 192.168.5.15 --user deploy --port 22
+serctl list
+serctl remove prod
+
+# 持久连接与命令
+serctl up prod
+serctl exec prod --timeout-secs 30 -- "uname -a; whoami"
+serctl shell prod
+serctl status prod
+serctl down prod
+
+# M7 evidence 工作流
+serctl upload prod request.json /tmp/request.json --timeout-secs 120
+serctl download prod /tmp/server-evidence.json server-evidence.json --timeout-secs 120</code></pre>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>命令</th><th>profile 规则</th><th>关键语义</th></tr></thead>
+            <tbody>
+              <tr><td><code>add</code></td><td>省略时 <code>default</code></td><td>新增/更新；保留已有 pinned host key，防止无意清除信任锚</td></tr>
+              <tr><td><code>list</code></td><td>不适用</td><td>只展示 profile、明文 host 与 port，不解密用户名/密码</td></tr>
+              <tr><td><code>up</code>/<code>shell</code>/<code>status</code>/<code>down</code></td><td>省略时 <code>default</code></td><td>前台 daemon、PTY、状态与关闭</td></tr>
+              <tr><td><code>exec</code></td><td>必须显式指定</td><td>默认 300 秒；最终进程退出码来自远端明确 ExitStatus</td></tr>
+              <tr><td><code>upload</code>/<code>download</code></td><td>必须显式指定</td><td>默认 300 秒；不覆盖既有目标；临时文件 + rename</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><code>SERCTL_SSH_PASS</code> 与 <code>SERCTL_MASTER</code> 可用于自动化，读取后会从当前进程环境移除；但父进程、调试器或同权限观察者仍可能在读取前获得环境内容，交互输入更稳妥。</p>
+      </section>
+
+      <section id="ui">
+        <h2>7. 桌面 UI</h2>
+        <div class="grid">
+          <div class="card"><h3>主机与连接</h3><p>新建、编辑、删除 profile；启动、刷新和停止 daemon；显示远端地址与连接状态。</p></div>
+          <div class="card"><h3>命令工作区</h3><p>执行远程命令，分别展示 stdout、stderr 和退出码；网络任务不阻塞 Winit 事件循环。</p></div>
+          <div class="card"><h3>目录与传输</h3><p>浏览、上级目录、建目录、上传、下载；与 CLI 复用相同 client/daemon/SFTP 实现。</p></div>
+          <div class="card"><h3>Bash / PTY</h3><p>持续输入、Ctrl+C、Ctrl+D、清屏；daemon 不存在时可建立直连 PTY。</p></div>
+        </div>
+        <div class="callout warn">UI 中的“daemon active”状态现在会触发 <code>SessionManager.current()</code>，因此它不仅检查本机 IPC，也会在 SSH 已关闭时尝试重连。这减少假活，但同时意味着状态刷新可能受到重连阶段无硬 deadline 的影响。</div>
+      </section>
+
+      <section id="credentials">
+        <h2>8. 凭证保存安全</h2>
+        <h3>8.1 加密结构</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>数据</th><th>保存形态</th><th>完整性绑定</th></tr></thead>
+            <tbody>
+              <tr><td>profile 名、host、port</td><td>明文，支持无需解密的列表</td><td>作为 AEAD AAD；篡改会导致解密失败</td></tr>
+              <tr><td>用户名、SSH 密码、host key 指纹</td><td>ChaCha20-Poly1305 密文</td><td>AEAD tag + profile/host/port AAD</td></tr>
+              <tr><td>主口令</td><td>不保存</td><td>用于 Argon2id 派生 32 字节密钥</td></tr>
+              <tr><td>主口令验证器</td><td>独立 AEAD 密文</td><td>错误主口令或篡改在写入前被拒绝</td></tr>
+              <tr><td>IPC token</td><td>运行锁明文</td><td>依赖 OS 文件权限；daemon 退出时令牌锁被删除</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>8.2 KDF 与输入限制</h3>
+        <ul>
+          <li>算法：Argon2id v1.3；默认内存 64 MiB、迭代 3、并行度 1、输出 32 字节。</li>
+          <li>加载时允许范围：内存 8–256 MiB、迭代 1–10、并行度 1–16，输出必须为 32 字节。</li>
+          <li>salt 必须恰好 16 字节；ChaCha20-Poly1305 nonce 必须恰好 12 字节。</li>
+          <li>vault 最大 16 MiB、profile 最多 10,000 条；拒绝未知 vault/record 格式版本。</li>
+        </ul>
+        <h3>8.3 文件权限与更新一致性</h3>
+        <ul>
+          <li>Windows：目录/文件设置 protected DACL，仅保留 owner、SYSTEM、Administrators。</li>
+          <li>Unix：目录 <code>0700</code>，文件与 socket <code>0600</code>。</li>
+          <li>保存使用进程间互斥锁和同目录原子替换，避免并发丢更新与崩溃截断。</li>
+          <li>凭证和派生密钥使用 <code>Zeroizing</code> 包装，降低正常 drop 后的内存残留；这不等同于防御进程转储。</li>
+        </ul>
+        <div class="callout risk"><strong>信任边界：</strong>同一用户、管理员、调试器、内存转储、键盘记录和父进程环境观察均不在防御范围内。主口令强度直接决定 vault 离线破解成本。TOFU 首次连接若遭中间人攻击，错误指纹仍可能被固定。</div>
+      </section>
+
+      <section id="ipc">
+        <h2>9. 本机 IPC</h2>
+        <div class="grid">
+          <div class="card"><h3>Windows</h3><p><code>\\.\pipe\serctl-&lt;128-bit id&gt;</code>；首实例防抢占，拒绝远程 pipe 客户端，忙碌/实例切换时每 10 ms 重试。</p></div>
+          <div class="card"><h3>Unix</h3><p><code>~/.serctl/run/&lt;128-bit id&gt;.sock</code>；运行目录 <code>0700</code>、socket <code>0600</code>，listener Drop 时删除路径。</p></div>
+        </div>
+        <h3>协议与认证</h3>
+        <ul>
+          <li>4 字节大端长度 + JSON 帧；通用最大帧 64 MiB。</li>
+          <li>认证必须是第一帧，最大 4 KiB，读取 deadline 为 2 秒。</li>
+          <li>token 为 32 随机字节的 Base64；比较使用 constant-time equality。</li>
+          <li>认证后支持 Exec、Shell、Status、Shutdown、ListDir、CreateDir、Upload、Download。</li>
+          <li>daemon 同时最多处理 64 个已接收 IPC 连接。</li>
+        </ul>
+        <p><span class="badge good">已实现</span> 认证前帧限制可避免未认证本机连接直接声明 64 MiB 帧并触发同等分配。<span class="badge caution">防御纵深</span> Windows Named Pipe 本体没有显式传入 owner-only security descriptor，而是依赖系统默认 pipe DACL、<code>reject_remote_clients</code> 和受保护锁文件中的随机 token。</p>
+      </section>
+
+      <section id="timeouts">
+        <h2>10. Deadline 与取消语义</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>操作</th><th>客户端</th><th>daemon / SSH</th><th>取消后处理</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td>daemon exec</td><td>传递 deadline；等待 IPC 结果本身无独立外层 timeout</td><td>命令 channel 内部硬 deadline</td><td>deadline 或 IPC 断开时 EOF/Close</td><td>SSH 重连发生在命令计时之前</td></tr>
+              <tr><td>direct exec</td><td>命令执行 timeout</td><td><code>finish()</code> timeout</td><td>EOF/Close</td><td>解密、TCP/SSH 连接不计入命令 deadline</td></tr>
+              <tr><td>list/create</td><td>整个 inner Future 外层 timeout</td><td>daemon 业务 timeout</td><td>Future drop / channel drop</td><td>默认 300 秒</td></tr>
+              <tr><td>daemon upload</td><td>整个客户端上传外层 timeout</td><td>一个绝对 deadline 覆盖 SFTP 建立、接收、写入和 rename</td><td>2 秒 best-effort remove</td><td>若客户端断开，daemon 检测 EOF</td></tr>
+              <tr><td>direct upload</td><td>整个 inner Future 外层 timeout</td><td>无 daemon</td><td>Drop 守卫 + 新 SFTP channel，最多 2 秒</td><td>短暂重试覆盖 CREATE 竞态</td></tr>
+              <tr><td>download</td><td>整个 inner Future 外层 timeout</td><td>daemon 下载 timeout</td><td>删除本地 <code>.serctl-part</code></td><td>最终文件不被半成品覆盖</td></tr>
+              <tr><td>PTY shell</td><td>交互式，无业务 deadline</td><td>持续到 EOF/断开</td><td>channel/IPC drop</td><td>这是交互功能的预期语义</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>exec/SFTP timeout 的默认值均为 300 秒，合法范围为 1 ms 到 24 小时。CLI 以整秒输入；UI/内部 API 可传更细粒度的 <code>Duration</code>。</p>
+      </section>
+
+      <section id="transfer">
+        <h2>11. 文件传输完整性</h2>
+        <div class="grid">
+          <div class="card">
+            <h3>上传</h3>
+            <ul><li>不覆盖既有远端文件；</li><li>随机同目录临时路径；</li><li>声明大小与实际大小核对；</li><li>rename 前二次检查目标；</li><li>错误/timeout/取消清理残片。</li></ul>
+          </div>
+          <div class="card">
+            <h3>下载</h3>
+            <ul><li>不覆盖既有本地文件；</li><li><code>create_new</code> 建立部分文件；</li><li>daemon 报告字节数与接收量核对；</li><li>flush + sync_all；</li><li>成功后 rename，失败删除部分文件。</li></ul>
+          </div>
+        </div>
+        <div class="callout warn"><strong>不承诺内容级校验：</strong>当前验证的是传输字节数、写入完成和原子可见性，没有端到端内容哈希或远端 fsync 协议。需要不可抵赖 evidence 时，应另行生成并核对 SHA-256/签名。</div>
+      </section>
+
+      <section id="reconnect">
+        <h2>12. SSH 存活检测与重连</h2>
+        <ul>
+          <li>russh 每 30 秒发送 keepalive；最大连续无响应次数为 3。</li>
+          <li><code>SessionManager</code> 以 <code>RwLock&lt;Arc&lt;SshSession&gt;&gt;</code> 保存当前连接。</li>
+          <li>多个请求同时发现连接关闭时，通过 <code>Mutex</code> 单飞重连；首个请求认证，其余复用结果。</li>
+          <li>替代连接继续使用已固定 host key，避免重连绕过主机身份校验。</li>
+          <li>在途请求持有旧 <code>Arc</code>，替换不会把会话从其他请求下方移走。</li>
+          <li><code>status</code> 也会检查/重连 SSH，避免仅因 IPC 存活而报告假健康。</li>
+        </ul>
+        <div class="callout risk"><strong>当前缺口：</strong><code>SessionManager.current()</code> 内的 DNS/TCP/SSH 连接没有显式 deadline/cancel，并且位于 exec/SFTP daemon deadline 之前。网络栈若长时间不返回，等待重连锁的请求也会一起滞留并占用最多 64 个 IPC 槽。建议为 connect/reconnect 增加独立硬 deadline，并把业务 absolute deadline 传入会话获取阶段。</div>
+      </section>
+
+      <section id="tests">
+        <h2>13. 测试与验证证据</h2>
+        <pre><code>cargo fmt -- --check
+cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo test
+
+# 结果
+30 passed; 0 failed</code></pre>
+        <h3>真实 E2E 覆盖</h3>
+        <ul>
+          <li>临时 russh SSH 服务、内存 SFTP 服务和真实 daemon；</li>
+          <li>当前平台原生 IPC、正确认证、错误 token 拒绝；</li>
+          <li>exec 正常退出、无退出码失败、IPC 断开取消、deadline；</li>
+          <li>SSH transport 主动断开后 daemon 重连并恢复命令；</li>
+          <li>上传/下载内容往返、SFTP hang timeout、daemon 继续可用；</li>
+          <li>无 daemon 直连上传在外层 Future 取消后清理远端残片；</li>
+          <li>CLI stdout/stderr 在进程退出前明确 flush。</li>
+        </ul>
+        <h3>尚未覆盖</h3>
+        <ul>
+          <li>Linux/macOS Unix Socket 运行时 E2E；</li>
+          <li>OpenSSH、Dropbear、各类 SFTP server 的外部兼容矩阵；</li>
+          <li>真实 DNS 黑洞、TCP SYN 长时等待、重连风暴与 64 槽耗尽压力测试；</li>
+          <li>大型文件、多 GiB、磁盘耗尽、断电/文件系统崩溃注入；</li>
+          <li>Windows 多用户会话下 Named Pipe DACL 的专门攻击测试。</li>
+        </ul>
+      </section>
+
+      <section id="risks">
+        <h2>14. 残余风险与建议</h2>
+        <div class="risk-list">
+          <article class="risk-item">
+            <div class="risk-head"><h3>R1 · SSH connect/reconnect 缺少硬 deadline</h3><span class="badge open">中高 · 待修补</span></div>
+            <p>可能超过用户指定 deadline，并让并发请求等待同一重连锁、占用 daemon IPC 槽。建议以 absolute deadline 覆盖 session 获取、通道创建和业务执行，并在超时后取消连接 Future。</p>
+          </article>
+          <article class="risk-item">
+            <div class="risk-head"><h3>R2 · Named Pipe 缺少显式 owner-only DACL</h3><span class="badge caution">中低 · 防御纵深</span></div>
+            <p>当前依赖默认 pipe DACL、拒绝远程客户端和 256 位 token。建议创建 Pipe 时显式传入仅 owner/SYSTEM/Administrators 的 security descriptor，并增加多用户访问测试。</p>
+          </article>
+          <article class="risk-item">
+            <div class="risk-head"><h3>R3 · 远端临时文件清理不是事务保证</h3><span class="badge caution">低 · 已缓解</span></div>
+            <p>清理有 2 秒硬上限。SSH 完全不可用、权限变化或服务器故障时仍可能残留 <code>.serctl-part-*</code>。建议运维侧周期扫描，或未来增加可审计的残片回收命令。</p>
+          </article>
+          <article class="risk-item">
+            <div class="risk-head"><h3>R4 · TOFU 首次连接风险</h3><span class="badge caution">固有风险</span></div>
+            <p>首次连接遭 MITM 时会固定错误指纹。高安全环境必须通过独立渠道预核对指纹，或增加导入 known_hosts/预置 fingerprint 的流程。</p>
+          </article>
+          <article class="risk-item">
+            <div class="risk-head"><h3>R5 · 内容证据没有加密哈希/签名</h3><span class="badge caution">按场景</span></div>
+            <p>传输层检查字节数和原子性，但不提供 evidence 的内容身份或不可抵赖性。M7 等审计流程应同时拉取或计算 SHA-256，并在可信渠道记录。</p>
+          </article>
+          <article class="risk-item">
+            <div class="risk-head"><h3>R6 · Unix 与外部服务器验证空白</h3><span class="badge open">验证缺口</span></div>
+            <p>当前证据来自 Windows 与内置测试服务器。建议 CI 增加 Windows/Linux/macOS 矩阵，并以容器化 OpenSSH 运行 upload/download/timeout/reconnect E2E。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="operations">
+        <h2>15. 运维手册</h2>
+        <h3>推荐启动顺序</h3>
+        <ol>
+          <li>使用长且唯一的主口令添加 profile；通过独立渠道核对首次显示的 SSH host key 指纹。</li>
+          <li>需要复用连接时运行 <code>serctl up NAME</code>；自动化前先用 <code>status</code> 验证。</li>
+          <li>为每项命令和传输设置符合任务 SLA 的 <code>--timeout-secs</code>，不要无条件使用 24 小时上限。</li>
+          <li>M7 evidence 下载后立即计算 SHA-256，并记录 serctl commit、远端路径、时间和文件摘要。</li>
+          <li>升级跨越 IPC 迁移版本时先停止旧 loopback TCP daemon，再启动新版。</li>
+        </ol>
+        <h3>故障定位</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>症状</th><th>含义</th><th>处理</th></tr></thead>
+          <tbody>
+            <tr><td>legacy daemon / legacy TCP lock</td><td>正在运行不兼容旧协议</td><td>停止旧进程后重新 <code>up</code>；不要删除仍由活进程持有的锁来绕过</td></tr>
+            <tr><td>authentication timed out/failed</td><td>锁/token/daemon 不匹配或 IPC 无响应</td><td>确认同一用户、检查 daemon 日志；正常退出后再清陈旧锁</td></tr>
+            <tr><td>remote command completed without exit status</td><td>远端 channel/transport 关闭但未给退出码</td><td>视为失败；检查远端 shell、服务重启与网络日志</td></tr>
+            <tr><td>SFTP ... exceeded its deadline</td><td>整个操作超出 deadline</td><td>检查网络/磁盘/权限；扫描远端 <code>.serctl-part-*</code> 与本地 <code>.serctl-part</code></td></tr>
+            <tr><td>status 长时间等待</td><td>可能正在执行无硬上限的 SSH 重连</td><td>终止客户端不会取消 daemon 重连；必要时重启 daemon，后续修补 R1</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+
+      <section id="release">
+        <h2>16. 构建、发布与来源追踪</h2>
+        <div class="grid">
+          <div class="card"><h3>源码基线</h3><p><code>81f8d395e2e1a16a50cc943c08a30bbf3fe94c79</code></p><p class="small">工作树在检查开始时干净。</p></div>
+          <div class="card"><h3>Release 二进制</h3><p><code>serctl 0.1.0 (git 81f8d395e2e1)</code></p><p class="small">SHA-256：<code>72F03A3D1756B619413A410561A2A2CE3F8F815E0BAE9D21160DE0F6C32ECF32</code></p></div>
+        </div>
+        <p><a href="../build.rs"><code>build.rs</code></a> 在编译时读取 Git commit；工作树不干净时追加 <code>-dirty</code>。这提供来源可见性，但不是数字签名：正式分发仍应在制品库记录 commit、编译环境、SHA-256，并使用代码签名或可信发布签名。</p>
+        <pre><code>cargo build --release
+target\release\serctl.exe --version
+Get-FileHash target\release\serctl.exe -Algorithm SHA256</code></pre>
+        <h3>近期安全/可靠性修补</h3>
+        <ul>
+          <li><code>81f8d39</code> — CLI 退出前 flush 远端 stdout/stderr；</li>
+          <li><code>2b1a65c</code> — keepalive、SSH 断线检测与单飞重连；</li>
+          <li><code>1a552ea</code> — 无 daemon 上传取消后的远端残片清理；</li>
+          <li><code>b52d092</code> — Windows Named Pipe / Unix Socket 统一 IPC；</li>
+          <li><code>6e5b944</code> — SFTP 操作硬 deadline。</li>
+        </ul>
+      </section>
+
+      <section id="files">
+        <h2>17. 源码与文档索引</h2>
+        <ul>
+          <li><a href="../README.md">README.md</a> — 快速使用与基础安全说明</li>
+          <li><a href="../src/main.rs">src/main.rs</a> — CLI 和入口</li>
+          <li><a href="../src/ui.rs">src/ui.rs</a> — Winit/Egui UI</li>
+          <li><a href="../src/client.rs">src/client.rs</a> — 客户端、直连、传输与 PTY</li>
+          <li><a href="../src/daemon.rs">src/daemon.rs</a> — daemon、重连、deadline 与 SFTP</li>
+          <li><a href="../src/ipc.rs">src/ipc.rs</a> — 原生 IPC 抽象与协议</li>
+          <li><a href="../src/ssh.rs">src/ssh.rs</a> — SSH/SFTP 封装</li>
+          <li><a href="../src/vault.rs">src/vault.rs</a> — 凭证库与运行锁</li>
+          <li><a href="../src/security.rs">src/security.rs</a> — OS 权限</li>
+          <li><a href="../src/e2e_tests.rs">src/e2e_tests.rs</a> — 端到端测试</li>
+        </ul>
+        <p class="small">本文档为静态、无外部依赖的 UTF-8 HTML，可离线打开、打印或转为 PDF。信息基线见页首；源码后续变化时应重新检查并更新。</p>
+      </section>
+    </main>
+  </div>
+
+  <footer>serctl implementation review · generated from repository evidence · 2026-08-07</footer>
+</body>
+</html>

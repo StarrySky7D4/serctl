@@ -2,6 +2,8 @@
 
 `serctl` 是一个纯 Rust 的持久 SSH 控制工具，提供基于 Winit/Egui 的桌面 UI 和完整 CLI。它复用长连接完成远程命令、目录浏览、SFTP 文件传输与 Bash PTY 交互。
 
+实现级架构、凭证安全、IPC、deadline/cancel、测试证据、残余风险与运维说明见 [详尽 HTML 文档](docs/serctl-architecture-security.html)。
+
 ## 桌面 UI
 
 开发时直接启动 debug 版本：
