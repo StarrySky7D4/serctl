@@ -439,6 +439,82 @@ pub async fn upload_file_with_timeout(
     }
 }
 
+const REMOTE_PARTIAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct RemotePartialCleanup {
+    session: Option<SshSession>,
+    partial: String,
+    armed: bool,
+}
+
+impl RemotePartialCleanup {
+    fn new(session: SshSession, partial: String) -> Self {
+        Self {
+            session: Some(session),
+            partial,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn cleanup(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(session) = self.session.as_ref() {
+            cleanup_remote_partial(session, &self.partial, false).await;
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for RemotePartialCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let partial = std::mem::take(&mut self.partial);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                cleanup_remote_partial(&session, &partial, true).await;
+            });
+        }
+    }
+}
+
+async fn cleanup_remote_partial(session: &SshSession, partial: &str, retry_after_cancel: bool) {
+    let deadline = tokio::time::Instant::now() + REMOTE_PARTIAL_CLEANUP_TIMEOUT;
+    loop {
+        let attempt = async {
+            // Use a fresh subsystem channel: the transfer channel itself may
+            // be the operation that hung and triggered cancellation.
+            let sftp = session.sftp().await?;
+            sftp.remove_file(partial).await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        match tokio::time::timeout_at(deadline, attempt).await {
+            Ok(Ok(())) => break,
+            Ok(Err(_)) if retry_after_cancel => {
+                // Cancellation may race a CREATE request already in flight.
+                // Retry briefly so a late-created partial is still removed.
+                if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(50)))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
 async fn upload_file_inner(
     profile: &str,
     local: &Path,
@@ -503,6 +579,7 @@ async fn upload_file_inner(
         bail!("remote destination already exists: {remote}");
     }
     let partial = temporary_remote_path(remote);
+    let mut cleanup = RemotePartialCleanup::new(session, partial.clone());
     let transfer: Result<u64> = async {
         let mut destination = sftp.create(&partial).await?;
         let mut transferred = 0_u64;
@@ -523,8 +600,10 @@ async fn upload_file_inner(
         Ok(transferred)
     }
     .await;
-    if transfer.is_err() {
-        let _ = sftp.remove_file(&partial).await;
+    if transfer.is_ok() {
+        cleanup.disarm();
+    } else {
+        cleanup.cleanup().await;
     }
     transfer
 }

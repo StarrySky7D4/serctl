@@ -19,6 +19,8 @@ struct TestState {
     files: Mutex<HashMap<String, Vec<u8>>>,
     cancelled: AtomicBool,
     sftp_hang: AtomicBool,
+    sftp_write_hang: AtomicBool,
+    upload_partial_created: AtomicBool,
 }
 
 struct TestSsh {
@@ -157,6 +159,11 @@ impl russh_sftp::server::Handler for MemorySftp {
         let mut files = self.state.files.lock().await;
         if flags.contains(OpenFlags::CREATE) {
             files.entry(filename.clone()).or_default();
+            if filename.contains(".serctl-part-") {
+                self.state
+                    .upload_partial_created
+                    .store(true, Ordering::SeqCst);
+            }
         }
         let Some(file) = files.get_mut(&filename) else {
             return Err(StatusCode::NoSuchFile);
@@ -181,6 +188,9 @@ impl russh_sftp::server::Handler for MemorySftp {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
+        if self.state.sftp_write_hang.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         let path = self.handles.get(&handle).ok_or(StatusCode::Failure)?;
         let mut files = self.state.files.lock().await;
         let file = files.get_mut(path).ok_or(StatusCode::NoSuchFile)?;
@@ -319,7 +329,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             port: ssh_port,
             user: "tester".into(),
             password: "password".into(),
-            host_key: Some(fingerprint),
+            host_key: Some(fingerprint.clone()),
         },
         "unused-test-master".into(),
         Some(ready_tx),
@@ -447,6 +457,52 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
 
     assert!(client::down_quiet("e2e").await.unwrap());
     daemon_task.await.unwrap().unwrap();
+
+    let direct_master = "direct-test-master";
+    vault::add_or_update(
+        "direct-e2e",
+        &vault::Creds {
+            host: "127.0.0.1".into(),
+            port: ssh_port,
+            user: "tester".into(),
+            password: "password".into(),
+            host_key: None,
+        },
+        direct_master,
+    )
+    .unwrap();
+    vault::set_pinned_fp("direct-e2e", fingerprint, direct_master).unwrap();
+    state.upload_partial_created.store(false, Ordering::SeqCst);
+    state.sftp_write_hang.store(true, Ordering::SeqCst);
+    let direct_timeout = client::upload_file_with_timeout(
+        "direct-e2e",
+        &upload_source,
+        "/direct-timeout.txt",
+        Some(direct_master),
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err();
+    assert!(direct_timeout.to_string().contains("deadline"));
+    assert!(state.upload_partial_created.load(Ordering::SeqCst));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let has_partial = state
+                .files
+                .lock()
+                .await
+                .keys()
+                .any(|path| path.starts_with("/direct-timeout.txt.serctl-part-"));
+            if !has_partial {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!state.files.lock().await.contains_key("/direct-timeout.txt"));
+
     ssh_task.abort();
     vault::set_test_home(None);
     std::fs::remove_dir_all(test_home).unwrap();
