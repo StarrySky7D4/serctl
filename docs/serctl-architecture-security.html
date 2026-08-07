@@ -534,6 +534,7 @@ cargo test
           <div class="card"><h3>Release 二进制</h3><p><code>serctl 0.1.0 (git 81f8d395e2e1)</code></p><p class="small">SHA-256：<code>72F03A3D1756B619413A410561A2A2CE3F8F815E0BAE9D21160DE0F6C32ECF32</code></p></div>
         </div>
         <p><a href="../build.rs"><code>build.rs</code></a> 在编译时读取 Git commit；工作树不干净时追加 <code>-dirty</code>。这提供来源可见性，但不是数字签名：正式分发仍应在制品库记录 commit、编译环境、SHA-256，并使用代码签名或可信发布签名。</p>
+        <p>项目源代码与文档依据 <a href="../LICENSE">Apache License 2.0</a> 授权，Cargo 包元数据使用 SPDX 标识 <code>Apache-2.0</code>。</p>
         <pre><code>cargo build --release
 target\release\serctl.exe --version
 Get-FileHash target\release\serctl.exe -Algorithm SHA256</code></pre>
