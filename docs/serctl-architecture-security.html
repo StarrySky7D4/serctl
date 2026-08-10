@@ -68,9 +68,9 @@
     }
     .eyebrow { margin: 0 0 8px; color: #a6ddd5; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
     h1 { margin: 0; font-size: clamp(2rem, 4vw, 3.5rem); line-height: 1.1; letter-spacing: -.035em; }
-    .lede { max-width: 860px; margin: 20px 0 0; color: #d7e5ee; font-size: 1.08rem; }
-    .meta-row, .chip-row { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 22px; }
-    .meta, .chip {
+    .lede { max-width: 900px; margin: 20px 0 0; color: #d7e5ee; font-size: 1.08rem; }
+    .meta-row { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 22px; }
+    .meta {
       display: inline-flex; align-items: center; gap: 7px; border-radius: 999px;
       padding: 7px 11px; border: 1px solid rgba(255,255,255,.18); background: rgba(255,255,255,.08);
       font-size: .88rem;
@@ -112,8 +112,6 @@
     .flow { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); align-items: stretch; gap: 8px; margin: 18px 0; }
     .node { position: relative; display: grid; place-items: center; min-height: 78px; padding: 11px; text-align: center; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); font-weight: 700; }
     .node:not(:last-child)::after { content: "→"; position: absolute; right: -13px; top: 50%; transform: translateY(-50%); z-index: 2; color: var(--brand); font-size: 1.2rem; }
-    details { margin: 12px 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-2); }
-    summary { cursor: pointer; font-weight: 700; }
     .risk-list { display: grid; gap: 12px; }
     .risk-item { padding: 16px; border: 1px solid var(--line); border-radius: 12px; }
     .risk-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
@@ -144,8 +142,6 @@
       .layout { display: block; max-width: none; padding: 0; }
       nav { display: none; }
       section { break-inside: avoid; box-shadow: none; border-color: #bbb; }
-      details { break-inside: avoid; }
-      details > * { display: block; }
       footer { margin: 0; padding: 10px 0; }
       a { color: inherit; text-decoration: none; }
     }
@@ -156,13 +152,13 @@
   <header class="hero">
     <p class="eyebrow">Implementation review · architecture · security · operations</p>
     <h1>serctl 架构、安全与运维说明</h1>
-    <p class="lede">面向开发、审计与运行人员的实现级说明。内容以源码和本机验证结果为准，覆盖 Winit/Egui UI、CLI、原生本机 IPC、SSH 会话管理、SFTP 原子传输、凭证保护、deadline/cancel 语义和发布追踪。</p>
+    <p class="lede">面向开发、审计与运行人员的实现级说明。内容以当前冻结源码和本轮 debug 验证为准，覆盖 Winit/Egui、CLI、IPC v2、SSH/SFTP、凭证保护、deadline/cancel、原子传输、测试证据与残余风险。</p>
     <div class="meta-row">
-      <span class="meta"><span class="dot"></span>检查通过：30 / 30 tests</span>
-      <span class="meta">基线 commit：<code>81f8d395e2e1</code></span>
-      <span class="meta">版本：<code>serctl 0.1.0</code></span>
-      <span class="meta">检查日期：2026-08-07</span>
-      <span class="meta">验证平台：Windows x86_64 MSVC</span>
+      <span class="meta"><span class="dot"></span>177/177，连续 3 轮</span>
+      <span class="meta">Audit：529 dependencies / 1198 advisories，通过</span>
+      <span class="meta">提交前 Debug：<code>9fa2a3463e6a-dirty</code></span>
+      <span class="meta">检查日期：2026-08-10</span>
+      <span class="meta">Release：本轮未构建</span>
     </div>
   </header>
 
@@ -170,17 +166,17 @@
     <nav aria-label="文档目录">
       <strong>目录</strong>
       <a href="#summary">1. 执行摘要</a>
-      <a href="#scope">2. 检查范围与证据</a>
+      <a href="#scope">2. 范围与证据</a>
       <a href="#architecture">3. 总体架构</a>
       <a href="#components">4. 组件职责</a>
       <a href="#flows">5. 关键流程</a>
       <a href="#cli">6. CLI 参考</a>
       <a href="#ui">7. 桌面 UI</a>
-      <a href="#credentials">8. 凭证保存安全</a>
-      <a href="#ipc">9. 本机 IPC</a>
+      <a href="#credentials">8. 凭证与运行锁</a>
+      <a href="#ipc">9. IPC v2</a>
       <a href="#timeouts">10. Deadline 与取消</a>
-      <a href="#transfer">11. 文件传输完整性</a>
-      <a href="#reconnect">12. SSH 存活与重连</a>
+      <a href="#transfer">11. 目录与传输</a>
+      <a href="#ssh">12. SSH 与重连</a>
       <a href="#tests">13. 测试与验证</a>
       <a href="#risks">14. 残余风险</a>
       <a href="#operations">15. 运维手册</a>
@@ -192,381 +188,458 @@
       <section id="summary">
         <h2>1. 执行摘要</h2>
         <div class="grid three">
-          <div class="card"><div class="kpi">Native IPC</div><div class="label">Windows Named Pipe / Unix Domain Socket，不开放 daemon TCP 端口</div></div>
-          <div class="card"><div class="kpi">300 s</div><div class="label">exec 与 SFTP 默认 deadline；输入范围 1 ms 至 24 h</div></div>
-          <div class="card"><div class="kpi">8 MiB</div><div class="label">单次远程命令 stdout + stderr 的联合内存上限</div></div>
-          <div class="card"><div class="kpi">256 bit</div><div class="label">daemon 每次启动生成的 IPC capability token</div></div>
-          <div class="card"><div class="kpi">64 MiB × 3</div><div class="label">默认 Argon2id 内存与迭代参数，输出 32 字节密钥</div></div>
-          <div class="card"><div class="kpi">30 / 30</div><div class="label">本次单元与真实 daemon/SSH/SFTP E2E 测试全部通过</div></div>
+          <div class="card"><div class="kpi">IPC v2</div><div class="label">三帧 nonce-HMAC 双向认证；共享秘密不经 wire 传输</div></div>
+          <div class="card"><div class="kpi">64 + 8</div><div class="label">64 个本机连接；Exec/ListDir 共用 8 个重结果槽</div></div>
+          <div class="card"><div class="kpi">300 s</div><div class="label">exec/SFTP 默认硬 deadline；最大 24 小时</div></div>
+          <div class="card"><div class="kpi">1 MiB</div><div class="label">任何 SFTP body 在分配前的单帧硬上限</div></div>
+          <div class="card"><div class="kpi">创建即保护</div><div class="label">远端 0600；本地 Unix 0600 / Windows protected DACL</div></div>
+          <div class="card"><div class="kpi">177 × 3</div><div class="label">locked/offline all-targets/all-features 完整套件</div></div>
         </div>
         <div class="callout">
-          <strong>总体结论：</strong>当前实现已具备可用的本机认证 IPC、明确退出码语义、daemon 端命令取消、SFTP 双层 deadline、原子上传/下载、取消后残片清理、SSH keepalive 与断线重连，以及 Git commit 嵌入式来源标识。它适合受信任单用户主机上的 SSH 控制工作流，但不是针对已取得同用户权限或管理员权限攻击者的隔离边界。
+          <strong>结论：</strong>本轮已修补缺失 upload/download、IPC 断开误报成功、无界 exec/SFTP、客户端退出后远端任务不取消、直连上传外层 Future 取消后清理丢失、NamedPipe/UnixSocket 分裂、凭证与临时文件权限窗口、运行锁损坏恢复、UI 迟到结果和来源追踪等缺陷。当前实现适合受信任单用户工作站上的 SSH 控制任务；它不是针对已取得同一 OS 用户或管理员权限攻击者的沙箱。
         </div>
-        <p><span class="badge caution">需要继续修补</span> 新增的 SSH 重连发生在 daemon 业务 deadline 启动之前；若网络连接阶段长时间不返回，IPC 请求可能占用并发槽超过用户指定的命令/SFTP deadline。详见“残余风险”。</p>
+        <p><span class="badge good">验证完成</span> <code>fmt</code>、all-target/all-feature <code>check</code>、<code>clippy -D warnings</code>、177 项测试连续三轮、build.rs 11 项 standalone 测试、依赖审计、debug 构建和来源字符串均已核验。<span class="badge caution">发布边界</span> 本轮没有执行 <code>cargo build --release</code>；正在使用的旧 release 仅做只读元数据/哈希复核，未覆盖。</p>
       </section>
 
       <section id="scope">
         <h2>2. 检查范围与证据</h2>
-        <p>本说明不是从 README 二次转述，而是基于当前工作树逐项核对以下实现与验证结果：</p>
         <ul>
-          <li>CLI 参数、默认值、命令路由与退出行为；</li>
-          <li>Winit/Egui 前端与 Tokio 后台任务的边界；</li>
-          <li>Windows Named Pipe / Unix Socket 条件编译实现及 IPC 帧限制；</li>
-          <li>daemon 生命周期租约、锁文件、能力令牌认证与并发上限；</li>
-          <li>SSH TOFU、keepalive、断线检测、单飞重连和远端 channel 取消；</li>
-          <li>SFTP 上传/下载的临时文件、字节数检查、rename、deadline 与取消清理；</li>
-          <li>Argon2id、ChaCha20-Poly1305、AEAD AAD、文件权限与原子写；</li>
-          <li>30 项测试、严格 Clippy、全 target 本机检查、release 版本标识与 SHA-256。</li>
+          <li>CLI/Winit UI 的 profile、命令、目录、上传、下载、Bash PTY、状态和关闭流程；</li>
+          <li>Windows Named Pipe 与 Unix Domain Socket 的统一抽象、端点权限、OS peer 预验、互认证和所有帧预算；</li>
+          <li>vault v2 的 KDF、AEAD AAD、权限、稳定句柄、租约、序列化清零和畸形运行锁恢复；</li>
+          <li>russh 建连/KEX、host-key 算法、TOFU、keepalive、单飞重连、exec deadline 与 channel 终止；</li>
+          <li>SFTP 长度防护、流式目录预算、上传/下载提交、no-overwrite、commit 不确定态和残片清理；</li>
+          <li>daemon 连接/重结果并发槽、认证后 idle、响应写、shutdown <code>JoinSet</code> 收尾；</li>
+          <li>Git provenance、dependency audit、debug 版本与 Cargo Fresh 行为。</li>
         </ul>
-        <div class="callout warn"><strong>验证边界：</strong>本机仅安装并执行了 <code>x86_64-pc-windows-msvc</code> 目标。Windows Named Pipe 路径经过真实 E2E；Unix Socket 分支经过源码与条件编译结构检查，但本次没有 Linux/macOS 运行时证据。临时 SSH/SFTP 服务可验证协议行为，不等价于对所有外部服务器实现的兼容性认证。</div>
+        <div class="callout warn"><strong>平台证据：</strong>运行时验证平台为 Windows x86_64 MSVC。Windows 原生 IPC、ACL、真实 daemon/SSH/SFTP 路径进入 E2E；Unix 代码由条件编译测试覆盖，但本轮未在 Linux/macOS 实际运行。Windows symlink/reparse 动态用例在当前账户没有创建权限时会明确 skip，且尚无多账户 DACL 攻击矩阵。</div>
       </section>
 
       <section id="architecture">
         <h2>3. 总体架构</h2>
-        <div class="flow" aria-label="serctl 核心数据流">
-          <div class="node">Winit / Egui UI<br>或 CLI</div>
-          <div class="node">client<br>统一业务接口</div>
-          <div class="node">原生本机 IPC<br>或无 daemon 直连</div>
-          <div class="node">daemon +<br>SessionManager</div>
-          <div class="node">russh / SFTP<br>远端服务器</div>
+        <pre><code>Winit / Egui UI ─┐
+                 ├── client ── OS peer check ── IPC v2 ── daemon ── SessionManager
+CLI ─────────────┘       │          │              │           ├── russh 0.62.5
+                         │          │              │           └── SFTP v3
+                         │          │              └── JoinSet + semaphores + shutdown
+                         │          └── Named Pipe / Unix Domain Socket
+                         └── no daemon: DirectSession + shared/exclusive profile lease
+
+vault v2 ── Argon2id ── ChaCha20-Poly1305
+                         AAD = domain + profile name + host + port</code></pre>
+        <p>UI 与 CLI 复用相同 client API。每个业务操作只执行一次 daemon 探测与互认证；探测成功后固定使用该 stream，失败或无 daemon 时固定进入直连路径，因此不会在操作中途二次探测并换路由。</p>
+        <div class="flow" aria-label="请求处理流程">
+          <div class="node">验证参数与本地源</div>
+          <div class="node">建立 absolute deadline</div>
+          <div class="node">单次 daemon 路由</div>
+          <div class="node">SSH / SFTP / PTY</div>
+          <div class="node">有界响应或清理</div>
         </div>
-        <p>UI 和 CLI 共用 <code>client</code> 层。存在可认证 daemon 时，命令、目录、文件和 PTY 请求通过平台原生 IPC 复用持久 SSH 会话；否则需要主口令解密凭证并建立临时 SSH 连接。凭证库独立于 IPC 数据流，daemon 启动后只在内存中保留当前配置所需的认证材料。</p>
-        <pre><code>UI / CLI
-  ├── client ── Authenticate(token) ── Native IPC ── daemon
-  │                                                └── SessionManager ── SSH
-  ├── client ── no daemon + master passphrase ───────── direct SSH
-  └── vault ── Argon2id ── ChaCha20-Poly1305 ── vault.json</code></pre>
       </section>
 
       <section id="components">
         <h2>4. 组件职责</h2>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>组件</th><th>职责</th><th>关键边界</th></tr></thead>
-            <tbody>
-              <tr><td><a href="../src/main.rs"><code>main.rs</code></a></td><td>Clap 命令、口令输入、runtime 启动、远端退出码映射</td><td><code>exec</code> 使用远端退出码结束进程；口令不进入命令行参数</td></tr>
-              <tr><td><a href="../src/ui.rs"><code>ui.rs</code></a></td><td>Winit/Egui 工作台、主机编辑、命令、目录、传输与 Bash UI</td><td>派生与网络任务放入后台 Tokio runtime，避免阻塞事件循环</td></tr>
-              <tr><td><a href="../src/client.rs"><code>client.rs</code></a></td><td>daemon 探测/认证、直连回退、命令输出、文件传输与 shell</td><td>负责客户端外层 deadline、明确退出状态和本地临时文件</td></tr>
-              <tr><td><a href="../src/daemon.rs"><code>daemon.rs</code></a></td><td>持久 SSH、IPC 服务、业务 deadline、取消、SFTP 服务</td><td>64 个 IPC 连接槽；认证前帧限制；单飞 SSH 重连</td></tr>
-              <tr><td><a href="../src/ipc.rs"><code>ipc.rs</code></a></td><td>平台端点、长度前缀 JSON 帧、消息类型和协议限制</td><td>Windows Named Pipe / Unix Socket 共用 AsyncRead/AsyncWrite 协议</td></tr>
-              <tr><td><a href="../src/ssh.rs"><code>ssh.rs</code></a></td><td>russh 认证、TOFU、命令 channel、PTY、SFTP、keepalive</td><td>命令输出 8 MiB；取消发送 EOF/Close；30 秒 keepalive</td></tr>
-              <tr><td><a href="../src/vault.rs"><code>vault.rs</code></a></td><td>加密凭证库、主口令校验、锁文件、生命周期租约</td><td>格式/大小/KDF 参数校验；原子写；并发互斥</td></tr>
-              <tr><td><a href="../src/security.rs"><code>security.rs</code></a></td><td>Windows DACL 与 Unix 权限收紧</td><td>权限设置失败时保存失败关闭</td></tr>
-              <tr><td><a href="../src/e2e_tests.rs"><code>e2e_tests.rs</code></a></td><td>临时真实 SSH/SFTP 服务和真实 daemon E2E</td><td>隔离测试 home，不读取用户真实凭证库</td></tr>
-            </tbody>
-          </table>
-        </div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>组件</th><th>职责</th><th>关键安全/可靠性属性</th></tr></thead>
+          <tbody>
+            <tr><td><a href="../src/main.rs"><code>main.rs</code></a></td><td>CLI、启动与退出码</td><td>在 runtime 前消费环境秘密；Clap/anyhow/log 诊断转义；远端非零码保持非零</td></tr>
+            <tr><td><a href="../src/ui.rs"><code>ui.rs</code></a></td><td>Winit/Egui 工作台</td><td>masked secret buffer、无持久化/undo、sensitive message envelope、单一 32 秒 refresh deadline、owned runtime shutdown</td></tr>
+            <tr><td><a href="../src/client.rs"><code>client.rs</code></a></td><td>路由、命令、传输、PTY</td><td>稳定本地 handle、absolute deadline、typed commit 不确定态、owned blocking worker/RAII rollback、control 3 秒</td></tr>
+            <tr><td><a href="../src/daemon.rs"><code>daemon.rs</code></a></td><td>持久 SSH 与 IPC 服务</td><td>64 连接、8 个重结果槽、10 秒 idle、2 秒响应写、<code>JoinSet</code> 4 秒收尾</td></tr>
+            <tr><td><a href="../src/ipc.rs"><code>ipc.rs</code></a></td><td>统一本机 IPC 与协议</td><td>三帧 nonce-HMAC、OS peer 验证、严格 Base64、partial-header 拒绝、按消息类别的帧预算</td></tr>
+            <tr><td><a href="../src/ssh.rs"><code>ssh.rs</code></a></td><td>SSH/SFTP 封装</td><td>可取消 KEX 代理、算法过滤、SFTP 1 MiB guard、流式 DirList、TERM/KILL</td></tr>
+            <tr><td><a href="../src/vault.rs"><code>vault.rs</code></a></td><td>凭证库、运行锁与租约</td><td>Argon2id zeroize、AEAD AAD/格式降级拒绝、30 秒锁上限、两遍 Zeroizing JSON、generation/lease fail-closed 对账</td></tr>
+            <tr><td><a href="../src/security.rs"><code>security.rs</code></a></td><td>平台文件/目录保护</td><td>0600/0700、owner/SY/BA protected DACL、稳定 handle、regular/reparse 检查</td></tr>
+            <tr><td><a href="../src/e2e_tests.rs"><code>e2e_tests.rs</code></a></td><td>真实 daemon/SSH/SFTP E2E</td><td>隔离 home；认证、deadline、race、cleanup、权限、直连与重连</td></tr>
+          </tbody>
+        </table></div>
       </section>
 
       <section id="flows">
         <h2>5. 关键流程</h2>
-        <details open>
-          <summary>daemon 启动与认证</summary>
-          <ol>
-            <li>获取按 profile 划分的 OS 级生命周期租约，防止重复 daemon。</li>
-            <li>拒绝无令牌旧锁和 loopback TCP 旧锁；对新格式锁执行带 800 ms 上限的认证探测。</li>
-            <li>解密凭证并连接 SSH；首次连接采用 TOFU，成功后只写一次固定主机指纹。</li>
-            <li>创建 256 位随机 IPC token；用 <code>SHA-256(profile || NUL || token)</code> 的前 128 位构造紧凑端点名。</li>
-            <li>写入受保护锁文件。锁中保留 profile、PID、端点、启动时间、token；新格式不写远端 host/user。</li>
-            <li>客户端连接后必须在 2 秒内发送不超过 4 KiB 的认证帧；令牌用常量时间比较。</li>
-          </ol>
-        </details>
-        <details>
-          <summary>远程命令</summary>
-          <ol>
-            <li>客户端验证 timeout 范围并发送 <code>Exec { cmd, timeout_ms }</code>。</li>
-            <li>daemon 获取当前 SSH 会话；会话已关闭时由单飞锁创建替代连接。</li>
-            <li>命令 channel 在 daemon deadline、完成、IPC 断开三者之间竞争。</li>
-            <li>deadline 或客户端断开时发送 EOF/Close；只有明确收到 SSH ExitStatus 才返回成功。</li>
-            <li>stdout/stderr 总量超过 8 MiB 即失败；CLI 在使用远端退出码结束前显式 flush 两个输出流。</li>
-          </ol>
-        </details>
-        <details>
-          <summary>原子上传与取消清理</summary>
-          <ol>
-            <li>拒绝空路径、超长路径和已存在的最终目标。</li>
-            <li>在同目录写入 <code>目标.serctl-part-&lt;128-bit random&gt;</code>，以便最终 rename 保持同文件系统原子性。</li>
-            <li>按 32 KiB 分块传输，核对声明字节数，并在 rename 前再次检查目标是否并发出现。</li>
-            <li>成功后 rename 到最终路径；失败时清理临时路径。</li>
-            <li>无 daemon 直连上传若被外层 timeout 取消，Drop 守卫保留 SSH 会话，在新 SFTP channel 上做最多 2 秒的后台清理，并短暂重试以覆盖 CREATE 与取消竞态。</li>
-          </ol>
-        </details>
-        <details>
-          <summary>原子下载</summary>
-          <ol>
-            <li>本地最终文件已存在时拒绝覆盖。</li>
-            <li>以 <code>create_new</code> 创建 <code>.serctl-part</code>，流式写入并累计字节数。</li>
-            <li>daemon 模式核对 <code>TransferDone.bytes</code>；成功后 flush、<code>sync_all</code> 并 rename。</li>
-            <li>超时或错误时删除本地部分文件。最终目标不会被半成品覆盖。</li>
-          </ol>
-        </details>
+        <h3>daemon 启动</h3>
+        <ol>
+          <li>验证 profile，取得排他生命周期租约；vault 文件锁等待最多 30 秒。</li>
+          <li>读取 hashed-v2 运行锁；只有在排他租约下安全删除畸形当前 v2 候选并重读后得到 <code>Removed</code>/<code>Absent</code>，才可继续。<code>Changed</code>/<code>Contended</code>、Unix raw legacy 和未知协议都 fail closed。</li>
+          <li>解密 v2 profile；首次连接先 KEX/观测 host key，在排他租约下原子写 pin，只有写入成功后才发 SSH 密码。迟到 pin 可能持久化，但不会认证已过期 transport。</li>
+          <li>UI 从最初 status probe 起使用单一 30 秒 absolute deadline。listener bind 与 lock publication 在 owned blocking worker 内完成；原子写锁前就 arm token-CAS cleanup guard，并持有排他租约。</li>
+          <li>readiness 通过 oneshot 交接所有权；receiver 消失会 invalidate SSH 并清理已发布 runtime。ready 与 daemon ended 同时发生时偏向先发 <code>Started</code>。成功后进入 64 连接/8 重结果槽 accept loop。</li>
+        </ol>
+        <h3>IPC v2 互认证</h3>
+        <ol>
+          <li>客户端从受保护锁读取 PID、endpoint 和随机秘密，验证 endpoint 派生值。</li>
+          <li>连接后、发送认证帧前核对 OS 对端 PID/UID。</li>
+          <li>交换 <code>AuthHello</code>、<code>AuthChallenge</code>、<code>AuthResponse</code>；daemon 与 client 分别证明持有共享秘密。</li>
+          <li>只有互认证成功后才接受业务帧；失败直接关闭，不向未认证 peer 返回结构化错误 oracle。</li>
+        </ol>
+        <h3>exec</h3>
+        <ol>
+          <li>校验命令不含 NUL 且不超过 64 KiB，建立 absolute deadline并只路由一次。</li>
+          <li>deadline 覆盖 IPC、重结果槽等待、单飞重连、DNS/TCP/KEX/auth、channel open、exec request、输出与退出状态。</li>
+          <li>只接受明确且唯一的 <code>ExitStatus</code>；IPC EOF、无退出码、重复退出码、输出超 8 MiB都失败。</li>
+          <li>异常退出依次有界尝试 TERM、短宽限、KILL、EOF、Close 和关闭确认；不能确认时使 transport 失效。</li>
+        </ol>
+        <h3>上传</h3>
+        <ol>
+          <li>在任何路由/SSH 之前只打开一次本地普通文件，保留稳定 handle 与 size。</li>
+          <li>远端同目录以 <code>CREATE | EXCLUDE</code> 和 <code>0600</code> 创建随机 partial；流式写入并核对字节数。</li>
+          <li>优先 <code>hardlink@openssh.com</code> no-replace commit；未声明扩展时才走标准 SFTP v3 <code>RENAME</code> fallback。</li>
+          <li>commit 确认后即使临时名删除被打断也报告已提交；UploadEnd 周围的响应丢失有 2.25 秒对账，否则返回 typed <code>UploadCommitOutcomeUnknown</code>。</li>
+          <li>直连上传的 owned worker 在外层 Future timeout/drop 后继续拥有 fresh-channel 清理；commit 已开始后的 <code>Finished(Err)</code> 也是 outcome unknown，不是确定未提交。</li>
+        </ol>
+        <h3>下载</h3>
+        <ol>
+          <li>受保护 <code>CREATE_NEW</code> 一成功就立即 arm <code>CreatedFileRollback</code>，再验证 owner/type/ACL；错误或 panic 只删除稳定身份确认的新对象。</li>
+          <li>读取远端内容、核对字节数、flush、sync_all。</li>
+          <li>同目录 hard link 原子安装最终名；已存在时不覆盖，并以稳定 handle 对账最终对象身份。</li>
+          <li>本地 partial create 在 owned blocking worker 内返回 <code>UnclaimedLocalPartial</code>；未 claim 结果在 cancel/timeout/drop/unwind 下仍由 Drop 调度清理，claim 交接中间无 await。</li>
+        </ol>
+        <h3>交互 shell</h3>
+        <p>直连 SSH+PTY setup 共用 30 秒 deadline；IPC client 的 Shell/Ack 上限为 32 秒，daemon 内部仍为 30 秒。client/daemon 在整个 IPC shell 中各自保留一个 pinned frame decoder，避免 cancel/drop 卡在 header/body 中间时丢失 framing；等待满队列和已入队的 channel element 都有 RAII zeroize envelope。CLI stdin 以 100 ms <code>crossterm::poll</code> 响应取消，忽略 key release，接受 press/repeat。setup 成功后的会话没有整体 deadline。</p>
       </section>
 
       <section id="cli">
         <h2>6. CLI 参考</h2>
-        <pre><code># 默认打开 UI
-serctl
-serctl ui
+        <pre><code>$exe = ".\target\debug\serctl.exe"
 
-# 配置；密码与主口令交互输入
-serctl add prod --host 192.168.5.15 --user deploy --port 22
-serctl list
-serctl remove prod
-
-# 持久连接与命令
-serctl up prod
-serctl exec prod --timeout-secs 30 -- "uname -a; whoami"
-serctl shell prod
-serctl status prod
-serctl down prod
-
-# M7 evidence 工作流
-serctl upload prod request.json /tmp/request.json --timeout-secs 120
-serctl download prod /tmp/server-evidence.json server-evidence.json --timeout-secs 120</code></pre>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>命令</th><th>profile 规则</th><th>关键语义</th></tr></thead>
-            <tbody>
-              <tr><td><code>add</code></td><td>省略时 <code>default</code></td><td>新增/更新；保留已有 pinned host key，防止无意清除信任锚</td></tr>
-              <tr><td><code>list</code></td><td>不适用</td><td>只展示 profile、明文 host 与 port，不解密用户名/密码</td></tr>
-              <tr><td><code>up</code>/<code>shell</code>/<code>status</code>/<code>down</code></td><td>省略时 <code>default</code></td><td>前台 daemon、PTY、状态与关闭</td></tr>
-              <tr><td><code>exec</code></td><td>必须显式指定</td><td>默认 300 秒；最终进程退出码来自远端明确 ExitStatus</td></tr>
-              <tr><td><code>upload</code>/<code>download</code></td><td>必须显式指定</td><td>默认 300 秒；不覆盖既有目标；临时文件 + rename</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p><code>SERCTL_SSH_PASS</code> 与 <code>SERCTL_MASTER</code> 可用于自动化，读取后会从当前进程环境移除；但父进程、调试器或同权限观察者仍可能在读取前获得环境内容，交互输入更稳妥。</p>
+&amp; $exe add prod --host 192.168.5.15 --user deploy --port 22
+&amp; $exe up prod
+&amp; $exe exec prod --timeout-secs 30 -- "collect-evidence"
+&amp; $exe upload prod .\request.json /tmp/request.json --timeout-secs 120
+&amp; $exe download prod /tmp/server-evidence.json .\evidence.json --timeout-secs 120
+&amp; $exe shell prod
+&amp; $exe status prod
+&amp; $exe down prod</code></pre>
+        <div class="table-wrap"><table>
+          <thead><tr><th>命令</th><th>用途</th><th>边界</th></tr></thead>
+          <tbody>
+            <tr><td><code>ui</code></td><td>打开 Winit/Egui 工作台</td><td>无子命令时默认</td></tr>
+            <tr><td><code>add/list/remove</code></td><td>管理 profile</td><td>变更需要排他 profile 租约；list 不解密秘密</td></tr>
+            <tr><td><code>up/down/status</code></td><td>运行与控制 daemon</td><td>status/down control exchange 3 秒；shutdown generation/lease reconcile 10 秒</td></tr>
+            <tr><td><code>exec</code></td><td>执行命令并保留 stdout/stderr/exit status</td><td>默认 300 秒；非零远端码映射为本地非零</td></tr>
+            <tr><td><code>upload/download</code></td><td>发送或拉取 evidence</td><td>默认 300 秒；目标已存在安全失败</td></tr>
+            <tr><td><code>shell</code></td><td>Bash PTY</td><td>setup 和单次输入有 deadline；会话本身无总 deadline</td></tr>
+          </tbody>
+        </table></div>
+        <p><code>SERCTL_SSH_PASS</code> / <code>SERCTL_MASTER</code> 在任何可失败 Unicode 解码和异步 runtime 前先快照，再从本进程环境一并删除；第一个值无效也不会留下第二个。环境继承本身不是秘密通道。Clap 的动态错误、anyhow 链、日志和程序生成字段会转义控制字符；help/version 保持静态原始布局。</p>
+        <div class="callout warn"><strong>终端信任边界：</strong><code>exec</code> stdout/stderr 与 PTY 输出来自远端，被设计为原样交互数据，可能包含 ANSI/OSC。对不可信服务器应重定向到文件、使用 <code>download</code> 或先做独立转义，不要直接显示到高权限终端。</div>
       </section>
 
       <section id="ui">
-        <h2>7. 桌面 UI</h2>
-        <div class="grid">
-          <div class="card"><h3>主机与连接</h3><p>新建、编辑、删除 profile；启动、刷新和停止 daemon；显示远端地址与连接状态。</p></div>
-          <div class="card"><h3>命令工作区</h3><p>执行远程命令，分别展示 stdout、stderr 和退出码；网络任务不阻塞 Winit 事件循环。</p></div>
-          <div class="card"><h3>目录与传输</h3><p>浏览、上级目录、建目录、上传、下载；与 CLI 复用相同 client/daemon/SFTP 实现。</p></div>
-          <div class="card"><h3>Bash / PTY</h3><p>持续输入、Ctrl+C、Ctrl+D、清屏；daemon 不存在时可建立直连 PTY。</p></div>
-        </div>
-        <div class="callout warn">UI 中的“daemon active”状态现在会触发 <code>SessionManager.current()</code>，因此它不仅检查本机 IPC，也会在 SSH 已关闭时尝试重连。这减少假活，但同时意味着状态刷新可能受到重连阶段无硬 deadline 的影响。</div>
+        <h2>7. Winit/Egui 桌面 UI</h2>
+        <ul>
+          <li>目录、文件传输、命令与 Bash 交互均通过后台 Tokio runtime 执行。profile refresh 在 UI 调用时只建立一个 32 秒 absolute deadline，覆盖 <code>spawn_blocking</code> vault list/KDF 和分波的最多 8 个 daemon status probe；未启动波次被取消。运行中的 blocking job 可迟到，但其 <code>SensitiveProfileListResult</code> 由 RAII 清零，不占住 Tokio worker。</li>
+          <li>profile epoch、目录 generation 与 daemon instance id 进入异步结果身份；切换、编辑、删除或重启 profile 后，旧 worker 的迟到响应不能覆盖新状态。</li>
+          <li>workspace master、editor SSH password 和 editor master 由 <code>MaskedSecretTextBuffer</code> 编辑；egui 只看到等 Unicode 字符数的 <code>*</code>。每次 show 前后都将 undo <code>max_undos=0</code>，Unicode 编辑替换的旧 app string 会清零。eframe persistence feature 已移除，<code>persist_egui_memory</code>/<code>persist_window</code> 均为 false。</li>
+          <li><code>SensitiveUiMessage</code> envelope 从队列、send 失败、receiver drop 一直持有到 reducer match 完成；unwind 会清零 payload 并取消 <code>GuiShell</code>。<code>CommandOutput::drop</code> 清零，command/PTY lossy 转换中间缓冲为 <code>Zeroizing</code>。</li>
+          <li>runtime 是独占 <code>Option&lt;Runtime&gt;</code>。正常 <code>on_exit</code> 先 cancel transfer，最多 6 秒协作等待并 abort 超界任务，再并发 <code>down</code> UI-owned daemons，最后 <code>shutdown_timeout(1 s)</code>。panic/未调用 <code>on_exit</code> 只能 cancel + <code>shutdown_background</code>，不保证 async cleanup 完成。</li>
+        </ul>
+        <div class="callout warn"><strong>UI P3 边界：</strong>非凭证的 command/shell/path/output 仍可在 egui、字体布局、IME、OS 与 allocator 内形成普通临时副本。稳定 widget ID 和每帧清 undo 只是缩小暴露，不是完整内存清零。</div>
       </section>
 
       <section id="credentials">
-        <h2>8. 凭证保存安全</h2>
-        <h3>8.1 加密结构</h3>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>数据</th><th>保存形态</th><th>完整性绑定</th></tr></thead>
-            <tbody>
-              <tr><td>profile 名、host、port</td><td>明文，支持无需解密的列表</td><td>作为 AEAD AAD；篡改会导致解密失败</td></tr>
-              <tr><td>用户名、SSH 密码、host key 指纹</td><td>ChaCha20-Poly1305 密文</td><td>AEAD tag + profile/host/port AAD</td></tr>
-              <tr><td>主口令</td><td>不保存</td><td>用于 Argon2id 派生 32 字节密钥</td></tr>
-              <tr><td>主口令验证器</td><td>独立 AEAD 密文</td><td>错误主口令或篡改在写入前被拒绝</td></tr>
-              <tr><td>IPC token</td><td>运行锁明文</td><td>依赖 OS 文件权限；daemon 退出时令牌锁被删除</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <h3>8.2 KDF 与输入限制</h3>
+        <h2>8. 凭证保存与运行锁安全</h2>
+        <h3>vault v2</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>字段</th><th>磁盘形态</th><th>保护</th></tr></thead>
+          <tbody>
+            <tr><td>profile name / host / port</td><td>明文索引元数据</td><td>同时进入 AEAD AAD；篡改会使秘密解密失败</td></tr>
+            <tr><td>username / SSH password / host-key pin</td><td>ChaCha20-Poly1305 ciphertext</td><td>AAD 域绑定 <code>serctl/profile/v2</code> + name + host + port</td></tr>
+            <tr><td>master verifier</td><td>AEAD 密文</td><td>写入前验证主口令与篡改</td></tr>
+            <tr><td>KDF salt / 参数</td><td>明文格式参数</td><td>Argon2id；当前 64 MiB / 3 iterations / p=1；读取时有上下限；<code>argon2/zeroize</code> 已启用</td></tr>
+            <tr><td>IPC 共享秘密</td><td>受保护运行锁</td><td>256 位随机；用于 endpoint 派生和 HMAC，不经 IPC wire 传输</td></tr>
+          </tbody>
+        </table></div>
         <ul>
-          <li>算法：Argon2id v1.3；默认内存 64 MiB、迭代 3、并行度 1、输出 32 字节。</li>
-          <li>加载时允许范围：内存 8–256 MiB、迭代 1–10、并行度 1–16，输出必须为 32 字节。</li>
-          <li>salt 必须恰好 16 字节；ChaCha20-Poly1305 nonce 必须恰好 12 字节。</li>
-          <li>vault 最大 16 MiB、profile 最多 10,000 条；拒绝未知 vault/record 格式版本。</li>
+          <li>v2 profile 的 endpoint 元数据受认证。磁盘 format 字节不在 AAD 内，因此显式离线替换会先按 no-AAD legacy decrypt 验证真正旧记录，且不继承旧 host-key pin；翻转现代记录 format 2→0 会因 tag/decrypt 失败，不能擦 pin 或重开 TOFU。</li>
+          <li>密钥派生通过 <code>hash_password_into_with_memory</code> 直接写入精确的 <code>Zeroizing&lt;Vec&lt;Argon2Block&gt;&gt;</code>；64 MiB 矩阵由 RAII 擦除，Argon2 内部 initial/block hash 的可控副本由开启的 <code>zeroize</code> feature 覆盖。</li>
+          <li>密码校验、profile 加解密、vault 更新和运行锁写入的敏感 JSON使用两遍序列化：第一遍仅计数，第二遍写入精确预分配的 <code>Zeroizing&lt;Vec&lt;u8&gt;&gt;</code>。IPC frame 同样不先生成普通敏感 <code>Vec</code>。</li>
+          <li>可控明文、命令、帧、输出和缓冲在 Drop/错误路径清零；这不能清除 allocator、OS cache、第三方库、swap 或 crash dump 中的副本。</li>
+          <li>vault 更新使用同目录原子替换和进程间锁；文件锁采用 <code>try_lock</code> 轮询且最多等待 30 秒。</li>
         </ul>
-        <h3>8.3 文件权限与更新一致性</h3>
+        <h3>稳定句柄与平台权限</h3>
         <ul>
-          <li>Windows：目录/文件设置 protected DACL，仅保留 owner、SYSTEM、Administrators。</li>
-          <li>Unix：目录 <code>0700</code>，文件与 socket <code>0600</code>。</li>
-          <li>保存使用进程间互斥锁和同目录原子替换，避免并发丢更新与崩溃截断。</li>
-          <li>凭证和派生密钥使用 <code>Zeroizing</code> 包装，降低正常 drop 后的内存残留；这不等同于防御进程转储。</li>
+          <li>Unix：安全目录/文件以 <code>O_NOFOLLOW | O_NONBLOCK</code> 打开，在相同 handle 上验证 regular/type、effective UID和 <code>0700</code>/<code>0600</code>。</li>
+          <li>Windows：目录/文件拒绝 reparse，验证当前 owner，并使用禁止继承的 owner/SYSTEM/Administrators protected DACL；失败关闭。</li>
+          <li>只读运行锁在首次读取前就建立 <code>Zeroizing</code> 缓冲，一次预分配 64 KiB + 1，避免增长/realloc 时释放含 token 前缀的旧 allocation；稳定 handle 上的二次上限读取阻断 metadata 后增长竞态。</li>
         </ul>
-        <div class="callout risk"><strong>信任边界：</strong>同一用户、管理员、调试器、内存转储、键盘记录和父进程环境观察均不在防御范围内。主口令强度直接决定 vault 离线破解成本。TOFU 首次连接若遭中间人攻击，错误指纹仍可能被固定。</div>
+        <h3>租约与畸形锁恢复</h3>
+        <p>daemon 生命周期和 profile 变更使用排他租约；普通直连使用共享租约。首次 TOFU 时，直连与 daemon 都先 KEX/观测 key，在排他租约下原子只写一次 pin，之后才发送 SSH password。假 server E2E 已验证 pin 写入失败时不会看到 auth request。</p>
+        <p>当前 hashed-v2 运行锁若无法解析，清理器必须先取得同一排他生命周期租约，再验证 runtime 目录及文件权限/类型并重读 namespace。对账结果只有 <code>Removed</code>/<code>Absent</code> 允许进入 direct fallback；<code>Changed</code>/<code>Contended</code> 均 fail closed。Unix 上被遮蔽的 raw legacy 锁仍会拒绝；Windows 不探测不安全的 raw legacy 名称。</p>
       </section>
 
       <section id="ipc">
-        <h2>9. 本机 IPC</h2>
-        <div class="grid">
-          <div class="card"><h3>Windows</h3><p><code>\\.\pipe\serctl-&lt;128-bit id&gt;</code>；首实例防抢占，拒绝远程 pipe 客户端，忙碌/实例切换时每 10 ms 重试。</p></div>
-          <div class="card"><h3>Unix</h3><p><code>~/.serctl/run/&lt;128-bit id&gt;.sock</code>；运行目录 <code>0700</code>、socket <code>0600</code>，listener Drop 时删除路径。</p></div>
-        </div>
-        <h3>协议与认证</h3>
+        <h2>9. IPC v2：统一抽象与双向认证</h2>
+        <h3>传输与 OS 边界</h3>
         <ul>
-          <li>4 字节大端长度 + JSON 帧；通用最大帧 64 MiB。</li>
-          <li>认证必须是第一帧，最大 4 KiB，读取 deadline 为 2 秒。</li>
-          <li>token 为 32 随机字节的 Base64；比较使用 constant-time equality。</li>
-          <li>认证后支持 Exec、Shell、Status、Shutdown、ListDir、CreateDir、Upload、Download。</li>
-          <li>daemon 同时最多处理 64 个已接收 IPC 连接。</li>
+          <li>Windows Named Pipe 和 Unix Domain Socket 对上层暴露同一 AsyncRead/AsyncWrite、listener、connect 与长度前缀 JSON frame API，不存在两套业务协议。</li>
+          <li>Windows 每一个 pipe instance（包括 accept 后预建的下一实例）都在创建时传入禁止继承、仅 owner/SYSTEM/Administrators 的 DACL，并拒绝远程客户端。</li>
+          <li>Unix socket 位于 <code>0700</code> runtime 目录，socket mode 为 <code>0600</code>。</li>
+          <li>认证前客户端用 <code>GetNamedPipeServerProcessId</code> 核对 server PID；Unix 用 peer credentials 核对当前 euid，并在平台提供 PID 时与锁中 PID 匹配。</li>
         </ul>
-        <p><span class="badge good">已实现</span> 认证前帧限制可避免未认证本机连接直接声明 64 MiB 帧并触发同等分配。<span class="badge caution">防御纵深</span> Windows Named Pipe 本体没有显式传入 owner-only security descriptor，而是依赖系统默认 pipe DACL、<code>reject_remote_clients</code> 和受保护锁文件中的随机 token。</p>
+        <h3>三帧 nonce-HMAC-SHA256</h3>
+        <pre><code>client  → AuthHello(version=2, client_nonce)
+daemon  → AuthChallenge(version=2, server_nonce, server_proof)
+client  → AuthResponse(client_proof)</code></pre>
+        <p>证明输入绑定独立的 server/client role 域、协议版本、profile 长度与内容、派生 endpoint id、client nonce 和 server nonce。共享秘密只作为 HMAC key，不作为帧字段发送；双方 nonce 各为 32 随机字节且不得相等。Base64 解码必须得到规范、带 padding 的恰好 32 字节值，proof 使用常量时间比较。这样可以阻止角色反射、跨 profile/endpoint 重放、降级和非规范编码混淆。</p>
+        <h3>帧与并发预算</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>类别</th><th>上限</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>认证帧</td><td>4 KiB</td><td>未认证 peer 不能声明大 body 诱导等量分配</td></tr>
+            <tr><td>控制帧</td><td>16 KiB</td><td>Ack/Error/Status/Shutdown/TransferDone 等；合法最坏 Status 可大于 4 KiB</td></tr>
+            <tr><td>请求/上传 chunk/shell</td><td>按类型限制</td><td>命令 64 KiB；上传 chunk 和 shell input 各 64 KiB</td></tr>
+            <tr><td>业务响应</td><td>16 MiB</td><td>DirList 在返回前按最终 JSON 精确测量</td></tr>
+            <tr><td>命令输出</td><td>8 MiB</td><td>stdout + stderr 合计</td></tr>
+            <tr><td>连接/重结果</td><td>64 / 8</td><td>64 连接；Exec/ListDir 共用 8 槽聚合内存预算</td></tr>
+          </tbody>
+        </table></div>
+        <p>长度前缀读取只有在第一个 header 字节前就得到 0 字节才是正常 EOF；1–3 字节的 partial header 是硬错误，不能被解释为干净断开。认证上限 2 秒；成功后 10 秒不发送业务帧即断开。daemon 响应写通常使用 <code>min(request deadline, now + 2 s)</code> 并接受 shutdown 抢占；上传已提交但原 deadline 刚过时，<code>TransferDone</code> 可用新的最多 2 秒确认窗口。半帧写失败直接关闭连接，不追加 Error 破坏 framing。</p>
+        <p>daemon download 把下游阻塞/断开分类为 <code>IpcResponseWriteFailure</code>；该失败只关闭当前 IPC/SFTP channel，不会 invalidate daemon-wide 共享 SSH transport。真实 E2E 在 client 不读取 12 MiB download 后执行 exec，且不需要新 SSH connection。</p>
       </section>
 
       <section id="timeouts">
-        <h2>10. Deadline 与取消语义</h2>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>操作</th><th>客户端</th><th>daemon / SSH</th><th>取消后处理</th><th>说明</th></tr></thead>
-            <tbody>
-              <tr><td>daemon exec</td><td>传递 deadline；等待 IPC 结果本身无独立外层 timeout</td><td>命令 channel 内部硬 deadline</td><td>deadline 或 IPC 断开时 EOF/Close</td><td>SSH 重连发生在命令计时之前</td></tr>
-              <tr><td>direct exec</td><td>命令执行 timeout</td><td><code>finish()</code> timeout</td><td>EOF/Close</td><td>解密、TCP/SSH 连接不计入命令 deadline</td></tr>
-              <tr><td>list/create</td><td>整个 inner Future 外层 timeout</td><td>daemon 业务 timeout</td><td>Future drop / channel drop</td><td>默认 300 秒</td></tr>
-              <tr><td>daemon upload</td><td>整个客户端上传外层 timeout</td><td>一个绝对 deadline 覆盖 SFTP 建立、接收、写入和 rename</td><td>2 秒 best-effort remove</td><td>若客户端断开，daemon 检测 EOF</td></tr>
-              <tr><td>direct upload</td><td>整个 inner Future 外层 timeout</td><td>无 daemon</td><td>Drop 守卫 + 新 SFTP channel，最多 2 秒</td><td>短暂重试覆盖 CREATE 竞态</td></tr>
-              <tr><td>download</td><td>整个 inner Future 外层 timeout</td><td>daemon 下载 timeout</td><td>删除本地 <code>.serctl-part</code></td><td>最终文件不被半成品覆盖</td></tr>
-              <tr><td>PTY shell</td><td>交互式，无业务 deadline</td><td>持续到 EOF/断开</td><td>channel/IPC drop</td><td>这是交互功能的预期语义</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p>exec/SFTP timeout 的默认值均为 300 秒，合法范围为 1 ms 到 24 小时。CLI 以整秒输入；UI/内部 API 可传更细粒度的 <code>Duration</code>。</p>
+        <h2>10. Deadline、取消与收尾</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>操作</th><th>主要 deadline</th><th>取消/收尾</th><th>明确边界</th></tr></thead>
+          <tbody>
+            <tr><td>daemon connect/auth</td><td>2 秒</td><td>连接失败后按稳定运行锁判断 stale/错误</td><td>先 OS peer 预验，再发送 AuthHello</td></tr>
+            <tr><td>status/down</td><td>控制交换 3 秒</td><td>Shutdown 完整发送后，Ack 丢失仍以 token generation + lease probe 对账最多 10 秒</td><td>锁消失不足以证明旧 daemon 已释放租约</td></tr>
+            <tr><td>UI daemon 启动</td><td>从 status probe 起单一 30 秒</td><td>owned bind/publication + token-CAS/lease Drop cleanup + readiness ownership handoff</td><td>已进入 OS blocking syscall 不可抢占</td></tr>
+            <tr><td>UI profile refresh</td><td>从 UI 调用起单一 32 秒</td><td>vault/KDF blocking work + 分波最多 8 个 status probe</td><td>运行中 blocking job 可 detach，迟到结果 RAII 清零</td></tr>
+            <tr><td>exec</td><td>默认 300 秒，范围 1 ms–24 h</td><td>TERM → KILL → EOF/Close；失败则 invalidate transport</td><td>远端可忽略信号或已让子进程脱离 channel</td></tr>
+            <tr><td>list/create/upload/download</td><td>默认 300 秒，范围 1 ms–24 h</td><td>覆盖路由、reconnect、SFTP init 与远端 I/O</td><td>本地 kernel syscall 是不可抢占边界</td></tr>
+            <tr><td>远端上传残片</td><td>业务 deadline 后另有最多 2 秒</td><td>fresh SFTP channel + 短重试；必要时 invalidate</td><td>服务器不可达/进程强杀可留下 partial</td></tr>
+            <tr><td>上传 commit 对账</td><td>UploadEnd 后最多 2.25 秒 grace</td><td>只接受明确 TransferDone；否则 outcome unknown</td><td>重试前必须检查目标</td></tr>
+            <tr><td>本地 download create/commit</td><td>调用者 absolute deadline；commit 1 秒 + 最多 2 秒 reconcile</td><td>owned blocking task、<code>UnclaimedLocalPartial</code> Drop 清理、稳定 handle 对账</td><td>blocking pool/thread 耗尽可延迟或保留 partial</td></tr>
+            <tr><td>shell setup/input</td><td>direct 30 秒；IPC 32/daemon 30 秒；单次写 2 秒</td><td>EOF/Close 有界，输入最多 64 KiB</td><td>成功会话没有整体 deadline</td></tr>
+            <tr><td>daemon shutdown</td><td>handler grace 4 秒</td><td>广播 cancel、drain、abort_all、逐项 join、invalidate SSH</td><td>client generation/lease reconcile 最多 10 秒</td></tr>
+            <tr><td>UI exit</td><td>transfer grace 最多 6 秒；runtime shutdown 1 秒</td><td>cancel/abort transfer → 并发 down owned daemon → 消费 owned runtime</td><td>panic/kill 只有 cancel + background shutdown</td></tr>
+          </tbody>
+        </table></div>
+        <p>deadline 使用绝对 <code>Instant</code> 向下传递，不在每个阶段重新赠送完整预算。shutdown 轮询也在同一 deadline 下交给 blocking worker：常量时间比较同 token 表示预期 generation 仍活跃，有效不同 token 证明 replacement generation 已在旧租约释放后发布；锁缺失时另行探测排他运行租约。上传 commit 和本地文件操作记录线性化状态，区分“明确未提交”“明确已提交”和“结果未知”。</p>
       </section>
 
       <section id="transfer">
-        <h2>11. 文件传输完整性</h2>
-        <div class="grid">
-          <div class="card">
-            <h3>上传</h3>
-            <ul><li>不覆盖既有远端文件；</li><li>随机同目录临时路径；</li><li>声明大小与实际大小核对；</li><li>rename 前二次检查目标；</li><li>错误/timeout/取消清理残片。</li></ul>
-          </div>
-          <div class="card">
-            <h3>下载</h3>
-            <ul><li>不覆盖既有本地文件；</li><li><code>create_new</code> 建立部分文件；</li><li>daemon 报告字节数与接收量核对；</li><li>flush + sync_all；</li><li>成功后 rename，失败删除部分文件。</li></ul>
-          </div>
-        </div>
-        <div class="callout warn"><strong>不承诺内容级校验：</strong>当前验证的是传输字节数、写入完成和原子可见性，没有端到端内容哈希或远端 fsync 协议。需要不可抵赖 evidence 时，应另行生成并核对 SHA-256/签名。</div>
+        <h2>11. 目录浏览与传输完整性</h2>
+        <h3>统一 SFTP frame guard</h3>
+        <p>高层 russh-sftp 和自实现目录 reader 均通过相同 bounded stream。每个 SFTP 长度前缀一到达就先检查 body 不超过 1 MiB；超限时不读取/分配声明 body，立刻标记 transport 失效并触发代理取消。SFTP init 卡住仍由外层 absolute deadline 兜底。</p>
+        <h3>流式目录列表</h3>
+        <ul>
+          <li>直接执行 SFTP v3 <code>REALPATH</code>、<code>OPENDIR</code>、重复 <code>READDIR</code>、<code>CLOSE</code>，不调用先聚合任意结果的便捷 API。</li>
+          <li>协议 packet encoded body 累计最多 8 MiB；canonical path、name 与完整 path 的保留字符串合计最多 2 MiB；entry 最多 10,000。</li>
+          <li>拒绝空名、绝对名、包含 <code>/</code>、<code>..</code> escape 或 NUL 的 entry component。</li>
+          <li>排序一次性缓存小写 key，避免比较器重复分配；最终以真实 <code>DirList</code> JSON 序列化大小验证 16 MiB IPC wire 上限，覆盖控制字符六倍转义最坏情形。</li>
+          <li>daemon 与 direct 使用同一 reader/预算；解析或预算失败会关闭 channel 并使 transport 失效，下一请求通过单飞重连恢复。</li>
+        </ul>
+        <h3>远端上传</h3>
+        <ul>
+          <li>目标/临时路径长度和 NUL 被统一验证；临时名预留完整 45 字节后缀。</li>
+          <li>partial 使用 SFTP <code>CREATE | EXCLUDE | WRITE</code>，创建属性 <code>0600</code>，因此没有服务器默认常见 <code>0644</code> 的暴露窗口。</li>
+          <li>优先 OpenSSH <a href="https://github.com/openssh/openssh-portable/blob/master/PROTOCOL"><code>hardlink@openssh.com</code></a>。扩展被声明却报错时，不尝试 rename，以免“目标存在”被错误降级成覆盖路径。</li>
+          <li>仅当扩展未声明时使用标准 <a href="https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02">SFTP v3 RENAME</a>；v3 要求目标已存在时失败，但这是对服务端合规性的外部假设。</li>
+          <li>hardlink 成功即记录 committed，再尝试 unlink 本方 partial；删除失败不会把已安装目标倒退成失败。直连 worker 在 <code>commit_started</code> 后的 timeout/cancel 或 <code>Finished(Err)</code> 而未确认 committed 时，均返回 typed <code>UploadCommitOutcomeUnknown</code>。</li>
+        </ul>
+        <h3>本地上传源</h3>
+        <p>源文件在 daemon/direct 路由和 SSH 认证前只打开一次，后续始终读取同一 handle。Unix 用 <code>O_NONBLOCK</code> 后 <code>fstat</code> 拒绝 FIFO、设备、目录，允许最终指向普通文件的 symlink；Windows 用 <code>OPEN_REPARSE_POINT</code> 并拒绝 reparse/设备/目录。程序不改变用户源文件 ACL。</p>
+        <h3>本地下载</h3>
+        <ul>
+          <li>partial 以随机同目录名称和 atomic <code>create_new</code> 建立；创建成功一返回就 arm <code>CreatedFileRollback</code>，所以后续验证错误/panic 也会回滚。Unix 用 dev/inode 保留同名替换对象，Windows 用稳定 handle 删除原创建对象；碰撞不会误删。</li>
+          <li>Unix 从创建瞬间即 owner-only <code>0600</code>，并在 handle 上核对 UID/type/mode。Windows 在 <code>CREATE_NEW</code> 时通过 <code>SECURITY_ATTRIBUTES</code> 应用 protected owner/SYSTEM/Administrators DACL，再验证 owner/DACL/reparse/type。</li>
+          <li>本地 create 由 owned <code>spawn_blocking</code> 返回 <code>UnclaimedLocalPartial</code>；异步 Future 在 cancel/timeout/drop/unwind 下未 claim 时，Drop 仍会调度清理，claim 交接中间没有 await。blocking pool 饱和会延迟但不放弃清理；无法创建清理线程时可能保留路径。</li>
+          <li>传输完成后 flush + sync_all，再以 hard link 原子 no-replace 安装最终名称。Windows 在 clone path/spawn 不可逆 hardlink worker 之前先复查 <code>now &lt; deadline</code>，避免 elapsed deadline 下 <code>timeout_at</code> 仍先 poll ready inner；安装后在有界 blocking worker 内对稳定 handle 调用 <code>GetFileInformationByHandle</code> 对账。</li>
+          <li>hard link 不可用时安全失败而不是退化为可覆盖 rename；磁盘耗尽/文件系统故障也会保留明确错误。</li>
+        </ul>
+        <div class="callout warn"><strong>内容级边界：</strong>当前验证字节数、权限、提交身份和 no-overwrite，不实现远端 fsync 协议或 evidence 内容签名。审计流程仍应独立计算/核对 SHA-256 或数字签名。</div>
       </section>
 
-      <section id="reconnect">
-        <h2>12. SSH 存活检测与重连</h2>
+      <section id="ssh">
+        <h2>12. SSH 算法、存活与重连</h2>
         <ul>
-          <li>russh 每 30 秒发送 keepalive；最大连续无响应次数为 3。</li>
-          <li><code>SessionManager</code> 以 <code>RwLock&lt;Arc&lt;SshSession&gt;&gt;</code> 保存当前连接。</li>
-          <li>多个请求同时发现连接关闭时，通过 <code>Mutex</code> 单飞重连；首个请求认证，其余复用结果。</li>
-          <li>替代连接继续使用已固定 host key，避免重连绕过主机身份校验。</li>
-          <li>在途请求持有旧 <code>Arc</code>，替换不会把会话从其他请求下方移走。</li>
-          <li><code>status</code> 也会检查/重连 SSH，避免仅因 IPC 存活而报告假健康。</li>
+          <li>依赖 <code>russh 0.62.5</code>，关闭默认 feature 并只启用 <code>ring</code> 后端；KEX/MAC 沿用 russh 当前安全默认。</li>
+          <li>server host-key 签名仅允许 Ed25519、ECDSA、RSA-SHA2-256 与 RSA-SHA2-512；没有 hash 标识的 <code>ssh-rsa</code> SHA-1 被明确过滤。</li>
+          <li>SSH host key 使用 SHA-256 fingerprint。首次 TOFU 按 KEX/观测 key → 排他租约下原子 pin → 发送 password 的顺序执行；pin 失败时在 auth 前中止 transport。之后所有连接/重连都要求一致。</li>
+          <li>TCP 经双向 copy proxy 交给 russh。deadline 或 cancel 会关闭 proxy 两端并等待退出，解决 russh 在 KEX 前已 spawn session task、丢弃 connect Future 仍可能泄漏的问题。</li>
+          <li>keepalive 每 30 秒发送，连续 3 次无响应后连接失效；<code>SessionManager</code> 通过 Mutex 单飞重连，等待锁、DNS/TCP/KEX/auth 全部消耗调用者剩余 deadline。</li>
+          <li>在途请求持有旧 <code>Arc&lt;SshSession&gt;</code>；替换不会从请求下方移动对象。不可安全取消的 channel-open/SFTP-init 超时会 invalidate 整个旧 transport。</li>
+          <li><code>status</code> 不只检查本机 IPC，还要求取得健康 SSH session/reconnect，避免报告“daemon 活着但 SSH 永久失效”的假健康。daemon 内部 control setup 上限为 30 秒，但 client 的整个 status control exchange 硬上限为 3 秒，因此外部调用由更短的 3 秒预算主导，超时后断开该 IPC。</li>
         </ul>
-        <div class="callout risk"><strong>当前缺口：</strong><code>SessionManager.current()</code> 内的 DNS/TCP/SSH 连接没有显式 deadline/cancel，并且位于 exec/SFTP daemon deadline 之前。网络栈若长时间不返回，等待重连锁的请求也会一起滞留并占用最多 64 个 IPC 槽。建议为 connect/reconnect 增加独立硬 deadline，并把业务 absolute deadline 传入会话获取阶段。</div>
       </section>
 
       <section id="tests">
         <h2>13. 测试与验证证据</h2>
         <pre><code>cargo fmt -- --check
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo test
-
-# 结果
-30 passed; 0 failed</code></pre>
+cargo check --locked --offline --all-targets --all-features
+cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+cargo test --locked --offline --all-targets --all-features -- --test-threads=1
+                               # 177/177；连续 3 轮
+cargo audit --no-fetch
+cargo build --locked --offline -v   # debug only
+target\debug\serctl.exe --version
+cargo build --locked --offline -v   # 第二次：Fresh serctl</code></pre>
+        <div class="grid three">
+          <div class="card"><div class="kpi">177/177</div><div class="label">all-targets/all-features 每轮；连续 3 轮</div></div>
+          <div class="card"><div class="kpi">529</div><div class="label">cargo-audit 扫描 crate dependencies</div></div>
+          <div class="card"><div class="kpi">1198</div><div class="label">advisories 数据库；0 warning</div></div>
+        </div>
+        <h3>关键单元/组件覆盖</h3>
+        <ul>
+          <li>HMAC proof 对 role/version/profile/endpoint id/双 nonce 的绑定、nonce 复用、严格 Base64 与旧协议拒绝；</li>
+          <li>Windows secured pipe 的首个及后续 instance DACL 与 server PID，Unix UID/可用 PID peer check；</li>
+          <li>vault v2 AAD/format-downgrade 拒绝、Argon2 zeroize matrix、两遍敏感 JSON、KDF/nonce 边界、30 秒锁策略；</li>
+          <li>畸形 hashed-v2 锁只有安全清理并对账成 <code>Removed</code>/<code>Absent</code> 才 fallback；<code>Changed</code>/<code>Contended</code> 与 shadowed raw legacy 继续 fail closed；</li>
+          <li>100 次 KEX stall 均关闭 proxy；<code>ssh-rsa</code> SHA-1 过滤；SFTP 前缀分配前拒绝；</li>
+          <li>目录 1 MiB/8 MiB/2 MiB/10,000 与 exact 16 MiB wire budget，包括控制字符最坏 JSON 扩张；</li>
+          <li>远端 hardlink/rename 分支、声明扩展错误不降级、committed 后 unlink 失败语义、commit 响应丢失；</li>
+          <li>本地 protected create-new、碰撞不删除、regular source、FIFO/目录无挂起、hard-link no-replace 与 syscall 对账；</li>
+          <li>CLI 退出码/终端转义；UI masked secret 不进入 TextEdit、undo 禁用、message-envelope unwind、32 秒 refresh/6 秒 exit 有界行为；build provenance/Fresh。</li>
+        </ul>
         <h3>真实 E2E 覆盖</h3>
         <ul>
-          <li>临时 russh SSH 服务、内存 SFTP 服务和真实 daemon；</li>
-          <li>当前平台原生 IPC、正确认证、错误 token 拒绝；</li>
-          <li>exec 正常退出、无退出码失败、IPC 断开取消、deadline；</li>
-          <li>SSH transport 主动断开后 daemon 重连并恢复命令；</li>
-          <li>上传/下载内容往返、SFTP hang timeout、daemon 继续可用；</li>
-          <li>无 daemon 直连上传在外层 Future 取消后清理远端残片；</li>
-          <li>CLI stdout/stderr 在进程退出前明确 flush。</li>
+          <li>当前平台原生 IPC、三帧 authenticated daemon、错误 proof/身份拒绝；</li>
+          <li>临时真实 russh SSH server、内存 SFTP server、真实 daemon 与无 daemon direct fallback；</li>
+          <li>exec 正常/非零/无退出码/超输出/deadline/IPC 断开取消，随后 daemon 槽和 SSH transport 恢复；</li>
+          <li>目录正常流式读取、预算拒绝与重连；上传/下载往返、SFTP hang deadline、残片清理；</li>
+          <li>并发上传/下载 no-overwrite、远端 partial <code>0600</code>、owned cleanup/本地 rollback；不读取 12 MiB download 后 exec 复用原 SSH connection；</li>
+          <li>分阶段 TOFU 的 pin 失败时假 server 零 auth request；shell partial-frame/cancel 和队列元素 RAII 清零；</li>
+          <li>畸形运行锁恢复后零 SSH connection，证明修复不会在 fail-closed 路径偷偷建立网络；</li>
+          <li>shutdown 广播取消在途 handler、4 秒 drain/abort/join、Ack 丢失后的 10 秒 token-generation/lease 对账。</li>
         </ul>
-        <h3>尚未覆盖</h3>
+        <h3>依赖与构建证据</h3>
         <ul>
-          <li>Linux/macOS Unix Socket 运行时 E2E；</li>
-          <li>OpenSSH、Dropbear、各类 SFTP server 的外部兼容矩阵；</li>
-          <li>真实 DNS 黑洞、TCP SYN 长时等待、重连风暴与 64 槽耗尽压力测试；</li>
-          <li>大型文件、多 GiB、磁盘耗尽、断电/文件系统崩溃注入；</li>
-          <li>Windows 多用户会话下 Named Pipe DACL 的专门攻击测试。</li>
+          <li><code>cargo audit --no-fetch</code>：使用本机已有 RustSec 数据库快照扫描 529 crate dependencies、1198 advisories 并通过。由于使用 <code>--no-fetch</code>，此结果不声称离线快照包含检查时刻之后的上游更新。</li>
+          <li><a href="https://rustsec.org/advisories/RUSTSEC-2026-0154.html">RUSTSEC-2026-0154</a>（russh）与 <a href="https://rustsec.org/advisories/RUSTSEC-2026-0153.html">RUSTSEC-2026-0153</a>（russh-cryptovec）均在 <code>&gt;= 0.60.3</code> 修复；本项目锁定的对应版本为 <code>0.62.5</code> / <code>0.62.0</code>。</li>
+          <li><a href="https://rustsec.org/advisories/RUSTSEC-2023-0071.html">RUSTSEC-2023-0071</a> 的 <code>rsa</code> 仍没有 patched release，但本项目已从依赖图移除该 package；<a href="https://rustsec.org/advisories/RUSTSEC-2026-0192.html">RUSTSEC-2026-0192</a> 标记 <code>ttf-parser</code> unmaintained，本项目也已移除该 package。</li>
+          <li><code>argon2</code> 的 <code>zeroize</code> feature 已确认；锁定依赖图不含 <code>rsa</code> 与 <code>ttf-parser</code>。build.rs standalone 测试 11/11。</li>
+          <li>提交前审计 debug <code>--version</code> 为 <code>serctl 0.1.0 (git 9fa2a3463e6a-dirty)</code>；连续第二次 locked/offline debug 构建为 <code>Fresh serctl</code>。这不是最终发布状态。</li>
+          <li><strong>没有执行 release 构建</strong>；既有 <code>target/release</code> 程序不属于本轮证据。</li>
         </ul>
       </section>
 
       <section id="risks">
-        <h2>14. 残余风险与建议</h2>
+        <h2>14. 残余风险与信任边界</h2>
         <div class="risk-list">
           <article class="risk-item">
-            <div class="risk-head"><h3>R1 · SSH connect/reconnect 缺少硬 deadline</h3><span class="badge open">中高 · 待修补</span></div>
-            <p>可能超过用户指定 deadline，并让并发请求等待同一重连锁、占用 daemon IPC 槽。建议以 absolute deadline 覆盖 session 获取、通道创建和业务执行，并在超时后取消连接 Future。</p>
+            <div class="risk-head"><h3>R1 · TOFU 首次 MITM</h3><span class="badge caution">固有</span></div>
+            <p>第一次看到的 host key 会被固定；若首次链路已被中间人控制，就会固定错误指纹。高安全环境必须通过独立渠道预核对 fingerprint，或未来支持预置 known_hosts/pin。</p>
           </article>
           <article class="risk-item">
-            <div class="risk-head"><h3>R2 · Named Pipe 缺少显式 owner-only DACL</h3><span class="badge caution">中低 · 防御纵深</span></div>
-            <p>当前依赖默认 pipe DACL、拒绝远程客户端和 256 位 token。建议创建 Pipe 时显式传入仅 owner/SYSTEM/Administrators 的 security descriptor，并增加多用户访问测试。</p>
+            <div class="risk-head"><h3>R2 · SFTP v3 fallback 依赖服务端合规</h3><span class="badge caution">兼容边界</span></div>
+            <p>OpenSSH hardlink 扩展存在时提供明确 no-replace；只有扩展未声明才使用 v3 RENAME。规范要求目标已存在时报错，但非合规服务器可能替换目标。应在目标服务器矩阵中验证，或要求 hardlink 扩展。</p>
           </article>
           <article class="risk-item">
-            <div class="risk-head"><h3>R3 · 远端临时文件清理不是事务保证</h3><span class="badge caution">低 · 已缓解</span></div>
-            <p>清理有 2 秒硬上限。SSH 完全不可用、权限变化或服务器故障时仍可能残留 <code>.serctl-part-*</code>。建议运维侧周期扫描，或未来增加可审计的残片回收命令。</p>
+            <div class="risk-head"><h3>R3 · 本地文件系统 syscall 不可抢占</h3><span class="badge caution">OS 边界</span></div>
+            <p><code>open</code>、<code>flush</code>、<code>sync_all</code>、<code>hard_link</code> 等进入 kernel 后不能由 Tokio timeout 取消。owned task 与身份 reconcile 防止假成功，但病态调用可在 grace 后才改变目录。可写目录中的同用户攻击者也能持续制造 path race；这不属于不同 OS principal 的隔离。</p>
           </article>
           <article class="risk-item">
-            <div class="risk-head"><h3>R4 · TOFU 首次连接风险</h3><span class="badge caution">固有风险</span></div>
-            <p>首次连接遭 MITM 时会固定错误指纹。高安全环境必须通过独立渠道预核对指纹，或增加导入 known_hosts/预置 fingerprint 的流程。</p>
+            <div class="risk-head"><h3>R4 · 强杀、崩溃与 panic cleanup</h3><span class="badge caution">协作式</span></div>
+            <p>正常 timeout/cancel/关闭会等待有界清理；<code>TerminateProcess</code>、kill -9、断电或 runtime 崩溃不会运行 async cleanup。UI Drop/panic 能发 cancel，却不能保证等待 worker。远端/本地 <code>.serctl-part-*</code> 仍应纳入运维扫描。</p>
           </article>
           <article class="risk-item">
-            <div class="risk-head"><h3>R5 · 内容证据没有加密哈希/签名</h3><span class="badge caution">按场景</span></div>
-            <p>传输层检查字节数和原子性，但不提供 evidence 的内容身份或不可抵赖性。M7 等审计流程应同时拉取或计算 SHA-256，并在可信渠道记录。</p>
+            <div class="risk-head"><h3>R5 · 平台验证缺口</h3><span class="badge open">待 CI</span></div>
+            <p>Unix 分支只有 cfg 测试，需 Linux/macOS runtime CI。Windows reparse 动态测试在无 symlink 权限时 skip，且未做多账户 Named Pipe/vault DACL 攻击矩阵。还需 OpenSSH/Dropbear/其他 SFTP server 的外部兼容矩阵。</p>
           </article>
           <article class="risk-item">
-            <div class="risk-head"><h3>R6 · Unix 与外部服务器验证空白</h3><span class="badge open">验证缺口</span></div>
-            <p>当前证据来自 Windows 与内置测试服务器。建议 CI 增加 Windows/Linux/macOS 矩阵，并以容器化 OpenSSH 运行 upload/download/timeout/reconnect E2E。</p>
+            <div class="risk-head"><h3>R6 · 原始远端终端输出</h3><span class="badge caution">信任输入</span></div>
+            <p>程序自身错误和日志会转义控制字符，但 <code>exec</code>/PTY 的远端输出为实现终端交互而原样发送。恶意 ANSI/OSC 可影响终端；不可信输出应重定向、下载后检查或额外转义。</p>
+          </article>
+          <article class="risk-item">
+            <div class="risk-head"><h3>R7 · 同用户/管理员与内存副本</h3><span class="badge caution">威胁模型</span></div>
+            <p>owner-controlled Unix mode、owner/SYSTEM/Administrators protected DACL 与 HMAC 不防御已经取得同一用户、管理员、调试、键盘记录或内存转储能力的攻击者。Zeroizing 只能清理本程序掌控的副本，无法追溯 OS、allocator、russh/serde 内部、swap 或 crash dump。UI 的非凭证 command/shell/path/output 也可在 egui/字体/IME/OS 中留普通临时副本。</p>
+          </article>
+          <article class="risk-item">
+            <div class="risk-head"><h3>R8 · TERM/KILL 不是远端进程组保证</h3><span class="badge caution">协议边界</span></div>
+            <p>channel signal、EOF/Close 和 transport invalidate 会释放本地/daemon 资源，但远端 shell 可忽略信号，或子进程已经脱离 channel。需要强任务终止时，远端命令本身应使用进程组/任务控制器和服务端 deadline。</p>
+          </article>
+          <article class="risk-item">
+            <div class="risk-head"><h3>R9 · 来源标识不是签名</h3><span class="badge caution">供应链边界</span></div>
+            <p>commit + dirty 只能说明 build script 观察到的 Git 状态。仓库根不监听，新增根级 untracked 文件可能需其他输入变化才重算；ignored/动态构建输入也可逸出 dirty 判定。它不是签名或可复现构建证明；可靠回滚需 clean commit/push。</p>
+          </article>
+          <article class="risk-item">
+            <div class="risk-head"><h3>R10 · 旧 release / protocol 0 不兼容</h3><span class="badge caution">迁移边界</span></div>
+            <p>正在使用的旧 release 使用同一 hashed <code>.lock</code>/<code>.lease</code>，但 lock 没有 <code>protocol</code>，解析为 protocol 0/bearer IPC；v2 没有 dual-stack，必须 fail closed。活动旧 daemon 应用匹配旧 executable 正常 down。旧 release 崩溃留下的 stale protocol0 hashed lock 不会被 v2 自动清理；只能在离线核实 PID/进程不存在、租约未持有、owner/ACL/type 安全后人工处理。</p>
           </article>
         </div>
       </section>
 
       <section id="operations">
         <h2>15. 运维手册</h2>
-        <h3>推荐启动顺序</h3>
+        <h3>推荐流程</h3>
         <ol>
-          <li>使用长且唯一的主口令添加 profile；通过独立渠道核对首次显示的 SSH host key 指纹。</li>
-          <li>需要复用连接时运行 <code>serctl up NAME</code>；自动化前先用 <code>status</code> 验证。</li>
-          <li>为每项命令和传输设置符合任务 SLA 的 <code>--timeout-secs</code>，不要无条件使用 24 小时上限。</li>
-          <li>M7 evidence 下载后立即计算 SHA-256，并记录 serctl commit、远端路径、时间和文件摘要。</li>
-          <li>升级跨越 IPC 迁移版本时先停止旧 loopback TCP daemon，再启动新版。</li>
+          <li>使用长且唯一的主口令创建 v2 profile；旧格式不要直接用于网络，使用显式离线替换。</li>
+          <li>通过独立渠道核对首次 SHA-256 host-key fingerprint，再让 TOFU pin 成为可信基线。</li>
+          <li>需要连接复用时运行 <code>serctl up NAME</code>；自动化前用 <code>status</code> 验证 daemon 与 SSH 都健康。</li>
+          <li>为 exec/传输设置符合任务 SLA 的 <code>--timeout-secs</code>，不要无条件使用 24 小时上限。</li>
+          <li>下载 M7 evidence 后独立计算 SHA-256/验证签名，并记录 serctl commit、remote path、时间和摘要。</li>
+          <li>升级跨 IPC 协议版本时，先用与活动旧 daemon 匹配的旧 executable 正常 <code>down</code>，然后整体切换 client/daemon；新版对 protocol0/bearer 锁 fail closed，不静默降级。</li>
+          <li>定期扫描双方目录中的 <code>.serctl-part-*</code>，只在确认没有运行任务后清理。</li>
         </ol>
         <h3>故障定位</h3>
         <div class="table-wrap"><table>
           <thead><tr><th>症状</th><th>含义</th><th>处理</th></tr></thead>
           <tbody>
-            <tr><td>legacy daemon / legacy TCP lock</td><td>正在运行不兼容旧协议</td><td>停止旧进程后重新 <code>up</code>；不要删除仍由活进程持有的锁来绕过</td></tr>
-            <tr><td>authentication timed out/failed</td><td>锁/token/daemon 不匹配或 IPC 无响应</td><td>确认同一用户、检查 daemon 日志；正常退出后再清陈旧锁</td></tr>
-            <tr><td>remote command completed without exit status</td><td>远端 channel/transport 关闭但未给退出码</td><td>视为失败；检查远端 shell、服务重启与网络日志</td></tr>
-            <tr><td>SFTP ... exceeded its deadline</td><td>整个操作超出 deadline</td><td>检查网络/磁盘/权限；扫描远端 <code>.serctl-part-*</code> 与本地 <code>.serctl-part</code></td></tr>
-            <tr><td>status 长时间等待</td><td>可能正在执行无硬上限的 SSH 重连</td><td>终止客户端不会取消 daemon 重连；必要时重启 daemon，后续修补 R1</td></tr>
+            <tr><td>legacy runtime lock uses bearer-token IPC / protocol 0</td><td>活动旧 release 或其 hashed stale lock 不兼容 v2</td><td>活动 daemon 用匹配旧 binary 正常 down；不要绕过租约强删</td></tr>
+            <tr><td>stale hashed protocol0 lock after old-release crash</td><td>v2 自动清理只覆盖 malformed current hashed-v2，不会清 protocol0</td><td>离线确认 PID/进程已消失、租约未持有、owner/ACL/type 安全后再人工处理</td></tr>
+            <tr><td>runtime lock ... not eligible for safe recovery</td><td>畸形锁不能在排他租约和安全属性下确认删除</td><td>检查 owner/ACL、活动进程和路径；保持 fail closed</td></tr>
+            <tr><td>IPC server PID / Unix peer mismatch</td><td>连接对象与受保护锁不一致</td><td>拒绝连接；检查 stale 锁、同用户冲突或端点替换</td></tr>
+            <tr><td>authentication timed out/failed</td><td>nonce-HMAC、版本或 endpoint/profile 不匹配</td><td>确认 client/daemon 同版本和同用户，检查 daemon 日志</td></tr>
+            <tr><td>remote command closed without exit status</td><td>远端 channel 未提供明确退出码</td><td>按失败处理；检查远端 shell、重启和网络日志</td></tr>
+            <tr><td>buffered-operation capacity ... deadline</td><td>8 个重结果槽在请求预算内没有空位</td><td>降低并发或增加调用 timeout；不要无限堆积 Exec/ListDir</td></tr>
+            <tr><td>SFTP ... exceeded its deadline</td><td>connect/init/远端 I/O 超出 absolute deadline</td><td>检查网络/服务端磁盘与权限；查看 partial 并让下一请求重连</td></tr>
+            <tr><td>upload commit outcome unknown</td><td>UploadEnd 后 2.25 秒内没有明确完成结果</td><td><strong>先检查远端目标和大小，再决定是否重试</strong></td></tr>
+            <tr><td>local download commit ... may still complete</td><td>不可取消的 hardlink syscall 超过 reconcile</td><td>检查目标与 partial 的文件身份；不要盲目并发重试</td></tr>
+            <tr><td>IPC response write exceeded its deadline</td><td>client 停止读取或响应预算耗尽</td><td>该连接关闭；其他 handler/shutdown 不会永久阻塞</td></tr>
+            <tr><td>shell input write timed out</td><td>2 秒内 IPC 或远端 PTY writer 未接受输入</td><td>会话有界收尾；恢复网络后重新打开 shell</td></tr>
+            <tr><td>daemon did not release its runtime lock and lease within 10000 ms</td><td>shutdown 已请求，但预期 generation/排他租约未在 10 秒内释放</td><td>检查 daemon 日志和进程；锁缺失也不等于租约已释放</td></tr>
           </tbody>
         </table></div>
       </section>
 
       <section id="release">
         <h2>16. 构建、发布与来源追踪</h2>
-        <div class="grid">
-          <div class="card"><h3>源码基线</h3><p><code>81f8d395e2e1a16a50cc943c08a30bbf3fe94c79</code></p><p class="small">工作树在检查开始时干净。</p></div>
-          <div class="card"><h3>Release 二进制</h3><p><code>serctl 0.1.0 (git 81f8d395e2e1)</code></p><p class="small">SHA-256：<code>72F03A3D1756B619413A410561A2A2CE3F8F815E0BAE9D21160DE0F6C32ECF32</code></p></div>
+        <div class="grid three">
+          <div class="card"><h3>审计基线</h3><p><code>9fa2a3463e6af59454af497610dd397e372ed211</code> + dirty</p><p class="small">这是提交前审计构建证据，不是最终发布身份。</p></div>
+          <div class="card"><h3>Debug 证据</h3><p><code>serctl 0.1.0 (git 9fa2a3463e6a-dirty)</code></p><p class="small">locked/offline debug executable 实测；第二次 build 为 Fresh。</p></div>
+          <div class="card"><h3>Release 状态</h3><p><strong>未构建、未覆盖</strong></p><p class="small">旧产物仅做只读元数据/SHA-256 复核，不属于当前源码验证。</p></div>
         </div>
-        <p><a href="../build.rs"><code>build.rs</code></a> 在编译时读取 Git commit；工作树不干净时追加 <code>-dirty</code>。这提供来源可见性，但不是数字签名：正式分发仍应在制品库记录 commit、编译环境、SHA-256，并使用代码签名或可信发布签名。</p>
-        <p>项目源代码与文档依据 <a href="../LICENSE">Apache License 2.0</a> 授权，Cargo 包元数据使用 SPDX 标识 <code>Apache-2.0</code>。</p>
-        <pre><code>cargo build --release
+        <p><a href="../build.rs"><code>build.rs</code></a> 移除所有可重定向 repository/work-tree/index/object/config/replace refs 的继承 Git 环境，禁用 system/global config，只从 manifest 祖先的文件系统发现真实 <code>.git</code>；Windows 去除 <code>\\?\</code> 前缀，canonical root 必须包含 manifest。查询固定 <code>--work-tree</code>，设置 <code>GIT_NO_REPLACE_OBJECTS=1</code>，关闭 fsmonitor/untracked cache，查询失败按 dirty 关闭失败。</p>
+        <ul>
+          <li>监听 <code>build.rs</code>、tracked 文件、Git HEAD/index/packed-refs/symbolic ref、config/config.worktree 与 info/exclude；submodule dirty 不忽略。</li>
+          <li><code>git ls-files -v -z --cached</code> 发现 assume-unchanged 小写 tag 或 skip-worktree <code>S</code> 就强制 dirty；replace refs 不能改写所嵌 commit/工作树视图。</li>
+          <li>脚本执行时枚举的 untracked 文件和现存非仓库根父目录也加入 rerun 依赖；缺失路径使用最近现存祖先，避免永久 Dirty。</li>
+          <li>仓库根目录故意不监听，避免 <code>target/</code> 输出自触发。代价是新建根级 untracked 文件本身不能保证立即唤醒脚本；下一次其他输入变化或脚本执行才发现。</li>
+          <li>所有已知会影响二进制的根级文件 <code>Cargo.toml</code>、<code>Cargo.lock</code>、<code>build.rs</code> 已 tracked/watched；正式 release 仍须以 clean status 做门禁。</li>
+          <li>实际工作树连续第二次 debug build 报 <code>Fresh serctl</code>，说明 watcher 没有因 Git 查询或 target 输出形成永久重建循环。</li>
+        </ul>
+        <div class="callout warn"><strong>本轮 release 边界：</strong>没有运行 <code>cargo build --release</code>，也没有执行/覆盖旧 <code>target/release/serctl.exe</code>。只读复核结果：15,201,280 bytes；<code>LastWriteTimeUtc=2026-08-07T13:23:12.8335051Z</code>；SHA-256 <code>72F03A3D1756B619413A410561A2A2CE3F8F815E0BAE9D21160DE0F6C32ECF32</code>。下列命令仅是未来发布流程。</div>
+        <pre><code># 仅在现有 release 程序已停止、工作树 clean、准备正式发布时执行
+cargo build --release
 target\release\serctl.exe --version
 Get-FileHash target\release\serctl.exe -Algorithm SHA256</code></pre>
-        <h3>近期安全/可靠性修补</h3>
-        <ul>
-          <li><code>81f8d39</code> — CLI 退出前 flush 远端 stdout/stderr；</li>
-          <li><code>2b1a65c</code> — keepalive、SSH 断线检测与单飞重连；</li>
-          <li><code>1a552ea</code> — 无 daemon 上传取消后的远端残片清理；</li>
-          <li><code>b52d092</code> — Windows Named Pipe / Unix Socket 统一 IPC；</li>
-          <li><code>6e5b944</code> — SFTP 操作硬 deadline。</li>
-        </ul>
+        <p>正式制品还应记录 commit、Cargo.lock、Rust toolchain、构建环境、SHA-256 与代码签名。项目依据 <a href="../LICENSE">Apache License 2.0</a> 授权，Cargo 元数据使用 SPDX <code>Apache-2.0</code>。</p>
       </section>
 
       <section id="files">
         <h2>17. 源码与文档索引</h2>
         <ul>
-          <li><a href="../README.md">README.md</a> — 快速使用与基础安全说明</li>
-          <li><a href="../src/main.rs">src/main.rs</a> — CLI 和入口</li>
-          <li><a href="../src/ui.rs">src/ui.rs</a> — Winit/Egui UI</li>
-          <li><a href="../src/client.rs">src/client.rs</a> — 客户端、直连、传输与 PTY</li>
-          <li><a href="../src/daemon.rs">src/daemon.rs</a> — daemon、重连、deadline 与 SFTP</li>
-          <li><a href="../src/ipc.rs">src/ipc.rs</a> — 原生 IPC 抽象与协议</li>
-          <li><a href="../src/ssh.rs">src/ssh.rs</a> — SSH/SFTP 封装</li>
-          <li><a href="../src/vault.rs">src/vault.rs</a> — 凭证库与运行锁</li>
-          <li><a href="../src/security.rs">src/security.rs</a> — OS 权限</li>
-          <li><a href="../src/e2e_tests.rs">src/e2e_tests.rs</a> — 端到端测试</li>
+          <li><a href="../README.md">README.md</a> — 快速使用、安全摘要和验证状态</li>
+          <li><a href="../Cargo.toml">Cargo.toml</a> / <a href="../Cargo.lock">Cargo.lock</a> — 依赖与锁定版本</li>
+          <li><a href="../src/main.rs">src/main.rs</a> — CLI、入口、退出码与终端诊断</li>
+          <li><a href="../src/ui.rs">src/ui.rs</a> — Winit/Egui UI、epoch/generation、取消与清零</li>
+          <li><a href="../src/client.rs">src/client.rs</a> — daemon/direct 路由、传输、commit 对账与 shell</li>
+          <li><a href="../src/daemon.rs">src/daemon.rs</a> — IPC handlers、SSH session、并发槽和 shutdown</li>
+          <li><a href="../src/ipc.rs">src/ipc.rs</a> — 原生 IPC 抽象、三帧认证和 frame budgets</li>
+          <li><a href="../src/ssh.rs">src/ssh.rs</a> — russh、KEX proxy、exec/SFTP 与目录 reader</li>
+          <li><a href="../src/vault.rs">src/vault.rs</a> — vault v2、租约、运行锁和敏感 JSON</li>
+          <li><a href="../src/security.rs">src/security.rs</a> — 平台权限、稳定 handle 与受保护 create-new</li>
+          <li><a href="../src/e2e_tests.rs">src/e2e_tests.rs</a> — 真实 daemon/SSH/SFTP E2E</li>
+          <li><a href="../build.rs">build.rs</a> — Git provenance 与 Cargo rerun 依赖</li>
         </ul>
-        <p class="small">本文档为静态、无外部依赖的 UTF-8 HTML，可离线打开、打印或转为 PDF。信息基线见页首；源码后续变化时应重新检查并更新。</p>
+        <p class="small">本文为静态、无脚本、无外部样式依赖的 UTF-8 HTML，可离线打开或打印。内容基线为 2026-08-10 当前修补工作树；源码变化后应重新审查并更新证据。</p>
       </section>
     </main>
   </div>
 
-  <footer>serctl implementation review · generated from repository evidence · 2026-08-07</footer>
+  <footer>serctl implementation review · repository evidence · Apache-2.0 · 2026-08-10</footer>
 </body>
 </html>
