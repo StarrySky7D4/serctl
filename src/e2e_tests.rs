@@ -114,7 +114,7 @@ impl TestState {
     }
 
     async fn wait_for_exec_start(&self, after: u64, command: &[u8]) -> ExecChannel {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let changed = self.exec_changed.notified();
                 if let Some(channel) = self
@@ -247,7 +247,16 @@ impl russh::server::Handler for TestSsh {
                 session.close(channel)?;
             }
             b"disconnect" => {
+                let exec_channel = ExecChannel {
+                    connection: self.connection,
+                    channel,
+                };
+                self.state.record_exec_start(exec_channel, command).await;
                 session.disconnect(Disconnect::ByApplication, "test disconnect", "en-US")?;
+                // A transport disconnect ends every channel without a later
+                // per-channel EOF callback, so record that terminal state at
+                // the point where the test server queues the disconnect.
+                self.state.record_cancel(exec_channel).await;
             }
             b"hang" => {
                 self.state
@@ -755,9 +764,12 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .to_string()
         .contains("daemon"));
     #[cfg(windows)]
-    assert!(lock.endpoint.starts_with(r"\\.\pipe\serctl-"));
+    assert!(lock.endpoint.starts_with(r"\\.\pipe\serctl-v3-"));
     #[cfg(unix)]
-    assert!(lock.endpoint.ends_with(".sock"));
+    assert!(std::path::Path::new(&lock.endpoint)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("serctl-v3-") && name.ends_with(".sock")));
 
     let mut rejected = ipc::connect(&lock.endpoint).await.unwrap();
     let rejected_auth = ipc::authenticate_client(
@@ -797,8 +809,10 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     });
     let overflow_channel = state.wait_for_exec_start(overflow_after, b"overflow").await;
     let overflow = overflow_task.await.unwrap().unwrap_err();
+    assert!(overflow.is::<crate::ssh::ExecOutcomeUnknown>());
     assert!(
-        overflow.to_string().contains("8 MiB safety limit"),
+        overflow.to_string().contains("8 MiB safety limit")
+            && overflow.to_string().contains("outcome unknown"),
         "unexpected overflow result: {overflow:#}"
     );
     state
@@ -809,9 +823,12 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         client::exec_capture_with_timeout("e2e", "disconnect", None, Duration::from_secs(1))
             .await
             .unwrap_err();
+    assert!(disconnected.is::<crate::ssh::ExecOutcomeUnknown>());
     assert!(
-        disconnected.to_string().contains("exit status")
-            || disconnected.to_string().contains("disconnected")
+        disconnected.to_string().contains("outcome unknown")
+            && disconnected
+                .to_string()
+                .contains("inspect remote side effects before retry")
     );
     let reconnected = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -833,7 +850,11 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     });
     let timeout_channel = state.wait_for_exec_start(timeout_after, b"hang").await;
     let timeout = timeout_task.await.unwrap().unwrap_err();
+    assert!(timeout.is::<crate::ssh::ExecOutcomeUnknown>());
     assert!(timeout.to_string().contains("deadline"));
+    assert!(timeout
+        .to_string()
+        .contains("inspect remote side effects before retry"));
     state
         .wait_for_cancel(timeout_channel, "command deadline")
         .await;
@@ -1180,7 +1201,36 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             .is_err()
     );
 
-    // A malformed current-v2 lock in the hashed namespace is recoverable only
+    // Protocol v2 used an untagged Error frame for both definite rejection
+    // and post-submit uncertainty. A v3 client must reject its lock before
+    // connecting, disclose no authentication bytes, and retain the evidence
+    // instead of treating it as a malformed current-version lock.
+    let old_v2_lock = vault::LockInfo {
+        profile: legacy_profile.into(),
+        protocol: 2,
+        pid: std::process::id(),
+        port: 0,
+        endpoint: legacy_endpoint.clone(),
+        host: String::new(),
+        user: String::new(),
+        started_unix: vault::now_unix(),
+        token: legacy_token.as_str().to_owned(),
+    };
+    let old_v2_json = Zeroizing::new(serde_json::to_vec(&old_v2_lock).unwrap());
+    std::fs::write(&legacy_path, &old_v2_json).unwrap();
+    let old_v2_error = client::daemon_status(legacy_profile).await.unwrap_err();
+    assert!(old_v2_error
+        .to_string()
+        .contains("unsupported runtime lock IPC protocol 2"));
+    assert!(!old_v2_error.to_string().contains(legacy_token.as_str()));
+    assert!(legacy_path.exists());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), legacy_listener.accept())
+            .await
+            .is_err()
+    );
+
+    // A malformed current-v3 lock in the hashed namespace is recoverable only
     // after the client obtains the exclusive runtime lease. Endpoint mismatch
     // is then deleted without connecting or sending authentication bytes.
     let tampered_lock = vault::LockInfo {
@@ -1210,7 +1260,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     #[cfg(unix)]
     {
         // The raw v1 name is consulted only after the hashed namespace has no
-        // record. A malformed hashed-v2 lock must therefore be removed and
+        // record. A malformed hashed-v3 lock must therefore be removed and
         // followed by a second read, which exposes (and rejects) this legacy
         // bearer-token lock instead of silently falling back to direct SSH.
         let raw_legacy_path = vault::run_dir()
@@ -1301,6 +1351,48 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     .unwrap();
     assert_eq!(direct_exec.stdout, b"evidence\n");
     assert_eq!(direct_exec.code, Some(0));
+
+    let direct_hang_after = state.latest_exec_generation().await;
+    let direct_hang_task = tokio::spawn(async move {
+        client::exec_capture_with_timeout(
+            "direct-e2e",
+            "hang",
+            Some(direct_master),
+            Duration::from_secs(3),
+        )
+        .await
+    });
+    let direct_hang_channel = state.wait_for_exec_start(direct_hang_after, b"hang").await;
+    let direct_hang = direct_hang_task.await.unwrap().unwrap_err();
+    assert!(direct_hang.is::<crate::ssh::ExecOutcomeUnknown>());
+    assert!(direct_hang
+        .to_string()
+        .contains("inspect remote side effects before retry"));
+    state
+        .wait_for_cancel(direct_hang_channel, "direct command deadline")
+        .await;
+
+    let direct_disconnect_after = state.latest_exec_generation().await;
+    let direct_disconnect_task = tokio::spawn(async move {
+        client::exec_capture_with_timeout(
+            "direct-e2e",
+            "disconnect",
+            Some(direct_master),
+            Duration::from_secs(3),
+        )
+        .await
+    });
+    let direct_disconnect_channel = state
+        .wait_for_exec_start(direct_disconnect_after, b"disconnect")
+        .await;
+    let direct_disconnect = direct_disconnect_task.await.unwrap().unwrap_err();
+    assert!(direct_disconnect.is::<crate::ssh::ExecOutcomeUnknown>());
+    assert!(direct_disconnect
+        .to_string()
+        .contains("inspect remote side effects before retry"));
+    state
+        .wait_for_cancel(direct_disconnect_channel, "direct server disconnect")
+        .await;
 
     let direct_download_target = test_home.join("direct-downloaded-evidence.txt");
     assert_eq!(

@@ -7,7 +7,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::{Algorithm, Argon2, Block as Argon2Block, Params, Version};
-use atomic_write_file::AtomicWriteFile;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
 use fs2::FileExt;
@@ -406,11 +405,7 @@ fn save_vault_unlocked(vault: &VaultFile) -> Result<()> {
         JsonStyle::Pretty,
         "vault exceeds the 16 MiB safety limit",
     )?;
-    let mut file = AtomicWriteFile::open(&path)?;
-    security::harden_open_file(file.as_file())?;
-    file.write_all(&bytes)?;
-    file.commit()?;
-    Ok(())
+    security::write_protected_atomic(&path, &bytes)
 }
 
 fn validate_loaded_vault(vault: &VaultFile) -> Result<()> {
@@ -1113,17 +1108,13 @@ pub fn remove(name: &str) -> Result<bool> {
 pub fn write_lock(info: &LockInfo) -> Result<()> {
     validate_runtime_lock_info(&info.profile, info)?;
     let path = lock_path(&info.profile)?;
-    let mut file = AtomicWriteFile::open(&path)?;
-    security::harden_open_file(file.as_file())?;
     let serialized = serialize_json_zeroizing(
         info,
         MAX_LOCK_BYTES as usize,
         JsonStyle::Pretty,
         "runtime lock exceeds the 64 KiB safety limit",
     )?;
-    file.write_all(&serialized)?;
-    file.commit()?;
-    Ok(())
+    security::write_protected_atomic(&path, &serialized)
 }
 
 pub fn read_lock(profile: &str) -> Result<Option<LockInfo>> {
@@ -1159,7 +1150,7 @@ fn validate_runtime_lock_info(expected_profile: &str, info: &LockInfo) -> Result
     crate::ipc::validate_endpoint(expected_profile, &info.token, &info.endpoint)
         .context("validate runtime lock endpoint and capability")?;
     if info.port != 0 || !info.host.is_empty() || !info.user.is_empty() {
-        bail!("protocol-v2 runtime lock contains forbidden remote metadata");
+        bail!("protocol-v3 runtime lock contains forbidden remote metadata");
     }
     Ok(())
 }
@@ -1224,7 +1215,7 @@ fn read_legacy_lock(_profile: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
 
 #[cfg(not(windows))]
 fn read_legacy_lock(profile: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
-    // Unix retains read-only detection of a v1 daemon so a v2 client will not
+    // Unix retains read-only detection of a v1 daemon so a v3 client will not
     // start a second instance. Safe opening still rejects links, FIFOs, and
     // devices.
     read_lock_file(&run_dir_path()?.join(format!("{profile}.lock")))
@@ -1303,21 +1294,21 @@ fn read_bounded_handle(
     Ok(bytes)
 }
 
-/// Remove a malformed lock from the hashed protocol-v2 namespace, but only
+/// Remove a malformed lock from the hashed protocol-v3 namespace, but only
 /// after acquiring the same exclusive lifetime lease used by daemon startup.
 /// Security/open/read failures and locks from other protocol versions remain
 /// fail-closed. The legacy raw-name namespace is never inspected or removed.
-pub fn remove_invalid_hashed_v2_lock(profile: &str) -> Result<bool> {
+pub fn remove_invalid_hashed_v3_lock(profile: &str) -> Result<bool> {
     let lease = open_runtime_lease_file(profile)?;
     with_exclusive_runtime_cleanup(&lease, || {
-        remove_invalid_hashed_v2_lock_while_leased(profile)
+        remove_invalid_hashed_v3_lock_while_leased(profile)
     })
 }
 
 /// Variant for daemon startup, whose caller already owns the profile's
 /// exclusive runtime lease. This mirrors `remove_lock_if_token_while_leased`;
 /// callers must keep that lease handle alive for the full call.
-pub(crate) fn remove_invalid_hashed_v2_lock_while_leased(profile: &str) -> Result<bool> {
+pub(crate) fn remove_invalid_hashed_v3_lock_while_leased(profile: &str) -> Result<bool> {
     validate_profile_name(profile)?;
     // Validate/harden the directory before classifying contents. Any owner,
     // ACL, reparse, or directory I/O error exits before deletion is possible.
@@ -1326,7 +1317,7 @@ pub(crate) fn remove_invalid_hashed_v2_lock_while_leased(profile: &str) -> Resul
     let Some(bytes) = read_lock_file(&path)? else {
         return Ok(false);
     };
-    if !hashed_v2_lock_is_invalid(profile, &bytes, &runtime_dir)? {
+    if !hashed_v3_lock_is_invalid(profile, &bytes, &runtime_dir)? {
         return Ok(false);
     }
     match std::fs::remove_file(path) {
@@ -1336,7 +1327,7 @@ pub(crate) fn remove_invalid_hashed_v2_lock_while_leased(profile: &str) -> Resul
     }
 }
 
-fn hashed_v2_lock_is_invalid(
+fn hashed_v3_lock_is_invalid(
     expected_profile: &str,
     bytes: &[u8],
     verified_runtime_dir: &Path,
@@ -1347,7 +1338,7 @@ fn hashed_v2_lock_is_invalid(
     };
     if info.protocol != crate::ipc::IPC_PROTOCOL_VERSION {
         bail!(
-            "runtime lock protocol {} is not eligible for protocol-v2 malformed-lock cleanup",
+            "runtime lock protocol {} is not eligible for protocol-v3 malformed-lock cleanup",
             info.protocol
         );
     }
@@ -1393,7 +1384,7 @@ pub enum LockReconcileOutcome {
     Contended,
 }
 
-/// Reconcile a v2 runtime lock only if it still belongs to the expected daemon.
+/// Reconcile a v3 runtime lock only if it still belongs to the expected daemon.
 /// This prevents stale-client cleanup from deleting a newly replaced lock and
 /// distinguishes a normal shutdown (the lock is already absent) from lease
 /// contention or a changed lock. The exclusive lease is held across the stable
@@ -1717,7 +1708,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_secret_file_is_hardened_before_commit() {
+    fn atomic_secret_file_is_durably_committed_with_protection() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1727,20 +1718,9 @@ mod tests {
             .join("target")
             .join(format!("atomic-secret-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
+        security::harden_directory(&directory).unwrap();
         let path = directory.join("vault.json");
-        let mut file = AtomicWriteFile::open(&path).unwrap();
-
-        security::harden_open_file(file.as_file()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                file.as_file().metadata().unwrap().permissions().mode() & 0o7777,
-                0o600
-            );
-        }
-        file.write_all(b"{}").unwrap();
-        file.commit().unwrap();
+        security::write_protected_atomic(&path, b"{}").unwrap();
 
         let committed = security::open_existing_protected_file(&path)
             .unwrap()
@@ -1780,6 +1760,13 @@ mod tests {
         assert!(legacy.to_string().contains("bearer-token IPC"));
         assert!(!legacy.to_string().contains(secret_token));
 
+        lock.protocol = 2;
+        let old_v2 = validate_runtime_lock_info("prod", &lock).unwrap_err();
+        assert!(old_v2
+            .to_string()
+            .contains("unsupported runtime lock IPC protocol 2"));
+        assert!(!old_v2.to_string().contains(secret_token));
+
         lock.protocol = crate::ipc::IPC_PROTOCOL_VERSION + 1;
         let unknown = validate_runtime_lock_info("prod", &lock).unwrap_err();
         assert!(unknown.to_string().contains("unsupported runtime lock"));
@@ -1793,7 +1780,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_hashed_lock_cleanup_classification_is_v2_only() {
+    fn malformed_hashed_lock_cleanup_classification_is_v3_only() {
         let runtime_dir = std::env::temp_dir();
         let token = new_ipc_token();
         let endpoint =
@@ -1810,16 +1797,20 @@ mod tests {
             token,
         };
         let valid = serde_json::to_vec(&lock).unwrap();
-        assert!(!hashed_v2_lock_is_invalid("prod", &valid, &runtime_dir).unwrap());
-        assert!(hashed_v2_lock_is_invalid("prod", b"{broken", &runtime_dir).unwrap());
+        assert!(!hashed_v3_lock_is_invalid("prod", &valid, &runtime_dir).unwrap());
+        assert!(hashed_v3_lock_is_invalid("prod", b"{broken", &runtime_dir).unwrap());
 
         lock.pid = 0;
-        let invalid_v2 = serde_json::to_vec(&lock).unwrap();
-        assert!(hashed_v2_lock_is_invalid("prod", &invalid_v2, &runtime_dir).unwrap());
+        let invalid_v3 = serde_json::to_vec(&lock).unwrap();
+        assert!(hashed_v3_lock_is_invalid("prod", &invalid_v3, &runtime_dir).unwrap());
+
+        lock.protocol = 2;
+        let old_v2 = serde_json::to_vec(&lock).unwrap();
+        assert!(hashed_v3_lock_is_invalid("prod", &old_v2, &runtime_dir).is_err());
 
         lock.protocol = crate::ipc::IPC_PROTOCOL_VERSION + 1;
         let future = serde_json::to_vec(&lock).unwrap();
-        assert!(hashed_v2_lock_is_invalid("prod", &future, &runtime_dir).is_err());
+        assert!(hashed_v3_lock_is_invalid("prod", &future, &runtime_dir).is_err());
     }
 
     #[test]

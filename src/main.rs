@@ -99,7 +99,7 @@ fn nm(n: Option<String>) -> String {
     n.unwrap_or_else(|| "default".to_string())
 }
 
-fn prompt(label: &str) -> Result<String> {
+fn prompt(label: &'static str) -> Result<String> {
     use std::io::Write;
     print!("{label}");
     std::io::stdout().flush()?;
@@ -632,10 +632,15 @@ mod cli_tests {
 
     #[test]
     fn list_fields_escape_terminal_control_sequences() {
-        let value = "prod\tbad\r\n\u{1b}]52;c;payload\u{7}";
+        let value = "prod\tbad\r\n\u{1b}]52;c;payload\u{7}\u{2028}spoof\u{202e}txt";
         let escaped = terminal_safe_field(value);
-        assert_eq!(escaped, "prod\\tbad\\r\\n\\u{1b}]52;c;payload\\u{7}");
+        assert_eq!(
+            escaped,
+            "prod\\tbad\\r\\n\\u{1b}]52;c;payload\\u{7}\\u{2028}spoof\\u{202e}txt"
+        );
         assert!(!escaped.chars().any(char::is_control));
+        assert!(!escaped.contains('\u{2028}'));
+        assert!(!escaped.contains('\u{202e}'));
     }
 
     #[test]
@@ -668,7 +673,10 @@ mod cli_tests {
 
     #[test]
     fn clap_diagnostics_escape_untrusted_arguments_and_preserve_exit_semantics() {
-        let invalid = match Cli::try_parse_from(["serctl", "bad\n\u{1b}]52;c;payload\u{7}"]) {
+        let invalid = match Cli::try_parse_from([
+            "serctl",
+            "bad\n\u{1b}]52;c;payload\u{7}\u{2028}spoof\u{202e}txt",
+        ]) {
             Ok(_) => panic!("invalid subcommand unexpectedly parsed"),
             Err(error) => error,
         };
@@ -677,6 +685,8 @@ mod cli_tests {
         assert_ne!(invalid.exit_code, 0);
         assert!(!invalid.text.chars().any(char::is_control));
         assert!(invalid.text.contains("\\n"));
+        assert!(invalid.text.contains("\\u{2028}"));
+        assert!(invalid.text.contains("\\u{202e}"));
 
         let help = match Cli::try_parse_from(["serctl", "--help"]) {
             Ok(_) => panic!("help unexpectedly parsed as a command"),

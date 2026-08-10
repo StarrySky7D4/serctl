@@ -19,9 +19,11 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ipc;
 use crate::security;
 use crate::ssh::{
-    commit_remote_upload_no_replace, protected_upload_file_attributes, temporary_remote_path,
-    validate_remote_command, validate_remote_path, validate_upload_remote_path, RemoteEntry,
-    SshSession, MAX_TRANSFER_BYTES,
+    commit_remote_upload_no_replace_until, is_explicit_sftp_status, poll_remote_mutation_until,
+    protected_upload_file_attributes, temporary_remote_path, validate_remote_command,
+    validate_remote_path, validate_shell_dimensions, validate_upload_remote_path,
+    CreateDirOutcomeUnknown, CreateDirSubmissionState, ExecOutcomeUnknown, ExecSubmissionState,
+    RemoteEntry, SshSession, MAX_TRANSFER_BYTES,
 };
 use crate::vault::{self, now_unix, Creds, LockInfo};
 
@@ -46,6 +48,55 @@ const LOCAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCAL_COMMIT_RECONCILE_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_COMMIT_RECONCILE_TIMEOUT: Duration = Duration::from_millis(2250);
 
+fn terminal_safe_field(value: &str) -> String {
+    value.escape_debug().to_string()
+}
+
+fn terminal_safe_display(value: &(impl std::fmt::Display + ?Sized)) -> String {
+    terminal_safe_field(&value.to_string())
+}
+
+fn terminal_safe_error(error: &anyhow::Error) -> String {
+    terminal_safe_field(&format!("{error:#}"))
+}
+
+struct RawModeGuard<F: FnOnce()> {
+    restore: Option<F>,
+}
+
+impl<F: FnOnce()> RawModeGuard<F> {
+    fn new(restore: F) -> Self {
+        Self {
+            restore: Some(restore),
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for RawModeGuard<F> {
+    fn drop(&mut self) {
+        if let Some(restore) = self.restore.take() {
+            restore();
+        }
+    }
+}
+
+fn enter_raw_mode_with<E, F>(enable: E, restore: F) -> Result<RawModeGuard<F>>
+where
+    E: FnOnce() -> io::Result<()>,
+    F: FnOnce(),
+{
+    enable()?;
+    Ok(RawModeGuard::new(restore))
+}
+
+fn restore_raw_mode() {
+    let _ = disable_raw_mode();
+}
+
+fn enter_raw_mode() -> Result<RawModeGuard<fn()>> {
+    enter_raw_mode_with(enable_raw_mode, restore_raw_mode as fn())
+}
+
 #[derive(Clone, Debug)]
 pub struct DaemonStatus {
     pub profile: String,
@@ -55,12 +106,53 @@ pub struct DaemonStatus {
     pub endpoint: String,
 }
 
+fn daemon_status_line(info: &DaemonStatus, now: i64) -> String {
+    let up = elapsed_nonnegative_seconds(now, info.started_unix);
+    format!(
+        "daemon: ACTIVE  profile={}  {} as {}  uptime={up}s  ipc={}:{}",
+        terminal_safe_field(&info.profile),
+        terminal_safe_field(&info.host),
+        terminal_safe_field(&info.user),
+        terminal_safe_field(ipc::endpoint_kind()),
+        terminal_safe_field(&info.endpoint),
+    )
+}
+
+fn daemon_absent_line(profile: &str) -> String {
+    format!(
+        "daemon: not running for profile '{}'",
+        terminal_safe_field(profile)
+    )
+}
+
+fn daemon_down_line(profile: &str, stopped: bool) -> String {
+    if stopped {
+        "daemon stopped".to_owned()
+    } else {
+        format!(
+            "no running daemon for '{}' (stale lock cleared)",
+            terminal_safe_field(profile)
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CommandOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub code: Option<i32>,
 }
+
+#[derive(Debug)]
+struct DaemonExecRejected(String);
+
+impl std::fmt::Display for DaemonExecRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DaemonExecRejected {}
 
 impl Drop for CommandOutput {
     fn drop(&mut self) {
@@ -148,12 +240,12 @@ where
     match read {
         Ok(lock) => Ok(lock),
         Err(read_error) => match cleanup() {
-            // Removing the hashed current-v2 record can expose a raw legacy
+            // Removing the hashed current-v3 record can expose a raw legacy
             // Unix lock that was previously shadowed. Re-read the complete
             // namespace before deciding that no daemon exists.
             Ok(true) => reread(),
             Ok(false) => Err(read_error
-                .context("invalid runtime lock was not eligible for safe protocol-v2 recovery")),
+                .context("invalid runtime lock was not eligible for safe protocol-v3 recovery")),
             Err(cleanup_error) => Err(anyhow!(
                 "{read_error:#}; malformed runtime-lock recovery failed: {cleanup_error:#}"
             )),
@@ -164,7 +256,7 @@ where
 fn read_daemon_lock_with_recovery(profile: &str) -> Result<Option<LockInfo>> {
     recover_invalid_daemon_lock_read(
         vault::read_lock(profile),
-        || vault::remove_invalid_hashed_v2_lock(profile),
+        || vault::remove_invalid_hashed_v3_lock(profile),
         || vault::read_lock(profile),
     )
 }
@@ -418,7 +510,7 @@ async fn direct_connect_until(
                 return Err(error);
             }
         };
-        eprintln!("[serctl] pinned host key {fp}");
+        eprintln!("[serctl] pinned host key {}", terminal_safe_field(&fp));
         lease
     } else {
         profile_lease
@@ -591,18 +683,15 @@ async fn exec_capture_with_timeout_inner(
         };
     if let Some(daemon) = daemon {
         let mut s = daemon.stream;
-        let operation = async {
-            let request = ZeroizingRequestFrame(ipc::Frame::Exec {
-                cmd: cmd.to_string(),
-                timeout_ms,
-            });
-            ipc::write_frame_limited(&mut s, &request.0, ipc::MAX_REQUEST_FRAME).await?;
-            read_exec_response(&mut s).await
-        };
-        match tokio::time::timeout_at(deadline, operation).await {
+        let mut submission = ExecSubmissionState::BeforeRequest;
+        write_daemon_exec_request_until(&mut s, cmd, timeout_ms, deadline, &mut submission).await?;
+        let result = match tokio::time::timeout_at(deadline, read_exec_response(&mut s)).await {
             Ok(result) => result,
-            Err(_) => bail!("remote command exceeded its deadline of {timeout_ms} ms"),
-        }
+            Err(_) => Err(anyhow!(
+                "remote command exceeded its deadline of {timeout_ms} ms"
+            )),
+        };
+        result.map_err(|error| classify_daemon_exec_read_error(submission, error))
     } else {
         let prompted_master = if master.is_none() && prompt_if_direct {
             Some(ask_master()?)
@@ -635,6 +724,132 @@ async fn exec_capture_with_timeout_inner(
     }
 }
 
+async fn poll_request_write_before_deadline<F>(
+    deadline: tokio::time::Instant,
+    deadline_message: &str,
+    write: F,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    tokio::pin!(write);
+    let mut first_poll = true;
+    std::future::poll_fn(|context| {
+        if first_poll {
+            first_poll = false;
+            // Tokio may poll an immediately-ready inner future once even when
+            // its timeout has elapsed. Refuse that poll before serialization
+            // or any frame bytes can reach the writer.
+            if tokio::time::Instant::now() >= deadline {
+                return std::task::Poll::Ready(Err(anyhow!(deadline_message.to_owned())));
+            }
+        }
+        write.as_mut().poll(context)
+    })
+    .await
+}
+
+struct DeadlineAwareWriter<'a, W> {
+    writer: &'a mut W,
+    deadline: tokio::time::Instant,
+    deadline_message: &'a str,
+}
+
+impl<W> DeadlineAwareWriter<'_, W> {
+    fn deadline_error(&self) -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, self.deadline_message.to_owned())
+    }
+}
+
+impl<W> AsyncWrite for DeadlineAwareWriter<'_, W>
+where
+    W: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if tokio::time::Instant::now() >= this.deadline {
+            return std::task::Poll::Ready(Err(this.deadline_error()));
+        }
+        std::pin::Pin::new(&mut *this.writer).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if tokio::time::Instant::now() >= this.deadline {
+            return std::task::Poll::Ready(Err(this.deadline_error()));
+        }
+        std::pin::Pin::new(&mut *this.writer).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if tokio::time::Instant::now() >= this.deadline {
+            return std::task::Poll::Ready(Err(this.deadline_error()));
+        }
+        std::pin::Pin::new(&mut *this.writer).poll_shutdown(context)
+    }
+}
+
+async fn write_daemon_exec_request_until<W>(
+    writer: &mut W,
+    cmd: &str,
+    timeout_ms: u64,
+    deadline: tokio::time::Instant,
+    submission: &mut ExecSubmissionState,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let deadline_message = format!("remote command exceeded its deadline of {timeout_ms} ms");
+    let request = ZeroizingRequestFrame(ipc::Frame::Exec {
+        cmd: cmd.to_string(),
+        timeout_ms,
+    });
+    let result = {
+        let mut deadline_writer = DeadlineAwareWriter {
+            writer,
+            deadline,
+            deadline_message: &deadline_message,
+        };
+        let write = ipc::write_frame_limited_with_written_callback(
+            &mut deadline_writer,
+            &request.0,
+            ipc::MAX_REQUEST_FRAME,
+            || submission.request_started(),
+        );
+        match tokio::time::timeout_at(
+            deadline,
+            poll_request_write_before_deadline(deadline, &deadline_message, write),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(deadline_message.clone())),
+        }
+    };
+    result.map_err(|error| submission.classify(error))
+}
+
+fn classify_daemon_exec_read_error(
+    submission: ExecSubmissionState,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match error.downcast::<DaemonExecRejected>() {
+        Ok(rejected) => anyhow!(rejected.0),
+        Err(error) => submission.classify(error),
+    }
+}
+
 async fn read_exec_response<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<CommandOutput> {
     let mut stdout = Zeroizing::new(Vec::new());
     let mut stderr = Zeroizing::new(Vec::new());
@@ -659,7 +874,12 @@ async fn read_exec_response<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<C
                     code: Some(code),
                 });
             }
-            Some(ipc::Frame::Error { msg }) => bail!(msg),
+            Some(ipc::Frame::Error { msg }) => {
+                if let Some(error) = ExecOutcomeUnknown::from_wire_message(&msg) {
+                    return Err(error.into());
+                }
+                return Err(DaemonExecRejected(msg).into());
+            }
             None => bail!("daemon disconnected before returning an exit status"),
             Some(mut frame) => {
                 frame.zeroize_sensitive();
@@ -671,17 +891,9 @@ async fn read_exec_response<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<C
 
 pub async fn status(profile: &str) -> Result<()> {
     if let Some(info) = daemon_status(profile).await? {
-        let up = elapsed_nonnegative_seconds(now_unix(), info.started_unix);
-        println!(
-            "daemon: ACTIVE  profile={}  {} as {}  uptime={up}s  ipc={}:{}",
-            info.profile,
-            info.host,
-            info.user,
-            ipc::endpoint_kind(),
-            info.endpoint
-        );
+        println!("{}", daemon_status_line(&info, now_unix()));
     } else {
-        println!("daemon: not running for profile '{profile}'");
+        println!("{}", daemon_absent_line(profile));
     }
     Ok(())
 }
@@ -727,11 +939,8 @@ pub async fn daemon_status(profile: &str) -> Result<Option<DaemonStatus>> {
 }
 
 pub async fn down(profile: &str) -> Result<()> {
-    if down_quiet(profile).await? {
-        println!("daemon stopped");
-    } else {
-        println!("no running daemon for '{profile}' (stale lock cleared)");
-    }
+    let stopped = down_quiet(profile).await?;
+    println!("{}", daemon_down_line(profile, stopped));
     Ok(())
 }
 
@@ -745,7 +954,7 @@ pub async fn down_quiet(profile: &str) -> Result<bool> {
         if let Some(daemon) = connect_daemon_until(profile, deadline).await? {
             expected_token = daemon.expected_token;
             let mut s = daemon.stream;
-            shutdown_daemon_exchange(&mut s, &mut shutdown_sent).await?;
+            shutdown_daemon_exchange(&mut s, &mut shutdown_sent, deadline).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -767,21 +976,59 @@ pub async fn down_quiet(profile: &str) -> Result<bool> {
     .await
 }
 
-async fn shutdown_daemon_exchange<S>(stream: &mut S, shutdown_sent: &mut bool) -> Result<()>
+async fn write_shutdown_request_until<W>(
+    writer: &mut W,
+    shutdown_sent: &mut bool,
+    deadline: tokio::time::Instant,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    const DEADLINE_ERROR: &str = "daemon shutdown exchange exceeded its deadline";
+    let mut deadline_writer = DeadlineAwareWriter {
+        writer,
+        deadline,
+        deadline_message: DEADLINE_ERROR,
+    };
+    let write = ipc::write_frame_limited_with_written_callback(
+        &mut deadline_writer,
+        &ipc::Frame::Shutdown,
+        ipc::MAX_CONTROL_FRAME,
+        || *shutdown_sent = true,
+    );
+    match tokio::time::timeout_at(
+        deadline,
+        poll_request_write_before_deadline(deadline, DEADLINE_ERROR, write),
+    )
+    .await
+    {
+        Ok(result) => result.context("send daemon shutdown request"),
+        Err(_) => bail!(DEADLINE_ERROR),
+    }
+}
+
+async fn shutdown_daemon_exchange<S>(
+    stream: &mut S,
+    shutdown_sent: &mut bool,
+    deadline: tokio::time::Instant,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    ipc::write_frame_limited(stream, &ipc::Frame::Shutdown, ipc::MAX_CONTROL_FRAME)
-        .await
-        .context("send daemon shutdown request")?;
     // A complete framed write is the linearization point. If the Ack is lost,
     // the daemon may still have consumed the request and stopped, so callers
     // must reconcile against the runtime lock before reporting failure.
-    *shutdown_sent = true;
-    match ipc::read_frame_limited(stream, ipc::MAX_CONTROL_FRAME)
-        .await
-        .context("read daemon shutdown acknowledgement")?
+    write_shutdown_request_until(stream, shutdown_sent, deadline).await?;
+    let response = match tokio::time::timeout_at(
+        deadline,
+        ipc::read_frame_limited(stream, ipc::MAX_CONTROL_FRAME),
+    )
+    .await
     {
+        Ok(result) => result.context("read daemon shutdown acknowledgement")?,
+        Err(_) => bail!("daemon shutdown exchange exceeded its deadline"),
+    };
+    match response {
         Some(ipc::Frame::Ack) => Ok(()),
         Some(mut frame) => {
             frame.zeroize_sensitive();
@@ -1010,6 +1257,93 @@ pub async fn create_dir_with_timeout(
     create_dir_inner(profile, path, master, timeout_ms, deadline).await
 }
 
+async fn write_daemon_create_dir_request_until<W>(
+    writer: &mut W,
+    path: &str,
+    timeout_ms: u64,
+    deadline: tokio::time::Instant,
+    submission: &mut CreateDirSubmissionState,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let deadline_message =
+        format!("SFTP create-directory exceeded its deadline of {timeout_ms} ms");
+    let request = ZeroizingRequestFrame(ipc::Frame::CreateDir {
+        path: path.to_owned(),
+        timeout_ms,
+    });
+    let result = {
+        let mut deadline_writer = DeadlineAwareWriter {
+            writer,
+            deadline,
+            deadline_message: &deadline_message,
+        };
+        let write = ipc::write_frame_limited_with_written_callback(
+            &mut deadline_writer,
+            &request.0,
+            ipc::MAX_REQUEST_FRAME,
+            || submission.request_started(),
+        );
+        match tokio::time::timeout_at(
+            deadline,
+            poll_request_write_before_deadline(deadline, &deadline_message, write),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(deadline_message.clone())),
+        }
+    };
+    result.map_err(|error| submission.classify(error))
+}
+
+async fn read_daemon_create_dir_response_until<R>(
+    reader: &mut R,
+    timeout_ms: u64,
+    deadline: tokio::time::Instant,
+    submission: CreateDirSubmissionState,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let response = match tokio::time::timeout_at(
+        deadline,
+        ipc::read_frame_limited(reader, ipc::MAX_CONTROL_FRAME),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => return Err(submission.classify(error)),
+        Err(_) => {
+            return Err(submission.classify(anyhow!(
+                "SFTP create-directory exceeded its deadline of {timeout_ms} ms"
+            )))
+        }
+    };
+    match response {
+        Some(ipc::Frame::Ack) => Ok(()),
+        Some(ipc::Frame::Error { msg }) => {
+            if let Some(error) = CreateDirOutcomeUnknown::from_wire_message(&msg) {
+                Err(error.into())
+            } else {
+                // The daemon emits plain errors only for validation/session
+                // setup failures or an explicit SFTP STATUS rejection.
+                Err(anyhow!(msg))
+            }
+        }
+        Some(mut frame) => {
+            frame.zeroize_sensitive();
+            Err(submission.classify(anyhow!(
+                "daemon returned an unexpected create-directory response"
+            )))
+        }
+        None => Err(submission.classify(anyhow!(
+            "daemon disconnected during create-directory request"
+        ))),
+    }
+}
+
 async fn create_dir_inner(
     profile: &str,
     path: &str,
@@ -1025,30 +1359,22 @@ async fn create_dir_inner(
         };
     if let Some(daemon) = daemon {
         let mut stream = daemon.stream;
-        let operation = async {
-            ipc::write_frame_limited(
-                &mut stream,
-                &ipc::Frame::CreateDir {
-                    path: path.to_owned(),
-                    timeout_ms,
-                },
-                ipc::MAX_REQUEST_FRAME,
-            )
-            .await?;
-            match ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME).await? {
-                Some(ipc::Frame::Ack) => Ok(()),
-                Some(ipc::Frame::Error { msg }) => bail!(msg),
-                Some(mut frame) => {
-                    frame.zeroize_sensitive();
-                    bail!("daemon returned an unexpected create-directory response")
-                }
-                None => bail!("daemon disconnected during create-directory request"),
-            }
-        };
-        return match tokio::time::timeout_at(deadline, operation).await {
-            Ok(result) => result,
-            Err(_) => bail!("SFTP create-directory exceeded its deadline of {timeout_ms} ms"),
-        };
+        let mut submission = CreateDirSubmissionState::BeforeRequest;
+        write_daemon_create_dir_request_until(
+            &mut stream,
+            path,
+            timeout_ms,
+            deadline,
+            &mut submission,
+        )
+        .await?;
+        return read_daemon_create_dir_response_until(
+            &mut stream,
+            timeout_ms,
+            deadline,
+            submission,
+        )
+        .await;
     }
 
     let master = master.ok_or_else(|| anyhow!("master passphrase is required"))?;
@@ -1287,10 +1613,16 @@ async fn cleanup_remote_partial(
         // Use a fresh subsystem channel: the transfer channel itself may be
         // the operation that hung and triggered cancellation.
         let attempt = match session.sftp_until(deadline).await {
-            Ok(sftp) => match tokio::time::timeout_at(deadline, sftp.remove_file(partial)).await {
-                Ok(result) => result.map_err(anyhow::Error::from),
-                Err(_) => return false,
-            },
+            Ok(sftp) => {
+                poll_remote_mutation_until(
+                    deadline,
+                    sftp.remove_file(partial),
+                    || {},
+                    || {},
+                    "remote partial cleanup exceeded its deadline",
+                )
+                .await
+            }
             Err(error) => Err(error),
         };
         match attempt {
@@ -1511,7 +1843,10 @@ async fn upload_file_via_daemon(
                 .await
         }
         End::Finished(Err(error)) if commit_phase => {
-            log::warn!("upload commit frame write was interrupted: {error:#}");
+            log::warn!(
+                "upload commit frame write was interrupted: {}",
+                terminal_safe_error(&error)
+            );
             await_daemon_upload_commit_response(&mut stream, size, deadline, &cancellation, true)
                 .await
         }
@@ -1642,22 +1977,30 @@ async fn upload_file_direct_worker(
     let partial_may_exist = std::sync::atomic::AtomicBool::new(false);
     let commit_started = std::sync::atomic::AtomicBool::new(false);
     let remote_committed = std::sync::atomic::AtomicBool::new(false);
+    let deadline_message = format!("SFTP upload exceeded its deadline of {timeout_ms} ms");
     let operation = async {
-        partial_may_exist.store(true, std::sync::atomic::Ordering::Release);
-        let opened = sftp
-            .open_with_flags_and_attributes(
+        let opened = poll_remote_mutation_until(
+            deadline,
+            sftp.open_with_flags_and_attributes(
                 &partial,
                 OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
                 protected_upload_file_attributes(),
-            )
-            .await;
+            ),
+            || partial_may_exist.store(true, std::sync::atomic::Ordering::Release),
+            || {},
+            deadline_message.as_str(),
+        )
+        .await;
         let mut destination = match opened {
             Ok(file) => file,
             Err(error) => {
                 // A completed EXCLUDE failure proves this request did not
-                // create the random partial; never remove someone else's file.
-                partial_may_exist.store(false, std::sync::atomic::Ordering::Release);
-                return Err(error.into());
+                // create the random partial only when it is an explicit server
+                // STATUS. Transport/protocol failures remain uncertain.
+                if is_explicit_sftp_status(&error) {
+                    partial_may_exist.store(false, std::sync::atomic::Ordering::Release);
+                }
+                return Err(error);
             }
         };
         let mut transferred = 0_u64;
@@ -1667,7 +2010,14 @@ async fn upload_file_direct_worker(
             if read == 0 {
                 break;
             }
-            destination.write_all(&buffer[..read]).await?;
+            poll_remote_mutation_until(
+                deadline,
+                destination.write_all(&buffer[..read]),
+                || {},
+                || {},
+                deadline_message.as_str(),
+            )
+            .await?;
             transferred = transferred
                 .checked_add(read as u64)
                 .context("upload size overflow")?;
@@ -1676,8 +2026,22 @@ async fn upload_file_direct_worker(
                 "upload exceeded its declared or configured size"
             );
         }
-        destination.flush().await?;
-        destination.shutdown().await?;
+        poll_remote_mutation_until(
+            deadline,
+            destination.flush(),
+            || {},
+            || {},
+            deadline_message.as_str(),
+        )
+        .await?;
+        poll_remote_mutation_until(
+            deadline,
+            destination.shutdown(),
+            || {},
+            || {},
+            deadline_message.as_str(),
+        )
+        .await?;
         drop(destination);
         if transferred != size {
             bail!("upload size changed while reading: expected {size}, read {transferred}");
@@ -1691,8 +2055,15 @@ async fn upload_file_direct_worker(
             "SFTP upload exceeded its deadline of {timeout_ms} ms"
         );
         commit_started.store(true, std::sync::atomic::Ordering::Release);
-        let commit =
-            commit_remote_upload_no_replace(&sftp, &partial, remote, &remote_committed).await?;
+        let commit = commit_remote_upload_no_replace_until(
+            &sftp,
+            &partial,
+            remote,
+            &remote_committed,
+            deadline,
+            deadline_message.as_str(),
+        )
+        .await?;
         if !commit.used_hardlink {
             log::warn!(
                 "SFTP server lacks hardlink@openssh.com; upload no-replace commit relies on \
@@ -1703,7 +2074,9 @@ async fn upload_file_direct_worker(
             partial_may_exist.store(false, std::sync::atomic::Ordering::Release);
         } else {
             log::warn!(
-                "upload committed to {remote}, but remote temporary name {partial} could not be removed"
+                "upload committed to {}, but remote temporary name {} could not be removed",
+                terminal_safe_field(remote),
+                terminal_safe_field(&partial),
             );
         }
         Ok::<u64, anyhow::Error>(transferred)
@@ -1732,7 +2105,11 @@ async fn upload_file_direct_worker(
             {
                 partial_may_exist.store(false, std::sync::atomic::Ordering::Release);
             }
-            log::warn!("upload to {remote} committed before post-commit cleanup failed: {error:#}");
+            log::warn!(
+                "upload to {} committed before post-commit cleanup failed: {}",
+                terminal_safe_field(remote),
+                terminal_safe_error(&error),
+            );
             session.invalidate().await;
             Ok(size)
         }
@@ -1754,7 +2131,8 @@ async fn upload_file_direct_worker(
             session.invalidate().await;
             if remote_committed.load(std::sync::atomic::Ordering::Acquire) {
                 log::warn!(
-                    "upload to {remote} committed before its post-commit cleanup deadline elapsed"
+                    "upload to {} committed before its post-commit cleanup deadline elapsed",
+                    terminal_safe_field(remote),
                 );
                 Ok(size)
             } else if commit_started.load(std::sync::atomic::Ordering::Acquire) {
@@ -1769,7 +2147,10 @@ async fn upload_file_direct_worker(
             }
             session.invalidate().await;
             if remote_committed.load(std::sync::atomic::Ordering::Acquire) {
-                log::warn!("upload to {remote} committed before cancellation was observed");
+                log::warn!(
+                    "upload to {} committed before cancellation was observed",
+                    terminal_safe_field(remote),
+                );
                 Ok(size)
             } else if commit_started.load(std::sync::atomic::Ordering::Acquire) {
                 Err(direct_upload_outcome_unknown(remote, "after cancellation"))
@@ -2516,8 +2897,9 @@ where
     verify_committed_file_identity(local, expected, post_commit_deadline).await?;
     if let Err(error) = sync_parent_directory(local, post_commit_deadline).await {
         log::warn!(
-            "download committed to {}, but parent-directory sync failed: {error:#}",
-            local.display()
+            "download committed to {}, but parent-directory sync failed: {}",
+            terminal_safe_display(&local.display()),
+            terminal_safe_error(&error),
         );
     }
 
@@ -2525,16 +2907,17 @@ where
         Ok(Ok(())) => Ok(true),
         Ok(Err(error)) => {
             log::warn!(
-                "download committed to {}, but temporary name {} could not be removed: {error}",
-                local.display(),
-                partial.display()
+                "download committed to {}, but temporary name {} could not be removed: {}",
+                terminal_safe_display(&local.display()),
+                terminal_safe_display(&partial.display()),
+                terminal_safe_display(&error),
             );
             Ok(false)
         }
         Err(_) => {
             log::warn!(
                 "download committed to {}, but temporary-name cleanup exceeded its deadline",
-                local.display()
+                terminal_safe_display(&local.display()),
             );
             Ok(false)
         }
@@ -2921,6 +3304,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    validate_shell_dimensions(cols, rows)?;
     let setup = async {
         ipc::write_frame_limited(wr, &ipc::Frame::Shell { cols, rows }, ipc::MAX_SHELL_FRAME)
             .await?;
@@ -2947,6 +3331,7 @@ async fn open_direct_shell_until(
     rows: u32,
     deadline: tokio::time::Instant,
 ) -> Result<russh::Channel<russh::client::Msg>> {
+    validate_shell_dimensions(cols, rows)?;
     match tokio::time::timeout_at(deadline, session.pty_shell(term, cols, rows)).await {
         Ok(Ok(channel)) => Ok(channel),
         Ok(Err(error)) => {
@@ -2961,6 +3346,7 @@ async fn open_direct_shell_until(
 }
 
 pub async fn open_gui_shell(profile: &str, master: Option<&str>) -> Result<GuiShell> {
+    validate_shell_dimensions(120, 36)?;
     let (input_tx, mut input_rx) = mpsc::channel::<Zeroizing<Vec<u8>>>(64);
     let (event_tx, event_rx) = mpsc::channel::<ShellEvent>(128);
     let cancellation = CancellationToken::new();
@@ -3154,9 +3540,11 @@ fn spawn_stdin_pump() -> StdinPump {
 }
 
 pub async fn shell_with_master(profile: &str, master: Option<Zeroizing<String>>) -> Result<()> {
+    let (cols, rows) = term_size();
+    validate_shell_dimensions(cols, rows)?;
     let ipc_setup_deadline = tokio::time::Instant::now() + IPC_SHELL_SETUP_TIMEOUT;
     if let Some(daemon) = connect_daemon_until(profile, ipc_setup_deadline).await? {
-        shell_via_ipc(daemon.stream, ipc_setup_deadline).await
+        shell_via_ipc(daemon.stream, cols, rows, ipc_setup_deadline).await
     } else {
         let prompted_master = if master.is_none() {
             Some(ask_master()?)
@@ -3170,22 +3558,21 @@ pub async fn shell_with_master(profile: &str, master: Option<Zeroizing<String>>)
             .ok_or_else(|| anyhow!("master passphrase is required"))?;
         let setup_deadline = tokio::time::Instant::now() + DIRECT_SHELL_SETUP_TIMEOUT;
         let direct = connect_direct_profile_until(profile, master, setup_deadline).await?;
-        shell_direct(&direct.session, setup_deadline).await
+        shell_direct(&direct.session, cols, rows, setup_deadline).await
     }
 }
 
 async fn shell_via_ipc(
     stream: ipc::ClientStream,
+    cols: u32,
+    rows: u32,
     setup_deadline: tokio::time::Instant,
 ) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(stream);
-    let (cols, rows) = term_size();
     start_ipc_shell_until(&mut rd, &mut wr, cols, rows, setup_deadline).await?;
 
-    enable_raw_mode()?;
-    let res = shell_loop_ipc(&mut rd, &mut wr).await;
-    let _ = disable_raw_mode();
-    res
+    let _raw_mode = enter_raw_mode()?;
+    shell_loop_ipc(&mut rd, &mut wr).await
 }
 
 async fn shell_loop_ipc<R, W>(rd: &mut R, wr: &mut W) -> Result<()>
@@ -3234,12 +3621,17 @@ where
     result
 }
 
-async fn shell_direct(session: &SshSession, setup_deadline: tokio::time::Instant) -> Result<()> {
-    let (cols, rows) = term_size();
+async fn shell_direct(
+    session: &SshSession,
+    cols: u32,
+    rows: u32,
+    setup_deadline: tokio::time::Instant,
+) -> Result<()> {
+    validate_shell_dimensions(cols, rows)?;
     let mut ch =
         open_direct_shell_until(session, "xterm-256color", cols, rows, setup_deadline).await?;
     let mut writer = ch.make_writer();
-    enable_raw_mode()?;
+    let raw_mode = enter_raw_mode()?;
     let mut kbrx = spawn_stdin_pump();
     let mut out = tokio::io::stdout();
     let result: Result<()> = async {
@@ -3281,7 +3673,7 @@ async fn shell_direct(session: &SshSession, setup_deadline: tokio::time::Instant
         Ok(())
     }
     .await;
-    let _ = disable_raw_mode();
+    drop(raw_mode);
     drop(writer);
     let _ = session.terminate_channel(&mut ch, true).await;
     result
@@ -3340,31 +3732,40 @@ mod tests {
     use super::{
         acquire_direct_profile_snapshot_with, authenticate_connected_daemon,
         await_daemon_upload_commit_response_with_grace, await_owned_upload_worker,
-        classify_direct_upload_finished_error, classify_shutdown_lock_generation,
-        commit_local_no_replace_with_hook, commit_local_no_replace_with_hook_and_link,
-        complete_shell_input_write_until, create_dir_inner, create_local_download_partial,
-        create_local_download_partial_with, download_file_with_timeout_owned,
-        elapsed_nonnegative_seconds, exec_capture_with_timeout_inner, finalize_local_download,
-        join_blocking_until, key_to_bytes, list_dir_inner, open_local_upload_source,
-        open_local_upload_source_with, read_exec_response, read_shell_frame_pump,
+        classify_daemon_exec_read_error, classify_direct_upload_finished_error,
+        classify_shutdown_lock_generation, commit_local_no_replace_with_hook,
+        commit_local_no_replace_with_hook_and_link, complete_shell_input_write_until,
+        create_dir_inner, create_local_download_partial, create_local_download_partial_with,
+        daemon_absent_line, daemon_down_line, daemon_status_line, download_file_with_timeout_owned,
+        elapsed_nonnegative_seconds, enter_raw_mode_with, exec_capture_with_timeout_inner,
+        finalize_local_download, join_blocking_until, key_to_bytes, list_dir_inner,
+        open_local_upload_source, open_local_upload_source_with,
+        read_daemon_create_dir_response_until, read_exec_response, read_shell_frame_pump,
         read_shell_frame_pump_inner, reconcile_shutdown_exchange, recover_invalid_daemon_lock_read,
         run_gui_ipc_shell, run_local_partial_cleanup_with, send_gui_shell_output_or_cancel,
-        shutdown_daemon_exchange, spawn_stdin_pump_with, upload_file_with_timeout_inner,
+        shutdown_daemon_exchange, spawn_stdin_pump_with, start_ipc_shell_until,
+        terminal_safe_error, terminal_safe_field, upload_file_with_timeout_inner,
         validate_shell_input, validated_sftp_timeout_ms, verify_owned_file_identities_until_with,
-        wait_for_daemon_lock_release_with, write_command_output_to, CommandOutput, ShellEvent,
+        wait_for_daemon_lock_release_with, write_command_output_to,
+        write_daemon_create_dir_request_until, write_daemon_exec_request_until,
+        write_shutdown_request_until, CommandOutput, DaemonStatus, ShellEvent,
         ShutdownLockObservation, UnclaimedLocalPartial, UploadCommitOutcomeUnknown,
         DAEMON_LOCK_RELEASE_TIMEOUT, MAX_SHELL_INPUT_BYTES,
     };
     use crate::ipc::{self, Frame};
+    use crate::ssh::{
+        CreateDirOutcomeUnknown, CreateDirSubmissionState, ExecOutcomeUnknown, ExecSubmissionState,
+    };
     use crate::vault::{LockInfo, RuntimeLeaseLiveness};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use std::future::Future;
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::{Condvar, Mutex as StdMutex};
     use std::task::{Context, Poll};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot, Notify};
     use tokio_util::sync::CancellationToken;
@@ -3391,6 +3792,82 @@ mod tests {
             _cx: &mut Context<'_>,
         ) -> Poll<std::io::Result<()>> {
             self.flushed = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Default)]
+    struct FailAfterBytesWriter {
+        fail_after: usize,
+        fail_flush: bool,
+        accepted: usize,
+        poll_writes: usize,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for FailAfterBytesWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.poll_writes += 1;
+            if self.accepted >= self.fail_after {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected broken pipe",
+                )));
+            }
+            let written = (self.fail_after - self.accepted).min(buf.len());
+            self.accepted += written;
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushes += 1;
+            if self.fail_flush {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected flush failure",
+                )))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct PendingUntilWriter {
+        ready: Pin<Box<tokio::time::Sleep>>,
+        accepted: usize,
+        poll_writes: usize,
+    }
+
+    impl AsyncWrite for PendingUntilWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.poll_writes += 1;
+            if self.ready.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.accepted += buf.len();
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 
@@ -3438,6 +3915,26 @@ mod tests {
         })
         .await
         .expect("cancelled stdin poll worker did not exit");
+    }
+
+    #[tokio::test]
+    async fn aborting_a_raw_mode_scope_runs_its_injected_restore() {
+        let restored = Arc::new(AtomicBool::new(false));
+        let worker_restored = Arc::clone(&restored);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _raw_mode = enter_raw_mode_with(
+                || Ok(()),
+                move || worker_restored.store(true, Ordering::Release),
+            )
+            .unwrap();
+            entered_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        entered_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(restored.load(Ordering::Acquire));
     }
 
     #[test]
@@ -3644,7 +4141,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_v2_lock_recovery_is_fail_closed_unless_deletion_succeeds() {
+    fn malformed_v3_lock_recovery_is_fail_closed_unless_deletion_succeeds() {
         let recovered = recover_invalid_daemon_lock_read::<u8, _, _>(
             Err(anyhow::anyhow!("malformed lock")),
             || Ok(true),
@@ -3693,8 +4190,38 @@ mod tests {
         assert_eq!(elapsed_nonnegative_seconds(i64::MAX, i64::MIN), i64::MAX);
     }
 
+    #[test]
+    fn daemon_terminal_lines_escape_controls_and_bidi_fields() {
+        let hostile = "保留\n\u{1b}]52;c;payload\u{7}\u{202e}\u{2028}";
+        let info = DaemonStatus {
+            profile: hostile.into(),
+            host: hostile.into(),
+            user: hostile.into(),
+            started_unix: 5,
+            endpoint: hostile.into(),
+        };
+        let lines = [
+            daemon_status_line(&info, 10),
+            daemon_absent_line(hostile),
+            daemon_down_line(hostile, false),
+            terminal_safe_error(&anyhow::anyhow!("failure: {hostile}")),
+        ];
+        for line in lines {
+            assert!(line.contains("保留"));
+            assert!(line.contains("\\n"));
+            assert!(line.contains("\\u{1b}"));
+            assert!(line.contains("\\u{202e}"));
+            assert!(line.contains("\\u{2028}"));
+            assert!(!line.chars().any(char::is_control));
+            assert!(!line.contains('\u{202e}'));
+            assert!(!line.contains('\u{2028}'));
+        }
+        assert_eq!(terminal_safe_field("普通 Unicode"), "普通 Unicode");
+        assert_eq!(daemon_down_line(hostile, true), "daemon stopped");
+    }
+
     #[tokio::test]
-    async fn client_daemon_protocol_helper_uses_v2_mutual_authentication() {
+    async fn client_daemon_protocol_helper_uses_v3_mutual_authentication() {
         let (mut client, mut server) = tokio::io::duplex(8 * 1024);
         let token = crate::vault::new_ipc_token();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -3864,9 +4391,13 @@ mod tests {
             // released its runtime lock before the response reached us.
         });
         let mut shutdown_sent = false;
-        let exchange = shutdown_daemon_exchange(&mut client, &mut shutdown_sent)
-            .await
-            .map(|()| true);
+        let exchange = shutdown_daemon_exchange(
+            &mut client,
+            &mut shutdown_sent,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .map(|()| true);
         server.await.unwrap();
         assert!(shutdown_sent);
         assert!(exchange.is_err());
@@ -3875,6 +4406,61 @@ mod tests {
             .await
             .unwrap();
         assert!(contacted);
+    }
+
+    #[tokio::test]
+    async fn shutdown_submission_tracks_only_a_complete_request_frame() {
+        let expired_deadline = tokio::time::Instant::now() - Duration::from_millis(1);
+        let mut expired_writer = FailAfterBytesWriter {
+            fail_after: usize::MAX,
+            ..FailAfterBytesWriter::default()
+        };
+        let mut expired_sent = false;
+        let expired =
+            write_shutdown_request_until(&mut expired_writer, &mut expired_sent, expired_deadline)
+                .await
+                .unwrap_err();
+        assert!(!expired_sent);
+        assert_eq!(expired_writer.poll_writes, 0);
+        assert!(format!("{expired:#}").contains("deadline"));
+
+        let mut partial_writer = FailAfterBytesWriter {
+            fail_after: 1,
+            ..FailAfterBytesWriter::default()
+        };
+        let mut partial_sent = false;
+        let partial = write_shutdown_request_until(
+            &mut partial_writer,
+            &mut partial_sent,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(partial_writer.accepted, 1);
+        assert!(!partial_sent);
+        assert!(format!("{partial:#}").contains("broken pipe"));
+
+        let mut flush_writer = FailAfterBytesWriter {
+            fail_after: usize::MAX,
+            fail_flush: true,
+            ..FailAfterBytesWriter::default()
+        };
+        let mut complete_sent = false;
+        let flush = write_shutdown_request_until(
+            &mut flush_writer,
+            &mut complete_sent,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(complete_sent);
+        assert_eq!(flush_writer.flushes, 1);
+        assert!(format!("{flush:#}").contains("flush failure"));
+        assert!(
+            reconcile_shutdown_exchange(Err(flush), complete_sent, async { Ok(()) })
+                .await
+                .unwrap()
+        );
     }
 
     fn shutdown_test_lock(token: &str) -> LockInfo {
@@ -4114,6 +4700,330 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_daemon_exec_deadline_does_not_poll_or_write_request() {
+        let (mut writer, mut peer) = tokio::io::duplex(1024);
+        let mut submission = ExecSubmissionState::BeforeRequest;
+        let error = write_daemon_exec_request_until(
+            &mut writer,
+            "must-not-be-written",
+            1,
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            &mut submission,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(submission, ExecSubmissionState::BeforeRequest);
+        assert!(!error.is::<ExecOutcomeUnknown>());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), peer.read_u8())
+                .await
+                .is_err(),
+            "expired request wrote bytes before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_exec_pending_writer_is_not_polled_after_deadline() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let mut writer = PendingUntilWriter {
+            ready: Box::pin(tokio::time::sleep_until(deadline)),
+            accepted: 0,
+            poll_writes: 0,
+        };
+        let mut submission = ExecSubmissionState::BeforeRequest;
+        let error = write_daemon_exec_request_until(
+            &mut writer,
+            "must-not-write-after-deadline",
+            200,
+            deadline,
+            &mut submission,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(writer.poll_writes, 1);
+        assert_eq!(writer.accepted, 0);
+        assert_eq!(submission, ExecSubmissionState::BeforeRequest);
+        assert!(!error.is::<ExecOutcomeUnknown>());
+        assert!(error.to_string().contains("deadline"));
+    }
+
+    #[tokio::test]
+    async fn daemon_exec_zero_byte_write_and_serialization_errors_stay_pre_request() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut broken_pipe = FailAfterBytesWriter::default();
+        let mut submission = ExecSubmissionState::BeforeRequest;
+        let error = write_daemon_exec_request_until(
+            &mut broken_pipe,
+            "not-written",
+            1_000,
+            deadline,
+            &mut submission,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(broken_pipe.accepted, 0);
+        assert_eq!(broken_pipe.poll_writes, 1);
+        assert_eq!(submission, ExecSubmissionState::BeforeRequest);
+        assert!(!error.is::<ExecOutcomeUnknown>());
+        assert!(error.to_string().contains("broken pipe"));
+
+        let oversized = "x".repeat(ipc::MAX_REQUEST_FRAME + 1);
+        let mut never_polled = FailAfterBytesWriter::default();
+        let mut serialization_submission = ExecSubmissionState::BeforeRequest;
+        let serialization_error = write_daemon_exec_request_until(
+            &mut never_polled,
+            &oversized,
+            1_000,
+            deadline,
+            &mut serialization_submission,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(never_polled.accepted, 0);
+        assert_eq!(never_polled.poll_writes, 0);
+        assert_eq!(serialization_submission, ExecSubmissionState::BeforeRequest);
+        assert!(!serialization_error.is::<ExecOutcomeUnknown>());
+    }
+
+    #[tokio::test]
+    async fn daemon_exec_partial_frame_failure_stays_pre_request() {
+        let mut one_byte_then_broken_pipe = FailAfterBytesWriter {
+            fail_after: 1,
+            ..FailAfterBytesWriter::default()
+        };
+        let mut submission = ExecSubmissionState::BeforeRequest;
+        let error = write_daemon_exec_request_until(
+            &mut one_byte_then_broken_pipe,
+            "partially-written",
+            1_000,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &mut submission,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(one_byte_then_broken_pipe.accepted, 1);
+        assert_eq!(one_byte_then_broken_pipe.poll_writes, 2);
+        assert_eq!(submission, ExecSubmissionState::BeforeRequest);
+        assert!(!error.is::<ExecOutcomeUnknown>());
+    }
+
+    #[tokio::test]
+    async fn daemon_exec_flush_failure_after_complete_frame_is_outcome_unknown() {
+        let mut flush_failure = FailAfterBytesWriter {
+            fail_after: usize::MAX,
+            fail_flush: true,
+            ..FailAfterBytesWriter::default()
+        };
+        let mut submission = ExecSubmissionState::BeforeRequest;
+        let error = write_daemon_exec_request_until(
+            &mut flush_failure,
+            "fully-written",
+            1_000,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &mut submission,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(flush_failure.accepted > 4);
+        assert_eq!(flush_failure.flushes, 1);
+        assert_eq!(submission, ExecSubmissionState::RequestMayHaveReachedRemote);
+        assert!(error.is::<ExecOutcomeUnknown>());
+        assert!(error
+            .to_string()
+            .contains("inspect remote side effects before retry"));
+    }
+
+    #[tokio::test]
+    async fn daemon_create_directory_submission_uses_the_complete_frame_boundary() {
+        let mut expired_writer = FailAfterBytesWriter {
+            fail_after: usize::MAX,
+            ..FailAfterBytesWriter::default()
+        };
+        let mut expired_submission = CreateDirSubmissionState::BeforeRequest;
+        let expired = write_daemon_create_dir_request_until(
+            &mut expired_writer,
+            "/expired",
+            1,
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            &mut expired_submission,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(expired_writer.poll_writes, 0);
+        assert_eq!(expired_submission, CreateDirSubmissionState::BeforeRequest);
+        assert!(!expired.is::<CreateDirOutcomeUnknown>());
+
+        let mut partial_writer = FailAfterBytesWriter {
+            fail_after: 1,
+            ..FailAfterBytesWriter::default()
+        };
+        let mut partial_submission = CreateDirSubmissionState::BeforeRequest;
+        let partial = write_daemon_create_dir_request_until(
+            &mut partial_writer,
+            "/partial",
+            1_000,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &mut partial_submission,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(partial_writer.accepted, 1);
+        assert_eq!(partial_submission, CreateDirSubmissionState::BeforeRequest);
+        assert!(!partial.is::<CreateDirOutcomeUnknown>());
+
+        let mut flush_writer = FailAfterBytesWriter {
+            fail_after: usize::MAX,
+            fail_flush: true,
+            ..FailAfterBytesWriter::default()
+        };
+        let mut complete_submission = CreateDirSubmissionState::BeforeRequest;
+        let flush = write_daemon_create_dir_request_until(
+            &mut flush_writer,
+            "/complete",
+            1_000,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &mut complete_submission,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            complete_submission,
+            CreateDirSubmissionState::RequestMayHaveReachedRemote
+        );
+        assert!(flush.is::<CreateDirOutcomeUnknown>());
+        assert!(flush
+            .to_string()
+            .contains("inspect the remote path before retry"));
+    }
+
+    #[tokio::test]
+    async fn daemon_create_directory_wire_errors_preserve_definite_and_unknown_outcomes() {
+        let mut submission = CreateDirSubmissionState::BeforeRequest;
+        submission.request_started();
+
+        let (mut plain_writer, mut plain_reader) = tokio::io::duplex(1024);
+        ipc::write_frame(
+            &mut plain_writer,
+            &Frame::Error {
+                msg: "permission denied by SFTP server".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let plain = read_daemon_create_dir_response_until(
+            &mut plain_reader,
+            1_000,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            submission,
+        )
+        .await
+        .unwrap_err();
+        assert!(!plain.is::<CreateDirOutcomeUnknown>());
+
+        let typed_message = submission
+            .classify(anyhow::anyhow!("server disconnected after MKDIR"))
+            .to_string();
+        let (mut typed_writer, mut typed_reader) = tokio::io::duplex(1024);
+        ipc::write_frame(&mut typed_writer, &Frame::Error { msg: typed_message })
+            .await
+            .unwrap();
+        let typed = read_daemon_create_dir_response_until(
+            &mut typed_reader,
+            1_000,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            submission,
+        )
+        .await
+        .unwrap_err();
+        assert!(typed.is::<CreateDirOutcomeUnknown>());
+        assert_eq!(typed.to_string().matches("outcome unknown").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn daemon_create_directory_lost_or_unexpected_response_is_outcome_unknown() {
+        let mut submission = CreateDirSubmissionState::BeforeRequest;
+        submission.request_started();
+
+        let (writer, mut eof_reader) = tokio::io::duplex(64);
+        drop(writer);
+        let eof = read_daemon_create_dir_response_until(
+            &mut eof_reader,
+            1_000,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            submission,
+        )
+        .await
+        .unwrap_err();
+        assert!(eof.is::<CreateDirOutcomeUnknown>());
+
+        let (mut unexpected_writer, mut unexpected_reader) = tokio::io::duplex(1024);
+        ipc::write_frame(&mut unexpected_writer, &Frame::Status)
+            .await
+            .unwrap();
+        let unexpected = read_daemon_create_dir_response_until(
+            &mut unexpected_reader,
+            1_000,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            submission,
+        )
+        .await
+        .unwrap_err();
+        assert!(unexpected.is::<CreateDirOutcomeUnknown>());
+    }
+
+    #[tokio::test]
+    async fn daemon_plain_exec_error_remains_an_ordinary_rejection() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        ipc::write_frame(
+            &mut writer,
+            &Frame::Error {
+                msg: "buffered-operation capacity is unavailable".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut submission = ExecSubmissionState::BeforeRequest;
+        submission.request_started();
+        let wire_error = read_exec_response(&mut reader).await.unwrap_err();
+        let error = classify_daemon_exec_read_error(submission, wire_error);
+        assert!(!error.is::<ExecOutcomeUnknown>());
+        assert_eq!(
+            error.to_string(),
+            "buffered-operation capacity is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_typed_exec_error_is_restored_without_duplicate_wrapping() {
+        let mut submission = ExecSubmissionState::BeforeRequest;
+        submission.request_started();
+        let wire_message = submission
+            .classify(anyhow::anyhow!("remote finish response was lost"))
+            .to_string();
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        ipc::write_frame(&mut writer, &Frame::Error { msg: wire_message })
+            .await
+            .unwrap();
+
+        let wire_error = read_exec_response(&mut reader).await.unwrap_err();
+        let error = classify_daemon_exec_read_error(submission, wire_error);
+        assert!(error.is::<ExecOutcomeUnknown>());
+        assert_eq!(error.to_string().matches("outcome unknown").count(), 1);
+        assert_eq!(
+            error
+                .to_string()
+                .matches("inspect remote side effects before retry")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn every_route_rejects_invalid_commands_and_paths_before_io() {
         let timeout = std::time::Duration::from_secs(1);
         let deadline = tokio::time::Instant::now() + timeout;
@@ -4185,6 +5095,24 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("remote path"));
+
+        let (stream, mut peer) = tokio::io::duplex(64);
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let shell_error = start_ipc_shell_until(
+            &mut reader,
+            &mut writer,
+            0,
+            24,
+            tokio::time::Instant::now() + timeout,
+        )
+        .await
+        .unwrap_err();
+        assert!(shell_error.to_string().contains("shell dimensions"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), peer.read_u8())
+                .await
+                .is_err()
+        );
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {

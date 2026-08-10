@@ -13,7 +13,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ssh::RemoteEntry;
 
-pub const IPC_PROTOCOL_VERSION: u16 = 2;
+pub const IPC_PROTOCOL_VERSION: u16 = 3;
 #[cfg(test)]
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 pub const MAX_AUTH_FRAME: usize = 4 * 1024;
@@ -36,9 +36,9 @@ fn default_sftp_timeout_ms() -> u64 {
     DEFAULT_SFTP_TIMEOUT_MS
 }
 
-const ENDPOINT_DOMAIN: &[u8] = b"serctl/ipc/endpoint/v2\0";
-const SERVER_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/server/v2\0";
-const CLIENT_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/client/v2\0";
+const ENDPOINT_DOMAIN: &[u8] = b"serctl/ipc/endpoint/v3\0";
+const SERVER_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/server/v3\0";
+const CLIENT_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/client/v3\0";
 
 /// Encode binary frame fields once as canonical Base64 instead of serde's
 /// default integer arrays. Besides shrinking the wire representation, this
@@ -96,7 +96,7 @@ fn endpoint_id_with_token(profile: &str, token: &[u8; 32]) -> String {
 #[cfg(windows)]
 pub fn expected_endpoint(profile: &str, token: &str) -> Result<String> {
     let id = endpoint_id(profile, token)?;
-    Ok(format!(r"\\.\pipe\serctl-v2-{id}"))
+    Ok(format!(r"\\.\pipe\serctl-v3-{id}"))
 }
 
 #[cfg(unix)]
@@ -108,7 +108,7 @@ pub fn expected_endpoint(profile: &str, token: &str) -> Result<String> {
 /// Derive an endpoint without touching directory metadata. Callers must pass a
 /// runtime directory they already validated through `vault::run_dir`; this is
 /// used by stale-lock cleanup to keep filesystem-security failures distinct
-/// from malformed v2 lock contents.
+/// from malformed v3 lock contents.
 #[cfg(unix)]
 pub(crate) fn expected_endpoint_in_runtime_dir(
     profile: &str,
@@ -116,7 +116,7 @@ pub(crate) fn expected_endpoint_in_runtime_dir(
     runtime_dir: &std::path::Path,
 ) -> Result<String> {
     let id = endpoint_id(profile, token)?;
-    let path = runtime_dir.join(format!("serctl-v2-{id}.sock"));
+    let path = runtime_dir.join(format!("serctl-v3-{id}.sock"));
     path.to_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow::anyhow!("serctl runtime path is not valid UTF-8"))
@@ -807,6 +807,23 @@ pub async fn write_frame_limited<W: AsyncWrite + Unpin>(
     f: &Frame,
     max_frame: usize,
 ) -> Result<()> {
+    write_frame_limited_with_written_callback(w, f, max_frame, || {}).await
+}
+
+/// Write one complete framed payload and invoke `on_frame_written` after the
+/// length prefix and payload have both been accepted by `AsyncWrite`, but
+/// before flushing. Cancellation or an error during serialization or either
+/// write never invokes the callback; a later flush failure does.
+pub(crate) async fn write_frame_limited_with_written_callback<W, F>(
+    w: &mut W,
+    f: &Frame,
+    max_frame: usize,
+    on_frame_written: F,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    F: FnOnce(),
+{
     // Frames can contain command output, shell input, and file contents. Keep
     // the transient serialized copy in a zeroizing allocation so success,
     // I/O failure, and cancellation all erase it through RAII.
@@ -815,6 +832,7 @@ pub async fn write_frame_limited<W: AsyncWrite + Unpin>(
     let len = wire_len.to_be_bytes();
     w.write_all(&len).await?;
     w.write_all(&json).await?;
+    on_frame_written();
     w.flush().await?;
     Ok(())
 }
@@ -961,7 +979,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_mutual_authentication_completes() {
+    async fn v3_mutual_authentication_completes() {
         let (mut client, mut server) = tokio::io::duplex(8 * 1024);
         let token = test_token();
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -1159,6 +1177,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_rejects_v2_challenge_without_sending_a_response() {
+        let (mut client, mut old_server) = tokio::io::duplex(1024);
+        let token = test_token();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let client_task = authenticate_client(&mut client, "prod", &token, deadline);
+        let old_server_task = async {
+            let hello = read_frame_limited(&mut old_server, MAX_AUTH_FRAME)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                hello,
+                Frame::AuthHello {
+                    version: IPC_PROTOCOL_VERSION,
+                    ..
+                }
+            ));
+            write_frame_limited(
+                &mut old_server,
+                &Frame::AuthChallenge {
+                    version: 2,
+                    server_nonce: B64.encode([0x33_u8; 32]),
+                    server_proof: B64.encode([0x44_u8; 32]),
+                },
+                MAX_AUTH_FRAME,
+            )
+            .await
+            .unwrap();
+            assert!(tokio::time::timeout(
+                Duration::from_millis(75),
+                read_frame_limited(&mut old_server, MAX_AUTH_FRAME),
+            )
+            .await
+            .is_err());
+        };
+
+        let (client_result, ()) = tokio::join!(client_task, old_server_task);
+        assert!(client_result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported IPC authentication version 2"));
+    }
+
+    #[tokio::test]
     async fn authentication_uses_one_absolute_deadline() {
         let (mut client, _silent_server) = tokio::io::duplex(1024);
         let deadline = Instant::now() + Duration::from_millis(20);
@@ -1188,6 +1250,9 @@ mod tests {
         assert!(prod
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(expected_endpoint("prod", &token)
+            .unwrap()
+            .contains("serctl-v3-"));
         validate_endpoint_bytes("expected", "expected").unwrap();
         assert!(validate_endpoint_bytes("expected", "EXPECTED").is_err());
         assert!(validate_endpoint_bytes("expected", "expected ").is_err());

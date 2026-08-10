@@ -16,9 +16,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ipc;
 use crate::ssh::{
-    commit_remote_upload_no_replace, protected_upload_file_attributes, temporary_remote_path,
-    validate_remote_command, validate_remote_path, validate_upload_remote_path, SshSession,
-    MAX_TRANSFER_BYTES,
+    commit_remote_upload_no_replace_until, is_explicit_sftp_status, poll_remote_mutation_until,
+    protected_upload_file_attributes, temporary_remote_path, validate_remote_command,
+    validate_remote_path, validate_shell_dimensions, validate_upload_remote_path,
+    ExecSubmissionState, SshSession, MAX_TRANSFER_BYTES,
 };
 
 pub(crate) const CONTROL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -32,6 +33,46 @@ const POST_AUTH_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SHELL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 const BUFFERED_HEAVY_OPERATION_LIMIT: usize = 8;
+
+fn terminal_safe_field(value: &str) -> String {
+    value.escape_debug().to_string()
+}
+
+fn terminal_safe_display(value: &(impl fmt::Display + ?Sized)) -> String {
+    terminal_safe_field(&value.to_string())
+}
+
+fn terminal_safe_error(error: &anyhow::Error) -> String {
+    terminal_safe_field(&format!("{error:#}"))
+}
+
+fn exec_outcome_unknown_wire_message(error: anyhow::Error) -> String {
+    ExecSubmissionState::RequestMayHaveReachedRemote
+        .classify(error)
+        .to_string()
+}
+
+fn exec_request_rejected_wire_message(error: anyhow::Error) -> String {
+    error.to_string()
+}
+
+fn daemon_up_line(
+    profile: &str,
+    host: &str,
+    ssh_port: u16,
+    user: &str,
+    endpoint_kind: &str,
+    endpoint: &str,
+) -> String {
+    format!(
+        "[serctl] daemon up: profile={}  {}:{ssh_port} as {}  ipc={}:{}  (Ctrl-C to stop)",
+        terminal_safe_field(profile),
+        terminal_safe_field(host),
+        terminal_safe_field(user),
+        terminal_safe_field(endpoint_kind),
+        terminal_safe_field(endpoint),
+    )
+}
 
 #[derive(Clone)]
 struct ConnInfo {
@@ -141,14 +182,17 @@ impl Drop for RuntimeLockGuard {
             .name("serctl-lock-cleanup".into())
             .spawn(move || {
                 if let Err(error) = cleanup.run() {
-                    log::warn!("runtime-lock cleanup: {error:#}");
+                    log::warn!("runtime-lock cleanup: {}", terminal_safe_error(&error));
                 }
             })
         {
             // Thread creation failure drops `cleanup`, releasing the OS lease.
             // A subsequent startup can then reconcile the token-protected
             // stale record; it can never mistake this process for live.
-            log::warn!("could not start runtime-lock cleanup thread: {error}");
+            log::warn!(
+                "could not start runtime-lock cleanup thread: {}",
+                terminal_safe_display(&error)
+            );
         }
     }
 }
@@ -169,11 +213,17 @@ impl Drop for PublishedRuntime {
             .name("serctl-publication-cleanup".into())
             .spawn(move || {
                 if let Err(error) = cleanup.run() {
-                    log::warn!("runtime-publication cleanup: {error:#}");
+                    log::warn!(
+                        "runtime-publication cleanup: {}",
+                        terminal_safe_error(&error)
+                    );
                 }
             })
         {
-            log::warn!("could not start runtime-publication cleanup thread: {error}");
+            log::warn!(
+                "could not start runtime-publication cleanup thread: {}",
+                terminal_safe_display(&error)
+            );
         }
     }
 }
@@ -316,8 +366,13 @@ async fn cleanup_published_runtime(mut published: PublishedRuntime) {
     let mut task = tokio::task::spawn_blocking(move || cleanup.run());
     match tokio::time::timeout(RUNTIME_LOCK_CLEANUP_TIMEOUT, &mut task).await {
         Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(error))) => log::warn!("runtime-lock cleanup: {error:#}"),
-        Ok(Err(error)) => log::warn!("runtime-lock cleanup worker: {error}"),
+        Ok(Ok(Err(error))) => {
+            log::warn!("runtime-lock cleanup: {}", terminal_safe_error(&error))
+        }
+        Ok(Err(error)) => log::warn!(
+            "runtime-lock cleanup worker: {}",
+            terminal_safe_display(&error)
+        ),
         Err(_) => {
             task.abort();
             log::warn!(
@@ -433,7 +488,7 @@ where
             // on that legacy record rather than start a second daemon.
             Ok(true) => reread(),
             Ok(false) => Err(read_error
-                .context("invalid runtime lock was not eligible for safe protocol-v2 recovery")),
+                .context("invalid runtime lock was not eligible for safe protocol-v3 recovery")),
             Err(cleanup_error) => Err(anyhow::anyhow!(
                 "{read_error:#}; malformed runtime-lock recovery failed: {cleanup_error:#}"
             )),
@@ -453,7 +508,7 @@ async fn run_with_ready_and_lease(
     let mut lock_read = tokio::task::spawn_blocking(move || {
         let existing = recover_invalid_startup_lock_read(
             vault::read_lock(&profile_owned),
-            || vault::remove_invalid_hashed_v2_lock_while_leased(&profile_owned),
+            || vault::remove_invalid_hashed_v3_lock_while_leased(&profile_owned),
             || vault::read_lock(&profile_owned),
         )?;
         Ok::<_, anyhow::Error>((lease, existing))
@@ -559,7 +614,7 @@ async fn run_after_startup_lock_reconciliation(
                 return Err(error);
             }
         };
-        eprintln!("[serctl] pinned host key {fp}");
+        eprintln!("[serctl] pinned host key {}", terminal_safe_field(&fp));
         creds.host_key = Some(fp);
         lease
     } else {
@@ -601,11 +656,15 @@ async fn run_after_startup_lock_reconciliation(
     }
 
     eprintln!(
-        "[serctl] daemon up: profile={profile}  {host}:{ssh} as {user}  ipc={kind}:{endpoint}  (Ctrl-C to stop)",
-        host = host,
-        ssh = session.creds.port,
-        user = user,
-        kind = ipc::endpoint_kind(),
+        "{}",
+        daemon_up_line(
+            profile,
+            &host,
+            session.creds.port,
+            &user,
+            ipc::endpoint_kind(),
+            &endpoint,
+        )
     );
 
     let info = ConnInfo {
@@ -702,8 +761,10 @@ async fn run_after_startup_lock_reconciliation(
 
 fn log_handler_result(joined: Option<Result<Result<()>, tokio::task::JoinError>>) {
     match joined {
-        Some(Ok(Err(error))) => log::warn!("ipc handler: {error:#}"),
-        Some(Err(error)) if !error.is_cancelled() => log::warn!("ipc handler task: {error}"),
+        Some(Ok(Err(error))) => log::warn!("ipc handler: {}", terminal_safe_error(&error)),
+        Some(Err(error)) if !error.is_cancelled() => {
+            log::warn!("ipc handler task: {}", terminal_safe_display(&error))
+        }
         _ => {}
     }
 }
@@ -839,11 +900,7 @@ async fn existing_daemon_is_live(lock: &LockInfo, setup_deadline: Instant) -> Re
 fn validate_request_frame(frame: &ipc::Frame) -> Result<()> {
     match frame {
         ipc::Frame::Exec { cmd, .. } => validate_remote_command(cmd)?,
-        ipc::Frame::Shell { cols, rows }
-            if !(1..=10_000).contains(cols) || !(1..=10_000).contains(rows) =>
-        {
-            bail!("shell dimensions must be between 1 and 10000");
-        }
+        ipc::Frame::Shell { cols, rows } => validate_shell_dimensions(*cols, *rows)?,
         ipc::Frame::ShellInput { data } if data.len() > MAX_SHELL_INPUT_BYTES => {
             bail!("shell input exceeds {MAX_SHELL_INPUT_BYTES} bytes");
         }
@@ -954,7 +1011,10 @@ where
     if let Err(error) = authentication {
         // Authentication failures are intentionally indistinguishable to the
         // peer: close without sending a structured error oracle.
-        log::warn!("rejected local IPC authentication: {error:#}");
+        log::warn!(
+            "rejected local IPC authentication: {}",
+            terminal_safe_error(&error)
+        );
         return Ok(());
     }
     let (mut rd, mut wr) = tokio::io::split(stream);
@@ -1077,7 +1137,9 @@ where
                         write_owned_frame_or_shutdown(
                             &mut wr,
                             ipc::Frame::Error {
-                                msg: error.to_string(),
+                                // A failed/cancelled russh mpsc send never
+                                // transfers ownership of the exec request.
+                                msg: exec_request_rejected_wire_message(error),
                             },
                             deadline,
                             &mut shutdown_rx,
@@ -1119,7 +1181,9 @@ where
                             command.cancel().await;
                             write_owned_frame_or_shutdown(
                                 &mut wr,
-                                ipc::Frame::Error { msg: error.to_string() },
+                                ipc::Frame::Error {
+                                    msg: exec_outcome_unknown_wire_message(error),
+                                },
                                 deadline,
                                 &mut shutdown_rx,
                             ).await?;
@@ -1129,7 +1193,10 @@ where
                             write_owned_frame_or_shutdown(
                                 &mut wr,
                                 ipc::Frame::Error {
-                                    msg: format!("remote command exceeded its deadline of {} ms", timeout.as_millis()),
+                                    msg: exec_outcome_unknown_wire_message(anyhow::anyhow!(
+                                        "remote command exceeded its deadline of {} ms",
+                                        timeout.as_millis()
+                                    )),
                                 },
                                 Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
                                 &mut shutdown_rx,
@@ -1814,25 +1881,28 @@ struct UploadRequest<'a> {
     deadline: Instant,
 }
 
-async fn upload_remote_step<R, F, T>(
+async fn upload_remote_step<R, F, T, S>(
     reader: &mut R,
     shutdown: &mut watch::Receiver<bool>,
     deadline: Instant,
     uncertain: &AtomicBool,
+    on_first_poll: S,
     operation: F,
 ) -> Result<T>
 where
     R: AsyncRead + Unpin,
     F: std::future::Future<Output = Result<T>>,
+    S: FnOnce(),
 {
+    let guarded_operation = poll_remote_mutation_until(
+        deadline,
+        operation,
+        on_first_poll,
+        || uncertain.store(true, Ordering::Release),
+        "SFTP upload exceeded its deadline",
+    );
     tokio::select! {
-        result = tokio::time::timeout_at(deadline, operation) => match result {
-            Ok(result) => result,
-            Err(_) => {
-                uncertain.store(true, Ordering::Release);
-                bail!("SFTP upload exceeded its deadline")
-            }
-        },
+        result = guarded_operation => result,
         disconnected = reader.read_u8() => {
             uncertain.store(true, Ordering::Release);
             match disconnected {
@@ -1893,20 +1963,19 @@ where
             shutdown,
             deadline,
             &invalidate_after_cleanup,
+            || {},
             async { Ok(sftp.try_exists(path).await?) },
         )
         .await?
         {
             bail!("remote destination already exists: {path}");
         }
-        // Set this before CREATE: a timed-out request can still be processed by
-        // the server after this future is dropped.
-        partial_may_exist = true;
         let opened = upload_remote_step(
             reader,
             shutdown,
             deadline,
             &invalidate_after_cleanup,
+            || partial_may_exist = true,
             async {
                 Ok(sftp
                     .open_with_flags_and_attributes(
@@ -1921,7 +1990,7 @@ where
         let mut file = match opened {
             Ok(file) => file,
             Err(error) => {
-                if !invalidate_after_cleanup.load(Ordering::Acquire) {
+                if is_explicit_sftp_status(&error) {
                     // A definite EXCLUDE failure means this request never
                     // owned the random partial name. Do not delete it.
                     partial_may_exist = false;
@@ -1968,6 +2037,7 @@ where
                         shutdown,
                         deadline,
                         &invalidate_after_cleanup,
+                        || {},
                         async {
                             file.write_all(&data).await?;
                             Ok(())
@@ -1998,8 +2068,20 @@ where
             shutdown,
             deadline,
             &invalidate_after_cleanup,
+            || {},
             async {
                 file.flush().await?;
+                Ok(())
+            },
+        )
+        .await?;
+        upload_remote_step(
+            reader,
+            shutdown,
+            deadline,
+            &invalidate_after_cleanup,
+            || {},
+            async {
                 file.shutdown().await?;
                 Ok(())
             },
@@ -2011,11 +2093,16 @@ where
             shutdown,
             deadline,
             &invalidate_after_cleanup,
+            || {},
             async { Ok(sftp.try_exists(path).await?) },
         )
         .await?
         {
             bail!("remote destination was created during upload: {path}");
+        }
+        if Instant::now() >= deadline {
+            invalidate_after_cleanup.store(true, Ordering::Release);
+            bail!("SFTP upload exceeded its deadline of {timeout_ms} ms");
         }
         commit_started.store(true, Ordering::Release);
         let commit = upload_remote_step(
@@ -2023,7 +2110,15 @@ where
             shutdown,
             deadline,
             &invalidate_after_cleanup,
-            commit_remote_upload_no_replace(&sftp, &partial, path, &remote_committed),
+            || {},
+            commit_remote_upload_no_replace_until(
+                &sftp,
+                &partial,
+                path,
+                &remote_committed,
+                deadline,
+                "SFTP upload exceeded its deadline",
+            ),
         )
         .await?;
         if !commit.used_hardlink {
@@ -2036,7 +2131,9 @@ where
             partial_may_exist = false;
         } else {
             log::warn!(
-                "upload committed to {path}, but remote temporary name {partial} could not be removed"
+                "upload committed to {}, but remote temporary name {} could not be removed",
+                terminal_safe_field(path),
+                terminal_safe_field(&partial),
             );
         }
         Ok(transferred)
@@ -2056,7 +2153,9 @@ where
     if committed {
         if let Err(error) = &operation {
             log::warn!(
-                "upload to {path} committed before post-commit cleanup was interrupted: {error:#}"
+                "upload to {} committed before post-commit cleanup was interrupted: {}",
+                terminal_safe_field(path),
+                terminal_safe_error(error),
             );
         }
     }
@@ -2091,7 +2190,10 @@ where
         invalidate_after_cleanup.store(true, Ordering::Release);
     }
     if operation.is_err() && partial_may_exist && !cleanup_remote_partial(session, &partial).await {
-        log::warn!("remote upload partial cleanup failed for {partial}");
+        log::warn!(
+            "remote upload partial cleanup failed for {}",
+            terminal_safe_field(&partial)
+        );
         // Cleanup itself is a remote operation. If it cannot establish a
         // definite result, discard the shared transport even when the
         // original failure was only an IPC backpressure failure.
@@ -2132,7 +2234,10 @@ async fn cleanup_remote_partial(session: &SshSession, partial: &str) -> bool {
     let sftp = match tokio::time::timeout_at(deadline, session.sftp_until(deadline)).await {
         Ok(Ok(sftp)) => sftp,
         Ok(Err(error)) => {
-            log::warn!("open fresh SFTP channel for partial cleanup: {error:#}");
+            log::warn!(
+                "open fresh SFTP channel for partial cleanup: {}",
+                terminal_safe_error(&error)
+            );
             return false;
         }
         Err(_) => {
@@ -2142,13 +2247,23 @@ async fn cleanup_remote_partial(session: &SshSession, partial: &str) -> bool {
     };
 
     loop {
-        match tokio::time::timeout_at(deadline, sftp.remove_file(partial)).await {
-            Ok(Ok(())) => return true,
-            Ok(Err(_)) => {
+        match poll_remote_mutation_until(
+            deadline,
+            sftp.remove_file(partial),
+            || {},
+            || {},
+            "remote partial cleanup exceeded its deadline",
+        )
+        .await
+        {
+            Ok(()) => return true,
+            Err(_) => {
                 // A CREATE request canceled at its deadline may finish on the
                 // server after the first remove attempt observes no file.
             }
-            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         if tokio::time::timeout_at(deadline, tokio::time::sleep(REMOTE_PARTIAL_CLEANUP_RETRY))
             .await
@@ -2183,10 +2298,12 @@ fn validated_sftp_timeout(timeout_ms: u64) -> Result<std::time::Duration> {
 mod tests {
     use super::{
         acquire_buffered_operation_slot, authenticate_incoming_protocol,
-        await_owned_blocking_until, handoff_readiness, read_authenticated_request,
+        await_owned_blocking_until, daemon_up_line, exec_outcome_unknown_wire_message,
+        exec_request_rejected_wire_message, handoff_readiness, read_authenticated_request,
         read_shell_frame_pump, read_shell_frame_pump_inner, recover_invalid_startup_lock_read,
-        validate_request_frame, validated_exec_timeout, validated_sftp_timeout,
-        write_all_until_or_shutdown, write_frame_or_shutdown, MAX_UPLOAD_CHUNK_BYTES,
+        terminal_safe_error, validate_request_frame, validated_exec_timeout,
+        validated_sftp_timeout, write_all_until_or_shutdown, write_frame_or_shutdown,
+        MAX_UPLOAD_CHUNK_BYTES,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2404,7 +2521,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_protocol_helper_verifies_v2_client_proof() {
+    async fn daemon_protocol_helper_verifies_v3_client_proof() {
         let (mut client, mut server) = tokio::io::duplex(8 * 1024);
         let token = crate::vault::new_ipc_token();
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -2551,6 +2668,60 @@ mod tests {
             })
             .is_err());
         }
+
+        for (cols, rows) in [(0, 24), (80, crate::ssh::MAX_SHELL_DIMENSION + 1)] {
+            assert!(crate::ssh::validate_shell_dimensions(cols, rows).is_err());
+            assert!(validate_request_frame(&crate::ipc::Frame::Shell { cols, rows }).is_err());
+        }
+        assert!(crate::ssh::validate_shell_dimensions(80, 24).is_ok());
+        assert!(validate_request_frame(&crate::ipc::Frame::Shell { cols: 80, rows: 24 }).is_ok());
+    }
+
+    #[test]
+    fn daemon_terminal_diagnostics_escape_controls_and_bidi_fields() {
+        let hostile = "保留\n\u{1b}]52;c;payload\u{7}\u{202e}\u{2028}";
+        let startup = daemon_up_line(hostile, hostile, 22, hostile, hostile, hostile);
+        let diagnostic = terminal_safe_error(&anyhow::anyhow!("failure: {hostile}"));
+        for line in [startup, diagnostic] {
+            assert!(line.contains("保留"));
+            assert!(line.contains("\\n"));
+            assert!(line.contains("\\u{1b}"));
+            assert!(line.contains("\\u{202e}"));
+            assert!(line.contains("\\u{2028}"));
+            assert!(!line.chars().any(char::is_control));
+            assert!(!line.contains('\u{202e}'));
+            assert!(!line.contains('\u{2028}'));
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_exec_wire_errors_keep_request_send_failures_plain() {
+        let rejected = exec_request_rejected_wire_message(anyhow::anyhow!(
+            "injected russh exec queue send failure"
+        ));
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        crate::ipc::write_frame(
+            &mut writer,
+            &crate::ipc::Frame::Error {
+                msg: rejected.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let frame = crate::ipc::read_frame_limited(&mut reader, crate::ipc::MAX_RESPONSE_FRAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::ipc::Frame::Error { msg } = frame else {
+            panic!("daemon exec rejection was not encoded as an error frame");
+        };
+        assert_eq!(msg, rejected);
+        assert!(crate::ssh::ExecOutcomeUnknown::from_wire_message(&msg).is_none());
+
+        let uncertain = exec_outcome_unknown_wire_message(anyhow::anyhow!(
+            "remote command finish response was lost"
+        ));
+        assert!(crate::ssh::ExecOutcomeUnknown::from_wire_message(&uncertain).is_some());
     }
 
     #[tokio::test]

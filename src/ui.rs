@@ -171,6 +171,7 @@ enum UiMessage {
     },
     Saved {
         operation: OperationContext,
+        original_name: Option<String>,
         result: Result<String, String>,
     },
     Removed {
@@ -231,7 +232,16 @@ impl UiMessage {
                 zeroize_operation_context(operation);
                 zeroize_profile_result(result);
             }
-            Self::Saved { operation, result } | Self::Removed { operation, result } => {
+            Self::Saved {
+                operation,
+                original_name,
+                result,
+            } => {
+                zeroize_operation_context(operation);
+                zeroize_option_string(original_name);
+                zeroize_string_result(result);
+            }
+            Self::Removed { operation, result } => {
                 zeroize_operation_context(operation);
                 zeroize_string_result(result);
             }
@@ -981,6 +991,7 @@ impl SerctlApp {
 
         let name = self.editor.name.trim().to_owned();
         let original_name = self.editor.original_name.clone();
+        let saved_original_name = original_name.clone();
         let creds = vault::Creds {
             host: self.editor.host.trim().to_owned(),
             port,
@@ -1007,6 +1018,7 @@ impl SerctlApp {
             .and_then(|r| r.map_err(|e| e.to_string()));
             UiMessage::Saved {
                 operation,
+                original_name: saved_original_name,
                 result: result.map(|_| saved_name),
             }
         });
@@ -1506,12 +1518,31 @@ impl SerctlApp {
                         Err(error) => self.set_notice(std::mem::take(error), true),
                     }
                 }
-                UiMessage::Saved { operation, result } => {
+                UiMessage::Saved {
+                    operation,
+                    original_name,
+                    result,
+                } => {
                     let current = self.operation_is_current(operation);
                     self.operations.finish(operation);
                     zeroize_operation_context(operation);
                     match result {
                         Ok(name) => {
+                            let selected_was_updated = self.selected.as_deref()
+                                == Some(name.as_str())
+                                || original_name
+                                    .as_deref()
+                                    .is_some_and(|old| self.selected.as_deref() == Some(old));
+                            self.remove_cached_profile_rows(
+                                original_name.as_deref(),
+                                name.as_str(),
+                            );
+                            if current || selected_was_updated {
+                                // The vault mutation has already committed. Invalidate the old
+                                // endpoint/user context immediately instead of relying on the
+                                // follow-up profile refresh, which can time out or fail.
+                                self.invalidate_profile_context();
+                            }
                             if current {
                                 self.editor.clear();
                                 self.select_profile(Some(name.clone()));
@@ -1834,6 +1865,17 @@ impl SerctlApp {
             entry.name.zeroize();
             entry.path.zeroize();
         }
+    }
+
+    fn remove_cached_profile_rows(&mut self, original_name: Option<&str>, saved_name: &str) {
+        self.profiles.retain_mut(|profile| {
+            let remove = profile.name == saved_name
+                || original_name.is_some_and(|original| profile.name == original);
+            if remove {
+                zeroize_profile_row(profile);
+            }
+            !remove
+        });
     }
 
     fn close_shell(&mut self) {
@@ -3276,6 +3318,77 @@ mod tests {
         assert_eq!(app.profiles[0].name, "new");
         assert_eq!(app.selected.as_deref(), Some("new"));
         assert!(!app.operations.is_busy());
+    }
+
+    #[test]
+    fn saved_same_name_invalidates_old_context_even_if_refresh_fails() {
+        let (mut app, tx) = test_app();
+        app.profiles.push(ProfileRow {
+            name: "alpha".into(),
+            host: "old.example".into(),
+            port: 22,
+            daemon: None,
+        });
+        app.selected = Some("alpha".into());
+        app.workspace_tab = WorkspaceTab::Files;
+        app.remote_path = "/old/private".into();
+        app.remote_entries.push(RemoteEntry {
+            name: "old-secret.txt".into(),
+            path: "/old/private/old-secret.txt".into(),
+            is_dir: false,
+            is_symlink: false,
+            size: 17,
+            modified_unix: None,
+        });
+        app.selected_remote = app.remote_entries.first().cloned();
+        app.output = "output from old.example".into();
+        app.exit_code = Some(0);
+        let generation_before_save = app.operations.profile_generation;
+        let save = app
+            .operations
+            .begin(Some("alpha".into()), "save alpha".into());
+
+        tx.send(UiMessage::Saved {
+            operation: save,
+            original_name: Some("alpha".into()),
+            result: Ok("alpha".into()),
+        })
+        .expect("queue successful same-name save");
+        app.receive_messages(&egui::Context::default());
+
+        assert!(app.operations.profile_generation > generation_before_save);
+        assert_eq!(app.selected.as_deref(), Some("alpha"));
+        assert!(
+            app.selected_profile().is_none(),
+            "old endpoint row survived save"
+        );
+        assert!(!app.output.contains("old.example"));
+        assert!(app.remote_entries.is_empty());
+        assert!(app.selected_remote.is_none());
+        assert_eq!(app.remote_path, ".");
+        assert_eq!(app.workspace_tab, WorkspaceTab::Command);
+
+        // `Saved` starts the real follow-up refresh. Inject its failure without
+        // driving the test runtime; the reducer must not resurrect old state or
+        // make the stale endpoint actionable after busy state clears.
+        let refresh = OperationContext {
+            id: app.operations.next_id,
+            profile: None,
+            profile_generation: app.operations.profile_generation,
+        };
+        tx.send(UiMessage::Profiles {
+            operation: refresh,
+            epoch: app.operations.refresh_epoch,
+            result: Err("refresh failed".into()),
+        })
+        .expect("queue failed profile refresh");
+        app.receive_messages(&egui::Context::default());
+
+        assert!(!app.operations.is_busy());
+        assert!(app.selected_profile().is_none());
+        assert!(app.profiles.iter().all(|profile| profile.name != "alpha"));
+        assert!(app.remote_entries.is_empty());
+        assert!(!app.output.contains("old.example"));
     }
 
     #[test]

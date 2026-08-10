@@ -9,6 +9,8 @@ use russh_sftp::protocol::{
     StatusCode, VERSION,
 };
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +29,7 @@ pub const MAX_REMOTE_COMMAND_BYTES: usize = 64 * 1024;
 pub const MAX_REMOTE_PATH_BYTES: usize = 4096;
 pub const MAX_SFTP_PACKET_BYTES: usize = 1024 * 1024;
 pub const MAX_TRANSFER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const MAX_SHELL_DIMENSION: u32 = 10_000;
 const REMOTE_PARTIAL_SUFFIX_BYTES: usize = ".serctl-part-".len() + 32;
 const SSH_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
 const TRANSPORT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -66,6 +69,203 @@ fn command_deadline_error() -> anyhow::Error {
     anyhow::anyhow!("remote command exceeded its deadline")
 }
 
+/// A command request may already have been accepted by the remote process even
+/// when its reply, output, or exit status is lost. Callers can downcast an
+/// `anyhow::Error` to this type to prevent an unsafe automatic retry.
+#[derive(Debug)]
+pub struct ExecOutcomeUnknown(String);
+
+const EXEC_OUTCOME_UNKNOWN_PREFIX: &str = "remote command outcome unknown:";
+const EXEC_OUTCOME_UNKNOWN_GUIDANCE: &str = "inspect remote side effects before retry";
+
+impl fmt::Display for ExecOutcomeUnknown {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ExecOutcomeUnknown {}
+
+impl ExecOutcomeUnknown {
+    pub(crate) fn from_wire_message(message: &str) -> Option<Self> {
+        (message.starts_with(EXEC_OUTCOME_UNKNOWN_PREFIX)
+            && message.contains(EXEC_OUTCOME_UNKNOWN_GUIDANCE))
+        .then(|| Self(message.to_owned()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ExecSubmissionState {
+    #[default]
+    BeforeRequest,
+    RequestMayHaveReachedRemote,
+}
+
+impl ExecSubmissionState {
+    pub(crate) fn request_started(&mut self) {
+        *self = Self::RequestMayHaveReachedRemote;
+    }
+
+    pub(crate) fn classify(self, error: anyhow::Error) -> anyhow::Error {
+        if self == Self::BeforeRequest || error.is::<ExecOutcomeUnknown>() {
+            return error;
+        }
+        let detail = format!("{error:#}");
+        if let Some(error) = ExecOutcomeUnknown::from_wire_message(&detail) {
+            return error.into();
+        }
+        ExecOutcomeUnknown(format!(
+            "{EXEC_OUTCOME_UNKNOWN_PREFIX} {detail}; {EXEC_OUTCOME_UNKNOWN_GUIDANCE}"
+        ))
+        .into()
+    }
+}
+
+/// Creating a directory is not safely retryable once the SFTP request may have
+/// reached the server. Callers can downcast an `anyhow::Error` to this type and
+/// require an explicit inspection before retrying.
+#[derive(Debug)]
+pub struct CreateDirOutcomeUnknown(String);
+
+const CREATE_DIR_OUTCOME_UNKNOWN_PREFIX: &str = "remote create-directory outcome unknown:";
+const CREATE_DIR_OUTCOME_UNKNOWN_GUIDANCE: &str = "inspect the remote path before retry";
+
+impl fmt::Display for CreateDirOutcomeUnknown {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CreateDirOutcomeUnknown {}
+
+impl CreateDirOutcomeUnknown {
+    pub(crate) fn from_wire_message(message: &str) -> Option<Self> {
+        (message.starts_with(CREATE_DIR_OUTCOME_UNKNOWN_PREFIX)
+            && message.contains(CREATE_DIR_OUTCOME_UNKNOWN_GUIDANCE))
+        .then(|| Self(message.to_owned()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum CreateDirSubmissionState {
+    #[default]
+    BeforeRequest,
+    RequestMayHaveReachedRemote,
+}
+
+impl CreateDirSubmissionState {
+    pub(crate) fn request_started(&mut self) {
+        *self = Self::RequestMayHaveReachedRemote;
+    }
+
+    pub(crate) fn classify(self, error: anyhow::Error) -> anyhow::Error {
+        if self == Self::BeforeRequest || error.is::<CreateDirOutcomeUnknown>() {
+            return error;
+        }
+        let detail = format!("{error:#}");
+        if let Some(error) = CreateDirOutcomeUnknown::from_wire_message(&detail) {
+            return error.into();
+        }
+        CreateDirOutcomeUnknown(format!(
+            "{CREATE_DIR_OUTCOME_UNKNOWN_PREFIX} {detail}; {CREATE_DIR_OUTCOME_UNKNOWN_GUIDANCE}"
+        ))
+        .into()
+    }
+}
+
+/// Poll an irreversible remote operation only while its absolute deadline is
+/// still live. Tokio timeouts poll their inner future before checking the timer,
+/// so the explicit check must happen on every poll; the timeout is retained only
+/// to arrange a wakeup at the deadline.
+pub(crate) async fn poll_remote_mutation_until<F, T, E, S, D>(
+    deadline: tokio::time::Instant,
+    operation: F,
+    on_first_poll: S,
+    on_deadline: D,
+    deadline_message: impl Into<String>,
+) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+    E: Into<anyhow::Error>,
+    S: FnOnce(),
+    D: FnOnce(),
+{
+    tokio::pin!(operation);
+    let mut on_first_poll = Some(on_first_poll);
+    let mut on_deadline = Some(on_deadline);
+    let deadline_message = deadline_message.into();
+    let poll_deadline_message = deadline_message.clone();
+    let guarded = std::future::poll_fn(|context| {
+        if tokio::time::Instant::now() >= deadline {
+            if let Some(on_deadline) = on_deadline.take() {
+                on_deadline();
+            }
+            return Poll::Ready(Err(anyhow::anyhow!(poll_deadline_message.clone())));
+        }
+        if let Some(on_first_poll) = on_first_poll.take() {
+            on_first_poll();
+        }
+        match operation.as_mut().poll(context) {
+            Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    });
+
+    match tokio::time::timeout_at(deadline, guarded).await {
+        Ok(result) => result,
+        Err(_) => {
+            if let Some(on_deadline) = on_deadline.take() {
+                on_deadline();
+            }
+            Err(anyhow::anyhow!(deadline_message))
+        }
+    }
+}
+
+pub(crate) fn is_explicit_sftp_status(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<russh_sftp::client::error::Error>(),
+        Some(russh_sftp::client::error::Error::Status(_))
+    )
+}
+
+async fn await_exec_request_queued_until<F, E>(
+    submission: &mut ExecSubmissionState,
+    deadline: tokio::time::Instant,
+    request: F,
+) -> Result<()>
+where
+    F: Future<Output = std::result::Result<(), E>>,
+    E: Into<anyhow::Error>,
+{
+    tokio::pin!(request);
+    let guarded_request = std::future::poll_fn(|context| {
+        // Tokio's timeout polls the inner future before checking its timer.
+        // Guard every poll so bounded mpsc capacity becoming available at the
+        // deadline cannot enqueue a command after its absolute budget.
+        if tokio::time::Instant::now() >= deadline {
+            return Poll::Ready(Err(command_deadline_error()));
+        }
+        match request.as_mut().poll(context) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    });
+    match tokio::time::timeout_at(deadline, guarded_request).await {
+        Ok(Ok(())) => {
+            // `russh::Channel::exec` is a cancellation-safe mpsc send. Only
+            // its successful completion proves that the transport task took
+            // ownership of the request and may deliver it to the peer.
+            submission.request_started();
+            Ok(())
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(command_deadline_error()),
+    }
+}
+
 /// Enforce one command boundary before choosing either daemon IPC or a direct
 /// SSH route. This prevents a missing daemon from bypassing the daemon's
 /// resource limit.
@@ -102,6 +302,15 @@ pub fn validate_upload_remote_path(path: &str) -> Result<()> {
     ensure!(
         temporary_len <= MAX_REMOTE_PATH_BYTES,
         "remote upload path leaves no room for its protected temporary suffix"
+    );
+    Ok(())
+}
+
+/// Keep PTY dimensions identical on direct SSH and daemon IPC routes.
+pub fn validate_shell_dimensions(cols: u32, rows: u32) -> Result<()> {
+    ensure!(
+        (1..=MAX_SHELL_DIMENSION).contains(&cols) && (1..=MAX_SHELL_DIMENSION).contains(&rows),
+        "shell dimensions must be between 1 and {MAX_SHELL_DIMENSION}"
     );
     Ok(())
 }
@@ -164,19 +373,46 @@ where
 }
 
 /// Commit a completed remote sibling without overwriting an existing target.
-/// An advertised hardlink extension is authoritative: any hardlink error is a
-/// safe failure and must never fall back to the less strongly implemented v3
-/// RENAME operation.
-pub async fn commit_remote_upload_no_replace(
+/// Each remote mutation is guarded separately, including the rename fallback,
+/// so no SFTP request is polled after the caller's absolute deadline. An
+/// advertised hardlink extension is authoritative: any hardlink error is a safe
+/// failure and must never fall back to the less strongly implemented v3 RENAME.
+pub async fn commit_remote_upload_no_replace_until(
     sftp: &SftpSession,
     partial: &str,
     target: &str,
     committed: &AtomicBool,
+    deadline: tokio::time::Instant,
+    deadline_message: &str,
 ) -> Result<RemoteUploadCommit> {
     commit_remote_upload_no_replace_with(
-        || async { Ok(sftp.hardlink(partial, target).await?) },
-        || async { Ok(sftp.rename(partial, target).await?) },
-        || async { Ok(sftp.remove_file(partial).await?) },
+        || {
+            poll_remote_mutation_until(
+                deadline,
+                sftp.hardlink(partial, target),
+                || {},
+                || {},
+                deadline_message,
+            )
+        },
+        || {
+            poll_remote_mutation_until(
+                deadline,
+                sftp.rename(partial, target),
+                || {},
+                || {},
+                deadline_message,
+            )
+        },
+        || {
+            poll_remote_mutation_until(
+                deadline,
+                sftp.remove_file(partial),
+                || {},
+                || {},
+                deadline_message,
+            )
+        },
         committed,
     )
     .await
@@ -253,6 +489,7 @@ pub struct ExecResult {
 pub struct RunningCommand {
     channel: russh::Channel<russh::client::Msg>,
     transport: TransportTrip,
+    submission: ExecSubmissionState,
 }
 
 #[derive(Clone)]
@@ -551,14 +788,30 @@ impl StagedSshSession {
             self.abort().await;
             bail!("SSH connection exceeded its deadline");
         }
-        let authentication = self
-            .handle
-            .as_mut()
-            .context("SSH transport is unavailable before authentication")?
-            .authenticate_password(user, password);
-        let result = tokio::time::timeout_at(deadline, authentication).await;
+        let result = {
+            let authentication = self
+                .handle
+                .as_mut()
+                .context("SSH transport is unavailable before authentication")?
+                .authenticate_password(user, password);
+            tokio::pin!(authentication);
+            let guarded_authentication = std::future::poll_fn(|context| {
+                // Password authentication begins with the same bounded russh
+                // mpsc send as exec. Prevent an authentication attempt (and
+                // password disclosure) from being enqueued on a post-deadline
+                // repoll.
+                if tokio::time::Instant::now() >= deadline {
+                    return Poll::Ready(None);
+                }
+                match authentication.as_mut().poll(context) {
+                    Poll::Ready(result) => Poll::Ready(Some(result)),
+                    Poll::Pending => Poll::Pending,
+                }
+            });
+            tokio::time::timeout_at(deadline, guarded_authentication).await
+        };
         match result {
-            Ok(Ok(client::AuthResult::Success)) => {
+            Ok(Some(Ok(client::AuthResult::Success))) => {
                 let handle = self
                     .handle
                     .take()
@@ -573,16 +826,16 @@ impl StagedSshSession {
                     transport,
                 })
             }
-            Ok(Ok(_)) => {
+            Ok(Some(Ok(_))) => {
                 let error = anyhow::anyhow!("authentication failed for user '{user}'");
                 self.abort().await;
                 Err(error)
             }
-            Ok(Err(error)) => {
+            Ok(Some(Err(error))) => {
                 self.abort().await;
                 Err(error.into())
             }
-            Err(_) => {
+            Ok(None) | Err(_) => {
                 self.abort().await;
                 bail!("SSH connection exceeded its deadline")
             }
@@ -740,6 +993,7 @@ impl SshSession {
             Ok(Ok(channel)) => Ok(RunningCommand {
                 channel,
                 transport: self.transport_trip(),
+                submission: ExecSubmissionState::BeforeRequest,
             }),
             Ok(Err(error)) => Err(error.into()),
             Err(_) => {
@@ -775,11 +1029,11 @@ impl SshSession {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => {
                 command.cancel().await;
-                Err(error)
+                Err(command.submission.classify(error))
             }
             Err(_) => {
                 command.cancel().await;
-                Err(command_deadline_error())
+                Err(command.submission.classify(command_deadline_error()))
             }
         }
     }
@@ -791,6 +1045,7 @@ impl SshSession {
         cols: u32,
         rows: u32,
     ) -> Result<russh::Channel<russh::client::Msg>> {
+        validate_shell_dimensions(cols, rows)?;
         let ch = self.handle.channel_open_session().await?;
         ch.request_pty(false, term, cols, rows, 0, 0, &[]).await?;
         ch.request_shell(true).await?;
@@ -874,12 +1129,27 @@ impl SshSession {
 
     pub async fn create_dir_until(&self, path: &str, deadline: tokio::time::Instant) -> Result<()> {
         let sftp = self.sftp_until(deadline).await?;
-        match tokio::time::timeout_at(deadline, sftp.create_dir(path)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(error.into()),
-            Err(_) => {
-                self.invalidate().await;
-                bail!("SFTP create-directory exceeded its deadline");
+        let mut submission = CreateDirSubmissionState::BeforeRequest;
+        let result = poll_remote_mutation_until(
+            deadline,
+            sftp.create_dir(path),
+            || submission.request_started(),
+            || {},
+            "SFTP create-directory exceeded its deadline",
+        )
+        .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if is_explicit_sftp_status(&error) => {
+                // A STATUS response is an explicit server rejection, so its
+                // outcome is definite even though the request was submitted.
+                Err(error)
+            }
+            Err(error) => {
+                if submission == CreateDirSubmissionState::RequestMayHaveReachedRemote {
+                    self.invalidate().await;
+                }
+                Err(submission.classify(error))
             }
         }
     }
@@ -1365,13 +1635,22 @@ impl RunningCommand {
         cmd: &str,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
-        match tokio::time::timeout_at(deadline, self.channel.exec(true, cmd.to_string())).await {
-            Ok(result) => Ok(result?),
-            Err(_) => Err(command_deadline_error()),
-        }
+        await_exec_request_queued_until(
+            &mut self.submission,
+            deadline,
+            self.channel.exec(true, cmd.to_string()),
+        )
+        .await
     }
 
     pub async fn finish(&mut self) -> Result<ExecResult> {
+        let submission = self.submission;
+        self.finish_after_submission()
+            .await
+            .map_err(|error| submission.classify(error))
+    }
+
+    async fn finish_after_submission(&mut self) -> Result<ExecResult> {
         let mut out = Zeroizing::new(Vec::new());
         let mut err = Zeroizing::new(Vec::new());
         let mut code: Option<i32> = None;
@@ -1431,21 +1710,25 @@ fn extend_command_output(target: &mut Vec<u8>, data: &[u8], other_len: usize) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_remote_upload_no_replace_with, extend_command_output,
+        await_exec_request_queued_until, commit_remote_upload_no_replace_with,
+        extend_command_output, is_explicit_sftp_status, poll_remote_mutation_until,
         protected_upload_file_attributes, push_directory_entry, read_sftp_packet,
         require_server_fingerprint, secure_client_algorithms, status_error, temporary_remote_path,
-        validate_remote_command, validate_remote_path, validate_upload_remote_path,
-        BoundedSftpStream, DirectoryBudget, DirectoryLimits, SshSession, TransportTrip,
-        DIRECTORY_LIMITS, MAX_DIRECTORY_ENTRIES, MAX_DIRECTORY_STRING_BYTES,
-        MAX_REMOTE_COMMAND_BYTES, MAX_REMOTE_PATH_BYTES, MAX_SFTP_PACKET_BYTES,
-        REMOTE_PARTIAL_SUFFIX_BYTES,
+        validate_remote_command, validate_remote_path, validate_shell_dimensions,
+        validate_upload_remote_path, BoundedSftpStream, CreateDirOutcomeUnknown,
+        CreateDirSubmissionState, DirectoryBudget, DirectoryLimits, ExecOutcomeUnknown,
+        ExecSubmissionState, SshSession, TransportTrip, DIRECTORY_LIMITS, MAX_DIRECTORY_ENTRIES,
+        MAX_DIRECTORY_STRING_BYTES, MAX_REMOTE_COMMAND_BYTES, MAX_REMOTE_PATH_BYTES,
+        MAX_SFTP_PACKET_BYTES, MAX_SHELL_DIMENSION, REMOTE_PARTIAL_SUFFIX_BYTES,
     };
     use crate::vault::Creds;
     use russh::keys::ssh_key;
     use russh_sftp::client::{Config as SftpConfig, SftpSession};
     use russh_sftp::protocol::{File, FileAttributes, Status, StatusCode};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::task::Poll;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
@@ -1492,6 +1775,194 @@ mod tests {
             MAX_REMOTE_PATH_BYTES
         );
         assert!(validate_upload_remote_path(&format!("{longest_upload}x")).is_err());
+
+        assert!(validate_shell_dimensions(1, MAX_SHELL_DIMENSION).is_ok());
+        assert!(validate_shell_dimensions(0, 24).is_err());
+        assert!(validate_shell_dimensions(80, MAX_SHELL_DIMENSION + 1).is_err());
+    }
+
+    #[test]
+    fn exec_submission_state_only_types_post_request_failures_as_unknown() {
+        let pre_request = ExecSubmissionState::BeforeRequest
+            .classify(anyhow::anyhow!("connect failed before exec"));
+        assert!(!pre_request.is::<ExecOutcomeUnknown>());
+
+        let mut submitted = ExecSubmissionState::BeforeRequest;
+        submitted.request_started();
+        let post_request = submitted.classify(anyhow::anyhow!("exit status was lost"));
+        assert!(post_request.is::<ExecOutcomeUnknown>());
+        assert!(post_request.to_string().contains("outcome unknown"));
+        assert!(post_request
+            .to_string()
+            .contains("inspect remote side effects before retry"));
+
+        let classified_once = submitted.classify(post_request);
+        assert!(classified_once.is::<ExecOutcomeUnknown>());
+        assert_eq!(
+            classified_once
+                .to_string()
+                .matches("outcome unknown")
+                .count(),
+            1
+        );
+
+        let round_tripped_over_ipc =
+            submitted.classify(anyhow::anyhow!(classified_once.to_string()));
+        assert!(round_tripped_over_ipc.is::<ExecOutcomeUnknown>());
+        assert_eq!(
+            round_tripped_over_ipc
+                .to_string()
+                .matches("outcome unknown")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_exec_queue_send_stays_pre_request() {
+        let mut submission = ExecSubmissionState::BeforeRequest;
+        let error = await_exec_request_queued_until(
+            &mut submission,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            async { Err::<(), anyhow::Error>(anyhow::anyhow!("injected exec send failure")) },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(submission, ExecSubmissionState::BeforeRequest);
+        assert!(!error.is::<ExecOutcomeUnknown>());
+        assert!(error.to_string().contains("injected exec send failure"));
+    }
+
+    #[tokio::test]
+    async fn expired_exec_queue_deadline_does_not_poll_the_send() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let future_polled = Arc::clone(&polled);
+        let request = std::future::poll_fn(move |_| {
+            future_polled.store(true, Ordering::Release);
+            std::task::Poll::Ready(Ok::<(), anyhow::Error>(()))
+        });
+        let mut submission = ExecSubmissionState::BeforeRequest;
+        let error = await_exec_request_queued_until(
+            &mut submission,
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            request,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!polled.load(Ordering::Acquire));
+        assert_eq!(submission, ExecSubmissionState::BeforeRequest);
+        assert!(!error.is::<ExecOutcomeUnknown>());
+        assert!(error.to_string().contains("deadline"));
+    }
+
+    #[tokio::test]
+    async fn pending_exec_queue_send_is_not_repolled_at_deadline() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let future_polls = Arc::clone(&polls);
+        let mut ready = Box::pin(tokio::time::sleep_until(deadline));
+        let request = std::future::poll_fn(move |context| {
+            future_polls.fetch_add(1, Ordering::AcqRel);
+            match ready.as_mut().poll(context) {
+                Poll::Ready(()) => Poll::Ready(Ok::<(), anyhow::Error>(())),
+                Poll::Pending => Poll::Pending,
+            }
+        });
+        let mut submission = ExecSubmissionState::BeforeRequest;
+        let error = await_exec_request_queued_until(&mut submission, deadline, request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(polls.load(Ordering::Acquire), 1);
+        assert_eq!(submission, ExecSubmissionState::BeforeRequest);
+        assert!(!error.is::<ExecOutcomeUnknown>());
+        assert!(error.to_string().contains("deadline"));
+    }
+
+    #[test]
+    fn create_directory_submission_state_types_only_uncertain_failures() {
+        let ordinary = CreateDirSubmissionState::BeforeRequest
+            .classify(anyhow::anyhow!("connection failed before MKDIR"));
+        assert!(!ordinary.is::<CreateDirOutcomeUnknown>());
+
+        let mut submitted = CreateDirSubmissionState::BeforeRequest;
+        submitted.request_started();
+        let unknown = submitted.classify(anyhow::anyhow!("SFTP response was lost"));
+        assert!(unknown.is::<CreateDirOutcomeUnknown>());
+        assert!(unknown
+            .to_string()
+            .contains("inspect the remote path before retry"));
+
+        let round_trip = submitted.classify(anyhow::anyhow!(unknown.to_string()));
+        assert!(round_trip.is::<CreateDirOutcomeUnknown>());
+        assert_eq!(round_trip.to_string().matches("outcome unknown").count(), 1);
+
+        let status: anyhow::Error = russh_sftp::client::error::Error::Status(Status {
+            id: 7,
+            status_code: StatusCode::PermissionDenied,
+            error_message: "denied".into(),
+            language_tag: String::new(),
+        })
+        .into();
+        assert!(is_explicit_sftp_status(&status));
+    }
+
+    #[tokio::test]
+    async fn expired_remote_mutation_is_not_polled_or_marked_submitted() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let future_polled = Arc::clone(&polled);
+        let mut submission = CreateDirSubmissionState::BeforeRequest;
+        let result = poll_remote_mutation_until(
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            std::future::poll_fn(move |_| {
+                future_polled.store(true, Ordering::Release);
+                Poll::Ready(Ok::<(), anyhow::Error>(()))
+            }),
+            || submission.request_started(),
+            || {},
+            "SFTP create-directory exceeded its deadline",
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(!polled.load(Ordering::Acquire));
+        assert_eq!(submission, CreateDirSubmissionState::BeforeRequest);
+        assert!(!error.is::<CreateDirOutcomeUnknown>());
+        assert!(error.to_string().contains("deadline"));
+    }
+
+    #[tokio::test]
+    async fn pending_remote_mutation_is_not_repolled_after_deadline() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let future_polls = Arc::clone(&polls);
+        let mut ready = Box::pin(tokio::time::sleep_until(deadline));
+        let operation = std::future::poll_fn(move |context| {
+            future_polls.fetch_add(1, Ordering::AcqRel);
+            match ready.as_mut().poll(context) {
+                Poll::Ready(()) => Poll::Ready(Ok::<(), anyhow::Error>(())),
+                Poll::Pending => Poll::Pending,
+            }
+        });
+        let mut submission = CreateDirSubmissionState::BeforeRequest;
+        let result = poll_remote_mutation_until(
+            deadline,
+            operation,
+            || submission.request_started(),
+            || {},
+            "SFTP create-directory exceeded its deadline",
+        )
+        .await;
+
+        let error = submission.classify(result.unwrap_err());
+        assert_eq!(polls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            submission,
+            CreateDirSubmissionState::RequestMayHaveReachedRemote
+        );
+        assert!(error.is::<CreateDirOutcomeUnknown>());
     }
 
     #[test]

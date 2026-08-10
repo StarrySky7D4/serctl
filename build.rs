@@ -37,6 +37,7 @@ const GIT_METADATA_PATHS: &[&str] = &[
     "packed-refs",
     "config",
     "config.worktree",
+    "info/attributes",
     "info/exclude",
 ];
 
@@ -207,6 +208,78 @@ fn tracked_files(work_dir: &Path) -> Option<Vec<PathBuf>> {
     listed_files(work_dir, &["ls-files", "-z", "--cached"])
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct IndexStageZeroEntry {
+    mode: Vec<u8>,
+    oid: Vec<u8>,
+    path: PathBuf,
+}
+
+fn index_stage_zero_entries(work_dir: &Path) -> Option<Vec<IndexStageZeroEntry>> {
+    let root = repository_root(work_dir)?;
+    let output = run_git(&root, &["ls-files", "--stage", "-z", "--cached"])?;
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let separator = entry.iter().position(|byte| *byte == b'\t')?;
+            let mut header = entry[..separator].split(|byte| *byte == b' ');
+            let mode = header.next()?.to_vec();
+            let oid = header.next()?.to_vec();
+            let stage = header.next()?;
+            if header.next().is_some()
+                || stage != b"0"
+                || !oid.iter().all(u8::is_ascii_hexdigit)
+                || !matches!(
+                    mode.as_slice(),
+                    b"100644" | b"100755" | b"120000" | b"160000"
+                )
+            {
+                return None;
+            }
+            Some(IndexStageZeroEntry {
+                mode,
+                oid,
+                path: root.join(path_from_git_bytes(&entry[separator + 1..])),
+            })
+        })
+        .collect()
+}
+
+fn raw_worktree_oid(repository_root: &Path, path: &Path) -> Option<Vec<u8>> {
+    let relative = path.strip_prefix(repository_root).ok()?;
+    let output = configured_git_command(repository_root, &["hash-object", "--no-filters"])
+        .arg("--")
+        .arg(relative)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut oid = output.stdout.as_slice();
+    while oid.last().is_some_and(|byte| matches!(byte, b'\r' | b'\n')) {
+        oid = &oid[..oid.len() - 1];
+    }
+    (!oid.is_empty() && oid.iter().all(u8::is_ascii_hexdigit)).then(|| oid.to_vec())
+}
+
+fn raw_tracked_worktree_is_clean(work_dir: &Path) -> Option<bool> {
+    let root = repository_root(work_dir)?;
+    for entry in index_stage_zero_entries(&root)? {
+        // A gitlink is not a worktree blob, so there is no raw file OID to
+        // compare. This project has no submodules; fail dirty if one appears
+        // instead of allowing a newly introduced provenance blind spot.
+        if entry.mode == b"160000" {
+            return Some(false);
+        }
+        if raw_worktree_oid(&root, &entry.path)? != entry.oid {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
 fn untracked_files(work_dir: &Path) -> Option<Vec<PathBuf>> {
     listed_files(
         work_dir,
@@ -346,7 +419,12 @@ fn git_rerun_paths(work_dir: &Path) -> GitRerunPaths {
 fn working_tree_is_dirty(work_dir: &Path) -> Option<bool> {
     let output = run_git(work_dir, GIT_STATUS_ARGS)?;
     let hidden_index_flags = run_git(work_dir, &["ls-files", "-v", "-z", "--cached"])?;
-    Some(!output.stdout.is_empty() || index_has_hidden_worktree_flags(&hidden_index_flags.stdout))
+    let raw_tracked_clean = raw_tracked_worktree_is_clean(work_dir)?;
+    Some(
+        !output.stdout.is_empty()
+            || index_has_hidden_worktree_flags(&hidden_index_flags.stdout)
+            || !raw_tracked_clean,
+    )
 }
 
 fn index_has_hidden_worktree_flags(output: &[u8]) -> bool {
@@ -360,13 +438,20 @@ fn index_has_hidden_worktree_flags(output: &[u8]) -> bool {
 }
 
 fn decorate_commit(commit: Option<String>, dirty: Option<bool>, force_dirty: bool) -> String {
+    let commit_missing = commit.as_ref().is_none_or(String::is_empty);
     let mut commit = commit
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown".into());
-    if force_dirty || dirty.unwrap_or(true) {
+    if force_dirty || commit_missing || dirty.unwrap_or(true) {
         commit.push_str("-dirty");
     }
     commit
+}
+
+fn validated_commit_id(commit: Option<String>) -> Option<String> {
+    commit.filter(|value| {
+        (12..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 fn build_commit(work_dir: &Path, force_dirty: bool) -> String {
@@ -374,14 +459,23 @@ fn build_commit(work_dir: &Path, force_dirty: bool) -> String {
         return decorate_commit(None, None, true);
     };
     decorate_commit(
-        git_text(&root, &["rev-parse", "--short=12", "HEAD"]),
+        validated_commit_id(git_text(&root, &["rev-parse", "--short=12", "HEAD"])),
         working_tree_is_dirty(&root),
         force_dirty,
     )
 }
 
+fn cargo_path_character_is_safe(value: char) -> bool {
+    if matches!(value, '\\' | '\'' | '"') {
+        return true;
+    }
+    let mut escaped = value.escape_debug();
+    escaped.next() == Some(value) && escaped.next().is_none()
+}
+
 fn rerun_path_text(path: &Path) -> Option<&str> {
-    path.to_str().filter(|value| !value.contains(['\r', '\n']))
+    path.to_str()
+        .filter(|value| value.chars().all(cargo_path_character_is_safe))
 }
 
 fn emit_rerun_path(path: &Path) -> bool {
@@ -389,7 +483,7 @@ fn emit_rerun_path(path: &Path) -> bool {
         println!("cargo:rerun-if-changed={path}");
         true
     } else {
-        println!("cargo:warning=not watching a non-UTF-8 Git path or one containing a newline");
+        println!("cargo:warning=not watching a non-UTF-8 or terminal-unsafe Git path");
         false
     }
 }
@@ -422,9 +516,10 @@ fn main() {
 mod tests {
     use super::{
         build_commit, classify_head_reference, combine_worktree_files, configured_git_command,
-        decorate_commit, discovered_repository_root, provenance_enumeration_complete,
-        repository_root, rerun_path_text, run_git, working_tree_is_dirty, HeadReference,
-        GIT_METADATA_PATHS, GIT_NULL_CONFIG, GIT_REPOSITORY_OVERRIDE_ENV, GIT_STATUS_ARGS,
+        decorate_commit, discovered_repository_root, git_path, provenance_enumeration_complete,
+        raw_tracked_worktree_is_clean, repository_root, rerun_path_text, run_git,
+        validated_commit_id, working_tree_is_dirty, HeadReference, GIT_METADATA_PATHS,
+        GIT_NULL_CONFIG, GIT_REPOSITORY_OVERRIDE_ENV, GIT_STATUS_ARGS,
     };
     use std::{
         ffi::OsStr,
@@ -480,14 +575,16 @@ mod tests {
             .to_owned()
     }
 
-    fn committed_fixture() -> Option<(TempFixture, PathBuf)> {
-        if !Command::new("git")
+    fn committed_fixture() -> (TempFixture, PathBuf) {
+        let git_version = Command::new("git")
             .arg("--version")
             .output()
-            .is_ok_and(|output| output.status.success())
-        {
-            return None;
-        }
+            .expect("Git is required for provenance fixture tests");
+        assert!(
+            git_version.status.success(),
+            "Git is required for provenance fixture tests: {}",
+            String::from_utf8_lossy(&git_version.stderr)
+        );
 
         let fixture = TempFixture::new();
         let repository = fixture.0.join("repository");
@@ -510,7 +607,7 @@ mod tests {
         fs::write(repository.join("tracked.txt"), "clean\n").expect("write tracked fixture input");
         fixture_git(&repository, &["add", "--", "tracked.txt"]);
         fixture_git(&repository, &["commit", "--quiet", "-m", "initial"]);
-        Some((fixture, repository))
+        (fixture, repository)
     }
 
     #[test]
@@ -533,6 +630,28 @@ mod tests {
             decorate_commit(Some("0123456789ab".into()), Some(false), !complete),
             "0123456789ab"
         );
+        assert_eq!(decorate_commit(None, Some(false), false), "unknown-dirty");
+        assert_eq!(
+            decorate_commit(Some(String::new()), Some(false), false),
+            "unknown-dirty"
+        );
+    }
+
+    #[test]
+    fn commit_id_is_terminal_safe_before_reaching_cargo_output() {
+        assert_eq!(
+            validated_commit_id(Some("0123456789ab".into())).as_deref(),
+            Some("0123456789ab")
+        );
+        for invalid in [
+            "0123456789a",
+            "0123456789ab\n",
+            "0123456789ab\u{1b}",
+            "0123456789ab\u{202e}",
+            "not-a-commit",
+        ] {
+            assert_eq!(validated_commit_id(Some(invalid.into())), None);
+        }
     }
 
     #[test]
@@ -572,9 +691,17 @@ mod tests {
     #[test]
     fn unrepresentable_cargo_watch_paths_are_incomplete() {
         let normal = PathBuf::from("normal/path");
+        let windows_separator = PathBuf::from(r"normal\path");
         let newline = PathBuf::from("bad\npath");
+        let escape = PathBuf::from("bad\u{1b}]52;c;payload");
+        let bidi = PathBuf::from("bad\u{202e}txt");
+        let line_separator = PathBuf::from("bad\u{2028}path");
         assert_eq!(rerun_path_text(&normal), Some("normal/path"));
+        assert_eq!(rerun_path_text(&windows_separator), Some(r"normal\path"));
         assert!(rerun_path_text(&newline).is_none());
+        assert!(rerun_path_text(&escape).is_none());
+        assert!(rerun_path_text(&bidi).is_none());
+        assert!(rerun_path_text(&line_separator).is_none());
     }
 
     #[test]
@@ -634,16 +761,19 @@ mod tests {
 
     #[test]
     fn provenance_watches_git_configuration_that_can_change_status() {
-        for required in ["config", "config.worktree", "info/exclude"] {
+        for required in [
+            "config",
+            "config.worktree",
+            "info/attributes",
+            "info/exclude",
+        ] {
             assert!(GIT_METADATA_PATHS.contains(&required));
         }
     }
 
     #[test]
     fn repository_core_worktree_cannot_redirect_provenance_to_a_clean_tree() {
-        let Some((fixture, repository)) = committed_fixture() else {
-            return;
-        };
+        let (fixture, repository) = committed_fixture();
         let clean_tree = fixture.0.join("redirected-clean-tree");
         fs::create_dir(&clean_tree).expect("create redirected worktree");
         fs::write(clean_tree.join("tracked.txt"), "clean\n").expect("write clean redirected input");
@@ -674,9 +804,7 @@ mod tests {
 
     #[test]
     fn assume_unchanged_cannot_hide_a_modified_tracked_input() {
-        let Some((_fixture, repository)) = committed_fixture() else {
-            return;
-        };
+        let (_fixture, repository) = committed_fixture();
         fixture_git(
             &repository,
             &["update-index", "--assume-unchanged", "--", "tracked.txt"],
@@ -694,10 +822,132 @@ mod tests {
     }
 
     #[test]
+    fn clean_filter_cannot_hide_modified_tracked_input() {
+        let (_fixture, repository) = committed_fixture();
+        fixture_git(
+            &repository,
+            &["config", "filter.provenance-mask.clean", "git show HEAD:%f"],
+        );
+        fixture_git(
+            &repository,
+            &["config", "filter.provenance-mask.required", "true"],
+        );
+        let attributes = git_path(&repository, "info/attributes")
+            .expect("resolve repository-local attributes path");
+        fs::create_dir_all(attributes.parent().expect("attributes parent"))
+            .expect("create attributes parent");
+        fs::write(&attributes, "tracked.txt filter=provenance-mask\n")
+            .expect("install clean-filter attribute");
+        // Keep the raw size equal to the committed `clean\n` blob so Git must
+        // consult the clean filter instead of short-circuiting on stat size.
+        fs::write(repository.join("tracked.txt"), "evil!\n")
+            .expect("modify filtered tracked input");
+
+        let attribute =
+            fixture_git_text(&repository, &["check-attr", "filter", "--", "tracked.txt"]);
+        assert!(
+            attribute.ends_with("provenance-mask"),
+            "clean-filter attribute was not active: {attribute:?}"
+        );
+        let filtered_oid = fixture_git_text(
+            &repository,
+            &["hash-object", "--path=tracked.txt", "--", "tracked.txt"],
+        );
+        let index_oid = fixture_git_text(&repository, &["rev-parse", ":tracked.txt"]);
+        assert_eq!(
+            filtered_oid, index_oid,
+            "clean filter did not mask the edit"
+        );
+
+        let porcelain = run_git(&repository, GIT_STATUS_ARGS).expect("read filtered status");
+        assert!(
+            porcelain.stdout.is_empty(),
+            "fixture no longer demonstrates a clean filter hiding the edit: {}",
+            String::from_utf8_lossy(&porcelain.stdout)
+        );
+        assert_eq!(raw_tracked_worktree_is_clean(&repository), Some(false));
+        assert_eq!(working_tree_is_dirty(&repository), Some(true));
+        assert!(build_commit(&repository, false).ends_with("-dirty"));
+    }
+
+    #[test]
+    fn lf_attributes_keep_autocrlf_checkout_raw_clean() {
+        let (_fixture, repository) = committed_fixture();
+        fixture_git(&repository, &["config", "core.autocrlf", "true"]);
+        fs::write(repository.join(".gitattributes"), "* text=auto eol=lf\n")
+            .expect("write LF checkout policy");
+        fixture_git(&repository, &["add", "--", ".gitattributes"]);
+        fixture_git(&repository, &["commit", "--quiet", "--amend", "--no-edit"]);
+
+        fs::remove_file(repository.join("tracked.txt")).expect("remove tracked checkout copy");
+        fixture_git(&repository, &["checkout", "--", "tracked.txt"]);
+        assert_eq!(
+            fs::read(repository.join("tracked.txt")).expect("read checked-out text"),
+            b"clean\n",
+            "eol=lf must override core.autocrlf in the worktree"
+        );
+        let porcelain = run_git(&repository, GIT_STATUS_ARGS).expect("read clean checkout status");
+        assert!(
+            porcelain.stdout.is_empty(),
+            "autocrlf fixture checkout is not clean: {}",
+            String::from_utf8_lossy(&porcelain.stdout)
+        );
+        assert_eq!(raw_tracked_worktree_is_clean(&repository), Some(true));
+        assert_eq!(working_tree_is_dirty(&repository), Some(false));
+        assert!(!build_commit(&repository, false).ends_with("-dirty"));
+    }
+
+    #[test]
+    fn gitlink_entry_is_never_treated_as_raw_clean() {
+        let (_fixture, repository) = committed_fixture();
+        let dependency = repository.join("dependency");
+        fs::create_dir(&dependency).expect("create nested repository");
+        let init = Command::new("git")
+            .current_dir(&dependency)
+            .args(["init", "--quiet"])
+            .output()
+            .expect("initialize nested Git fixture");
+        assert!(
+            init.status.success(),
+            "nested Git fixture init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        fixture_git(&dependency, &["config", "user.name", "serctl test"]);
+        fixture_git(
+            &dependency,
+            &["config", "user.email", "serctl-test@example.invalid"],
+        );
+        fs::write(dependency.join("input.txt"), "dependency\n")
+            .expect("write nested repository input");
+        fixture_git(&dependency, &["add", "--", "input.txt"]);
+        fixture_git(&dependency, &["commit", "--quiet", "-m", "dependency"]);
+        let dependency_oid = fixture_git_text(&dependency, &["rev-parse", "HEAD"]);
+        let cache_info = format!("160000,{dependency_oid},dependency");
+        fixture_git(
+            &repository,
+            &["update-index", "--add", "--cacheinfo", cache_info.as_str()],
+        );
+        fixture_git(&repository, &["commit", "--quiet", "-m", "add gitlink"]);
+
+        let staged = fixture_git_text(&repository, &["ls-files", "--stage", "--", "dependency"]);
+        assert!(
+            staged.starts_with("160000 "),
+            "fixture did not create a gitlink: {staged:?}"
+        );
+        let porcelain = run_git(&repository, GIT_STATUS_ARGS).expect("read gitlink status");
+        assert!(
+            porcelain.stdout.is_empty(),
+            "fixture no longer demonstrates a porcelain-clean gitlink: {}",
+            String::from_utf8_lossy(&porcelain.stdout)
+        );
+        assert_eq!(raw_tracked_worktree_is_clean(&repository), Some(false));
+        assert_eq!(working_tree_is_dirty(&repository), Some(true));
+        assert!(build_commit(&repository, false).ends_with("-dirty"));
+    }
+
+    #[test]
     fn replacement_refs_cannot_make_modified_inputs_look_clean() {
-        let Some((_fixture, repository)) = committed_fixture() else {
-            return;
-        };
+        let (_fixture, repository) = committed_fixture();
         let original = fixture_git_text(&repository, &["rev-parse", "HEAD"]);
         fs::write(
             repository.join("tracked.txt"),

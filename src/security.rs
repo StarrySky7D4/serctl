@@ -37,6 +37,34 @@ pub fn create_new_protected_file(path: &Path) -> Result<File> {
     create_new_protected_file_with_validation(path, validate_new_protected_file)
 }
 
+/// Replace a security-sensitive file atomically and durably. On Unix,
+/// `AtomicWriteFile::commit` syncs both the temporary file and its parent
+/// directory. Windows uses an explicit write-through rename because the
+/// generic `AtomicWriteFile` implementation only calls `fs::rename` there.
+#[cfg(unix)]
+pub fn write_protected_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    use atomic_write_file::AtomicWriteFile;
+    use std::io::Write;
+
+    let mut file = AtomicWriteFile::open(path)
+        .with_context(|| format!("open atomic temporary file for {}", path.display()))?;
+    harden_open_file(file.as_file())?;
+    file.write_all(contents)
+        .with_context(|| format!("write atomic temporary file for {}", path.display()))?;
+    file.commit()
+        .with_context(|| format!("commit protected atomic file {}", path.display()))
+}
+
+#[cfg(windows)]
+pub fn write_protected_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    write_protected_atomic_windows_with(path, contents, move_file_write_through)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn write_protected_atomic(_path: &Path, _contents: &[u8]) -> Result<()> {
+    bail!("durable protected atomic writes are unsupported on this platform")
+}
+
 fn create_new_protected_file_with_validation<F>(path: &Path, validate: F) -> Result<File>
 where
     F: FnOnce(&File) -> Result<()>,
@@ -346,6 +374,218 @@ fn open_protected_file(_path: &Path, _create: bool) -> Result<File> {
 const PROTECTED_FILE_SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)";
 
 #[cfg(windows)]
+const PROTECTED_DIRECTORY_SDDL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+#[cfg(windows)]
+fn write_protected_atomic_windows_with<F>(path: &Path, contents: &[u8], move_file: F) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    use std::io::Write;
+
+    if path.file_name().is_none() {
+        bail!("protected atomic destination has no file name");
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    // Keep the verified parent object open without FILE_SHARE_DELETE for the
+    // whole transaction. This prevents its pathname from being renamed or
+    // replaced between validation, temporary-file creation, and commit.
+    let directory = open_verified_atomic_parent(parent)?;
+    let mut temporary = create_protected_atomic_temporary(parent)?;
+    temporary
+        .file_mut()
+        .write_all(contents)
+        .with_context(|| format!("write protected atomic temporary for {}", path.display()))?;
+    temporary
+        .file()
+        .sync_all()
+        .with_context(|| format!("sync protected atomic temporary for {}", path.display()))?;
+
+    let move_result = move_file(temporary.path(), path);
+    match move_result {
+        Ok(()) => {
+            temporary.mark_moved();
+            drop(directory);
+            Ok(())
+        }
+        Err(move_error) => {
+            let cleanup = temporary.remove();
+            drop(directory);
+            match cleanup {
+                Ok(()) => Err(move_error).with_context(|| {
+                    format!("write-through commit protected atomic file {}", path.display())
+                }),
+                Err(cleanup_error) => Err(anyhow::anyhow!(
+                    "write-through commit protected atomic file {}: {}; remove protected atomic temporary after failed commit: {}",
+                    path.display(),
+                    move_error,
+                    cleanup_error
+                )),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_verified_atomic_parent(path: &Path) -> Result<File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+    };
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .access_mode(READ_CONTROL)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("open protected atomic parent {}", path.display()))?;
+    let metadata = directory
+        .metadata()
+        .context("inspect protected atomic parent handle")?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        bail!("protected atomic parent is not a non-reparse directory");
+    }
+    verify_current_user_owns_handle(directory.as_raw_handle() as _)?;
+    verify_protected_dacl_on_handle(
+        directory.as_raw_handle() as _,
+        PROTECTED_DIRECTORY_SDDL,
+        "atomic parent directory",
+    )?;
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn create_protected_atomic_temporary(parent: &Path) -> Result<ProtectedAtomicTemporary> {
+    use rand::{rngs::OsRng, RngCore};
+
+    for _ in 0..128 {
+        let mut random = [0_u8; 16];
+        OsRng
+            .try_fill_bytes(&mut random)
+            .context("generate protected atomic temporary name")?;
+        let path = parent.join(format!(
+            ".serctl-atomic-{:032x}.tmp",
+            u128::from_le_bytes(random)
+        ));
+        match create_new_protected_file(&path) {
+            Ok(file) => return Ok(ProtectedAtomicTemporary::new(path, file)),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create protected atomic temporary in {}", parent.display())
+                });
+            }
+        }
+    }
+    bail!("could not allocate a unique protected atomic temporary file")
+}
+
+#[cfg(windows)]
+fn move_file_write_through(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+struct ProtectedAtomicTemporary {
+    path: std::path::PathBuf,
+    file: Option<File>,
+    armed: bool,
+}
+
+#[cfg(windows)]
+impl ProtectedAtomicTemporary {
+    fn new(path: std::path::PathBuf, file: File) -> Self {
+        Self {
+            path,
+            file: Some(file),
+            armed: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn file(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("armed protected atomic temporary must retain its handle")
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file
+            .as_mut()
+            .expect("armed protected atomic temporary must retain its handle")
+    }
+
+    fn mark_moved(mut self) {
+        self.armed = false;
+        drop(self.file.take());
+    }
+
+    fn remove(mut self) -> std::io::Result<()> {
+        drop(self.file.take());
+        self.armed = false;
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProtectedAtomicTemporary {
+    fn drop(&mut self) {
+        if self.armed {
+            drop(self.file.take());
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(windows)]
 struct LocalSecurityDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
 
 #[cfg(windows)]
@@ -500,7 +740,7 @@ pub fn harden_directory(path: &Path) -> Result<()> {
     // DACL. SYSTEM and Administrators retain recovery access.
     apply_protected_dacl_to_handle(
         directory.as_raw_handle() as _,
-        "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+        PROTECTED_DIRECTORY_SDDL,
         "directory",
     )
 }
@@ -1023,6 +1263,56 @@ mod tests {
         }
 
         std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_atomic_write_propagates_injected_commit_failure_and_cleans_up() {
+        let directory = unique_test_directory("protected-atomic-injected-failure");
+        std::fs::create_dir_all(&directory).unwrap();
+        harden_directory(&directory).unwrap();
+        let path = directory.join("secret.json");
+        std::fs::write(&path, b"old secret").unwrap();
+
+        let error = write_protected_atomic_windows_with(&path, b"new secret", |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected write-through commit failure",
+            ))
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("injected write-through commit failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"old secret");
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            1,
+            "failed atomic commit left a credential-bearing temporary file"
+        );
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_atomic_write_through_move_succeeds_on_windows() {
+        let directory = unique_test_directory("protected-atomic-write-through");
+        std::fs::create_dir_all(&directory).unwrap();
+        harden_directory(&directory).unwrap();
+        let path = directory.join("secret.json");
+        std::fs::write(&path, b"old secret").unwrap();
+
+        write_protected_atomic(&path, b"new secret").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new secret");
+        let committed = open_existing_protected_file(&path).unwrap().unwrap();
+        validate_new_protected_file(&committed).unwrap();
+        drop(committed);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
 
