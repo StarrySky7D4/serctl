@@ -156,7 +156,7 @@
     <div class="meta-row">
       <span class="meta"><span class="dot"></span>当前 205/205，1 轮</span>
       <span class="meta">Audit：529 dependencies / 1198 advisories，通过</span>
-      <span class="meta">修补基线：<code>796b57def3b4-dirty</code></span>
+      <span class="meta">优化工作树：<code>6adbc13c87f8-dirty</code></span>
       <span class="meta">检查日期：2026-08-10</span>
       <span class="meta">Debug/Release：all targets/features 编译通过</span>
     </div>
@@ -198,7 +198,7 @@
         <div class="callout">
           <strong>结论：</strong>本轮已修补缺失 upload/download、IPC 断开误报成功、无界 exec/SFTP、客户端退出后远端任务不取消、直连上传外层 Future 取消后清理丢失、NamedPipe/UnixSocket 分裂、凭证与临时文件权限窗口、运行锁损坏恢复、UI 迟到结果和来源追踪等缺陷；最新修补还纠正了提升 Windows 令牌的 <code>TokenOwner</code> 识别及 mutation lease 的误导性“正在使用”包装。当前实现适合受信任单用户工作站上的 SSH 控制任务；它不是针对已取得同一 OS 用户或管理员权限攻击者的沙箱。
         </div>
-        <p><span class="badge good">验证完成</span> 当前修补树的 <code>fmt</code>、all-target/all-feature <code>check</code>、<code>clippy -D warnings</code>、205/205 完整测试一轮，以及 debug/release all-target/all-feature 编译均已通过；此前 203/203 连续三轮、build.rs 15 项 standalone 测试、依赖审计与来源字符串作为历史基线证据保留。<span class="badge caution">产物边界</span> 正在运行的旧 GUI 锁住标准 release 路径，本轮修补版 release 在隔离 target 输出中验证，未覆盖运行中二进制。</p>
+        <p><span class="badge good">验证完成</span> 安全修补基线的 <code>fmt</code>、all-target/all-feature <code>check</code>、<code>clippy -D warnings</code>、205/205 完整测试一轮，以及 debug/release all-target/all-feature 编译均已通过；此前 203/203 连续三轮、build.rs 15 项 standalone 测试、依赖审计与来源字符串作为历史基线证据保留。<span class="badge caution">产物边界</span> 本次体积优化已成功写出标准 <code>target/release/serctl.exe</code>，但版本是 <code>6adbc13c87f8-dirty</code>；其大小和摘要仅为 pre-commit 验证，最终提交后仍须重建。</p>
       </section>
 
       <section id="scope">
@@ -490,7 +490,7 @@ cargo audit --no-fetch
 cargo build --locked --offline --all-targets --all-features
 cargo build --release --locked --offline --all-targets --all-features
 target\debug\serctl.exe --version
-                               # 标准 release 被运行中旧 GUI 锁定时使用隔离 target 输出</code></pre>
+                               # 优化提交后重建标准 release 并复核 clean 版本/哈希</code></pre>
         <div class="grid three">
           <div class="card"><div class="kpi">205/205</div><div class="label">当前修补树 all-targets/all-features；本轮 1 次</div></div>
           <div class="card"><div class="kpi">529</div><div class="label">cargo-audit 扫描 crate dependencies</div></div>
@@ -529,7 +529,7 @@ target\debug\serctl.exe --version
           <li><a href="https://rustsec.org/advisories/RUSTSEC-2023-0071.html">RUSTSEC-2023-0071</a> 的 <code>rsa</code> 仍没有 patched release，但本项目已从依赖图移除该 package；<a href="https://rustsec.org/advisories/RUSTSEC-2026-0192.html">RUSTSEC-2026-0192</a> 标记 <code>ttf-parser</code> unmaintained，本项目也已移除该 package。</li>
           <li><code>argon2</code> 的 <code>zeroize</code> feature 已确认；锁定依赖图不含 <code>rsa</code> 与 <code>ttf-parser</code>。build.rs standalone 测试 15/15。</li>
           <li>此前提交前审计 debug <code>--version</code> 为 <code>serctl 0.1.0 (git bcfa616f2a39-dirty)</code>，连续第二次 locked/offline debug 构建为 <code>Fresh serctl</code>；这是历史来源追踪证据，不代表当前所有者修补树的最终提交身份。</li>
-          <li>当前所有者修补树的 debug/release、all-target/all-feature 编译均通过。标准 <code>target/release/serctl.exe</code> 被正在运行的旧 GUI 锁定，本轮没有覆盖它；修补版 release 在隔离 target 输出中完成编译验证。正式制品仍须在旧 GUI 停止后从 clean commit 重建、核对版本并记录 SHA-256。</li>
+          <li>安全修补基线的 debug/release、all-target/all-feature 编译均通过。本次体积优化已在标准路径生成 <code>target/release/serctl.exe</code>；版本 <code>6adbc13c87f8-dirty</code> 说明优化修改尚未提交，所以当前大小与摘要属于 pre-commit 验证，正式制品仍须在优化提交后重建、核对 clean 版本并记录新的 SHA-256。</li>
         </ul>
       </section>
 
@@ -618,10 +618,30 @@ target\debug\serctl.exe --version
       <section id="release">
         <h2>16. 构建、发布与来源追踪</h2>
         <div class="grid three">
-          <div class="card"><h3>修补基线</h3><p><code>796b57def3b4</code> + dirty</p><p class="small">当前所有者/租约修补工作树以该提交为基线；最终身份以修补提交与交付报告为准。</p></div>
+          <div class="card"><h3>优化工作树</h3><p><code>6adbc13c87f8-dirty</code></p><p class="small">体积优化修改尚未提交；最终身份以优化提交后的 clean 重建为准。</p></div>
           <div class="card"><h3>Debug 证据</h3><p><strong>all targets/features 通过</strong></p><p class="small">当前修补树完成完整 debug 编译；此前 Fresh/版本字符串证据另作历史基线。</p></div>
-          <div class="card"><h3>Release 证据</h3><p><strong>all targets/features 通过</strong></p><p class="small">修补版在隔离 target 输出中完成；标准路径仍被运行中旧 GUI 锁定。</p></div>
+          <div class="card"><h3>标准 Release</h3><p><strong>10,723,840 B</strong></p><p class="small">标准路径构建成功；当前为 pre-commit 验证产物。</p></div>
         </div>
+        <h3>Release 体积优化</h3>
+        <p>正式 Release 采用体积优先且保持可移植性的 profile：</p>
+        <pre><code>[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"</code></pre>
+        <p><code>opt-level = "s"</code>、fat LTO、单 codegen unit 与符号剥离共同压缩交付文件。<code>panic = "unwind"</code> 是有意保留的安全语义：终端 raw mode 恢复、敏感缓冲清零和已创建 partial 的回滚都依赖 unwind 时执行 <code>Drop</code>，所以不以 <code>panic = "abort"</code> 换取更小体积。构建不使用 UPX，避免引入运行时解包、恶意软件误报、代码签名/扫描和故障定位方面的额外发布变量；也不使用 <code>target-cpu=native</code>，确保同一 Windows 架构内的 Release 不绑定构建机 CPU 指令集。</p>
+        <p>依赖侧把 Tokio 的 <code>full</code> feature 收窄为实际使用的 <code>fs</code>、<code>io-std</code>、<code>io-util</code>、<code>macros</code>、<code>net</code>、<code>rt-multi-thread</code>、<code>signal</code>、<code>sync</code>、<code>time</code>，并移除已不再需要的 <code>async-trait</code> 直接依赖及锁定包，避免为未使用能力保留依赖和编译输入。</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Release 候选</th><th>文件大小</th><th>相对原基线</th></tr></thead>
+          <tbody>
+            <tr><td>原标准 Release 基线</td><td>17,074,688 B</td><td>—</td></tr>
+            <tr><td><code>opt-level=3</code> + fat LTO 候选</td><td>13,895,680 B</td><td>-18.6%</td></tr>
+            <tr><td>选定的 <code>opt-level=s</code> profile</td><td>10,734,080 B</td><td><strong>-37.1%</strong></td></tr>
+          </tbody>
+        </table></div>
+        <p>三次 <code>add</code> 的 Argon2 路径测量中，<code>opt-level=s</code> 平均约 215 ms，<code>opt-level=3</code> + fat LTO 平均约 200 ms，差约 7.5%。样本仅有三次，且 Argon2 本身刻意消耗时间和内存，因此这只是取舍信号，不是通用吞吐基准；当前选择以减少约 6.34 MB 分发体积为优先。上述 A/B 数据用于选择 profile，不替代最终 clean commit 的版本与 SHA-256 记录。</p>
+        <div class="callout warn"><strong>标准路径 pre-commit 产物：</strong><code>target/release/serctl.exe</code> 已构建成功，大小为 <strong>10,723,840 B</strong>，SHA-256 为 <code>68F571F7FDAD09986C8E5E6E23F8AE229B8E0043654298F3C349A0B99490F601</code>。单独留存的 <code>target/release/serctl.pdb</code> 为 <strong>2,748,416 B</strong>，不计入分发 EXE。当前版本是 <code>serctl 0.1.0 (git 6adbc13c87f8-dirty)</code>；这明确是优化修改尚未提交时的验证哈希，不是最终 clean artifact。优化提交后必须重建并重新记录版本、大小与 SHA-256。</div>
         <p><a href="../build.rs"><code>build.rs</code></a> 移除所有可重定向 repository/work-tree/index/object/config/replace refs 的继承 Git 环境，禁用 system/global config，只从 manifest 祖先的文件系统发现真实 <code>.git</code>；Windows 去除 <code>\\?\</code> 前缀，canonical root 必须包含 manifest。查询固定 <code>--work-tree</code>，设置 <code>GIT_NO_REPLACE_OBJECTS=1</code>，关闭 fsmonitor/untracked cache。它解析 index stage-0 的 mode/OID/path，并用 <code>git hash-object --no-filters</code> 计算原始工作树 blob OID，使 clean/smudge filter 不能掩盖变更；任何关键查询失败都 fail-dirty。</p>
         <ul>
           <li>监听 <code>build.rs</code>、tracked 文件、Git HEAD/index/packed-refs/symbolic ref、config/config.worktree、<code>info/exclude</code> 与 <code>info/attributes</code>；mode <code>160000</code> gitlink 直接 fail-dirty，不把 submodule 当普通 blob 跳过。</li>
@@ -632,8 +652,8 @@ target\debug\serctl.exe --version
           <li>所有已知会影响二进制的根级文件 <code>Cargo.toml</code>、<code>Cargo.lock</code>、<code>build.rs</code> 已 tracked/watched；正式 release 仍须以 clean status 做门禁。</li>
           <li>此前审计工作树连续第二次 debug build 报 <code>Fresh serctl</code>，说明 watcher 没有因 Git 查询或 target 输出形成永久重建循环；该证据不冒充当前 dirty 修补树的最终来源身份。</li>
         </ul>
-        <div class="callout warn"><strong>本轮 release 边界：</strong>修补版 release 已完成 all-target/all-feature 编译验证，但正在运行的旧 GUI 锁住标准 <code>target/release/serctl.exe</code>，所以验证使用隔离 target 输出且未覆盖标准路径。该隔离构建证明可编译性，不替代 clean commit 的正式制品流程。下列命令应在旧 GUI 停止后执行。</div>
-        <pre><code># 仅在现有 release 程序已停止、工作树 clean、准备正式发布时执行
+        <div class="callout warn"><strong>本轮 release 边界：</strong>标准路径的优化 EXE 已成功生成，但其 <code>-dirty</code> 来源身份与 pre-commit SHA-256 不能替代 clean commit 的正式制品流程。下列命令应在优化修改提交、工作树 clean 后重新执行；重建所得哈希才可作为最终交付记录。</div>
+        <pre><code># 仅在优化修改已提交、工作树 clean、准备正式发布时执行
 cargo build --release --locked --offline --all-targets --all-features
 target\release\serctl.exe --version
 Get-FileHash target\release\serctl.exe -Algorithm SHA256</code></pre>

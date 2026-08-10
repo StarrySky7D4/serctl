@@ -143,7 +143,7 @@ daemon download 把下游断开/背压识别为 `IpcResponseWriteFailure`：一�
 
 ## 构建与验证
 
-当前修补树完成 debug 与 release 的 all-target/all-feature 编译验证。正在运行的旧 GUI 锁住标准 `target\release\serctl.exe`，所以本轮修补版 release 使用隔离的 target 输出完成验证，没有覆盖该运行中产物：
+安全修补基线已有 debug 与 release 的 all-target/all-feature 编译证据。本次体积优化已成功写出标准路径 `target\release\serctl.exe`；优化修改尚未提交，下面单列其 pre-commit 产物身份，最终交付仍须在提交后重建和复核：
 
 ```powershell
 cargo fmt -- --check
@@ -156,6 +156,35 @@ cargo build --release --locked --offline --all-targets --all-features
 target\debug\serctl.exe --version
 ```
 
+### Release 体积策略
+
+正式 Release 使用以下可移植、体积优先配置：
+
+```toml
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"
+```
+
+`opt-level = "s"`、fat LTO、单 codegen unit 与符号剥离共同压缩交付文件。`panic = "unwind"` 是有意保留的安全语义：终端 raw mode 恢复、敏感缓冲清零和已创建 partial 的回滚都依赖 unwind 时执行 `Drop`；不以 `panic = "abort"` 换取更小体积。构建也不使用 UPX，避免引入运行时解包、恶意软件误报、代码签名/扫描和故障定位方面的额外发布变量；不使用 `target-cpu=native`，确保同一 Windows 架构内的 Release 不绑定构建机 CPU 指令集。
+
+依赖侧把 Tokio 的 `full` feature 收窄为实际使用的 `fs`、`io-std`、`io-util`、`macros`、`net`、`rt-multi-thread`、`signal`、`sync`、`time`，并移除已不再需要的 `async-trait` 直接依赖及锁定包，避免为未使用能力保留依赖和编译输入。
+
+同一优化轮次的 A/B 数据如下；它们用于选择 profile，不替代最终 clean commit 的版本与 SHA-256 记录：
+
+| Release 候选 | 文件大小 | 相对原基线 |
+| --- | ---: | ---: |
+| 原标准 Release 基线 | 17,074,688 B | — |
+| `opt-level=3` + fat LTO 候选 | 13,895,680 B | -18.6% |
+| 选定的 `opt-level=s` profile | 10,734,080 B | **-37.1%** |
+
+三次 `add` 的 Argon2 路径测量中，`opt-level=s` 平均约 215 ms，`opt-level=3` + fat LTO 平均约 200 ms，差约 7.5%。样本仅有三次，且 Argon2 本身刻意消耗时间和内存，因此这只是取舍信号，不是通用吞吐基准；当前选择以减少约 6.34 MB 分发体积为优先。
+
+本次标准路径的优化 Release 已构建成功：`target\release\serctl.exe` 为 **10,723,840 B**，SHA-256 为 `68F571F7FDAD09986C8E5E6E23F8AE229B8E0043654298F3C349A0B99490F601`。`target\release\serctl.pdb` 为 **2,748,416 B**，作为独立调试符号留存，不计入分发 EXE 的体积。该构建的版本为 `serctl 0.1.0 (git 6adbc13c87f8-dirty)`：`dirty` 明确表明体积优化修改尚未提交，因此上述摘要是 **pre-commit 验证哈希**，不是最终 clean artifact；优化提交完成后必须重建并重新记录版本、大小和 SHA-256。
+
 本轮最终证据：
 
 - `fmt`、所有 target/feature 的 `check` 与严格 `clippy -D warnings` 通过；
@@ -165,7 +194,7 @@ target\debug\serctl.exe --version
 - `cargo audit --no-fetch` 使用本机已有 RustSec 数据库快照扫描 **529 crate dependencies / 1198 advisories** 并通过；`--no-fetch` 证据不声称该离线快照包含检查时刻之后的上游更新；
 - `argon2` 的 `zeroize` feature 已确认；`rsa` 与 `ttf-parser` 均不在锁定依赖图中；
 - 先前提交前审计 debug 版本为 `serctl 0.1.0 (git bcfa616f2a39-dirty)`，无变化的第二次构建显示 `Fresh serctl`；这是历史来源追踪证据，不代表当前所有者修补树的最终提交身份；
-- 当前所有者修补树已完成 debug/release、all-target/all-feature 编译。标准 `target\release\serctl.exe` 因旧 GUI 正在运行而未被本轮覆盖；修补版 release 在隔离 target 输出中编译验证，因此标准路径中的运行中二进制不代表这些修补。正式交付仍应在停掉旧 GUI 后从 clean commit 重建并记录哈希。
+- 当前标准路径已成功生成上述体积优化 Release；由于版本仍为 `6adbc13c87f8-dirty`，它只证明 pre-commit 优化树可生成该产物，不冒充最终 clean 制品。正式交付须在优化提交后重建并记录新的版本、EXE 大小与 SHA-256；PDB 继续单独留存且不计入分发 EXE。
 
 `build.rs` 将 12 位 Git commit 和 dirty 状态写入版本字符串。它先移除所有可重定向 repository/work-tree/index/object/config/replace refs 的继承 Git 环境，禁用 system/global config，只从 manifest 祖先的文件系统发现真实 `.git`；规范根必须包含 manifest，并以固定 `--work-tree`、`GIT_NO_REPLACE_OBJECTS=1`、关闭 fsmonitor/untracked cache 的 Git 查询证明来源。脚本解析 index 的 stage-0 mode/OID/path，并用 `git hash-object --no-filters` 计算工作树原始 blob OID，避免 clean/smudge filter 隐藏源码改动；mode `160000` gitlink 直接 fail-dirty。它监听 `.git/info/attributes` 以及 HEAD/index/ref/config/info/exclude 等元数据，`assume-unchanged` / `skip-worktree` 也强制 dirty；Git fixture 不可用会明确失败测试而非静默跳过。仓库通过 `.gitattributes` 的 `* text=auto eol=lf` 固定文本策略，并以 `core.autocrlf=true` clean checkout fixture 验证不会假 dirty。查询失败同样 fail-dirty。仓库根不作为 watcher，所以新根级 untracked 文件可能需其他受监听输入变化才触发重算；ignored/外部/动态构建输入仍是披露边界。正式 release 必须从 clean checkout 构建并记录 commit、lockfile、工具链、SHA-256 与签名。
 
