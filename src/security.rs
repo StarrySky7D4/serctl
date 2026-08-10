@@ -792,14 +792,30 @@ pub fn harden_open_file(file: &File) -> Result<()> {
 }
 
 #[cfg(windows)]
+fn owner_matches_token_sids(
+    object_owner: windows_sys::Win32::Security::PSID,
+    token_user: windows_sys::Win32::Security::PSID,
+    token_default_owner: windows_sys::Win32::Security::PSID,
+) -> bool {
+    use windows_sys::Win32::Security::EqualSid;
+
+    if object_owner.is_null() {
+        return false;
+    }
+    (!token_user.is_null() && unsafe { EqualSid(object_owner, token_user) } != 0)
+        || (!token_default_owner.is_null()
+            && unsafe { EqualSid(object_owner, token_default_owner) } != 0)
+}
+
+#[cfg(windows)]
 fn verify_current_user_owns_handle(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<()> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        EqualSid, GetTokenInformation, TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, TokenOwner, TokenUser, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -864,8 +880,47 @@ fn verify_current_user_owns_handle(handle: windows_sys::Win32::Foundation::HANDL
             return Err(std::io::Error::last_os_error()).context("read current process user SID");
         }
         let token_user = unsafe { &*(token_buffer.as_ptr().cast::<TOKEN_USER>()) };
-        if token_user.User.Sid.is_null() || unsafe { EqualSid(owner, token_user.User.Sid) } == 0 {
-            bail!("protected object is not owned by the current user");
+        if owner_matches_token_sids(owner, token_user.User.Sid, null_mut()) {
+            return Ok(());
+        }
+
+        // Elevated Windows tokens commonly use BUILTIN\Administrators as
+        // their default owner even though TokenUser remains the individual
+        // account SID. Objects created by this exact token therefore need to
+        // be accepted when their owner matches TokenOwner. This does not
+        // broaden the administrator trust boundary: protected DACLs already
+        // grant BUILTIN\Administrators and SYSTEM explicit recovery access.
+        let mut owner_required = 0_u32;
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle() as _,
+                TokenOwner,
+                null_mut(),
+                0,
+                &mut owner_required,
+            );
+        }
+        if owner_required < std::mem::size_of::<TOKEN_OWNER>() as u32 {
+            bail!("current process token did not expose a default owner SID");
+        }
+        let owner_word_count = (owner_required as usize).div_ceil(word_size);
+        let mut owner_buffer = vec![0_usize; owner_word_count];
+        let owner_read = unsafe {
+            GetTokenInformation(
+                token.as_raw_handle() as _,
+                TokenOwner,
+                owner_buffer.as_mut_ptr().cast(),
+                owner_required,
+                &mut owner_required,
+            )
+        };
+        if owner_read == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("read current process default owner SID");
+        }
+        let token_owner = unsafe { &*(owner_buffer.as_ptr().cast::<TOKEN_OWNER>()) };
+        if !owner_matches_token_sids(owner, token_user.User.Sid, token_owner.Owner) {
+            bail!("protected object is not owned by the current user or token owner");
         }
         Ok(())
     })();
@@ -1029,6 +1084,47 @@ mod tests {
             .unwrap()
             .join("target")
             .join(format!("{prefix}-{}-{unique}", std::process::id()))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_check_accepts_user_or_token_default_owner_only() {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+
+        struct LocalSid(windows_sys::Win32::Security::PSID);
+        impl Drop for LocalSid {
+            fn drop(&mut self) {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+        fn sid(value: &str) -> LocalSid {
+            let wide = value.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+            let mut parsed = null_mut();
+            let converted = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut parsed) };
+            assert_ne!(converted, 0, "failed to parse test SID {value}");
+            assert!(!parsed.is_null());
+            LocalSid(parsed)
+        }
+
+        let user = sid("S-1-5-18");
+        let default_owner = sid("S-1-5-32-544");
+        let unrelated = sid("S-1-5-19");
+
+        assert!(owner_matches_token_sids(user.0, user.0, default_owner.0));
+        assert!(owner_matches_token_sids(
+            default_owner.0,
+            user.0,
+            default_owner.0
+        ));
+        assert!(!owner_matches_token_sids(
+            unrelated.0,
+            user.0,
+            default_owner.0
+        ));
     }
 
     #[test]

@@ -311,11 +311,28 @@ pub fn acquire_profile_use_lease(profile: &str) -> Result<File> {
 }
 
 fn acquire_profile_mutation_lease(profile: &str) -> Result<File> {
-    acquire_runtime_lease(profile).with_context(|| {
-        format!(
+    acquire_profile_mutation_lease_with(
+        profile,
+        || open_runtime_lease_file(profile),
+        FileExt::try_lock_exclusive,
+    )
+}
+
+fn acquire_profile_mutation_lease_with<T>(
+    profile: &str,
+    open: impl FnOnce() -> Result<T>,
+    try_lock_exclusive: impl FnOnce(&T) -> std::io::Result<()>,
+) -> Result<T> {
+    let lease = open().with_context(|| format!("open mutation lease for profile '{profile}'"))?;
+    match try_lock_exclusive(&lease) {
+        Ok(()) => Ok(lease),
+        Err(error) if is_lock_contention(&error) => bail!(
             "cannot modify profile '{profile}' while it is in use by a direct operation or daemon"
-        )
-    })
+        ),
+        Err(error) => {
+            Err(error).with_context(|| format!("acquire mutation lease for profile '{profile}'"))
+        }
+    }
 }
 
 fn acquire_rename_leases(old_name: &str, new_name: &str) -> Result<(File, File)> {
@@ -1971,6 +1988,29 @@ mod tests {
         assert!(unlock_error
             .to_string()
             .contains("release daemon runtime-lease liveness probe"));
+    }
+
+    #[test]
+    fn mutation_lease_reports_contention_without_mislabeling_open_errors() {
+        let contention = acquire_profile_mutation_lease_with(
+            "busy",
+            || Ok(()),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        )
+        .unwrap_err();
+        assert!(contention
+            .to_string()
+            .contains("while it is in use by a direct operation or daemon"));
+
+        let open_error = acquire_profile_mutation_lease_with::<()>(
+            "unreadable",
+            || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        let open_chain = format!("{open_error:#}");
+        assert!(open_chain.contains("open mutation lease for profile 'unreadable'"));
+        assert!(!open_chain.contains("while it is in use"));
     }
 
     #[test]
