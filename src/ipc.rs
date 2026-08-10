@@ -1,13 +1,27 @@
 //! Authenticated local IPC with one framing protocol over Windows named pipes
 //! or Unix domain sockets.
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use hmac::{Hmac, Mac};
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::ssh::RemoteEntry;
 
-const MAX_FRAME: usize = 64 * 1024 * 1024;
+pub const IPC_PROTOCOL_VERSION: u16 = 2;
+#[cfg(test)]
+pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 pub const MAX_AUTH_FRAME: usize = 4 * 1024;
+pub const MAX_CONTROL_FRAME: usize = 16 * 1024;
+pub const MAX_REQUEST_FRAME: usize = 512 * 1024;
+pub const MAX_UPLOAD_FRAME: usize = 128 * 1024;
+pub const MAX_SHELL_FRAME: usize = 128 * 1024;
+pub const MAX_RESPONSE_FRAME: usize = 16 * 1024 * 1024;
 pub const MAX_COMMAND_OUTPUT: usize = 8 * 1024 * 1024;
 pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 pub const MAX_EXEC_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
@@ -22,12 +36,125 @@ fn default_sftp_timeout_ms() -> u64 {
     DEFAULT_SFTP_TIMEOUT_MS
 }
 
-fn endpoint_id(profile: &str, token: &str) -> String {
-    use sha2::{Digest, Sha256};
+const ENDPOINT_DOMAIN: &[u8] = b"serctl/ipc/endpoint/v2\0";
+const SERVER_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/server/v2\0";
+const CLIENT_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/client/v2\0";
+
+/// Encode binary frame fields once as canonical Base64 instead of serde's
+/// default integer arrays. Besides shrinking the wire representation, this
+/// makes the byte-based frame limits meaningful for arbitrary binary data.
+mod base64_bytes {
+    use super::B64;
+    use base64::Engine;
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+    use zeroize::{Zeroize, Zeroizing};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded = Zeroizing::new(B64.encode(bytes));
+        serializer.serialize_str(&encoded)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = Zeroizing::new(String::deserialize(deserializer)?);
+        let mut decoded = B64.decode(encoded.as_bytes()).map_err(D::Error::custom)?;
+        let canonical = Zeroizing::new(B64.encode(decoded.as_slice()));
+        if canonical.as_bytes() != encoded.as_bytes() {
+            decoded.zeroize();
+            return Err(D::Error::custom(
+                "binary frame payload must use canonical padded Base64",
+            ));
+        }
+        Ok(decoded)
+    }
+}
+
+fn endpoint_id(profile: &str, token: &str) -> Result<String> {
+    crate::vault::validate_profile_name(profile)?;
+    let token = decode_base64_32("IPC token", token)?;
+    Ok(endpoint_id_with_token(profile, &token))
+}
+
+fn endpoint_id_with_token(profile: &str, token: &[u8; 32]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(ENDPOINT_DOMAIN);
+    digest.update(IPC_PROTOCOL_VERSION.to_be_bytes());
+    digest.update((profile.len() as u32).to_be_bytes());
+    digest.update(profile.as_bytes());
+    digest.update(token);
     // 128 bits keeps the platform endpoint compact (Unix socket paths have a
-    // small OS-defined limit) while the full 256-bit capability is still
-    // required by the framing protocol.
-    hex::encode(Sha256::digest(format!("{profile}\0{token}").as_bytes()))[..32].to_owned()
+    // small OS-defined limit). Authentication still requires the full
+    // 256-bit capability and never sends it on the wire.
+    hex::encode(digest.finalize())[..32].to_owned()
+}
+
+#[cfg(windows)]
+pub fn expected_endpoint(profile: &str, token: &str) -> Result<String> {
+    let id = endpoint_id(profile, token)?;
+    Ok(format!(r"\\.\pipe\serctl-v2-{id}"))
+}
+
+#[cfg(unix)]
+pub fn expected_endpoint(profile: &str, token: &str) -> Result<String> {
+    let runtime_dir = crate::vault::run_dir()?;
+    expected_endpoint_in_runtime_dir(profile, token, &runtime_dir)
+}
+
+/// Derive an endpoint without touching directory metadata. Callers must pass a
+/// runtime directory they already validated through `vault::run_dir`; this is
+/// used by stale-lock cleanup to keep filesystem-security failures distinct
+/// from malformed v2 lock contents.
+#[cfg(unix)]
+pub(crate) fn expected_endpoint_in_runtime_dir(
+    profile: &str,
+    token: &str,
+    runtime_dir: &std::path::Path,
+) -> Result<String> {
+    let id = endpoint_id(profile, token)?;
+    let path = runtime_dir.join(format!("serctl-v2-{id}.sock"));
+    path.to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("serctl runtime path is not valid UTF-8"))
+}
+
+#[cfg(windows)]
+pub(crate) fn expected_endpoint_in_runtime_dir(
+    profile: &str,
+    token: &str,
+    _runtime_dir: &std::path::Path,
+) -> Result<String> {
+    expected_endpoint(profile, token)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn expected_endpoint_in_runtime_dir(
+    _profile: &str,
+    _token: &str,
+    _runtime_dir: &std::path::Path,
+) -> Result<String> {
+    bail!("local IPC endpoints are unsupported on this platform")
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn expected_endpoint(_profile: &str, _token: &str) -> Result<String> {
+    bail!("local IPC endpoints are unsupported on this platform")
+}
+
+pub fn validate_endpoint(profile: &str, token: &str, endpoint: &str) -> Result<()> {
+    let expected = expected_endpoint(profile, token)?;
+    validate_endpoint_bytes(&expected, endpoint)
+}
+
+fn validate_endpoint_bytes(expected: &str, endpoint: &str) -> Result<()> {
+    if endpoint.as_bytes() != expected.as_bytes() {
+        bail!("runtime lock contains an unexpected local IPC endpoint");
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -50,14 +177,8 @@ pub struct LocalListener {
 #[cfg(windows)]
 impl LocalListener {
     pub fn bind(profile: &str, token: &str) -> Result<Self> {
-        use tokio::net::windows::named_pipe::ServerOptions;
-
-        let endpoint = format!(r"\\.\pipe\serctl-{}", endpoint_id(profile, token));
-        let pending = ServerOptions::new()
-            .first_pipe_instance(true)
-            .reject_remote_clients(true)
-            .create(&endpoint)
-            .with_context(|| format!("create named pipe {endpoint}"))?;
+        let endpoint = expected_endpoint(profile, token)?;
+        let pending = create_named_pipe_instance(&endpoint, true)?;
         Ok(Self { endpoint, pending })
     }
 
@@ -66,24 +187,89 @@ impl LocalListener {
     }
 
     pub async fn accept(&mut self) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-        use tokio::net::windows::named_pipe::ServerOptions;
-
         self.pending.connect().await?;
-        let next = ServerOptions::new()
-            .reject_remote_clients(true)
-            .create(&self.endpoint)
-            .with_context(|| format!("create next named pipe instance {}", self.endpoint))?;
+        let next = create_named_pipe_instance(&self.endpoint, false)?;
         Ok(std::mem::replace(&mut self.pending, next))
     }
+}
+
+#[cfg(windows)]
+const PIPE_SECURITY_SDDL: &str = "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)";
+
+#[cfg(windows)]
+struct LocalSecurityDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(windows)]
+impl LocalSecurityDescriptor {
+    fn owner_only_pipe() -> Result<Self> {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+
+        let wide = PIPE_SECURITY_SDDL
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let mut descriptor = null_mut();
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        };
+        if converted == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("create named-pipe security descriptor");
+        }
+        Ok(Self(descriptor))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_named_pipe_instance(
+    endpoint: &str,
+    first: bool,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use std::ffi::c_void;
+    use tokio::net::windows::named_pipe::ServerOptions;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+
+    let descriptor = LocalSecurityDescriptor::owner_only_pipe()?;
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let mut options = ServerOptions::new();
+    options
+        .first_pipe_instance(first)
+        .reject_remote_clients(true);
+    let pipe = unsafe {
+        options.create_with_security_attributes_raw(
+            endpoint,
+            (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+        )
+    }
+    .with_context(|| format!("create named pipe {endpoint}"))?;
+    Ok(pipe)
 }
 
 #[cfg(unix)]
 impl LocalListener {
     pub fn bind(profile: &str, token: &str) -> Result<Self> {
-        let endpoint = crate::vault::run_dir()?
-            .join(format!("{}.sock", endpoint_id(profile, token)))
-            .to_string_lossy()
-            .into_owned();
+        let endpoint = expected_endpoint(profile, token)?;
         let path = std::path::Path::new(&endpoint);
         match std::fs::remove_file(path) {
             Ok(()) => {}
@@ -141,6 +327,42 @@ pub async fn connect(endpoint: &str) -> Result<ClientStream> {
         .with_context(|| format!("connect Unix socket {endpoint}"))
 }
 
+/// Validate that a connected client stream terminates at the daemon recorded
+/// in the protected runtime lock. This is an identity cross-check in addition
+/// to the cryptographic handshake, not a replacement for it.
+#[cfg(windows)]
+pub fn validate_server_identity(stream: &ClientStream, expected_pid: u32) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+    let mut actual_pid = 0_u32;
+    let ok = unsafe { GetNamedPipeServerProcessId(stream.as_raw_handle() as _, &mut actual_pid) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("query named-pipe server process");
+    }
+    if actual_pid == 0 || actual_pid != expected_pid {
+        bail!("named-pipe server PID does not match the protected runtime lock");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn validate_server_identity(stream: &ClientStream, expected_pid: u32) -> Result<()> {
+    let credentials = stream
+        .peer_cred()
+        .context("query Unix-socket peer credentials")?;
+    let effective_uid = unsafe { libc::geteuid() };
+    if credentials.uid() != effective_uid {
+        bail!("Unix-socket peer is not owned by the current user");
+    }
+    if let Some(actual_pid) = credentials.pid() {
+        if actual_pid <= 0 || actual_pid as u32 != expected_pid {
+            bail!("Unix-socket peer PID does not match the protected runtime lock");
+        }
+    }
+    Ok(())
+}
+
 pub fn endpoint_kind() -> &'static str {
     #[cfg(windows)]
     return "named-pipe";
@@ -154,8 +376,12 @@ pub fn endpoint_kind() -> &'static str {
 #[serde(tag = "t", content = "d")]
 pub enum Frame {
     // client -> daemon
-    Authenticate {
-        token: String,
+    AuthHello {
+        version: u16,
+        client_nonce: String,
+    },
+    AuthResponse {
+        client_proof: String,
     },
     Exec {
         cmd: String,
@@ -167,6 +393,7 @@ pub enum Frame {
         rows: u32,
     },
     ShellInput {
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     Status,
@@ -193,20 +420,29 @@ pub enum Frame {
         timeout_ms: u64,
     },
     UploadChunk {
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     UploadEnd,
     // daemon -> client
+    AuthChallenge {
+        version: u16,
+        server_nonce: String,
+        server_proof: String,
+    },
     ExecOut {
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     ExecErr {
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     ExecExit {
         code: Option<i32>,
     },
     ShellOut {
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     ShellClosed,
@@ -222,6 +458,7 @@ pub enum Frame {
         entries: Vec<RemoteEntry>,
     },
     FileChunk {
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     TransferDone {
@@ -232,37 +469,484 @@ pub enum Frame {
     },
 }
 
-pub async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, f: &Frame) -> Result<()> {
-    let json = serde_json::to_vec(f)?;
-    if json.len() > MAX_FRAME {
-        bail!("frame too large: {} bytes", json.len());
+impl Frame {
+    /// Erase every owned string or byte payload carried by this frame. Frame
+    /// deliberately does not implement Drop because client and daemon handlers
+    /// move fields out while dispatching; callers can use this method in
+    /// rejected, cancelled, or otherwise unexpected-frame branches.
+    pub fn zeroize_sensitive(&mut self) {
+        self.zeroize();
     }
-    let len = (json.len() as u32).to_be_bytes();
+}
+
+impl Zeroize for Frame {
+    fn zeroize(&mut self) {
+        match self {
+            Frame::AuthHello { client_nonce, .. } => client_nonce.zeroize(),
+            Frame::AuthResponse { client_proof } => client_proof.zeroize(),
+            Frame::Exec { cmd, .. } => cmd.zeroize(),
+            Frame::ShellInput { data }
+            | Frame::UploadChunk { data }
+            | Frame::ExecOut { data }
+            | Frame::ExecErr { data }
+            | Frame::ShellOut { data }
+            | Frame::FileChunk { data } => data.zeroize(),
+            Frame::ListDir { path, .. }
+            | Frame::CreateDir { path, .. }
+            | Frame::Download { path, .. }
+            | Frame::UploadBegin { path, .. } => path.zeroize(),
+            Frame::AuthChallenge {
+                server_nonce,
+                server_proof,
+                ..
+            } => {
+                server_nonce.zeroize();
+                server_proof.zeroize();
+            }
+            Frame::StatusInfo {
+                profile,
+                host,
+                user,
+                ..
+            } => {
+                profile.zeroize();
+                host.zeroize();
+                user.zeroize();
+            }
+            Frame::DirList { path, entries } => {
+                path.zeroize();
+                for entry in entries.iter_mut() {
+                    entry.name.zeroize();
+                    entry.path.zeroize();
+                }
+                entries.clear();
+            }
+            Frame::Error { msg } => msg.zeroize(),
+            Frame::Shell { .. }
+            | Frame::Status
+            | Frame::Shutdown
+            | Frame::UploadEnd
+            | Frame::ExecExit { .. }
+            | Frame::ShellClosed
+            | Frame::Ack
+            | Frame::TransferDone { .. } => {}
+        }
+    }
+}
+
+/// Authentication never returns a Frame to a business dispatcher, so it can
+/// use a local RAII guard without preventing those dispatchers from moving
+/// fields out of ordinary Frames. This covers authentication errors, timeout,
+/// and future cancellation while a sensitive frame is still in scope.
+struct ZeroizingAuthFrame(Frame);
+
+impl Drop for ZeroizingAuthFrame {
+    fn drop(&mut self) {
+        self.0.zeroize_sensitive();
+    }
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn decode_base64_32(label: &str, encoded: &str) -> Result<Zeroizing<[u8; 32]>> {
+    let decoded = Zeroizing::new(
+        B64.decode(encoded)
+            .with_context(|| format!("decode {label}"))?,
+    );
+    if decoded.len() != 32 {
+        bail!("{label} must contain exactly 32 bytes");
+    }
+    let mut value = Zeroizing::new([0_u8; 32]);
+    value.copy_from_slice(&decoded);
+    let canonical = Zeroizing::new(B64.encode(value.as_ref()));
+    if canonical.as_bytes() != encoded.as_bytes() {
+        bail!("{label} must use canonical padded Base64");
+    }
+    Ok(value)
+}
+
+fn random_nonce() -> Zeroizing<[u8; 32]> {
+    let mut nonce = Zeroizing::new([0_u8; 32]);
+    OsRng.fill_bytes(&mut *nonce);
+    nonce
+}
+
+fn proof_mac(
+    token: &[u8; 32],
+    domain: &[u8],
+    version: u16,
+    profile: &str,
+    endpoint_id: &str,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> Result<HmacSha256> {
+    let mut mac = HmacSha256::new_from_slice(token)
+        .map_err(|_| anyhow::anyhow!("invalid IPC authentication key"))?;
+    mac.update(domain);
+    mac.update(&version.to_be_bytes());
+    mac.update(&(profile.len() as u32).to_be_bytes());
+    mac.update(profile.as_bytes());
+    mac.update(&(endpoint_id.len() as u32).to_be_bytes());
+    mac.update(endpoint_id.as_bytes());
+    mac.update(client_nonce);
+    mac.update(server_nonce);
+    Ok(mac)
+}
+
+fn encoded_proof(
+    token: &[u8; 32],
+    domain: &[u8],
+    version: u16,
+    profile: &str,
+    endpoint_id: &str,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> Result<String> {
+    let proof = proof_mac(
+        token,
+        domain,
+        version,
+        profile,
+        endpoint_id,
+        client_nonce,
+        server_nonce,
+    )?
+    .finalize()
+    .into_bytes();
+    Ok(B64.encode(proof))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeping every authenticated transcript field explicit prevents accidental omission"
+)]
+fn verify_proof(
+    token: &[u8; 32],
+    domain: &[u8],
+    version: u16,
+    profile: &str,
+    endpoint_id: &str,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+    encoded: &str,
+) -> Result<()> {
+    let provided = decode_base64_32("IPC authentication proof", encoded)?;
+    let expected = proof_mac(
+        token,
+        domain,
+        version,
+        profile,
+        endpoint_id,
+        client_nonce,
+        server_nonce,
+    )?
+    .finalize()
+    .into_bytes();
+    if !bool::from(expected.as_slice().ct_eq(provided.as_ref())) {
+        bail!("IPC authentication proof mismatch");
+    }
+    Ok(())
+}
+
+async fn write_auth_frame<S>(stream: &mut S, frame: &Frame, deadline: Instant) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    tokio::time::timeout_at(deadline, write_frame_limited(stream, frame, MAX_AUTH_FRAME))
+        .await
+        .map_err(|_| anyhow::anyhow!("IPC authentication timed out"))??;
+    Ok(())
+}
+
+async fn read_auth_frame<S>(stream: &mut S, deadline: Instant) -> Result<Frame>
+where
+    S: AsyncRead + Unpin,
+{
+    tokio::time::timeout_at(deadline, read_frame_limited(stream, MAX_AUTH_FRAME))
+        .await
+        .map_err(|_| anyhow::anyhow!("IPC authentication timed out"))??
+        .ok_or_else(|| anyhow::anyhow!("IPC peer disconnected during authentication"))
+}
+
+/// Authenticate a local IPC server before disclosing any reusable capability
+/// or sending a business request. Every I/O step shares the caller-provided
+/// absolute deadline.
+pub async fn authenticate_client<S>(
+    stream: &mut S,
+    profile: &str,
+    token: &str,
+    deadline: Instant,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    crate::vault::validate_profile_name(profile)?;
+    let token = decode_base64_32("IPC token", token)?;
+    let endpoint_id = endpoint_id_with_token(profile, &token);
+    let client_nonce = random_nonce();
+    let hello = ZeroizingAuthFrame(Frame::AuthHello {
+        version: IPC_PROTOCOL_VERSION,
+        client_nonce: B64.encode(client_nonce.as_ref()),
+    });
+    write_auth_frame(stream, &hello.0, deadline).await?;
+
+    let mut challenge = ZeroizingAuthFrame(read_auth_frame(stream, deadline).await?);
+    let (server_nonce, server_proof) = match &mut challenge.0 {
+        Frame::AuthChallenge {
+            version: IPC_PROTOCOL_VERSION,
+            server_nonce,
+            server_proof,
+        } => (
+            Zeroizing::new(std::mem::take(server_nonce)),
+            Zeroizing::new(std::mem::take(server_proof)),
+        ),
+        Frame::AuthChallenge { version, .. } => {
+            bail!("unsupported IPC authentication version {version}")
+        }
+        _ => bail!("unexpected IPC server authentication frame"),
+    };
+    let server_nonce = decode_base64_32("IPC server nonce", &server_nonce)?;
+    if bool::from(client_nonce.as_ref().ct_eq(server_nonce.as_ref())) {
+        bail!("IPC server reused the client nonce");
+    }
+    verify_proof(
+        &token,
+        SERVER_PROOF_DOMAIN,
+        IPC_PROTOCOL_VERSION,
+        profile,
+        &endpoint_id,
+        &client_nonce,
+        &server_nonce,
+        &server_proof,
+    )?;
+
+    let response = ZeroizingAuthFrame(Frame::AuthResponse {
+        client_proof: encoded_proof(
+            &token,
+            CLIENT_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            profile,
+            &endpoint_id,
+            &client_nonce,
+            &server_nonce,
+        )?,
+    });
+    write_auth_frame(stream, &response.0, deadline).await
+}
+
+/// Authenticate a local IPC client using a nonce challenge. No business frame
+/// is returned to the caller until the client proof has been verified.
+pub async fn authenticate_server<S>(
+    stream: &mut S,
+    profile: &str,
+    token: &str,
+    deadline: Instant,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    crate::vault::validate_profile_name(profile)?;
+    let token = decode_base64_32("IPC token", token)?;
+    let endpoint_id = endpoint_id_with_token(profile, &token);
+    let mut hello = ZeroizingAuthFrame(read_auth_frame(stream, deadline).await?);
+    let client_nonce = match &mut hello.0 {
+        Frame::AuthHello {
+            version: IPC_PROTOCOL_VERSION,
+            client_nonce,
+        } => Zeroizing::new(std::mem::take(client_nonce)),
+        Frame::AuthHello { version, .. } => {
+            bail!("unsupported IPC authentication version {version}")
+        }
+        _ => bail!("unexpected IPC client authentication frame"),
+    };
+    let client_nonce = decode_base64_32("IPC client nonce", &client_nonce)?;
+    let mut server_nonce = random_nonce();
+    while bool::from(client_nonce.as_ref().ct_eq(server_nonce.as_ref())) {
+        server_nonce = random_nonce();
+    }
+    let server_proof = encoded_proof(
+        &token,
+        SERVER_PROOF_DOMAIN,
+        IPC_PROTOCOL_VERSION,
+        profile,
+        &endpoint_id,
+        &client_nonce,
+        &server_nonce,
+    )?;
+    let challenge = ZeroizingAuthFrame(Frame::AuthChallenge {
+        version: IPC_PROTOCOL_VERSION,
+        server_nonce: B64.encode(server_nonce.as_ref()),
+        server_proof,
+    });
+    write_auth_frame(stream, &challenge.0, deadline).await?;
+
+    let mut response = ZeroizingAuthFrame(read_auth_frame(stream, deadline).await?);
+    let client_proof = match &mut response.0 {
+        Frame::AuthResponse { client_proof } => Zeroizing::new(std::mem::take(client_proof)),
+        _ => bail!("unexpected IPC client proof frame"),
+    };
+    verify_proof(
+        &token,
+        CLIENT_PROOF_DOMAIN,
+        IPC_PROTOCOL_VERSION,
+        profile,
+        &endpoint_id,
+        &client_nonce,
+        &server_nonce,
+        &client_proof,
+    )
+}
+
+#[cfg(test)]
+pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> Result<()> {
+    write_frame_limited(w, f, MAX_FRAME).await
+}
+
+pub async fn write_frame_limited<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    f: &Frame,
+    max_frame: usize,
+) -> Result<()> {
+    // Frames can contain command output, shell input, and file contents. Keep
+    // the transient serialized copy in a zeroizing allocation so success,
+    // I/O failure, and cancellation all erase it through RAII.
+    let json = serialize_frame_bounded(f, max_frame)?;
+    let wire_len = u32::try_from(json.len()).context("frame exceeds the u32 wire length")?;
+    let len = wire_len.to_be_bytes();
     w.write_all(&len).await?;
     w.write_all(&json).await?;
     w.flush().await?;
     Ok(())
 }
 
-pub async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Option<Frame>> {
+struct BoundedFrameCounter {
+    length: usize,
+    maximum: usize,
+    exceeded: bool,
+}
+
+impl BoundedFrameCounter {
+    fn new(maximum: usize) -> Self {
+        Self {
+            length: 0,
+            maximum,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for BoundedFrameCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(length) = self.length.checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame length overflow",
+            ));
+        };
+        if length > self.maximum {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame exceeds configured limit",
+            ));
+        }
+        self.length = length;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct PreallocatedFrameBuffer {
+    bytes: Zeroizing<Vec<u8>>,
+    expected: usize,
+}
+
+impl PreallocatedFrameBuffer {
+    fn new(expected: usize) -> Result<Self> {
+        let mut bytes = Zeroizing::new(Vec::new());
+        bytes
+            .try_reserve_exact(expected)
+            .map_err(|error| anyhow::anyhow!("reserve bounded frame buffer: {error}"))?;
+        Ok(Self { bytes, expected })
+    }
+}
+
+impl std::io::Write for PreallocatedFrameBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(new_len) = self.bytes.len().checked_add(bytes.len()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame length overflow",
+            ));
+        };
+        if new_len > self.expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame length changed between sizing and serialization",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn encoded_frame_len_limited(frame: &Frame, maximum: usize) -> Result<usize> {
+    let mut counter = BoundedFrameCounter::new(maximum);
+    if let Err(error) = serde_json::to_writer(&mut counter, frame) {
+        if counter.exceeded {
+            bail!("frame too large: exceeds {maximum} bytes");
+        }
+        return Err(error.into());
+    }
+    Ok(counter.length)
+}
+
+fn serialize_frame_bounded(frame: &Frame, maximum: usize) -> Result<Zeroizing<Vec<u8>>> {
+    let expected = encoded_frame_len_limited(frame, maximum)?;
+    let mut sink = PreallocatedFrameBuffer::new(expected)?;
+    serde_json::to_writer(&mut sink, frame)?;
+    if sink.bytes.len() != expected {
+        bail!("frame length changed between sizing and serialization");
+    }
+    Ok(sink.bytes)
+}
+
+#[cfg(test)]
+pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>> {
     read_frame_limited(r, MAX_FRAME).await
 }
 
-pub async fn read_frame_limited<R: AsyncReadExt + Unpin>(
+pub async fn read_frame_limited<R: AsyncRead + Unpin>(
     r: &mut R,
     max_frame: usize,
 ) -> Result<Option<Frame>> {
     let mut lenbuf = [0u8; 4];
-    match r.read_exact(&mut lenbuf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    // Only EOF before the first header byte is a clean frame-stream close.
+    // Treat a one-to-three-byte prefix as corruption: mapping every
+    // UnexpectedEof to `None` makes a truncated frame indistinguishable from
+    // an orderly peer shutdown and can let higher-level state machines accept
+    // an incomplete terminal exchange.
+    if r.read(&mut lenbuf[..1]).await? == 0 {
+        return Ok(None);
     }
+    r.read_exact(&mut lenbuf[1..])
+        .await
+        .context("IPC peer disconnected during frame length prefix")?;
     let len = u32::from_be_bytes(lenbuf) as usize;
     if len > max_frame {
         bail!("frame too large: {len} bytes");
     }
-    let mut buf = vec![0u8; len];
+    // Deserialization creates the owned Frame value; erase the raw JSON copy
+    // on every return path because it can contain the same sensitive payload.
+    let mut buf = Zeroizing::new(vec![0u8; len]);
     r.read_exact(&mut buf).await?;
     Ok(Some(serde_json::from_slice(&buf)?))
 }
@@ -270,23 +954,243 @@ pub async fn read_frame_limited<R: AsyncReadExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn test_token() -> String {
+        B64.encode([0x5a_u8; 32])
+    }
 
     #[tokio::test]
-    async fn authentication_frame_round_trips() {
-        let (mut tx, mut rx) = tokio::io::duplex(1024);
-        write_frame(
-            &mut tx,
-            &Frame::Authenticate {
-                token: "capability-token".into(),
+    async fn v2_mutual_authentication_completes() {
+        let (mut client, mut server) = tokio::io::duplex(8 * 1024);
+        let token = test_token();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (client_result, server_result) = tokio::join!(
+            authenticate_client(&mut client, "prod", &token, deadline),
+            authenticate_server(&mut server, "prod", &token, deadline),
+        );
+        client_result.unwrap();
+        server_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_server_sees_only_random_hello_and_gets_no_response() {
+        let (mut client, mut fake_server) = tokio::io::duplex(8 * 1024);
+        let token = test_token();
+        let token_for_server = token.clone();
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let client_task = authenticate_client(&mut client, "prod", &token, deadline);
+        let server_task = async move {
+            let mut header = [0_u8; 4];
+            fake_server.read_exact(&mut header).await.unwrap();
+            let length = u32::from_be_bytes(header) as usize;
+            assert!(length <= MAX_AUTH_FRAME);
+            let mut payload = vec![0_u8; length];
+            fake_server.read_exact(&mut payload).await.unwrap();
+            let mut wire = header.to_vec();
+            wire.extend_from_slice(&payload);
+            assert!(
+                !wire
+                    .windows(token_for_server.len())
+                    .any(|window| window == token_for_server.as_bytes()),
+                "client disclosed its reusable token before server proof"
+            );
+            match serde_json::from_slice::<Frame>(&payload).unwrap() {
+                Frame::AuthHello {
+                    version,
+                    client_nonce,
+                } => {
+                    assert_eq!(version, IPC_PROTOCOL_VERSION);
+                    decode_base64_32("test client nonce", &client_nonce).unwrap();
+                }
+                _ => panic!("client sent a non-hello frame before server authentication"),
+            }
+
+            write_frame_limited(
+                &mut fake_server,
+                &Frame::AuthChallenge {
+                    version: IPC_PROTOCOL_VERSION,
+                    server_nonce: B64.encode([0x33_u8; 32]),
+                    server_proof: B64.encode([0_u8; 32]),
+                },
+                MAX_AUTH_FRAME,
+            )
+            .await
+            .unwrap();
+            let unexpected = tokio::time::timeout(
+                Duration::from_millis(75),
+                read_frame_limited(&mut fake_server, MAX_AUTH_FRAME),
+            )
+            .await;
+            assert!(
+                unexpected.is_err(),
+                "client sent a proof or business frame to an unauthenticated server"
+            );
+        };
+
+        let (client_result, ()) = tokio::join!(client_task, server_task);
+        assert!(client_result.is_err());
+    }
+
+    #[test]
+    fn proofs_bind_role_nonce_version_profile_and_endpoint() {
+        let token = decode_base64_32("test token", &test_token()).unwrap();
+        let client_nonce = [1_u8; 32];
+        let server_nonce = [2_u8; 32];
+        let other_client_nonce = [3_u8; 32];
+        let other_server_nonce = [4_u8; 32];
+        let prod_endpoint = endpoint_id_with_token("prod", &token);
+        let stage_endpoint = endpoint_id_with_token("stage", &token);
+        let proof = encoded_proof(
+            &token,
+            SERVER_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            "prod",
+            &prod_endpoint,
+            &client_nonce,
+            &server_nonce,
+        )
+        .unwrap();
+
+        verify_proof(
+            &token,
+            SERVER_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            "prod",
+            &prod_endpoint,
+            &client_nonce,
+            &server_nonce,
+            &proof,
+        )
+        .unwrap();
+        assert!(verify_proof(
+            &token,
+            CLIENT_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            "prod",
+            &prod_endpoint,
+            &client_nonce,
+            &server_nonce,
+            &proof,
+        )
+        .is_err());
+        assert!(verify_proof(
+            &token,
+            SERVER_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            "prod",
+            &prod_endpoint,
+            &other_client_nonce,
+            &server_nonce,
+            &proof,
+        )
+        .is_err());
+        assert!(verify_proof(
+            &token,
+            SERVER_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            "prod",
+            &prod_endpoint,
+            &client_nonce,
+            &other_server_nonce,
+            &proof,
+        )
+        .is_err());
+        assert!(verify_proof(
+            &token,
+            SERVER_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION - 1,
+            "prod",
+            &prod_endpoint,
+            &client_nonce,
+            &server_nonce,
+            &proof,
+        )
+        .is_err());
+        assert!(verify_proof(
+            &token,
+            SERVER_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            "stage",
+            &stage_endpoint,
+            &client_nonce,
+            &server_nonce,
+            &proof,
+        )
+        .is_err());
+        assert!(verify_proof(
+            &token,
+            SERVER_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            "prod",
+            "different-endpoint-id",
+            &client_nonce,
+            &server_nonce,
+            &proof,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn protocol_downgrade_is_rejected() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_frame_limited(
+            &mut client,
+            &Frame::AuthHello {
+                version: IPC_PROTOCOL_VERSION - 1,
+                client_nonce: B64.encode([7_u8; 32]),
             },
+            MAX_AUTH_FRAME,
         )
         .await
         .unwrap();
+        let error = authenticate_server(
+            &mut server,
+            "prod",
+            &test_token(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported IPC authentication version"));
+    }
 
-        match read_frame(&mut rx).await.unwrap() {
-            Some(Frame::Authenticate { token }) => assert_eq!(token, "capability-token"),
-            _ => panic!("authentication frame did not round-trip"),
-        }
+    #[tokio::test]
+    async fn authentication_uses_one_absolute_deadline() {
+        let (mut client, _silent_server) = tokio::io::duplex(1024);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let error = authenticate_client(&mut client, "prod", &test_token(), deadline)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn base64_values_are_canonical_and_exactly_32_bytes() {
+        assert!(decode_base64_32("nonce", &B64.encode([1_u8; 31])).is_err());
+        assert!(decode_base64_32("nonce", &B64.encode([1_u8; 33])).is_err());
+        let mut unpadded = B64.encode([1_u8; 32]);
+        unpadded.pop();
+        assert!(decode_base64_32("nonce", &unpadded).is_err());
+        assert!(decode_base64_32("nonce", &B64.encode([1_u8; 32])).is_ok());
+    }
+
+    #[test]
+    fn endpoint_ids_are_domain_bound_lower_hex_and_compared_exactly() {
+        let token = test_token();
+        let prod = endpoint_id("prod", &token).unwrap();
+        let stage = endpoint_id("stage", &token).unwrap();
+        assert_ne!(prod, stage);
+        assert_eq!(prod.len(), 32);
+        assert!(prod
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        validate_endpoint_bytes("expected", "expected").unwrap();
+        assert!(validate_endpoint_bytes("expected", "EXPECTED").is_err());
+        assert!(validate_endpoint_bytes("expected", "expected ").is_err());
     }
 
     #[tokio::test]
@@ -303,5 +1207,174 @@ mod tests {
         assert!(read_frame_limited(&mut bytes, MAX_AUTH_FRAME)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn only_empty_stream_is_a_clean_frame_eof() {
+        let mut empty = &[][..];
+        assert!(read_frame_limited(&mut empty, MAX_AUTH_FRAME)
+            .await
+            .unwrap()
+            .is_none());
+
+        for prefix_len in 1..4 {
+            let header = 1_u32.to_be_bytes();
+            let mut truncated = &header[..prefix_len];
+            let error = read_frame_limited(&mut truncated, MAX_AUTH_FRAME)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("frame length prefix"),
+                "unexpected error for {prefix_len}-byte prefix: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_serializer_stops_at_limit_during_hostile_escaping() {
+        let frame = Frame::Error {
+            // Each NUL expands to a six-byte JSON escape. The serializer must
+            // stop at the configured wire limit rather than build the full
+            // multi-megabyte escaped representation first.
+            msg: "\0".repeat(1024 * 1024),
+        };
+        let maximum = 4 * 1024;
+        let mut counter = BoundedFrameCounter::new(maximum);
+        let error = serde_json::to_writer(&mut counter, &frame).unwrap_err();
+
+        assert!(counter.exceeded, "unexpected serialization error: {error}");
+        assert!(counter.length <= maximum);
+        assert!(serialize_frame_bounded(&frame, maximum).is_err());
+    }
+
+    #[test]
+    fn sensitive_frame_payloads_have_one_explicit_zeroize_path() {
+        let mut exec = Frame::Exec {
+            cmd: "password-bearing command".into(),
+            timeout_ms: DEFAULT_EXEC_TIMEOUT_MS,
+        };
+        exec.zeroize_sensitive();
+        match exec {
+            Frame::Exec { cmd, .. } => assert!(cmd.is_empty()),
+            _ => unreachable!(),
+        }
+
+        let mut output = Frame::FileChunk {
+            data: b"sensitive output".to_vec(),
+        };
+        output.zeroize_sensitive();
+        match output {
+            Frame::FileChunk { data } => assert!(data.is_empty()),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn binary_payloads_use_canonical_base64_and_fit_wire_limits() {
+        let transfer_payload = vec![0xff; 64 * 1024];
+        for (frame, maximum) in [
+            (
+                Frame::UploadChunk {
+                    data: transfer_payload.clone(),
+                },
+                MAX_UPLOAD_FRAME,
+            ),
+            (
+                Frame::ShellInput {
+                    data: transfer_payload.clone(),
+                },
+                MAX_SHELL_FRAME,
+            ),
+        ] {
+            let encoded = serialize_frame_bounded(&frame, maximum).unwrap();
+            assert!(encoded.len() <= maximum);
+            let decoded: Frame = serde_json::from_slice(&encoded).unwrap();
+            let data = match decoded {
+                Frame::UploadChunk { data } | Frame::ShellInput { data } => data,
+                _ => panic!("binary frame changed variant during roundtrip"),
+            };
+            assert_eq!(data, transfer_payload);
+        }
+
+        // The aggregate exec-output limit permits arbitrary 8 MiB output. Its
+        // Base64 wire representation must fit the 16 MiB response-frame cap.
+        let output = Frame::ExecOut {
+            data: vec![0xff; MAX_COMMAND_OUTPUT],
+        };
+        let encoded = serialize_frame_bounded(&output, MAX_RESPONSE_FRAME).unwrap();
+        assert!(encoded.len() <= MAX_RESPONSE_FRAME);
+        match serde_json::from_slice::<Frame>(&encoded).unwrap() {
+            Frame::ExecOut { data } => {
+                assert_eq!(data.len(), MAX_COMMAND_OUTPUT);
+                assert!(data.iter().all(|byte| *byte == 0xff));
+            }
+            _ => panic!("exec output changed variant during roundtrip"),
+        }
+
+        assert!(serde_json::from_str::<Frame>(r#"{"t":"ShellInput","d":{"data":"/w"}}"#).is_err());
+        assert!(
+            serde_json::from_str::<Frame>(r#"{"t":"ShellInput","d":{"data":"/x=="}}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn worst_case_valid_status_metadata_fits_control_not_auth_limit() {
+        let status = Frame::StatusInfo {
+            profile: "p".repeat(128),
+            host: "\"".repeat(1024),
+            user: "\\".repeat(1024),
+            started_unix: i64::MIN,
+        };
+        let encoded = serialize_frame_bounded(&status, MAX_CONTROL_FRAME).unwrap();
+        assert!(encoded.len() > MAX_AUTH_FRAME);
+        assert!(encoded.len() <= MAX_CONTROL_FRAME);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn protected_named_pipe_allows_owner_and_exposes_server_pid() {
+        assert!(!PIPE_SECURITY_SDDL.contains(";;;WD"));
+        assert!(!PIPE_SECURITY_SDDL.contains(";;;AN"));
+        assert!(PIPE_SECURITY_SDDL.contains(";;;OW"));
+
+        let profile = format!("pipe-test-{}", std::process::id());
+        let token = test_token();
+        let mut listener = LocalListener::bind(&profile, &token).unwrap();
+        let endpoint = listener.endpoint().to_owned();
+        let client = tokio::time::timeout(Duration::from_secs(1), connect(&endpoint))
+            .await
+            .unwrap()
+            .unwrap();
+        validate_server_identity(&client, std::process::id()).unwrap();
+        let first = listener.accept().await.unwrap();
+
+        // accept() creates a fresh pending instance through the same secured
+        // SECURITY_ATTRIBUTES path, so verify the second instance too.
+        let second_client = tokio::time::timeout(Duration::from_secs(1), connect(&endpoint))
+            .await
+            .unwrap()
+            .unwrap();
+        validate_server_identity(&second_client, std::process::id()).unwrap();
+        let second = listener.accept().await.unwrap();
+        drop((client, first, second_client, second));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_peer_identity_checks_uid_and_available_pid() {
+        let path = std::env::temp_dir().join(format!(
+            "serctl-peer-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let server = listener.accept().await.unwrap().0;
+        validate_server_identity(&client, std::process::id()).unwrap();
+        drop((client, server, listener));
+        std::fs::remove_file(path).unwrap();
     }
 }
