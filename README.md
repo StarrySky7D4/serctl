@@ -128,3 +128,7 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 测试套件除单元测试外，还会在随机本地端口启动临时 SSH/SFTP 服务和真实 daemon；daemon IPC 使用当前平台的 Named Pipe/Unix Socket，覆盖认证、错误令牌拒绝、exec 正常退出、deadline、客户端断连取消，以及上传/下载内容往返。所有状态写入 `target` 下的隔离临时目录，不读取或修改真实凭证库；外部服务器兼容性验证仍需要可访问的测试服务器。
+
+## 许可证
+
+本项目依据 [Apache License 2.0](LICENSE) 授权。

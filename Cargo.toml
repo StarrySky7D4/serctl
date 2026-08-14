@@ -3,6 +3,8 @@ name = "serctl"
 version = "0.1.0"
 edition = "2021"
 description = "Persistent SSH control suite: encrypted credentials, long-lived connection daemon, IPC command execution."
+license = "Apache-2.0"
+repository = "https://github.com/StarrySky7D4/serctl"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
