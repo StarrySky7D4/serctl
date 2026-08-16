@@ -11,9 +11,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::ssh::RemoteEntry;
+use crate::ssh::{RemoteEntry, TunnelMode, TunnelReady, TunnelSpec};
+use crate::vault::ProfileCallKey;
 
-pub const IPC_PROTOCOL_VERSION: u16 = 3;
+pub const IPC_PROTOCOL_VERSION: u16 = 5;
 #[cfg(test)]
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 pub const MAX_AUTH_FRAME: usize = 4 * 1024;
@@ -36,9 +37,13 @@ fn default_sftp_timeout_ms() -> u64 {
     DEFAULT_SFTP_TIMEOUT_MS
 }
 
-const ENDPOINT_DOMAIN: &[u8] = b"serctl/ipc/endpoint/v3\0";
-const SERVER_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/server/v3\0";
-const CLIENT_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/client/v3\0";
+const ENDPOINT_DOMAIN: &[u8] = b"serctl/ipc/endpoint/v5\0";
+const SERVER_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/server-token/v5\0";
+const CLIENT_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/client-token/v5\0";
+const REQUEST_DIGEST_DOMAIN: &[u8] = b"serctl/ipc/request-intent/v5\0";
+const INTENT_COMMITMENT_DOMAIN: &[u8] = b"serctl/ipc/intent-commitment/v5\0";
+const SERVER_CALL_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/server-call/v5\0";
+const CLIENT_CALL_PROOF_DOMAIN: &[u8] = b"serctl/ipc/auth/client-call/v5\0";
 
 /// Encode binary frame fields once as canonical Base64 instead of serde's
 /// default integer arrays. Besides shrinking the wire representation, this
@@ -96,7 +101,7 @@ fn endpoint_id_with_token(profile: &str, token: &[u8; 32]) -> String {
 #[cfg(windows)]
 pub fn expected_endpoint(profile: &str, token: &str) -> Result<String> {
     let id = endpoint_id(profile, token)?;
-    Ok(format!(r"\\.\pipe\serctl-v3-{id}"))
+    Ok(format!(r"\\.\pipe\serctl-v5-{id}"))
 }
 
 #[cfg(unix)]
@@ -108,7 +113,7 @@ pub fn expected_endpoint(profile: &str, token: &str) -> Result<String> {
 /// Derive an endpoint without touching directory metadata. Callers must pass a
 /// runtime directory they already validated through `vault::run_dir`; this is
 /// used by stale-lock cleanup to keep filesystem-security failures distinct
-/// from malformed v3 lock contents.
+/// from malformed v5 lock contents.
 #[cfg(unix)]
 pub(crate) fn expected_endpoint_in_runtime_dir(
     profile: &str,
@@ -116,7 +121,7 @@ pub(crate) fn expected_endpoint_in_runtime_dir(
     runtime_dir: &std::path::Path,
 ) -> Result<String> {
     let id = endpoint_id(profile, token)?;
-    let path = runtime_dir.join(format!("serctl-v3-{id}.sock"));
+    let path = runtime_dir.join(format!("serctl-v5-{id}.sock"));
     path.to_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow::anyhow!("serctl runtime path is not valid UTF-8"))
@@ -329,7 +334,8 @@ pub async fn connect(endpoint: &str) -> Result<ClientStream> {
 
 /// Validate that a connected client stream terminates at the daemon recorded
 /// in the protected runtime lock. This is an identity cross-check in addition
-/// to the cryptographic handshake, not a replacement for it.
+/// to the cryptographic handshake, not a replacement for it. Unix targets
+/// whose socket credential API cannot expose the peer PID fail closed.
 #[cfg(windows)]
 pub fn validate_server_identity(stream: &ClientStream, expected_pid: u32) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
@@ -352,13 +358,34 @@ pub fn validate_server_identity(stream: &ClientStream, expected_pid: u32) -> Res
         .peer_cred()
         .context("query Unix-socket peer credentials")?;
     let effective_uid = unsafe { libc::geteuid() };
-    if credentials.uid() != effective_uid {
+    validate_unix_peer_identity(
+        credentials.uid() as u64,
+        credentials.pid().map(|pid| pid as i64),
+        effective_uid as u64,
+        expected_pid,
+    )
+}
+
+#[cfg(any(unix, test))]
+fn validate_unix_peer_identity(
+    actual_uid: u64,
+    actual_pid: Option<i64>,
+    expected_uid: u64,
+    expected_pid: u32,
+) -> Result<()> {
+    if actual_uid != expected_uid {
         bail!("Unix-socket peer is not owned by the current user");
     }
-    if let Some(actual_pid) = credentials.pid() {
-        if actual_pid <= 0 || actual_pid as u32 != expected_pid {
-            bail!("Unix-socket peer PID does not match the protected runtime lock");
-        }
+
+    // Some Unix targets can authenticate a socket peer's UID but cannot
+    // expose its PID. UID-only acceptance would let another process owned by
+    // the same account impersonate the daemon, so unsupported targets fail
+    // closed instead of silently weakening the runtime-lock identity check.
+    let actual_pid = actual_pid.context("Unix-socket peer PID is unavailable on this platform")?;
+    let actual_pid =
+        u32::try_from(actual_pid).context("Unix-socket peer returned an invalid process ID")?;
+    if actual_pid == 0 || actual_pid != expected_pid {
+        bail!("Unix-socket peer PID does not match the protected runtime lock");
     }
     Ok(())
 }
@@ -379,9 +406,13 @@ pub enum Frame {
     AuthHello {
         version: u16,
         client_nonce: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intent_commitment: Option<String>,
     },
     AuthResponse {
         client_proof: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_call_proof: Option<String>,
     },
     Exec {
         cmd: String,
@@ -424,12 +455,19 @@ pub enum Frame {
         data: Vec<u8>,
     },
     UploadEnd,
+    TunnelOpen {
+        spec: TunnelSpec,
+    },
+    TunnelStop,
     // daemon -> client
     AuthChallenge {
         version: u16,
         server_nonce: String,
         server_proof: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_call_proof: Option<String>,
     },
+    AuthAccepted,
     ExecOut {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
@@ -464,6 +502,10 @@ pub enum Frame {
     TransferDone {
         bytes: u64,
     },
+    TunnelReady {
+        ready: TunnelReady,
+    },
+    TunnelClosed,
     Error {
         msg: String,
     },
@@ -482,8 +524,21 @@ impl Frame {
 impl Zeroize for Frame {
     fn zeroize(&mut self) {
         match self {
-            Frame::AuthHello { client_nonce, .. } => client_nonce.zeroize(),
-            Frame::AuthResponse { client_proof } => client_proof.zeroize(),
+            Frame::AuthHello {
+                client_nonce,
+                intent_commitment,
+                ..
+            } => {
+                client_nonce.zeroize();
+                intent_commitment.zeroize();
+            }
+            Frame::AuthResponse {
+                client_proof,
+                client_call_proof,
+            } => {
+                client_proof.zeroize();
+                client_call_proof.zeroize();
+            }
             Frame::Exec { cmd, .. } => cmd.zeroize(),
             Frame::ShellInput { data }
             | Frame::UploadChunk { data }
@@ -495,13 +550,16 @@ impl Zeroize for Frame {
             | Frame::CreateDir { path, .. }
             | Frame::Download { path, .. }
             | Frame::UploadBegin { path, .. } => path.zeroize(),
+            Frame::TunnelReady { ready } => ready.bind_host.zeroize(),
             Frame::AuthChallenge {
                 server_nonce,
                 server_proof,
+                server_call_proof,
                 ..
             } => {
                 server_nonce.zeroize();
                 server_proof.zeroize();
+                server_call_proof.zeroize();
             }
             Frame::StatusInfo {
                 profile,
@@ -523,9 +581,13 @@ impl Zeroize for Frame {
             }
             Frame::Error { msg } => msg.zeroize(),
             Frame::Shell { .. }
+            | Frame::TunnelOpen { .. }
+            | Frame::AuthAccepted
             | Frame::Status
             | Frame::Shutdown
             | Frame::UploadEnd
+            | Frame::TunnelStop
+            | Frame::TunnelClosed
             | Frame::ExecExit { .. }
             | Frame::ShellClosed
             | Frame::Ack
@@ -571,16 +633,117 @@ fn random_nonce() -> Zeroizing<[u8; 32]> {
     nonce
 }
 
+fn finish_mac(mac: HmacSha256) -> Zeroizing<[u8; 32]> {
+    let mut digest = mac.finalize().into_bytes();
+    let mut value = Zeroizing::new([0_u8; 32]);
+    value.copy_from_slice(&digest);
+    let digest_bytes: &mut [u8] = digest.as_mut();
+    digest_bytes.zeroize();
+    value
+}
+
+fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) -> Result<()> {
+    let length = u32::try_from(value.len())
+        .map_err(|_| anyhow::anyhow!("IPC request field exceeds the canonical intent limit"))?;
+    hasher.update(length.to_be_bytes());
+    hasher.update(value);
+    Ok(())
+}
+
+/// Hash only complete root requests. Streaming continuation and response
+/// frames can inherit an already-authorized root operation but can never be
+/// authorized independently.
+fn canonical_request_digest(frame: &Frame) -> Result<Zeroizing<[u8; 32]>> {
+    let mut digest = Sha256::new();
+    digest.update(REQUEST_DIGEST_DOMAIN);
+    digest.update(IPC_PROTOCOL_VERSION.to_be_bytes());
+    match frame {
+        Frame::Exec { cmd, timeout_ms } => {
+            digest.update([1]);
+            update_length_prefixed(&mut digest, cmd.as_bytes())?;
+            digest.update(timeout_ms.to_be_bytes());
+        }
+        Frame::Shell { cols, rows } => {
+            digest.update([2]);
+            digest.update(cols.to_be_bytes());
+            digest.update(rows.to_be_bytes());
+        }
+        Frame::Status => digest.update([3]),
+        Frame::Shutdown => digest.update([4]),
+        Frame::ListDir { path, timeout_ms } => {
+            digest.update([5]);
+            update_length_prefixed(&mut digest, path.as_bytes())?;
+            digest.update(timeout_ms.to_be_bytes());
+        }
+        Frame::CreateDir { path, timeout_ms } => {
+            digest.update([6]);
+            update_length_prefixed(&mut digest, path.as_bytes())?;
+            digest.update(timeout_ms.to_be_bytes());
+        }
+        Frame::Download { path, timeout_ms } => {
+            digest.update([7]);
+            update_length_prefixed(&mut digest, path.as_bytes())?;
+            digest.update(timeout_ms.to_be_bytes());
+        }
+        Frame::UploadBegin {
+            path,
+            size,
+            timeout_ms,
+        } => {
+            digest.update([8]);
+            update_length_prefixed(&mut digest, path.as_bytes())?;
+            digest.update(size.to_be_bytes());
+            digest.update(timeout_ms.to_be_bytes());
+        }
+        Frame::TunnelOpen { spec } => {
+            digest.update([9]);
+            digest.update([match spec.mode {
+                TunnelMode::Local => 1,
+                TunnelMode::Remote => 2,
+                TunnelMode::Dynamic => 3,
+            }]);
+            digest.update(spec.bind_port.to_be_bytes());
+            digest.update(spec.target_port.to_be_bytes());
+            digest.update(spec.max_connections.to_be_bytes());
+        }
+        _ => bail!("IPC frame is not an authorizable root request"),
+    }
+    let mut finalized = digest.finalize();
+    let mut value = Zeroizing::new([0_u8; 32]);
+    value.copy_from_slice(&finalized);
+    let finalized_bytes: &mut [u8] = finalized.as_mut();
+    finalized_bytes.zeroize();
+    Ok(value)
+}
+
+fn request_intent_commitment(
+    call_key: &ProfileCallKey,
+    frame: &Frame,
+) -> Result<Zeroizing<[u8; 32]>> {
+    let request_digest = canonical_request_digest(frame)?;
+    let mut mac = HmacSha256::new_from_slice(call_key.as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid IPC call authorization key"))?;
+    mac.update(INTENT_COMMITMENT_DOMAIN);
+    mac.update(&IPC_PROTOCOL_VERSION.to_be_bytes());
+    mac.update(request_digest.as_ref());
+    Ok(finish_mac(mac))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeping every authenticated transcript field explicit prevents accidental omission"
+)]
 fn proof_mac(
-    token: &[u8; 32],
+    key: &[u8; 32],
     domain: &[u8],
     version: u16,
     profile: &str,
     endpoint_id: &str,
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
+    intent_commitment: Option<&[u8; 32]>,
 ) -> Result<HmacSha256> {
-    let mut mac = HmacSha256::new_from_slice(token)
+    let mut mac = HmacSha256::new_from_slice(key)
         .map_err(|_| anyhow::anyhow!("invalid IPC authentication key"))?;
     mac.update(domain);
     mac.update(&version.to_be_bytes());
@@ -590,30 +753,41 @@ fn proof_mac(
     mac.update(endpoint_id.as_bytes());
     mac.update(client_nonce);
     mac.update(server_nonce);
+    match intent_commitment {
+        Some(commitment) => {
+            mac.update(&[1]);
+            mac.update(commitment);
+        }
+        None => mac.update(&[0]),
+    }
     Ok(mac)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeping every authenticated transcript field explicit prevents accidental omission"
+)]
 fn encoded_proof(
-    token: &[u8; 32],
+    key: &[u8; 32],
     domain: &[u8],
     version: u16,
     profile: &str,
     endpoint_id: &str,
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
+    intent_commitment: Option<&[u8; 32]>,
 ) -> Result<String> {
     let proof = proof_mac(
-        token,
+        key,
         domain,
         version,
         profile,
         endpoint_id,
         client_nonce,
         server_nonce,
-    )?
-    .finalize()
-    .into_bytes();
-    Ok(B64.encode(proof))
+        intent_commitment,
+    )?;
+    Ok(B64.encode(finish_mac(proof).as_ref()))
 }
 
 #[expect(
@@ -621,31 +795,59 @@ fn encoded_proof(
     reason = "keeping every authenticated transcript field explicit prevents accidental omission"
 )]
 fn verify_proof(
-    token: &[u8; 32],
+    key: &[u8; 32],
     domain: &[u8],
     version: u16,
     profile: &str,
     endpoint_id: &str,
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
+    intent_commitment: Option<&[u8; 32]>,
     encoded: &str,
 ) -> Result<()> {
     let provided = decode_base64_32("IPC authentication proof", encoded)?;
-    let expected = proof_mac(
-        token,
+    let expected = finish_mac(proof_mac(
+        key,
         domain,
         version,
         profile,
         endpoint_id,
         client_nonce,
         server_nonce,
-    )?
-    .finalize()
-    .into_bytes();
-    if !bool::from(expected.as_slice().ct_eq(provided.as_ref())) {
+        intent_commitment,
+    )?);
+    if !bool::from(expected.as_ref().ct_eq(provided.as_ref())) {
         bail!("IPC authentication proof mismatch");
     }
     Ok(())
+}
+
+/// A server-side authorization transcript. Sensitive transcript material is
+/// held only in zeroizing buffers. Verification consumes the context so one
+/// successful handshake cannot authorize a second root request.
+pub(crate) struct AuthContext {
+    intent_commitment: Option<Zeroizing<[u8; 32]>>,
+    request_verified: bool,
+}
+
+impl AuthContext {
+    pub(crate) fn verify_request(
+        &mut self,
+        call_key: &ProfileCallKey,
+        request: &Frame,
+    ) -> Result<()> {
+        if std::mem::replace(&mut self.request_verified, true) {
+            bail!("IPC authorization context was already consumed");
+        }
+        let Some(provided) = self.intent_commitment.as_ref() else {
+            bail!("IPC request requires master-passphrase authorization");
+        };
+        let expected = request_intent_commitment(call_key, request)?;
+        if !bool::from(expected.as_ref().ct_eq(provided.as_ref())) {
+            bail!("IPC request authorization failed");
+        }
+        Ok(())
+    }
 }
 
 async fn write_auth_frame<S>(stream: &mut S, frame: &Frame, deadline: Instant) -> Result<()>
@@ -680,25 +882,76 @@ pub async fn authenticate_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    authenticate_client_inner(stream, profile, token, None, None, deadline).await
+}
+
+/// Mutually authenticate a daemon and authorize exactly one root request with
+/// a profile-scoped key. The request itself is not sent by this function. A
+/// client only returns after it has verified the daemon's call-key proof and
+/// received `AuthAccepted`, so a wrong master or fake daemon sees zero business
+/// request bytes.
+pub(crate) async fn authenticate_client_for_request<S>(
+    stream: &mut S,
+    profile: &str,
+    token: &str,
+    call_key: &ProfileCallKey,
+    request: &Frame,
+    deadline: Instant,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    authenticate_client_inner(
+        stream,
+        profile,
+        token,
+        Some(call_key),
+        Some(request),
+        deadline,
+    )
+    .await
+}
+
+async fn authenticate_client_inner<S>(
+    stream: &mut S,
+    profile: &str,
+    token: &str,
+    call_key: Option<&ProfileCallKey>,
+    request: Option<&Frame>,
+    deadline: Instant,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     crate::vault::validate_profile_name(profile)?;
+    let intent_commitment = match (call_key, request) {
+        (Some(call_key), Some(request)) => Some(request_intent_commitment(call_key, request)?),
+        (None, None) => None,
+        _ => bail!("incomplete IPC call-authorization inputs"),
+    };
     let token = decode_base64_32("IPC token", token)?;
     let endpoint_id = endpoint_id_with_token(profile, &token);
     let client_nonce = random_nonce();
     let hello = ZeroizingAuthFrame(Frame::AuthHello {
         version: IPC_PROTOCOL_VERSION,
         client_nonce: B64.encode(client_nonce.as_ref()),
+        intent_commitment: intent_commitment
+            .as_ref()
+            .map(|commitment| B64.encode(commitment.as_ref())),
     });
     write_auth_frame(stream, &hello.0, deadline).await?;
 
     let mut challenge = ZeroizingAuthFrame(read_auth_frame(stream, deadline).await?);
-    let (server_nonce, server_proof) = match &mut challenge.0 {
+    let (server_nonce, server_proof, server_call_proof) = match &mut challenge.0 {
         Frame::AuthChallenge {
             version: IPC_PROTOCOL_VERSION,
             server_nonce,
             server_proof,
+            server_call_proof,
         } => (
             Zeroizing::new(std::mem::take(server_nonce)),
             Zeroizing::new(std::mem::take(server_proof)),
+            server_call_proof.take().map(Zeroizing::new),
         ),
         Frame::AuthChallenge { version, .. } => {
             bail!("unsupported IPC authentication version {version}")
@@ -717,8 +970,37 @@ where
         &endpoint_id,
         &client_nonce,
         &server_nonce,
+        intent_commitment.as_deref(),
         &server_proof,
     )?;
+
+    let client_call_proof = match (call_key, intent_commitment.as_ref(), server_call_proof) {
+        (Some(call_key), Some(commitment), Some(server_call_proof)) => {
+            verify_proof(
+                call_key.as_bytes(),
+                SERVER_CALL_PROOF_DOMAIN,
+                IPC_PROTOCOL_VERSION,
+                profile,
+                &endpoint_id,
+                &client_nonce,
+                &server_nonce,
+                Some(commitment),
+                &server_call_proof,
+            )?;
+            Some(encoded_proof(
+                call_key.as_bytes(),
+                CLIENT_CALL_PROOF_DOMAIN,
+                IPC_PROTOCOL_VERSION,
+                profile,
+                &endpoint_id,
+                &client_nonce,
+                &server_nonce,
+                Some(commitment),
+            )?)
+        }
+        (None, None, None) => None,
+        _ => bail!("IPC call-authorization challenge mismatch"),
+    };
 
     let response = ZeroizingAuthFrame(Frame::AuthResponse {
         client_proof: encoded_proof(
@@ -729,19 +1011,27 @@ where
             &endpoint_id,
             &client_nonce,
             &server_nonce,
+            intent_commitment.as_deref(),
         )?,
+        client_call_proof,
     });
-    write_auth_frame(stream, &response.0, deadline).await
+    write_auth_frame(stream, &response.0, deadline).await?;
+    let accepted = ZeroizingAuthFrame(read_auth_frame(stream, deadline).await?);
+    if !matches!(&accepted.0, Frame::AuthAccepted) {
+        bail!("unexpected IPC authorization completion frame");
+    }
+    Ok(())
 }
 
 /// Authenticate a local IPC client using a nonce challenge. No business frame
 /// is returned to the caller until the client proof has been verified.
-pub async fn authenticate_server<S>(
+pub(crate) async fn authenticate_server<S>(
     stream: &mut S,
     profile: &str,
     token: &str,
+    call_key: &ProfileCallKey,
     deadline: Instant,
-) -> Result<()>
+) -> Result<AuthContext>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -749,17 +1039,25 @@ where
     let token = decode_base64_32("IPC token", token)?;
     let endpoint_id = endpoint_id_with_token(profile, &token);
     let mut hello = ZeroizingAuthFrame(read_auth_frame(stream, deadline).await?);
-    let client_nonce = match &mut hello.0 {
+    let (client_nonce, intent_commitment) = match &mut hello.0 {
         Frame::AuthHello {
             version: IPC_PROTOCOL_VERSION,
             client_nonce,
-        } => Zeroizing::new(std::mem::take(client_nonce)),
+            intent_commitment,
+        } => (
+            Zeroizing::new(std::mem::take(client_nonce)),
+            intent_commitment.take().map(Zeroizing::new),
+        ),
         Frame::AuthHello { version, .. } => {
             bail!("unsupported IPC authentication version {version}")
         }
         _ => bail!("unexpected IPC client authentication frame"),
     };
     let client_nonce = decode_base64_32("IPC client nonce", &client_nonce)?;
+    let intent_commitment = intent_commitment
+        .as_ref()
+        .map(|commitment| decode_base64_32("IPC request intent commitment", commitment))
+        .transpose()?;
     let mut server_nonce = random_nonce();
     while bool::from(client_nonce.as_ref().ct_eq(server_nonce.as_ref())) {
         server_nonce = random_nonce();
@@ -772,17 +1070,40 @@ where
         &endpoint_id,
         &client_nonce,
         &server_nonce,
+        intent_commitment.as_deref(),
     )?;
+    let server_call_proof = intent_commitment
+        .as_ref()
+        .map(|commitment| {
+            encoded_proof(
+                call_key.as_bytes(),
+                SERVER_CALL_PROOF_DOMAIN,
+                IPC_PROTOCOL_VERSION,
+                profile,
+                &endpoint_id,
+                &client_nonce,
+                &server_nonce,
+                Some(commitment),
+            )
+        })
+        .transpose()?;
     let challenge = ZeroizingAuthFrame(Frame::AuthChallenge {
         version: IPC_PROTOCOL_VERSION,
         server_nonce: B64.encode(server_nonce.as_ref()),
         server_proof,
+        server_call_proof,
     });
     write_auth_frame(stream, &challenge.0, deadline).await?;
 
     let mut response = ZeroizingAuthFrame(read_auth_frame(stream, deadline).await?);
-    let client_proof = match &mut response.0 {
-        Frame::AuthResponse { client_proof } => Zeroizing::new(std::mem::take(client_proof)),
+    let (client_proof, client_call_proof) = match &mut response.0 {
+        Frame::AuthResponse {
+            client_proof,
+            client_call_proof,
+        } => (
+            Zeroizing::new(std::mem::take(client_proof)),
+            client_call_proof.take().map(Zeroizing::new),
+        ),
         _ => bail!("unexpected IPC client proof frame"),
     };
     verify_proof(
@@ -793,8 +1114,29 @@ where
         &endpoint_id,
         &client_nonce,
         &server_nonce,
+        intent_commitment.as_deref(),
         &client_proof,
-    )
+    )?;
+    match (intent_commitment.as_ref(), client_call_proof) {
+        (Some(commitment), Some(client_call_proof)) => verify_proof(
+            call_key.as_bytes(),
+            CLIENT_CALL_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            profile,
+            &endpoint_id,
+            &client_nonce,
+            &server_nonce,
+            Some(commitment),
+            &client_call_proof,
+        )?,
+        (None, None) => {}
+        _ => bail!("IPC call-authorization response mismatch"),
+    }
+    write_auth_frame(stream, &Frame::AuthAccepted, deadline).await?;
+    Ok(AuthContext {
+        intent_commitment,
+        request_verified: false,
+    })
 }
 
 #[cfg(test)]
@@ -978,17 +1320,248 @@ mod tests {
         B64.encode([0x5a_u8; 32])
     }
 
+    fn test_call_key() -> ProfileCallKey {
+        ProfileCallKey::from_bytes_for_test([0xa5_u8; 32])
+    }
+
     #[tokio::test]
-    async fn v3_mutual_authentication_completes() {
+    async fn v5_token_only_mutual_authentication_completes() {
         let (mut client, mut server) = tokio::io::duplex(8 * 1024);
         let token = test_token();
+        let call_key = test_call_key();
         let deadline = Instant::now() + Duration::from_secs(1);
         let (client_result, server_result) = tokio::join!(
             authenticate_client(&mut client, "prod", &token, deadline),
-            authenticate_server(&mut server, "prod", &token, deadline),
+            authenticate_server(&mut server, "prod", &token, &call_key, deadline),
         );
         client_result.unwrap();
         server_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v5_call_key_authentication_authorizes_exactly_one_request() {
+        let (mut client, mut server) = tokio::io::duplex(8 * 1024);
+        let token = test_token();
+        let call_key = test_call_key();
+        let request = Frame::Exec {
+            cmd: "printf authorized".into(),
+            timeout_ms: 7_000,
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (client_result, server_result) = tokio::join!(
+            authenticate_client_for_request(
+                &mut client,
+                "prod",
+                &token,
+                &call_key,
+                &request,
+                deadline,
+            ),
+            authenticate_server(&mut server, "prod", &token, &call_key, deadline),
+        );
+        client_result.unwrap();
+        let mut context = server_result.unwrap();
+        context.verify_request(&call_key, &request).unwrap();
+        assert!(context.verify_request(&call_key, &request).is_err());
+    }
+
+    #[tokio::test]
+    async fn wrong_call_key_sends_neither_response_proof_nor_business_frame() {
+        let (mut client, mut server) = tokio::io::duplex(8 * 1024);
+        let token = test_token();
+        let correct_key = test_call_key();
+        let wrong_key = ProfileCallKey::from_bytes_for_test([0x11_u8; 32]);
+        let request = Frame::Exec {
+            cmd: "must-not-be-sent".into(),
+            timeout_ms: 1_000,
+        };
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let (client_result, server_result) = tokio::join!(
+            authenticate_client_for_request(
+                &mut client,
+                "prod",
+                &token,
+                &wrong_key,
+                &request,
+                deadline,
+            ),
+            authenticate_server(&mut server, "prod", &token, &correct_key, deadline),
+        );
+        assert!(client_result.is_err());
+        let server_error = server_result
+            .err()
+            .expect("server unexpectedly accepted proof");
+        assert!(
+            server_error.to_string().contains("timed out")
+                || server_error.to_string().contains("disconnected"),
+            "server observed an unexpected client frame: {server_error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn intent_commitment_rejects_a_different_request_before_dispatch() {
+        let (mut client, mut server) = tokio::io::duplex(8 * 1024);
+        let token = test_token();
+        let call_key = test_call_key();
+        let authorized = Frame::Exec {
+            cmd: "safe".into(),
+            timeout_ms: 1_000,
+        };
+        let substituted = Frame::Exec {
+            cmd: "different".into(),
+            timeout_ms: 1_000,
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (client_result, server_result) = tokio::join!(
+            authenticate_client_for_request(
+                &mut client,
+                "prod",
+                &token,
+                &call_key,
+                &authorized,
+                deadline,
+            ),
+            authenticate_server(&mut server, "prod", &token, &call_key, deadline),
+        );
+        client_result.unwrap();
+        let mut context = server_result.unwrap();
+        assert!(context.verify_request(&call_key, &substituted).is_err());
+        assert!(context.verify_request(&call_key, &authorized).is_err());
+    }
+
+    #[test]
+    fn token_only_context_rejects_every_root_request() {
+        for request in [
+            Frame::Status,
+            Frame::Shutdown,
+            Frame::Exec {
+                cmd: "unauthorized".into(),
+                timeout_ms: 1,
+            },
+        ] {
+            let mut context = AuthContext {
+                intent_commitment: None,
+                request_verified: false,
+            };
+            let error = context
+                .verify_request(&test_call_key(), &request)
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("requires master-passphrase authorization"));
+        }
+    }
+
+    #[tokio::test]
+    async fn status_and_shutdown_require_exact_call_key_intents() {
+        for request in [Frame::Status, Frame::Shutdown] {
+            let (mut client, mut server) = tokio::io::duplex(8 * 1024);
+            let token = test_token();
+            let call_key = test_call_key();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let (client_result, server_result) = tokio::join!(
+                authenticate_client_for_request(
+                    &mut client,
+                    "prod",
+                    &token,
+                    &call_key,
+                    &request,
+                    deadline,
+                ),
+                authenticate_server(&mut server, "prod", &token, &call_key, deadline),
+            );
+            client_result.unwrap();
+            let mut context = server_result.unwrap();
+            context.verify_request(&call_key, &request).unwrap();
+        }
+    }
+
+    #[test]
+    fn canonical_intents_cover_every_field_and_reject_continuation_frames() {
+        let key = test_call_key();
+        assert_ne!(
+            request_intent_commitment(&key, &Frame::Status)
+                .unwrap()
+                .as_ref(),
+            request_intent_commitment(&key, &Frame::Shutdown)
+                .unwrap()
+                .as_ref(),
+        );
+        let first = Frame::UploadBegin {
+            path: "/tmp/file".into(),
+            size: 17,
+            timeout_ms: 5_000,
+        };
+        let changed_size = Frame::UploadBegin {
+            path: "/tmp/file".into(),
+            size: 18,
+            timeout_ms: 5_000,
+        };
+        let changed_timeout = Frame::UploadBegin {
+            path: "/tmp/file".into(),
+            size: 17,
+            timeout_ms: 5_001,
+        };
+        assert_ne!(
+            request_intent_commitment(&key, &first).unwrap().as_ref(),
+            request_intent_commitment(&key, &changed_size)
+                .unwrap()
+                .as_ref()
+        );
+        assert_ne!(
+            request_intent_commitment(&key, &first).unwrap().as_ref(),
+            request_intent_commitment(&key, &changed_timeout)
+                .unwrap()
+                .as_ref()
+        );
+        assert!(request_intent_commitment(
+            &key,
+            &Frame::UploadChunk {
+                data: b"continuation".to_vec(),
+            },
+        )
+        .is_err());
+        assert!(request_intent_commitment(&key, &Frame::UploadEnd).is_err());
+        assert!(request_intent_commitment(
+            &key,
+            &Frame::ShellInput {
+                data: b"continuation".to_vec(),
+            },
+        )
+        .is_err());
+
+        let tunnel = TunnelSpec {
+            mode: TunnelMode::Local,
+            bind_port: 8080,
+            target_port: 5432,
+            max_connections: 16,
+        };
+        let baseline = request_intent_commitment(
+            &key,
+            &Frame::TunnelOpen {
+                spec: tunnel.clone(),
+            },
+        )
+        .unwrap();
+        let mut variations = Vec::new();
+        let mut changed = tunnel.clone();
+        changed.mode = TunnelMode::Remote;
+        variations.push(changed);
+        let mut changed = tunnel.clone();
+        changed.bind_port += 1;
+        variations.push(changed);
+        let mut changed = tunnel.clone();
+        changed.target_port += 1;
+        variations.push(changed);
+        let mut changed = tunnel.clone();
+        changed.max_connections += 1;
+        variations.push(changed);
+        for changed in variations {
+            let commitment =
+                request_intent_commitment(&key, &Frame::TunnelOpen { spec: changed }).unwrap();
+            assert_ne!(baseline.as_ref(), commitment.as_ref());
+        }
+        assert!(request_intent_commitment(&key, &Frame::TunnelStop).is_err());
     }
 
     #[tokio::test]
@@ -1018,8 +1591,10 @@ mod tests {
                 Frame::AuthHello {
                     version,
                     client_nonce,
+                    intent_commitment,
                 } => {
                     assert_eq!(version, IPC_PROTOCOL_VERSION);
+                    assert!(intent_commitment.is_none());
                     decode_base64_32("test client nonce", &client_nonce).unwrap();
                 }
                 _ => panic!("client sent a non-hello frame before server authentication"),
@@ -1031,6 +1606,7 @@ mod tests {
                     version: IPC_PROTOCOL_VERSION,
                     server_nonce: B64.encode([0x33_u8; 32]),
                     server_proof: B64.encode([0_u8; 32]),
+                    server_call_proof: None,
                 },
                 MAX_AUTH_FRAME,
             )
@@ -1068,6 +1644,7 @@ mod tests {
             &prod_endpoint,
             &client_nonce,
             &server_nonce,
+            None,
         )
         .unwrap();
 
@@ -1079,6 +1656,7 @@ mod tests {
             &prod_endpoint,
             &client_nonce,
             &server_nonce,
+            None,
             &proof,
         )
         .unwrap();
@@ -1090,6 +1668,7 @@ mod tests {
             &prod_endpoint,
             &client_nonce,
             &server_nonce,
+            None,
             &proof,
         )
         .is_err());
@@ -1101,6 +1680,7 @@ mod tests {
             &prod_endpoint,
             &other_client_nonce,
             &server_nonce,
+            None,
             &proof,
         )
         .is_err());
@@ -1112,6 +1692,7 @@ mod tests {
             &prod_endpoint,
             &client_nonce,
             &other_server_nonce,
+            None,
             &proof,
         )
         .is_err());
@@ -1123,6 +1704,7 @@ mod tests {
             &prod_endpoint,
             &client_nonce,
             &server_nonce,
+            None,
             &proof,
         )
         .is_err());
@@ -1134,6 +1716,7 @@ mod tests {
             &stage_endpoint,
             &client_nonce,
             &server_nonce,
+            None,
             &proof,
         )
         .is_err());
@@ -1145,6 +1728,79 @@ mod tests {
             "different-endpoint-id",
             &client_nonce,
             &server_nonce,
+            None,
+            &proof,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn call_proofs_bind_commitment_and_reject_replay_on_new_nonces() {
+        let key = test_call_key();
+        let client_nonce = [1_u8; 32];
+        let server_nonce = [2_u8; 32];
+        let replay_server_nonce = [3_u8; 32];
+        let commitment = [4_u8; 32];
+        let changed_commitment = [5_u8; 32];
+        let token = decode_base64_32("test token", &test_token()).unwrap();
+        let endpoint = endpoint_id_with_token("prod", &token);
+        let proof = encoded_proof(
+            key.as_bytes(),
+            CLIENT_CALL_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            "prod",
+            &endpoint,
+            &client_nonce,
+            &server_nonce,
+            Some(&commitment),
+        )
+        .unwrap();
+
+        verify_proof(
+            key.as_bytes(),
+            CLIENT_CALL_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            "prod",
+            &endpoint,
+            &client_nonce,
+            &server_nonce,
+            Some(&commitment),
+            &proof,
+        )
+        .unwrap();
+        assert!(verify_proof(
+            key.as_bytes(),
+            CLIENT_CALL_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            "prod",
+            &endpoint,
+            &client_nonce,
+            &replay_server_nonce,
+            Some(&commitment),
+            &proof,
+        )
+        .is_err());
+        assert!(verify_proof(
+            key.as_bytes(),
+            CLIENT_CALL_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION,
+            "prod",
+            &endpoint,
+            &client_nonce,
+            &server_nonce,
+            Some(&changed_commitment),
+            &proof,
+        )
+        .is_err());
+        assert!(verify_proof(
+            key.as_bytes(),
+            CLIENT_CALL_PROOF_DOMAIN,
+            IPC_PROTOCOL_VERSION - 1,
+            "prod",
+            &endpoint,
+            &client_nonce,
+            &server_nonce,
+            Some(&commitment),
             &proof,
         )
         .is_err());
@@ -1158,6 +1814,7 @@ mod tests {
             &Frame::AuthHello {
                 version: IPC_PROTOCOL_VERSION - 1,
                 client_nonce: B64.encode([7_u8; 32]),
+                intent_commitment: None,
             },
             MAX_AUTH_FRAME,
         )
@@ -1167,17 +1824,19 @@ mod tests {
             &mut server,
             "prod",
             &test_token(),
+            &test_call_key(),
             Instant::now() + Duration::from_secs(1),
         )
         .await
-        .unwrap_err();
+        .err()
+        .expect("server unexpectedly accepted a downgraded protocol");
         assert!(error
             .to_string()
             .contains("unsupported IPC authentication version"));
     }
 
     #[tokio::test]
-    async fn client_rejects_v2_challenge_without_sending_a_response() {
+    async fn client_rejects_v4_challenge_without_sending_a_response() {
         let (mut client, mut old_server) = tokio::io::duplex(1024);
         let token = test_token();
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -1197,9 +1856,10 @@ mod tests {
             write_frame_limited(
                 &mut old_server,
                 &Frame::AuthChallenge {
-                    version: 2,
+                    version: IPC_PROTOCOL_VERSION - 1,
                     server_nonce: B64.encode([0x33_u8; 32]),
                     server_proof: B64.encode([0x44_u8; 32]),
+                    server_call_proof: None,
                 },
                 MAX_AUTH_FRAME,
             )
@@ -1217,7 +1877,7 @@ mod tests {
         assert!(client_result
             .unwrap_err()
             .to_string()
-            .contains("unsupported IPC authentication version 2"));
+            .contains("unsupported IPC authentication version 4"));
     }
 
     #[tokio::test]
@@ -1228,6 +1888,59 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn malformed_or_partial_intent_hello_fails_before_a_challenge() {
+        let (mut malformed_client, mut malformed_server) = tokio::io::duplex(1024);
+        write_frame_limited(
+            &mut malformed_client,
+            &Frame::AuthHello {
+                version: IPC_PROTOCOL_VERSION,
+                client_nonce: B64.encode([7_u8; 32]),
+                intent_commitment: Some("not-canonical-base64".into()),
+            },
+            MAX_AUTH_FRAME,
+        )
+        .await
+        .unwrap();
+        let malformed = authenticate_server(
+            &mut malformed_server,
+            "prod",
+            &test_token(),
+            &test_call_key(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .expect("server accepted malformed intent commitment");
+        assert!(malformed.to_string().contains("intent commitment"));
+
+        let (mut partial_client, mut partial_server) = tokio::io::duplex(1024);
+        let hello = serde_json::to_vec(&Frame::AuthHello {
+            version: IPC_PROTOCOL_VERSION,
+            client_nonce: B64.encode([8_u8; 32]),
+            intent_commitment: Some(B64.encode([9_u8; 32])),
+        })
+        .unwrap();
+        let declared = u32::try_from(hello.len()).unwrap().to_be_bytes();
+        partial_client.write_all(&declared).await.unwrap();
+        partial_client
+            .write_all(&hello[..hello.len() - 1])
+            .await
+            .unwrap();
+        partial_client.shutdown().await.unwrap();
+        let partial = authenticate_server(
+            &mut partial_server,
+            "prod",
+            &test_token(),
+            &test_call_key(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .expect("server accepted a partial authentication frame");
+        assert!(partial.to_string().contains("early eof"));
     }
 
     #[test]
@@ -1252,7 +1965,7 @@ mod tests {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
         assert!(expected_endpoint("prod", &token)
             .unwrap()
-            .contains("serctl-v3-"));
+            .contains("serctl-v5-"));
         validate_endpoint_bytes("expected", "expected").unwrap();
         assert!(validate_endpoint_bytes("expected", "EXPECTED").is_err());
         assert!(validate_endpoint_bytes("expected", "expected ").is_err());
@@ -1332,6 +2045,70 @@ mod tests {
             Frame::FileChunk { data } => assert!(data.is_empty()),
             _ => unreachable!(),
         }
+
+        let mut authentication = Frame::AuthResponse {
+            client_proof: "token-proof".into(),
+            client_call_proof: Some("call-proof".into()),
+        };
+        authentication.zeroize_sensitive();
+        match authentication {
+            Frame::AuthResponse {
+                client_proof,
+                client_call_proof,
+            } => {
+                assert!(client_proof.is_empty());
+                assert!(client_call_proof.as_deref().is_none_or(str::is_empty));
+            }
+            _ => unreachable!(),
+        }
+
+        let mut hello = Frame::AuthHello {
+            version: IPC_PROTOCOL_VERSION,
+            client_nonce: "nonce".into(),
+            intent_commitment: Some("commitment".into()),
+        };
+        hello.zeroize_sensitive();
+        match hello {
+            Frame::AuthHello {
+                client_nonce,
+                intent_commitment,
+                ..
+            } => {
+                assert!(client_nonce.is_empty());
+                assert!(intent_commitment.as_deref().is_none_or(str::is_empty));
+            }
+            _ => unreachable!(),
+        }
+
+        let mut tunnel = Frame::TunnelOpen {
+            spec: TunnelSpec {
+                mode: TunnelMode::Local,
+                bind_port: 8080,
+                target_port: 22,
+                max_connections: 4,
+            },
+        };
+        tunnel.zeroize_sensitive();
+        match tunnel {
+            Frame::TunnelOpen { spec } => {
+                assert_eq!(spec.bind_port, 8080);
+                assert_eq!(spec.target_port, 22);
+            }
+            _ => unreachable!(),
+        }
+
+        let mut ready = Frame::TunnelReady {
+            ready: TunnelReady {
+                mode: TunnelMode::Local,
+                bind_host: "sensitive-ready-bind".into(),
+                bind_port: 8080,
+            },
+        };
+        ready.zeroize_sensitive();
+        match ready {
+            Frame::TunnelReady { ready } => assert!(ready.bind_host.is_empty()),
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -1395,6 +2172,28 @@ mod tests {
         assert!(encoded.len() <= MAX_CONTROL_FRAME);
     }
 
+    #[test]
+    fn tunnel_control_frames_fit_the_control_limit() {
+        let open = Frame::TunnelOpen {
+            spec: TunnelSpec {
+                mode: TunnelMode::Remote,
+                bind_port: u16::MAX,
+                target_port: u16::MAX,
+                max_connections: crate::ssh::MAX_TUNNEL_CONNECTIONS as u16,
+            },
+        };
+        let ready = Frame::TunnelReady {
+            ready: TunnelReady {
+                mode: TunnelMode::Remote,
+                bind_host: "b".repeat(crate::ssh::MAX_TUNNEL_HOST_BYTES),
+                bind_port: u16::MAX,
+            },
+        };
+        for frame in [open, ready, Frame::TunnelStop, Frame::TunnelClosed] {
+            assert!(serialize_frame_bounded(&frame, MAX_CONTROL_FRAME).is_ok());
+        }
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn protected_named_pipe_allows_owner_and_exposes_server_pid() {
@@ -1426,7 +2225,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unix_peer_identity_checks_uid_and_available_pid() {
+    async fn unix_peer_identity_checks_uid_and_pid() {
         let path = std::env::temp_dir().join(format!(
             "serctl-peer-{}-{}.sock",
             std::process::id(),
@@ -1441,5 +2240,38 @@ mod tests {
         validate_server_identity(&client, std::process::id()).unwrap();
         drop((client, server, listener));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unix_peer_identity_fails_closed_without_pid() {
+        let uid = 1_000_u64;
+        let expected_pid = std::process::id();
+        let different_pid = expected_pid.wrapping_add(1);
+
+        assert_eq!(
+            validate_unix_peer_identity(uid, None, uid, expected_pid)
+                .unwrap_err()
+                .to_string(),
+            "Unix-socket peer PID is unavailable on this platform"
+        );
+        assert!(
+            validate_unix_peer_identity(uid, Some(i64::from(expected_pid)), uid, expected_pid)
+                .is_ok()
+        );
+        assert!(validate_unix_peer_identity(
+            uid,
+            Some(i64::from(different_pid)),
+            uid,
+            expected_pid
+        )
+        .is_err());
+        assert!(validate_unix_peer_identity(uid, Some(0), uid, expected_pid).is_err());
+        assert!(validate_unix_peer_identity(
+            uid + 1,
+            Some(i64::from(expected_pid)),
+            uid,
+            expected_pid
+        )
+        .is_err());
     }
 }

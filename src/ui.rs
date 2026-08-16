@@ -2,26 +2,377 @@
 //! through Winit; all blocking vault/SSH work stays off the Winit event loop.
 
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, Write};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, TextEdit};
 use tokio::runtime::Runtime;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{client, daemon, ssh::RemoteEntry, vault};
+use crate::{client, daemon, security, ssh::RemoteEntry, vault};
 
 const MAX_CONCURRENT_STATUS_PROBES: usize = 8;
 const TRANSFER_EXIT_GRACE: Duration = Duration::from_secs(6);
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const PROFILE_REFRESH_TIMEOUT: Duration = Duration::from_secs(32);
 const ABORT_JOIN_GRACE: Duration = Duration::from_millis(250);
+// Client/daemon cleanup has an internal 7-second bound. Keep a margin so this
+// outer UI join observes that fail-closed abort instead of detaching it first.
+const TUNNEL_EXIT_GRACE: Duration = Duration::from_secs(8);
+const MAX_UI_TUNNEL_CONNECTIONS: u16 = 128;
+const UI_AUTHORIZATION_TTL: Duration = Duration::from_secs(5 * 60);
+const UI_AUTHORIZATION_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+const UI_ADMIN_AUTHORIZATION_TTL: Duration = Duration::from_secs(2 * 60);
+const MAX_RECOVERY_MEDIA_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
-type VaultProfileRows = Vec<(String, String, u16)>;
+/// Recovery media is intentionally portable, but it must still be created as
+/// a new regular, non-link object through a stable read/write handle. This is
+/// kept equivalent to the CLI path so a UI-created medium has the same safety
+/// and durability guarantees.
+fn create_new_recovery_media_file(path: &Path) -> Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    let file = options
+        .open(path)
+        .with_context(|| format!("创建新的恢复介质 {}", path.display()))?;
+    let metadata = file.metadata().context("检查新恢复介质的文件句柄")?;
+    if !metadata.file_type().is_file() {
+        bail!("恢复介质目标不是普通文件");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            bail!("恢复介质目标不能是重解析点");
+        }
+    }
+    Ok(file)
+}
+
+fn persist_recovery_media_new(path: &Path, media: &[u8]) -> Result<()> {
+    use subtle::ConstantTimeEq;
+
+    crate::validate_external_secret_path(path, false, "UI recovery-media output")?;
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return Err(anyhow!("恢复介质必须使用绝对文件路径"));
+    }
+    if media.is_empty() || media.len() as u64 > MAX_RECOVERY_MEDIA_FILE_BYTES {
+        bail!("恢复介质内容为空或超过 4 MiB 安全上限");
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("恢复介质路径没有父目录"))?;
+    if !parent.is_dir() {
+        return Err(anyhow!("恢复介质的父目录不存在"));
+    }
+    let mut file = create_new_recovery_media_file(path)?;
+    file.write_all(media)
+        .with_context(|| format!("写入恢复介质 {}；可能残留部分文件", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("同步恢复介质 {}；可能残留部分文件", path.display()))?;
+
+    // Verify the exact bytes through the same stable handle before the vault
+    // transaction is allowed to commit. This catches short/removable-media
+    // writes without reopening an attacker-replaceable pathname.
+    file.rewind().context("回绕恢复介质以执行写后校验")?;
+    let mut persisted = Zeroizing::new(vec![0_u8; media.len()]);
+    file.read_exact(&mut persisted)
+        .context("回读恢复介质以执行写后校验")?;
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing)? != 0 || !bool::from(persisted.as_slice().ct_eq(media)) {
+        bail!("恢复介质写后校验失败");
+    }
+
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)
+            .with_context(|| format!("打开恢复介质目录 {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("同步恢复介质目录 {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn read_recovery_media(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    crate::validate_external_secret_path(path, true, "UI recovery media")?;
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return Err(anyhow!("恢复介质必须使用绝对文件路径"));
+    }
+    let mut file = security::open_regular_file_for_read(path)
+        .map_err(|error| anyhow!("安全打开恢复介质失败：{error}"))?;
+    let declared = file
+        .metadata()
+        .map_err(|error| anyhow!("检查恢复介质大小失败：{error}"))?
+        .len();
+    if declared == 0 || declared > MAX_RECOVERY_MEDIA_FILE_BYTES {
+        bail!("恢复介质为空或超过 4 MiB 安全上限");
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(declared as usize));
+    (&mut file)
+        .take(MAX_RECOVERY_MEDIA_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow!("读取恢复介质失败：{error}"))?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_RECOVERY_MEDIA_FILE_BYTES {
+        bail!("读取期间恢复介质大小发生变化");
+    }
+    Ok(bytes)
+}
+
+#[derive(Default)]
+struct UiAuthorization {
+    passphrase: Option<Zeroizing<String>>,
+    expires_at: Option<Instant>,
+}
+
+impl UiAuthorization {
+    fn grant(&mut self, passphrase: Zeroizing<String>, verified_at: Instant) {
+        self.revoke();
+        self.passphrase = Some(passphrase);
+        self.expires_at = Some(verified_at + UI_AUTHORIZATION_TTL);
+    }
+
+    fn revoke(&mut self) {
+        drop(self.passphrase.take());
+        self.expires_at = None;
+    }
+
+    fn is_expired_at(&self, now: Instant) -> bool {
+        self.expires_at.is_some_and(|expires_at| now >= expires_at)
+    }
+
+    fn remaining_at(&self, now: Instant) -> Option<Duration> {
+        self.expires_at
+            .filter(|expires_at| *expires_at > now)
+            .map(|expires_at| expires_at - now)
+    }
+
+    fn passphrase(&self) -> Option<Zeroizing<String>> {
+        self.passphrase
+            .as_ref()
+            .map(|passphrase| Zeroizing::new(passphrase.as_str().to_owned()))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ProfileAuthorizationKey {
+    profile: String,
+    profile_id: [u8; 16],
+    generation: u64,
+}
+
+#[derive(Default)]
+struct UiAuthorizations {
+    grants: BTreeMap<ProfileAuthorizationKey, UiAuthorization>,
+}
+
+impl UiAuthorizations {
+    fn grant(
+        &mut self,
+        profile: String,
+        identity: vault::ProfileIdentity,
+        passphrase: Zeroizing<String>,
+        verified_at: Instant,
+    ) {
+        self.revoke_profile(profile.as_str());
+        let mut authorization = UiAuthorization::default();
+        authorization.grant(passphrase, verified_at);
+        self.grants.insert(
+            ProfileAuthorizationKey {
+                profile,
+                profile_id: identity.profile_id,
+                generation: identity.generation,
+            },
+            authorization,
+        );
+    }
+
+    fn get(
+        &self,
+        profile: &str,
+        identity: vault::ProfileIdentity,
+        now: Instant,
+    ) -> Option<&UiAuthorization> {
+        self.grants
+            .get(&ProfileAuthorizationKey {
+                profile: profile.to_owned(),
+                profile_id: identity.profile_id,
+                generation: identity.generation,
+            })
+            .filter(|authorization| !authorization.is_expired_at(now))
+    }
+
+    fn passphrase(
+        &self,
+        profile: &str,
+        identity: vault::ProfileIdentity,
+        now: Instant,
+    ) -> Option<Zeroizing<String>> {
+        self.get(profile, identity, now)?.passphrase()
+    }
+
+    fn remaining_at(
+        &self,
+        profile: &str,
+        identity: vault::ProfileIdentity,
+        now: Instant,
+    ) -> Option<Duration> {
+        self.get(profile, identity, now)?.remaining_at(now)
+    }
+
+    fn revoke_profile(&mut self, profile: &str) -> bool {
+        let keys = self
+            .grants
+            .keys()
+            .filter(|key| key.profile == profile)
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = !keys.is_empty();
+        for mut key in keys {
+            self.grants.remove(&key);
+            key.profile.zeroize();
+        }
+        removed
+    }
+
+    fn revoke_all(&mut self) {
+        for (mut key, mut authorization) in std::mem::take(&mut self.grants) {
+            key.profile.zeroize();
+            authorization.revoke();
+        }
+    }
+
+    fn expire_at(&mut self, now: Instant) -> Vec<ProfileAuthorizationKey> {
+        let expired = self
+            .grants
+            .iter()
+            .filter(|(_, authorization)| authorization.is_expired_at(now))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in &expired {
+            self.grants.remove(key);
+        }
+        expired
+    }
+
+    fn retain_current_profiles(&mut self, profiles: &[ProfileRow]) -> bool {
+        let stale = self
+            .grants
+            .keys()
+            .filter(|key| {
+                !profiles.iter().any(|profile| {
+                    profile.name == key.profile
+                        && profile.generation == key.generation
+                        && profile.profile_id == key.profile_id
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = !stale.is_empty();
+        for mut key in stale {
+            self.grants.remove(&key);
+            key.profile.zeroize();
+        }
+        removed
+    }
+}
+
+struct AuthorizationGrant {
+    profile: String,
+    identity: vault::ProfileIdentity,
+    passphrase: Zeroizing<String>,
+    verified_at: Instant,
+}
+
+#[derive(Default)]
+struct AdminAuthorization {
+    passphrase: Option<Zeroizing<String>>,
+    expires_at: Option<Instant>,
+}
+
+impl AdminAuthorization {
+    fn grant(&mut self, passphrase: Option<Zeroizing<String>>, verified_at: Instant) {
+        self.revoke();
+        self.passphrase = passphrase;
+        self.expires_at = Some(verified_at + UI_ADMIN_AUTHORIZATION_TTL);
+    }
+
+    fn revoke(&mut self) {
+        drop(self.passphrase.take());
+        self.expires_at = None;
+    }
+
+    fn is_valid_at(&self, now: Instant) -> bool {
+        self.expires_at.is_some_and(|expires_at| now < expires_at)
+    }
+
+    fn remaining_at(&self, now: Instant) -> Option<Duration> {
+        self.expires_at
+            .filter(|expires_at| *expires_at > now)
+            .map(|expires_at| expires_at - now)
+    }
+
+    fn passphrase_at(&self, now: Instant) -> Option<Option<Zeroizing<String>>> {
+        self.is_valid_at(now).then(|| {
+            self.passphrase
+                .as_ref()
+                .map(|passphrase| Zeroizing::new(passphrase.as_str().to_owned()))
+        })
+    }
+}
+
+struct AdminAuthorizationGrant {
+    passphrase: Option<Zeroizing<String>>,
+    verified_at: Instant,
+}
+
+async fn verify_ui_admin_authorization(
+    passphrase: Option<Zeroizing<String>>,
+    deadline: tokio::time::Instant,
+) -> Result<AdminAuthorizationGrant, String> {
+    let mut task = tokio::task::spawn_blocking(move || {
+        vault::verify_admin_password(passphrase.as_deref().map(String::as_str))
+            .map(|_| passphrase)
+            .map_err(|error| error.to_string())
+    });
+    let passphrase = match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(Ok(passphrase))) => passphrase,
+        Ok(Ok(Err(error))) => return Err(error),
+        Ok(Err(error)) => return Err(format!("超管授权任务失败：{error}")),
+        Err(_) => {
+            task.abort();
+            return Err("超管授权超过 30 秒等待上限".into());
+        }
+    };
+    Ok(AdminAuthorizationGrant {
+        passphrase,
+        verified_at: Instant::now(),
+    })
+}
+
+type VaultProfileRows = Vec<vault::ProfileMetadata>;
 
 struct SensitiveProfileListResult(Option<Result<VaultProfileRows, String>>);
 
@@ -42,9 +393,9 @@ impl Drop for SensitiveProfileListResult {
         };
         match result {
             Ok(rows) => {
-                for (name, host, _) in rows.iter_mut() {
-                    name.zeroize();
-                    host.zeroize();
+                for row in rows.iter_mut() {
+                    row.name.zeroize();
+                    row.host.zeroize();
                 }
                 rows.clear();
             }
@@ -79,7 +430,9 @@ async fn load_vault_profile_rows(
     deadline: tokio::time::Instant,
 ) -> Result<VaultProfileRows, String> {
     let task = tokio::task::spawn_blocking(|| {
-        SensitiveProfileListResult::new(vault::list().map_err(|error| error.to_string()))
+        SensitiveProfileListResult::new(
+            vault::list_profile_metadata().map_err(|error| error.to_string()),
+        )
     });
     await_blocking_until(task, deadline, "读取主机配置")
         .await?
@@ -91,24 +444,37 @@ struct ProfileRow {
     name: String,
     host: String,
     port: u16,
+    generation: u64,
+    profile_id: [u8; 16],
     daemon: Option<client::DaemonStatus>,
 }
 
-fn spawn_status_probe<P, F>(probes: &mut JoinSet<ProfileRow>, row: (String, String, u16), probe: P)
+impl ProfileRow {
+    fn identity(&self) -> vault::ProfileIdentity {
+        vault::ProfileIdentity {
+            profile_id: self.profile_id,
+            generation: self.generation,
+        }
+    }
+}
+
+fn spawn_status_probe<R, P, F>(probes: &mut JoinSet<ProfileRow>, row: R, probe: P)
 where
-    P: FnOnce((String, String, u16)) -> F + Send + 'static,
+    R: Send + 'static,
+    P: FnOnce(R) -> F + Send + 'static,
     F: std::future::Future<Output = ProfileRow> + Send + 'static,
 {
     probes.spawn(probe(row));
 }
 
-async fn load_profile_rows_with_probe<P, F>(
-    rows: Vec<(String, String, u16)>,
+async fn load_profile_rows_with_probe<R, P, F>(
+    rows: Vec<R>,
     deadline: tokio::time::Instant,
     probe: P,
 ) -> Result<Vec<ProfileRow>, String>
 where
-    P: Fn((String, String, u16)) -> F + Clone + Send + 'static,
+    R: Send + 'static,
+    P: Fn(R) -> F + Clone + Send + 'static,
     F: std::future::Future<Output = ProfileRow> + Send + 'static,
 {
     if deadline <= tokio::time::Instant::now() {
@@ -148,22 +514,125 @@ where
 }
 
 async fn load_profile_rows(
-    rows: Vec<(String, String, u16)>,
+    rows: VaultProfileRows,
+    authorizations: Vec<(String, vault::ProfileIdentity, Zeroizing<String>)>,
     deadline: tokio::time::Instant,
 ) -> Result<Vec<ProfileRow>, String> {
-    load_profile_rows_with_probe(rows, deadline, |(name, host, port)| async move {
-        let daemon = client::daemon_status(&name).await.unwrap_or(None);
+    let authorizations = authorizations
+        .into_iter()
+        .map(|(name, identity, passphrase)| ((name, identity), passphrase))
+        .collect::<BTreeMap<_, _>>();
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            let passphrase: Option<Zeroizing<String>> = authorizations
+                .get(&(row.name.clone(), row.identity()))
+                .map(|passphrase| Zeroizing::new(passphrase.as_str().to_owned()));
+            (row, passphrase)
+        })
+        .collect();
+    load_profile_rows_with_probe(rows, deadline, move |(row, passphrase)| async move {
+        // Merely opening/refeshing the UI must never contact a daemon or the
+        // network for a profile whose independent passphrase is not cached.
+        let daemon = match passphrase {
+            Some(passphrase) => {
+                client::daemon_status_at_generation(&row.name, &passphrase, row.identity())
+                    .await
+                    .unwrap_or(None)
+            }
+            None => None,
+        };
         ProfileRow {
-            name,
-            host,
-            port,
+            name: row.name,
+            host: row.host,
+            port: row.port,
+            generation: row.generation,
+            profile_id: row.profile_id,
             daemon,
         }
     })
     .await
 }
 
+async fn verify_ui_authorization(
+    profile: String,
+    expected_identity: vault::ProfileIdentity,
+    passphrase: Zeroizing<String>,
+    deadline: tokio::time::Instant,
+) -> Result<AuthorizationGrant, String> {
+    let mut task = tokio::task::spawn_blocking(move || {
+        vault::verify_profile_identity(&profile, passphrase.as_str())
+            .and_then(|identity| {
+                if identity == expected_identity {
+                    Ok((profile, identity, passphrase))
+                } else {
+                    Err(anyhow!(
+                        "profile changed while authorization was being verified"
+                    ))
+                }
+            })
+            .map_err(|error| error.to_string())
+    });
+    let (profile, identity, passphrase) = match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(Ok(grant))) => grant,
+        Ok(Ok(Err(error))) => return Err(error),
+        Ok(Err(error)) => return Err(format!("独立口令验证任务失败：{error}")),
+        Err(_) => {
+            task.abort();
+            return Err("独立口令验证超过 30 秒等待上限".into());
+        }
+    };
+    Ok(AuthorizationGrant {
+        profile,
+        identity,
+        passphrase,
+        verified_at: Instant::now(),
+    })
+}
+
 enum UiMessage {
+    Authorization {
+        operation: OperationContext,
+        result: Result<AuthorizationGrant, String>,
+    },
+    AdminAuthorization {
+        operation: OperationContext,
+        result: Result<AdminAuthorizationGrant, String>,
+    },
+    AdminStatus {
+        operation: OperationContext,
+        result: Result<vault::AdminStatus, String>,
+    },
+    AdminInitialized {
+        operation: OperationContext,
+        result: Result<String, String>,
+    },
+    AdminPasswordChanged {
+        operation: OperationContext,
+        result: Result<(), String>,
+    },
+    RecoveryRotated {
+        operation: OperationContext,
+        result: Result<String, String>,
+    },
+    ProfileRecovered {
+        operation: OperationContext,
+        profile: String,
+        result: Result<u64, String>,
+    },
+    ProfileReset {
+        operation: OperationContext,
+        profile: String,
+        result: Result<u64, String>,
+    },
+    Migrated {
+        operation: OperationContext,
+        result: Result<usize, String>,
+    },
+    MigrationProgress {
+        operation_id: u64,
+        progress: vault::MigrationProgress,
+    },
     Profiles {
         operation: OperationContext,
         epoch: u64,
@@ -173,6 +642,11 @@ enum UiMessage {
         operation: OperationContext,
         original_name: Option<String>,
         result: Result<String, String>,
+    },
+    ProfilePassphraseChanged {
+        operation: OperationContext,
+        profile: String,
+        result: Result<u64, String>,
     },
     Removed {
         operation: OperationContext,
@@ -219,6 +693,16 @@ enum UiMessage {
         operation: OperationContext,
         result: Result<(String, client::GuiShell), String>,
     },
+    TunnelStarted {
+        operation: OperationContext,
+        context: TunnelContext,
+        spec: client::TunnelSpec,
+        result: Result<client::GuiTunnel, String>,
+    },
+    TunnelEnded {
+        context: TunnelContext,
+        result: Result<(), String>,
+    },
     #[cfg(test)]
     ZeroizeProbe(Arc<std::sync::atomic::AtomicBool>),
 }
@@ -226,6 +710,74 @@ enum UiMessage {
 impl UiMessage {
     fn zeroize_sensitive(&mut self) {
         match self {
+            Self::Authorization { operation, result } => {
+                zeroize_operation_context(operation);
+                match result {
+                    Ok(grant) => {
+                        grant.profile.zeroize();
+                        grant.passphrase.zeroize();
+                    }
+                    Err(error) => error.zeroize(),
+                }
+            }
+            Self::AdminAuthorization { operation, result } => {
+                zeroize_operation_context(operation);
+                match result {
+                    Ok(grant) => {
+                        if let Some(passphrase) = grant.passphrase.as_mut() {
+                            passphrase.zeroize();
+                        }
+                    }
+                    Err(error) => error.zeroize(),
+                }
+            }
+            Self::AdminStatus { operation, result } => {
+                zeroize_operation_context(operation);
+                if let Err(error) = result {
+                    error.zeroize();
+                }
+            }
+            Self::AdminInitialized { operation, result } => {
+                zeroize_operation_context(operation);
+                zeroize_string_result(result);
+            }
+            Self::AdminPasswordChanged { operation, result } => {
+                zeroize_operation_context(operation);
+                if let Err(error) = result {
+                    error.zeroize();
+                }
+            }
+            Self::RecoveryRotated { operation, result } => {
+                zeroize_operation_context(operation);
+                zeroize_string_result(result);
+            }
+            Self::ProfileRecovered {
+                operation,
+                profile,
+                result,
+            }
+            | Self::ProfileReset {
+                operation,
+                profile,
+                result,
+            } => {
+                zeroize_operation_context(operation);
+                profile.zeroize();
+                if let Err(error) = result {
+                    error.zeroize();
+                }
+            }
+            Self::Migrated { operation, result } => {
+                zeroize_operation_context(operation);
+                if let Err(error) = result {
+                    error.zeroize();
+                }
+            }
+            Self::MigrationProgress { progress, .. } => {
+                if let vault::MigrationProgress::MigratingProfile { profile, .. } = progress {
+                    profile.zeroize();
+                }
+            }
             Self::Profiles {
                 operation, result, ..
             } => {
@@ -240,6 +792,17 @@ impl UiMessage {
                 zeroize_operation_context(operation);
                 zeroize_option_string(original_name);
                 zeroize_string_result(result);
+            }
+            Self::ProfilePassphraseChanged {
+                operation,
+                profile,
+                result,
+            } => {
+                zeroize_operation_context(operation);
+                profile.zeroize();
+                if let Err(error) = result {
+                    error.zeroize();
+                }
             }
             Self::Removed { operation, result } => {
                 zeroize_operation_context(operation);
@@ -328,6 +891,26 @@ impl UiMessage {
                     Err(error) => error.zeroize(),
                 }
             }
+            Self::TunnelStarted {
+                operation,
+                context,
+                spec,
+                result,
+            } => {
+                zeroize_operation_context(operation);
+                zeroize_tunnel_context(context);
+                zeroize_tunnel_spec(spec);
+                match result {
+                    Ok(tunnel) => tunnel.cancel(),
+                    Err(error) => error.zeroize(),
+                }
+            }
+            Self::TunnelEnded { context, result } => {
+                zeroize_tunnel_context(context);
+                if let Err(error) = result {
+                    error.zeroize();
+                }
+            }
             #[cfg(test)]
             Self::ZeroizeProbe(probe) => {
                 probe.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -366,6 +949,21 @@ fn zeroize_operation_context(operation: &mut OperationContext) {
 fn zeroize_directory_request(request: &mut DirectoryRequest) {
     request.profile.zeroize();
     request.path.zeroize();
+}
+
+fn zeroize_tunnel_context(context: &mut TunnelContext) {
+    context.profile.zeroize();
+}
+
+fn zeroize_tunnel_spec(_spec: &mut client::TunnelSpec) {}
+
+fn clone_tunnel_spec(spec: &client::TunnelSpec) -> client::TunnelSpec {
+    client::TunnelSpec {
+        mode: spec.mode,
+        bind_port: spec.bind_port,
+        target_port: spec.target_port,
+        max_connections: spec.max_connections,
+    }
 }
 
 fn zeroize_remote_entries(entries: &mut Vec<RemoteEntry>) {
@@ -509,6 +1107,16 @@ fn add_secret_password_edit(
     hint: &str,
 ) -> egui::Response {
     let id = sensitive_text_edit_id(name);
+    add_secret_password_edit_with_id(ui, enabled, id, secret, hint)
+}
+
+fn add_secret_password_edit_with_id(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    id: egui::Id,
+    secret: &mut String,
+    hint: &str,
+) -> egui::Response {
     reset_text_edit_undo_state(ui.ctx(), id);
     let mut buffer = MaskedSecretTextBuffer::new(secret);
     let response = ui.add_enabled(
@@ -570,11 +1178,42 @@ fn ui_message_channel() -> (UiMessageSender, UiMessageReceiver) {
     (UiMessageSender(tx), UiMessageReceiver(rx))
 }
 
+fn schedule_active_operation_poll(ctx: &egui::Context, active: bool) {
+    if active {
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+fn send_migration_progress(
+    tx: &UiMessageSender,
+    repaint: &egui::Context,
+    operation_id: u64,
+    progress: vault::MigrationProgress,
+) {
+    if tx
+        .send(UiMessage::MigrationProgress {
+            operation_id,
+            progress,
+        })
+        .is_ok()
+    {
+        repaint.request_repaint();
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OperationContext {
     id: u64,
     profile: Option<String>,
     profile_generation: u64,
+    profile_identity: Option<vault::ProfileIdentity>,
+}
+
+impl OperationContext {
+    fn with_profile_identity(mut self, identity: vault::ProfileIdentity) -> Self {
+        self.profile_identity = Some(identity);
+        self
+    }
 }
 
 #[derive(Default)]
@@ -583,6 +1222,7 @@ struct UiOperations {
     profile_generation: u64,
     refresh_epoch: u64,
     next_daemon_instance: u64,
+    next_tunnel_instance: u64,
     active: BTreeMap<u64, Zeroizing<String>>,
 }
 
@@ -596,6 +1236,7 @@ impl UiOperations {
             id: self.next_id,
             profile,
             profile_generation: self.profile_generation,
+            profile_identity: None,
         };
         self.active.insert(operation.id, Zeroizing::new(activity));
         operation
@@ -603,6 +1244,15 @@ impl UiOperations {
 
     fn finish(&mut self, operation: &OperationContext) -> bool {
         self.active.remove(&operation.id).is_some()
+    }
+
+    fn update_activity(&mut self, operation_id: u64, activity: String) -> bool {
+        let Some(current) = self.active.get_mut(&operation_id) else {
+            return false;
+        };
+        current.zeroize();
+        *current = Zeroizing::new(activity);
+        true
     }
 
     fn is_busy(&self) -> bool {
@@ -650,6 +1300,14 @@ impl UiOperations {
             .expect("daemon instance identifier exhausted");
         self.next_daemon_instance
     }
+
+    fn next_tunnel_instance(&mut self) -> u64 {
+        self.next_tunnel_instance = self
+            .next_tunnel_instance
+            .checked_add(1)
+            .expect("tunnel instance identifier exhausted");
+        self.next_tunnel_instance
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -658,6 +1316,7 @@ struct DirectoryRequest {
     path: String,
     generation: u64,
     profile_generation: u64,
+    profile_identity: vault::ProfileIdentity,
 }
 
 #[derive(Default)]
@@ -679,21 +1338,30 @@ impl DirectoryRequests {
         profile: String,
         path: String,
         profile_generation: u64,
+        profile_identity: vault::ProfileIdentity,
     ) -> DirectoryRequest {
         DirectoryRequest {
             profile,
             path,
             generation: self.advance(),
             profile_generation,
+            profile_identity,
         }
     }
 
-    fn context(&self, profile: String, path: String, profile_generation: u64) -> DirectoryRequest {
+    fn context(
+        &self,
+        profile: String,
+        path: String,
+        profile_generation: u64,
+        profile_identity: vault::ProfileIdentity,
+    ) -> DirectoryRequest {
         DirectoryRequest {
             profile,
             path,
             generation: self.generation,
             profile_generation,
+            profile_identity,
         }
     }
 
@@ -705,11 +1373,13 @@ impl DirectoryRequests {
         &self,
         selected: Option<&str>,
         profile_generation: u64,
+        profile_identity: Option<vault::ProfileIdentity>,
         request: &DirectoryRequest,
     ) -> bool {
         selected == Some(request.profile.as_str())
             && self.generation == request.generation
             && profile_generation == request.profile_generation
+            && profile_identity == Some(request.profile_identity)
     }
 }
 
@@ -719,23 +1389,228 @@ enum WorkspaceTab {
     Command,
     Files,
     Bash,
+    Tunnel,
 }
 
 #[derive(Default)]
 struct ProfileEditor {
     visible: bool,
     original_name: Option<String>,
+    expected_identity: Option<vault::ProfileIdentity>,
     name: String,
     host: String,
     port: String,
     user: String,
     password: String,
-    master: String,
+    host_key_sha256: String,
+    profile_passphrase: String,
+    profile_passphrase_confirmation: String,
+}
+
+#[derive(Default)]
+struct SecurityDialog {
+    visible: bool,
+    profile: String,
+    expected_identity: Option<vault::ProfileIdentity>,
+    current_passphrase: String,
+    new_passphrase: String,
+    new_passphrase_confirmation: String,
+    random_passphrase_once: Option<Zeroizing<String>>,
+    pending_random_action: Option<PendingRandomProfileAction>,
+    pending_random_identity: Option<vault::ProfileIdentity>,
+    random_saved_confirmation: bool,
+    recovery_media_path: String,
+    destructive_confirm_text: String,
+    replacement_host: String,
+    replacement_port: String,
+    replacement_user: String,
+    replacement_ssh_password: String,
+    replacement_profile_passphrase: String,
+    replacement_profile_passphrase_confirmation: String,
+}
+
+impl SecurityDialog {
+    fn clear(&mut self) {
+        self.visible = false;
+        self.profile.zeroize();
+        self.expected_identity = None;
+        self.current_passphrase.zeroize();
+        self.new_passphrase.zeroize();
+        self.new_passphrase_confirmation.zeroize();
+        drop(self.random_passphrase_once.take());
+        self.pending_random_action = None;
+        self.pending_random_identity = None;
+        self.random_saved_confirmation = false;
+        self.recovery_media_path.zeroize();
+        self.destructive_confirm_text.zeroize();
+        self.replacement_host.zeroize();
+        self.replacement_port.zeroize();
+        self.replacement_user.zeroize();
+        self.replacement_ssh_password.zeroize();
+        self.replacement_profile_passphrase.zeroize();
+        self.replacement_profile_passphrase_confirmation.zeroize();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingRandomProfileAction {
+    RotatePassphrase,
+    PreserveRecovery,
+    DestructiveReset,
+}
+
+impl PendingRandomProfileAction {
+    fn description(self) -> &'static str {
+        match self {
+            Self::RotatePassphrase => "随机轮转独立口令",
+            Self::PreserveRecovery => "使用离线介质保留凭据并恢复",
+            Self::DestructiveReset => "永久丢弃原凭据并随机重置",
+        }
+    }
+
+    fn commit_label(self) -> &'static str {
+        match self {
+            Self::RotatePassphrase => "确认已保存并执行口令轮转",
+            Self::PreserveRecovery => "确认已保存并执行保留式恢复",
+            Self::DestructiveReset => "确认已保存并执行破坏性重置",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SecuritySection {
+    #[default]
+    ProfilePassphrase,
+    PreserveRecovery,
+    DestructiveReset,
+}
+
+#[derive(Default)]
+struct AdminDialog {
+    visible: bool,
+    status: Option<vault::AdminStatus>,
+    password_input: String,
+    new_password: String,
+    new_password_confirmation: String,
+    media_path: String,
+    old_media_path: String,
+    new_media_path: String,
+}
+
+impl AdminDialog {
+    fn clear_secrets(&mut self) {
+        self.password_input.zeroize();
+        self.new_password.zeroize();
+        self.new_password_confirmation.zeroize();
+    }
+
+    fn close(&mut self) {
+        self.visible = false;
+        self.clear_secrets();
+        self.media_path.zeroize();
+        self.old_media_path.zeroize();
+        self.new_media_path.zeroize();
+    }
+}
+
+#[derive(Default)]
+struct MigrationWizard {
+    visible: bool,
+    profiles: Vec<String>,
+    old_master: String,
+    profile_passphrases: BTreeMap<String, String>,
+    profile_confirmations: BTreeMap<String, String>,
+    administrator_password: String,
+    administrator_confirmation: String,
+    recovery_media_path: String,
+}
+
+impl MigrationWizard {
+    fn clear_secrets(&mut self) {
+        self.old_master.zeroize();
+        for value in self.profile_passphrases.values_mut() {
+            value.zeroize();
+        }
+        for value in self.profile_confirmations.values_mut() {
+            value.zeroize();
+        }
+        self.profile_passphrases.clear();
+        self.profile_confirmations.clear();
+        self.administrator_password.zeroize();
+        self.administrator_confirmation.zeroize();
+    }
+
+    fn reset_profiles(&mut self, profiles: Vec<String>) {
+        self.clear_secrets();
+        self.profiles = profiles;
+        for profile in &self.profiles {
+            self.profile_passphrases
+                .insert(profile.clone(), String::new());
+            self.profile_confirmations
+                .insert(profile.clone(), String::new());
+        }
+        self.visible = true;
+    }
 }
 
 struct PendingTransfer {
     cancellation: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TunnelContext {
+    profile: String,
+    profile_generation: u64,
+    profile_identity: vault::ProfileIdentity,
+    instance: u64,
+}
+
+struct ActiveTunnel {
+    context: TunnelContext,
+    spec: client::TunnelSpec,
+    bind_port: u16,
+    last_error: Option<String>,
+    tunnel: client::GuiTunnel,
+}
+
+struct PendingTunnelStart {
+    context: TunnelContext,
+    operation: OperationContext,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+struct PendingTunnelStop {
+    context: TunnelContext,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+fn tunnel_context_is_current(
+    selected: Option<&str>,
+    profile_generation: u64,
+    profile_identity: Option<vault::ProfileIdentity>,
+    context: &TunnelContext,
+) -> bool {
+    selected == Some(context.profile.as_str())
+        && profile_generation == context.profile_generation
+        && profile_identity == Some(context.profile_identity)
+}
+
+fn tunnel_start_may_be_adopted(
+    selected: Option<&str>,
+    profile_generation: u64,
+    profile_identity: Option<vault::ProfileIdentity>,
+    pending: Option<&TunnelContext>,
+    active: Option<&TunnelContext>,
+    incoming: &TunnelContext,
+) -> bool {
+    tunnel_context_is_current(selected, profile_generation, profile_identity, incoming)
+        && pending == Some(incoming)
+        && active.is_none()
+}
+
+fn tunnel_end_matches_pending(pending: Option<&TunnelContext>, incoming: &TunnelContext) -> bool {
+    pending == Some(incoming)
 }
 
 enum DaemonReadiness<T> {
@@ -792,12 +1667,15 @@ impl Drop for RuntimeShutdownGuard {
 impl ProfileEditor {
     fn zeroize_sensitive_state(&mut self) {
         zeroize_option_string(&mut self.original_name);
+        self.expected_identity = None;
         self.name.zeroize();
         self.host.zeroize();
         self.port.zeroize();
         self.user.zeroize();
         self.password.zeroize();
-        self.master.zeroize();
+        self.host_key_sha256.zeroize();
+        self.profile_passphrase.zeroize();
+        self.profile_passphrase_confirmation.zeroize();
     }
 
     fn clear(&mut self) {
@@ -811,6 +1689,23 @@ fn zeroize_option_string(value: &mut Option<String>) {
     if let Some(mut value) = value.take() {
         value.zeroize();
     }
+}
+
+fn zeroize_admin_status(status: &mut Option<vault::AdminStatus>) {
+    if let Some(vault::AdminStatus::Ready { recovery_id, .. }) = status.as_mut() {
+        recovery_id.zeroize();
+    }
+    *status = None;
+}
+
+fn zeroize_migration_state(state: &mut Option<vault::VaultMigrationState>) {
+    if let Some(vault::VaultMigrationState::LegacyV2 { profiles }) = state.as_mut() {
+        for profile in profiles.iter_mut() {
+            profile.zeroize();
+        }
+        profiles.clear();
+    }
+    *state = None;
 }
 
 pub fn run() -> Result<()> {
@@ -850,9 +1745,16 @@ struct SerctlApp {
     owned_daemons: BTreeMap<String, u64>,
     selected: Option<String>,
     editor: ProfileEditor,
+    security_dialog: SecurityDialog,
+    security_section: SecuritySection,
+    admin_dialog: AdminDialog,
+    admin_authorization: AdminAuthorization,
+    migration: MigrationWizard,
+    migration_state: Option<vault::VaultMigrationState>,
     delete_candidate: Option<String>,
     command: String,
-    master: String,
+    profile_passphrase_input: String,
+    authorizations: UiAuthorizations,
     output: String,
     exit_code: Option<i32>,
     workspace_tab: WorkspaceTab,
@@ -869,6 +1771,13 @@ struct SerctlApp {
     shell_input: String,
     shell_bytes: Vec<u8>,
     shell_output: String,
+    tunnel_mode: client::TunnelMode,
+    tunnel_bind_port: String,
+    tunnel_target_port: String,
+    tunnel_max_connections: String,
+    tunnel: Option<ActiveTunnel>,
+    pending_tunnel_start: Option<PendingTunnelStart>,
+    pending_tunnel_stops: BTreeMap<u64, PendingTunnelStop>,
     operations: UiOperations,
     pending_transfers: BTreeMap<u64, PendingTransfer>,
     notice: Option<(String, bool)>,
@@ -879,6 +1788,9 @@ impl SerctlApp {
         configure_appearance(&cc.egui_ctx);
         let (tx, rx) = ui_message_channel();
         let mut app = Self::with_channels(runtime, tx, rx);
+        // Metadata refresh is local-only. Status probes are skipped for every
+        // profile that does not already have a generation-bound UI grant.
+        app.refresh_migration_state();
         app.refresh(&cc.egui_ctx);
         app
     }
@@ -895,9 +1807,16 @@ impl SerctlApp {
                 port: "22".into(),
                 ..ProfileEditor::default()
             },
+            security_dialog: SecurityDialog::default(),
+            security_section: SecuritySection::default(),
+            admin_dialog: AdminDialog::default(),
+            admin_authorization: AdminAuthorization::default(),
+            migration: MigrationWizard::default(),
+            migration_state: None,
             delete_candidate: None,
             command: "uname -a && whoami".into(),
-            master: String::new(),
+            profile_passphrase_input: String::new(),
+            authorizations: UiAuthorizations::default(),
             output: "选择一个主机，然后执行命令。".into(),
             exit_code: None,
             workspace_tab: WorkspaceTab::Command,
@@ -914,6 +1833,13 @@ impl SerctlApp {
             shell_input: String::new(),
             shell_bytes: Vec::new(),
             shell_output: "尚未打开 Bash 会话。".into(),
+            tunnel_mode: client::TunnelMode::Local,
+            tunnel_bind_port: "0".into(),
+            tunnel_target_port: String::new(),
+            tunnel_max_connections: "32".into(),
+            tunnel: None,
+            pending_tunnel_start: None,
+            pending_tunnel_stops: BTreeMap::new(),
             operations: UiOperations::default(),
             pending_transfers: BTreeMap::new(),
             notice: None,
@@ -933,12 +1859,391 @@ impl SerctlApp {
         self.notice = Some((message, error));
     }
 
+    fn refresh_migration_state(&mut self) {
+        match vault::migration_state() {
+            Ok(state) => {
+                if let vault::VaultMigrationState::LegacyV2 { profiles } = &state {
+                    if self.migration.profiles != *profiles {
+                        self.migration.reset_profiles(profiles.clone());
+                    } else {
+                        self.migration.visible = true;
+                    }
+                }
+                self.migration_state = Some(state);
+            }
+            Err(error) => self.set_notice(format!("读取 vault 状态失败：{error}"), true),
+        }
+    }
+
+    fn admin_passphrase_for_operation(&mut self) -> Option<Option<Zeroizing<String>>> {
+        let now = Instant::now();
+        if self
+            .admin_authorization
+            .expires_at
+            .is_some_and(|expires_at| now >= expires_at)
+        {
+            self.admin_authorization.revoke();
+            self.set_notice("超管授权已过期并清零".into(), true);
+            return None;
+        }
+        let passphrase = self.admin_authorization.passphrase_at(now);
+        if passphrase.is_none() {
+            self.set_notice("此管理操作需要先取得超管授权".into(), true);
+        }
+        passphrase
+    }
+
+    fn expire_admin_authorization(&mut self, now: Instant) -> bool {
+        if !self
+            .admin_authorization
+            .expires_at
+            .is_some_and(|expires_at| now >= expires_at)
+        {
+            return false;
+        }
+        self.admin_authorization.revoke();
+        true
+    }
+
+    fn authorize_admin(&mut self, ctx: &egui::Context) {
+        let requires_password =
+            self.admin_dialog
+                .status
+                .as_ref()
+                .is_some_and(|status| match status {
+                    vault::AdminStatus::Uninitialized {
+                        platform_requires_password,
+                    }
+                    | vault::AdminStatus::Ready {
+                        platform_requires_password,
+                        ..
+                    } => *platform_requires_password,
+                });
+        if requires_password && self.admin_dialog.password_input.is_empty() {
+            self.set_notice("请输入超管密码".into(), true);
+            return;
+        }
+        let passphrase = requires_password
+            .then(|| Zeroizing::new(std::mem::take(&mut self.admin_dialog.password_input)));
+        let operation = self.operations.begin(None, "正在验证超管授权…".into());
+        let deadline = tokio::time::Instant::now() + UI_AUTHORIZATION_VERIFY_TIMEOUT;
+        self.send_future(ctx, async move {
+            UiMessage::AdminAuthorization {
+                operation,
+                result: verify_ui_admin_authorization(passphrase, deadline).await,
+            }
+        });
+    }
+
+    fn open_admin_dialog(&mut self, ctx: &egui::Context) {
+        self.admin_dialog.close();
+        zeroize_admin_status(&mut self.admin_dialog.status);
+        self.admin_dialog.visible = true;
+        let operation = self.operations.begin(None, "正在读取安全策略…".into());
+        self.send_future(ctx, async move {
+            let result = tokio::task::spawn_blocking(vault::admin_status)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            UiMessage::AdminStatus { operation, result }
+        });
+    }
+
+    fn initialize_admin_and_recovery(&mut self, ctx: &egui::Context) {
+        if self.admin_dialog.media_path.trim().is_empty() {
+            self.set_notice("请输入可移动介质上的新恢复文件绝对路径".into(), true);
+            return;
+        }
+        #[cfg(windows)]
+        let password = {
+            if self.admin_dialog.new_password.is_empty()
+                || self.admin_dialog.new_password != self.admin_dialog.new_password_confirmation
+            {
+                self.set_notice("请填写一致的新超管密码".into(), true);
+                return;
+            }
+            let password = Zeroizing::new(std::mem::take(&mut self.admin_dialog.new_password));
+            self.admin_dialog.new_password_confirmation.zeroize();
+            password
+        };
+        #[cfg(not(windows))]
+        {
+            // Linux administrator authorization is the already-verified root
+            // identity; do not retain or move an irrelevant password field.
+            self.admin_dialog.new_password.zeroize();
+            self.admin_dialog.new_password_confirmation.zeroize();
+        }
+        let media_path = PathBuf::from(self.admin_dialog.media_path.trim());
+        let display_path = self.admin_dialog.media_path.clone();
+        let operation = self
+            .operations
+            .begin(None, "正在初始化超管与离线恢复…".into());
+        self.send_future(ctx, async move {
+            let result = tokio::task::spawn_blocking(move || {
+                #[cfg(windows)]
+                vault::initialize_admin_password(&password, |media| {
+                    persist_recovery_media_new(&media_path, media)
+                })?;
+                #[cfg(not(windows))]
+                vault::initialize_linux_recovery(|media| {
+                    persist_recovery_media_new(&media_path, media)
+                })?;
+                Ok::<_, anyhow::Error>(display_path)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            UiMessage::AdminInitialized { operation, result }
+        });
+    }
+
+    fn change_admin_password(&mut self, ctx: &egui::Context) {
+        let Some(Some(old)) = self.admin_passphrase_for_operation() else {
+            return;
+        };
+        if self.admin_dialog.new_password.is_empty()
+            || self.admin_dialog.new_password != self.admin_dialog.new_password_confirmation
+        {
+            self.set_notice("请填写一致的新超管密码".into(), true);
+            return;
+        }
+        let new = Zeroizing::new(std::mem::take(&mut self.admin_dialog.new_password));
+        self.admin_dialog.new_password_confirmation.zeroize();
+        let operation = self.operations.begin(None, "正在更改超管密码…".into());
+        self.send_future(ctx, async move {
+            let result =
+                tokio::task::spawn_blocking(move || vault::change_admin_password(&old, &new))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+            UiMessage::AdminPasswordChanged { operation, result }
+        });
+    }
+
+    fn rotate_recovery_media(&mut self, ctx: &egui::Context) {
+        let Some(admin) = self.admin_passphrase_for_operation() else {
+            return;
+        };
+        let old_path = PathBuf::from(self.admin_dialog.old_media_path.trim());
+        let new_path = PathBuf::from(self.admin_dialog.new_media_path.trim());
+        if old_path.as_os_str().is_empty() || new_path.as_os_str().is_empty() {
+            self.set_notice("请填写旧介质和新介质的绝对路径".into(), true);
+            return;
+        }
+        let display_path = self.admin_dialog.new_media_path.clone();
+        let operation = self.operations.begin(None, "正在轮转离线恢复介质…".into());
+        self.send_future(ctx, async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let old_media = read_recovery_media(&old_path)?;
+                vault::rotate_recovery(
+                    &old_media,
+                    admin.as_deref().map(String::as_str),
+                    |media| persist_recovery_media_new(&new_path, media),
+                )?;
+                Ok::<_, anyhow::Error>(display_path)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            UiMessage::RecoveryRotated { operation, result }
+        });
+    }
+
+    fn profile_identity(&self, profile: &str) -> Option<vault::ProfileIdentity> {
+        self.profiles
+            .iter()
+            .find(|row| row.name == profile)
+            .map(ProfileRow::identity)
+    }
+
+    fn security_dialog_identity(&mut self, profile: &str) -> Option<vault::ProfileIdentity> {
+        let expected = self.security_dialog.expected_identity;
+        if expected.is_none() || self.profile_identity(profile) != expected {
+            self.discard_pending_random_profile_action();
+            self.set_notice(
+                "安全操作所针对的主机配置已变化，请关闭对话框、刷新后重试".into(),
+                true,
+            );
+            return None;
+        }
+        expected
+    }
+
+    fn profile_is_authorized_at(
+        &self,
+        profile: &str,
+        identity: vault::ProfileIdentity,
+        now: Instant,
+    ) -> bool {
+        self.authorizations.get(profile, identity, now).is_some()
+    }
+
+    fn required_authorized_profile_passphrase(
+        &mut self,
+        profile: &str,
+    ) -> Option<Zeroizing<String>> {
+        self.required_authorized_profile_grant(profile)
+            .map(|(_, passphrase)| passphrase)
+    }
+
+    fn required_authorized_profile_grant(
+        &mut self,
+        profile: &str,
+    ) -> Option<(vault::ProfileIdentity, Zeroizing<String>)> {
+        let now = Instant::now();
+        let Some(identity) = self.profile_identity(profile) else {
+            self.set_notice("主机配置已变化，请刷新后重试".into(), true);
+            return None;
+        };
+        let key = ProfileAuthorizationKey {
+            profile: profile.to_owned(),
+            profile_id: identity.profile_id,
+            generation: identity.generation,
+        };
+        let target_was_cached = self.authorizations.grants.contains_key(&key);
+        self.expire_authorizations_and_protected_sessions(now);
+        let passphrase = self.authorizations.passphrase(profile, identity, now);
+        if passphrase.is_none() && !target_was_cached {
+            self.set_notice(format!("此操作需要先授权 {profile} 的独立口令"), true);
+        }
+        passphrase.map(|passphrase| (identity, passphrase))
+    }
+
+    fn authorize(&mut self, ctx: &egui::Context) {
+        let Some(profile) = self.selected.clone() else {
+            self.set_notice("请先选择一台主机".into(), true);
+            return;
+        };
+        let Some(identity) = self.profile_identity(&profile) else {
+            self.set_notice("主机配置已变化，请刷新后重试".into(), true);
+            return;
+        };
+        if self.profile_passphrase_input.is_empty() {
+            self.set_notice("请输入该主机的独立口令".into(), true);
+            return;
+        }
+        let passphrase = Zeroizing::new(std::mem::take(&mut self.profile_passphrase_input));
+        let deadline = tokio::time::Instant::now() + UI_AUTHORIZATION_VERIFY_TIMEOUT;
+        let operation = self
+            .operations
+            .begin(
+                Some(profile.clone()),
+                format!("正在验证 {profile} 的独立口令…"),
+            )
+            .with_profile_identity(identity);
+        self.send_future(ctx, async move {
+            UiMessage::Authorization {
+                operation,
+                result: verify_ui_authorization(profile, identity, passphrase, deadline).await,
+            }
+        });
+    }
+
+    fn revoke_profile_authorization(&mut self, profile: &str) {
+        self.profile_passphrase_input.zeroize();
+        self.security_dialog.clear();
+        self.authorizations.revoke_profile(profile);
+        self.clear_protected_profile_workspace(profile);
+        self.set_notice(
+            format!("{profile} 的独立口令授权已撤销，相关长会话已关闭"),
+            false,
+        );
+    }
+
+    fn revoke_all_authorizations(&mut self) {
+        self.profile_passphrase_input.zeroize();
+        self.authorizations.revoke_all();
+        self.clear_all_protected_sessions();
+        self.set_notice("全部独立口令授权已撤销，长会话与传输已停止".into(), false);
+    }
+
+    fn expire_authorizations_and_protected_sessions(&mut self, now: Instant) -> bool {
+        let mut expired = self.authorizations.expire_at(now);
+        if expired.is_empty() {
+            return false;
+        }
+        self.profile_passphrase_input.zeroize();
+        for key in &expired {
+            self.clear_protected_profile_workspace(&key.profile);
+        }
+        for key in &mut expired {
+            key.profile.zeroize();
+        }
+        self.set_notice(
+            "一个或多个主机的独立口令授权已过期；缓存已清零，相关长会话已停止".into(),
+            true,
+        );
+        true
+    }
+
+    fn clear_protected_profile_workspace(&mut self, profile: &str) {
+        // Reject a late status snapshot that was authorized before this
+        // profile grant was revoked or expired.
+        self.operations.next_refresh_epoch();
+        if let Some(row) = self.profiles.iter_mut().find(|row| row.name == profile) {
+            if let Some(mut status) = row.daemon.take() {
+                status.profile.zeroize();
+                status.host.zeroize();
+                status.user.zeroize();
+                status.endpoint.zeroize();
+            }
+        }
+        for transfer in self.pending_transfers.values() {
+            transfer.cancellation.cancel();
+        }
+        if self.shell_profile.as_deref() == Some(profile) {
+            self.close_shell();
+        }
+        if self
+            .pending_tunnel_start
+            .as_ref()
+            .is_some_and(|pending| pending.context.profile == profile)
+        {
+            self.cancel_pending_tunnel_start();
+        }
+        if self
+            .tunnel
+            .as_ref()
+            .is_some_and(|active| active.context.profile == profile)
+        {
+            self.stop_active_tunnel();
+        }
+        if self.selected.as_deref() == Some(profile) {
+            self.invalidate_directory_context();
+            self.output.zeroize();
+            self.output = "独立口令授权后可执行远程操作。".into();
+        }
+        if self.security_dialog.profile == profile {
+            self.security_dialog.clear();
+        }
+        self.editor.clear();
+        zeroize_option_string(&mut self.delete_candidate);
+    }
+
+    fn clear_all_protected_sessions(&mut self) {
+        for transfer in self.pending_transfers.values() {
+            transfer.cancellation.cancel();
+        }
+        self.close_shell();
+        self.cancel_pending_tunnel_start();
+        self.stop_active_tunnel();
+        self.invalidate_directory_context();
+        self.output.zeroize();
+        self.output = "选择主机并验证其独立口令。".into();
+        self.editor.clear();
+        zeroize_option_string(&mut self.delete_candidate);
+    }
+
     fn send_future<F>(&self, ctx: &egui::Context, future: F)
     where
         F: std::future::Future<Output = UiMessage> + Send + 'static,
     {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
+        // A click can enqueue work after the status panel for the current
+        // frame has already been painted. Request the next frame now instead
+        // of waiting for the operation's final message.
+        ctx.request_repaint();
         self.runtime().spawn(async move {
             let message = future.await;
             let _ = tx.send(message);
@@ -947,6 +2252,30 @@ impl SerctlApp {
     }
 
     fn refresh(&mut self, ctx: &egui::Context) {
+        if matches!(
+            self.migration_state,
+            Some(vault::VaultMigrationState::LegacyV2 { .. })
+        ) {
+            return;
+        }
+        self.expire_authorizations_and_protected_sessions(Instant::now());
+        let authorization_snapshots = self
+            .authorizations
+            .grants
+            .iter()
+            .filter_map(|(key, authorization)| {
+                authorization.passphrase().map(|passphrase| {
+                    (
+                        key.profile.clone(),
+                        vault::ProfileIdentity {
+                            profile_id: key.profile_id,
+                            generation: key.generation,
+                        },
+                        passphrase,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
         // Capture one deadline at the UI invocation boundary. Vault lock/KDF
         // work and every bounded wave of daemon probes share this budget.
         let deadline = tokio::time::Instant::now() + PROFILE_REFRESH_TIMEOUT;
@@ -966,12 +2295,159 @@ impl SerctlApp {
             UiMessage::Profiles {
                 operation,
                 epoch,
-                result: load_profile_rows(rows, deadline).await,
+                result: load_profile_rows(rows, authorization_snapshots, deadline).await,
             }
         });
     }
 
+    fn submit_v2_migration(&mut self, _ctx: &egui::Context) {
+        // Validation errors are produced after the status panel has already
+        // been painted for the click frame. Always schedule another frame so
+        // an immediate failure is visible instead of looking like a dead
+        // button.
+        _ctx.request_repaint();
+        #[cfg(unix)]
+        self.set_notice(
+            "Linux v2 迁移当前失败关闭；未配置 root-owned 系统 share store，不会采集或提交迁移秘密"
+                .into(),
+            true,
+        );
+        #[cfg(windows)]
+        self.submit_v2_migration_windows(_ctx);
+    }
+
+    #[cfg(windows)]
+    fn submit_v2_migration_windows(&mut self, ctx: &egui::Context) {
+        if self.migration.old_master.is_empty() {
+            self.set_notice("请输入旧 v2 共享主口令".into(), true);
+            return;
+        }
+        if self.migration.recovery_media_path.trim().is_empty() {
+            self.set_notice("请输入新恢复介质的绝对文件路径".into(), true);
+            return;
+        }
+        let media_path = PathBuf::from(self.migration.recovery_media_path.trim());
+        if let Err(error) = crate::validate_external_secret_path(
+            &media_path,
+            false,
+            "UI migration recovery-media output",
+        ) {
+            self.set_notice(format!("恢复介质路径不可用：{error}"), true);
+            return;
+        }
+        if !media_path.is_absolute() {
+            self.set_notice("恢复介质必须使用绝对文件路径".into(), true);
+            return;
+        }
+        let Some(parent) = media_path.parent() else {
+            self.set_notice("恢复介质路径没有父目录".into(), true);
+            return;
+        };
+        if !parent.is_dir() {
+            self.set_notice("恢复介质的父目录不存在".into(), true);
+            return;
+        }
+        if media_path.exists() {
+            self.set_notice("恢复介质文件已存在；迁移不会覆盖它".into(), true);
+            return;
+        }
+        let profiles = self.migration.profiles.clone();
+        let all_valid = profiles.iter().all(|profile| {
+            let passphrase = self.migration.profile_passphrases.get(profile);
+            let confirmation = self.migration.profile_confirmations.get(profile);
+            passphrase.is_some_and(|value| !value.is_empty()) && passphrase == confirmation
+        });
+        if !all_valid {
+            self.set_notice("每个 profile 都必须填写两次一致的新独立口令".into(), true);
+            return;
+        }
+        if self.migration.administrator_password.is_empty()
+            || self.migration.administrator_password != self.migration.administrator_confirmation
+        {
+            self.set_notice("请填写两次一致的新超管密码".into(), true);
+            return;
+        }
+
+        let old_master = Zeroizing::new(std::mem::take(&mut self.migration.old_master));
+        let mut new_passphrases = BTreeMap::new();
+        for profile in &profiles {
+            let value = self
+                .migration
+                .profile_passphrases
+                .get_mut(profile)
+                .expect("migration profile passphrase is present");
+            new_passphrases.insert(profile.clone(), Zeroizing::new(std::mem::take(value)));
+            if let Some(confirmation) = self.migration.profile_confirmations.get_mut(profile) {
+                confirmation.zeroize();
+            }
+        }
+        let administrator_password =
+            Zeroizing::new(std::mem::take(&mut self.migration.administrator_password));
+        self.migration.administrator_confirmation.zeroize();
+        if let Some((mut previous, _)) = self.notice.take() {
+            previous.zeroize();
+        }
+        let operation = self
+            .operations
+            .begin(None, format!("正在原子迁移 {} 个 profile…", profiles.len()));
+        let operation_id = operation.id;
+        let tx = self.tx.clone();
+        let progress_repaint = ctx.clone();
+        self.send_future(ctx, async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let progress_tx = tx.clone();
+                vault::migrate_v2_with_progress(
+                    &old_master,
+                    &new_passphrases,
+                    Some(administrator_password.as_str()),
+                    |media| persist_recovery_media_new(&media_path, media),
+                    move |progress| {
+                        send_migration_progress(
+                            &progress_tx,
+                            &progress_repaint,
+                            operation_id,
+                            progress,
+                        );
+                    },
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            UiMessage::Migrated { operation, result }
+        });
+    }
+
+    fn tunnel_for_profile_is_active_or_stopping(&self, profile: &str) -> bool {
+        self.pending_tunnel_start
+            .as_ref()
+            .is_some_and(|pending| pending.context.profile == profile)
+            || self
+                .tunnel
+                .as_ref()
+                .is_some_and(|active| active.context.profile == profile)
+            || self
+                .pending_tunnel_stops
+                .values()
+                .any(|pending| pending.context.profile == profile)
+    }
+
     fn save_profile(&mut self, ctx: &egui::Context) {
+        let affected_profile = self
+            .editor
+            .original_name
+            .clone()
+            .or_else(|| self.selected.clone());
+        if let Some(profile) = affected_profile
+            .as_deref()
+            .filter(|profile| self.tunnel_for_profile_is_active_or_stopping(profile))
+        {
+            self.set_notice(
+                format!("请先显式停止 {profile} 的隧道，确认清理完成后再保存"),
+                true,
+            );
+            return;
+        }
         let port = match self.editor.port.parse::<u16>() {
             Ok(port) if port > 0 => port,
             _ => {
@@ -983,33 +2459,96 @@ impl SerctlApp {
             || self.editor.host.trim().is_empty()
             || self.editor.user.trim().is_empty()
             || self.editor.password.is_empty()
-            || self.editor.master.is_empty()
         {
-            self.set_notice("请完整填写名称、地址、用户、密码和主口令".into(), true);
+            self.set_notice("请完整填写名称、地址、用户和密码".into(), true);
             return;
         }
-
         let name = self.editor.name.trim().to_owned();
         let original_name = self.editor.original_name.clone();
         let saved_original_name = original_name.clone();
+        let expected_identity = self.editor.expected_identity;
+        let creating = original_name.is_none();
+        if let Some(original) = original_name.as_deref() {
+            if expected_identity.is_none() || self.profile_identity(original) != expected_identity {
+                self.set_notice("主机配置已变化，请关闭编辑器、刷新后重试".into(), true);
+                return;
+            }
+        }
+        #[cfg(windows)]
+        let administrator_passphrase = if creating {
+            let Some(passphrase) = self.admin_passphrase_for_operation() else {
+                self.open_admin_dialog(ctx);
+                return;
+            };
+            passphrase
+        } else {
+            None
+        };
+        // Linux profile creation is an ordinary per-user operation. Root is
+        // required only for the explicitly administrative reset paths.
+        #[cfg(not(windows))]
+        let administrator_passphrase: Option<Zeroizing<String>> = None;
+        let (profile_passphrase, creating) = match original_name.as_deref() {
+            Some(original) => {
+                let Some(passphrase) = self.required_authorized_profile_passphrase(original) else {
+                    return;
+                };
+                (passphrase, false)
+            }
+            None => {
+                if self.editor.profile_passphrase.is_empty() {
+                    self.set_notice("请为新主机设置独立口令".into(), true);
+                    return;
+                }
+                if self.editor.profile_passphrase != self.editor.profile_passphrase_confirmation {
+                    self.set_notice("两次输入的独立口令不一致".into(), true);
+                    return;
+                }
+                (
+                    Zeroizing::new(std::mem::take(&mut self.editor.profile_passphrase)),
+                    true,
+                )
+            }
+        };
+        self.editor.profile_passphrase_confirmation.zeroize();
+        let host_key = match self.editor.host_key_sha256.trim() {
+            "" => None,
+            fingerprint => Some(fingerprint.to_owned()),
+        };
+        self.editor.host_key_sha256.zeroize();
         let creds = vault::Creds {
             host: self.editor.host.trim().to_owned(),
             port,
             user: self.editor.user.trim().to_owned(),
             password: std::mem::take(&mut self.editor.password),
-            host_key: None,
+            host_key,
         };
-        let master = Zeroizing::new(std::mem::take(&mut self.editor.master));
-        let operation = self
+        let mut operation = self
             .operations
             .begin(self.selected.clone(), format!("正在保存 {name}…"));
+        if let Some(identity) = expected_identity {
+            operation = operation.with_profile_identity(identity);
+        }
         self.send_future(ctx, async move {
             let saved_name = name.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<String> {
-                if let Some(old) = original_name.as_deref().filter(|old| *old != name) {
-                    vault::rename_profile(old, &name, &creds, &master)?;
+                if creating {
+                    vault::create_profile(
+                        &name,
+                        &creds,
+                        &profile_passphrase,
+                        administrator_passphrase.as_deref().map(String::as_str),
+                    )?;
+                } else if let Some(old) = original_name.as_deref().filter(|old| *old != name) {
+                    vault::rename_profile_v3(
+                        old,
+                        &name,
+                        &creds,
+                        &profile_passphrase,
+                        expected_identity,
+                    )?;
                 } else {
-                    vault::add_or_update(&name, &creds, &master)?;
+                    vault::update_profile(&name, &creds, &profile_passphrase, expected_identity)?;
                 }
                 Ok(name)
             })
@@ -1025,29 +2564,467 @@ impl SerctlApp {
     }
 
     fn remove_profile(&mut self, ctx: &egui::Context, name: String) {
+        if self.tunnel_for_profile_is_active_or_stopping(&name) {
+            self.delete_candidate = Some(name);
+            self.set_notice(
+                "请先显式停止该主机的隧道，确认清理完成后再删除".into(),
+                true,
+            );
+            return;
+        }
+        let Some((expected_generation, master)) = self.required_authorized_profile_grant(&name)
+        else {
+            self.delete_candidate = Some(name);
+            return;
+        };
         let operation = self
             .operations
-            .begin(Some(name.clone()), format!("正在删除 {name}…"));
+            .begin(Some(name.clone()), format!("正在删除 {name}…"))
+            .with_profile_identity(expected_generation);
         self.send_future(ctx, async move {
             let display_name = name.clone();
-            if let Err(e) = client::down_quiet(&name).await {
+            if let Err(e) =
+                client::down_quiet_at_generation(&name, &master, expected_generation).await
+            {
                 return UiMessage::Removed {
                     operation,
                     result: Err(format!("停止连接失败：{e}")),
                 };
             }
-            let result = tokio::task::spawn_blocking(move || vault::remove(&name))
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|r| r.map_err(|e| e.to_string()))
-                .and_then(|removed| {
-                    if removed {
-                        Ok(display_name)
-                    } else {
-                        Err("主机配置已不存在".into())
-                    }
-                });
+            let result = tokio::task::spawn_blocking(move || {
+                vault::remove_profile(&name, &master, Some(expected_generation))
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()))
+            .and_then(|removed| {
+                if removed {
+                    Ok(display_name)
+                } else {
+                    Err("主机配置已不存在".into())
+                }
+            });
             UiMessage::Removed { operation, result }
+        });
+    }
+
+    fn open_security_dialog(&mut self, profile: &ProfileRow) {
+        self.security_dialog.clear();
+        self.security_section = SecuritySection::ProfilePassphrase;
+        self.security_dialog.visible = true;
+        self.security_dialog.profile = profile.name.clone();
+        self.security_dialog.expected_identity = Some(profile.identity());
+        self.security_dialog.replacement_host = profile.host.clone();
+        self.security_dialog.replacement_port = profile.port.to_string();
+    }
+
+    fn change_profile_passphrase(&mut self, ctx: &egui::Context) {
+        if self.security_dialog.current_passphrase.is_empty()
+            || self.security_dialog.new_passphrase.is_empty()
+        {
+            self.set_notice("请完整填写当前独立口令和新独立口令".into(), true);
+            return;
+        }
+        if self.security_dialog.new_passphrase != self.security_dialog.new_passphrase_confirmation {
+            self.set_notice("两次输入的新独立口令不一致".into(), true);
+            return;
+        }
+        let new = Zeroizing::new(std::mem::take(&mut self.security_dialog.new_passphrase));
+        self.security_dialog.new_passphrase_confirmation.zeroize();
+        let profile = self.security_dialog.profile.clone();
+        let Some(expected_identity) = self.security_dialog_identity(&profile) else {
+            return;
+        };
+        self.submit_profile_passphrase_change(ctx, new, expected_identity);
+    }
+
+    fn submit_profile_passphrase_change(
+        &mut self,
+        ctx: &egui::Context,
+        new: Zeroizing<String>,
+        expected_identity: vault::ProfileIdentity,
+    ) {
+        let profile = self.security_dialog.profile.clone();
+        if self.tunnel_for_profile_is_active_or_stopping(&profile)
+            || self.shell_profile.as_deref() == Some(profile.as_str())
+            || self.owned_daemons.contains_key(&profile)
+        {
+            self.set_notice(
+                "请先断开该 profile 的 daemon、Bash 与隧道再轮转口令".into(),
+                true,
+            );
+            return;
+        }
+        if self.security_dialog.current_passphrase.is_empty() {
+            self.set_notice("请输入当前独立口令".into(), true);
+            return;
+        }
+        if self.profile_identity(&profile) != Some(expected_identity) {
+            self.set_notice("主机配置已变化，请刷新后重试".into(), true);
+            return;
+        }
+        let old = Zeroizing::new(std::mem::take(&mut self.security_dialog.current_passphrase));
+        self.authorizations.revoke_profile(&profile);
+        let operation = self
+            .operations
+            .begin(
+                Some(profile.clone()),
+                format!("正在轮转 {profile} 的独立口令…"),
+            )
+            .with_profile_identity(expected_identity);
+        self.send_future(ctx, async move {
+            let task_profile = profile.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                vault::change_profile_passphrase(&task_profile, &old, &new, Some(expected_identity))
+            });
+            let result = task
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            UiMessage::ProfilePassphraseChanged {
+                operation,
+                profile,
+                result,
+            }
+        });
+    }
+
+    fn stage_random_profile_passphrase(&mut self, action: PendingRandomProfileAction) {
+        if self.security_dialog.random_passphrase_once.is_some() {
+            self.set_notice("已有一个尚未提交的一次性随机口令".into(), true);
+            return;
+        }
+        let profile = self.security_dialog.profile.clone();
+        let Some(identity) = self.security_dialog_identity(&profile) else {
+            return;
+        };
+        self.security_dialog.random_passphrase_once = Some(vault::generate_profile_passphrase());
+        self.security_dialog.pending_random_action = Some(action);
+        self.security_dialog.pending_random_identity = Some(identity);
+        self.security_dialog.random_saved_confirmation = false;
+        self.set_notice(
+            format!(
+                "已生成用于{}的新口令；vault 尚未修改，关闭或取消将只清零该口令",
+                action.description()
+            ),
+            false,
+        );
+    }
+
+    fn discard_pending_random_profile_action(&mut self) -> bool {
+        let had_pending = self.security_dialog.random_passphrase_once.is_some()
+            || self.security_dialog.pending_random_action.is_some();
+        drop(self.security_dialog.random_passphrase_once.take());
+        self.security_dialog.pending_random_action = None;
+        self.security_dialog.pending_random_identity = None;
+        self.security_dialog.random_saved_confirmation = false;
+        had_pending
+    }
+
+    fn commit_pending_random_profile_action(&mut self, ctx: &egui::Context) {
+        if !self.security_dialog.random_saved_confirmation {
+            self.set_notice("请先确认已将一次性随机口令保存到安全位置".into(), true);
+            return;
+        }
+        let Some(action) = self.security_dialog.pending_random_action.take() else {
+            self.discard_pending_random_profile_action();
+            self.set_notice("随机口令状态已失效，请重新生成".into(), true);
+            return;
+        };
+        let Some(expected_identity) = self.security_dialog.pending_random_identity.take() else {
+            self.discard_pending_random_profile_action();
+            self.set_notice("随机口令目标身份已失效，请重新生成".into(), true);
+            return;
+        };
+        let Some(generated) = self.security_dialog.random_passphrase_once.take() else {
+            self.security_dialog.random_saved_confirmation = false;
+            self.set_notice("随机口令状态已失效，请重新生成".into(), true);
+            return;
+        };
+        self.security_dialog.random_saved_confirmation = false;
+        let profile = self.security_dialog.profile.clone();
+        if self.security_dialog.expected_identity != Some(expected_identity)
+            || self.profile_identity(&profile) != Some(expected_identity)
+        {
+            self.set_notice("主机配置已变化，未提交随机口令操作".into(), true);
+            return;
+        }
+        match action {
+            PendingRandomProfileAction::RotatePassphrase => {
+                self.submit_profile_passphrase_change(ctx, generated, expected_identity);
+            }
+            PendingRandomProfileAction::PreserveRecovery => {
+                self.submit_profile_recovery(ctx, generated, expected_identity);
+            }
+            PendingRandomProfileAction::DestructiveReset => {
+                self.submit_destructive_profile_reset(ctx, generated, expected_identity);
+            }
+        }
+    }
+
+    fn prepare_random_profile_passphrase_rotation(&mut self) {
+        let profile = self.security_dialog.profile.clone();
+        if self.tunnel_for_profile_is_active_or_stopping(&profile)
+            || self.shell_profile.as_deref() == Some(profile.as_str())
+            || self.owned_daemons.contains_key(&profile)
+        {
+            self.set_notice(
+                "请先断开该 profile 的 daemon、Bash 与隧道再轮转口令".into(),
+                true,
+            );
+            return;
+        }
+        if self.security_dialog.current_passphrase.is_empty() {
+            self.set_notice("请输入当前独立口令".into(), true);
+            return;
+        }
+        if self.security_dialog_identity(&profile).is_none() {
+            return;
+        }
+        self.stage_random_profile_passphrase(PendingRandomProfileAction::RotatePassphrase);
+    }
+
+    fn recover_profile_preserving_credentials(&mut self, ctx: &egui::Context) {
+        if self.security_dialog.new_passphrase.is_empty()
+            || self.security_dialog.new_passphrase
+                != self.security_dialog.new_passphrase_confirmation
+        {
+            self.set_notice("请填写一致的新 profile 独立口令".into(), true);
+            return;
+        }
+        let new = Zeroizing::new(std::mem::take(&mut self.security_dialog.new_passphrase));
+        self.security_dialog.new_passphrase_confirmation.zeroize();
+        let profile = self.security_dialog.profile.clone();
+        let Some(expected_identity) = self.security_dialog_identity(&profile) else {
+            return;
+        };
+        self.submit_profile_recovery(ctx, new, expected_identity);
+    }
+
+    fn prepare_random_profile_recovery(&mut self) {
+        let profile = self.security_dialog.profile.clone();
+        if self.tunnel_for_profile_is_active_or_stopping(&profile)
+            || self.shell_profile.as_deref() == Some(profile.as_str())
+            || self.owned_daemons.contains_key(&profile)
+        {
+            self.set_notice(
+                "请先断开该 profile 的 daemon、Bash 与隧道再恢复".into(),
+                true,
+            );
+            return;
+        }
+        if self.admin_passphrase_for_operation().is_none() {
+            return;
+        }
+        if self.security_dialog.recovery_media_path.trim().is_empty() {
+            self.set_notice("请选择该 vault 对应的离线恢复介质绝对路径".into(), true);
+            return;
+        }
+        if self.security_dialog_identity(&profile).is_none() {
+            return;
+        }
+        self.stage_random_profile_passphrase(PendingRandomProfileAction::PreserveRecovery);
+    }
+
+    fn submit_profile_recovery(
+        &mut self,
+        ctx: &egui::Context,
+        new: Zeroizing<String>,
+        expected_identity: vault::ProfileIdentity,
+    ) {
+        let profile = self.security_dialog.profile.clone();
+        if self.tunnel_for_profile_is_active_or_stopping(&profile)
+            || self.shell_profile.as_deref() == Some(profile.as_str())
+            || self.owned_daemons.contains_key(&profile)
+        {
+            self.set_notice(
+                "请先断开该 profile 的 daemon、Bash 与隧道再恢复".into(),
+                true,
+            );
+            return;
+        }
+        let Some(admin) = self.admin_passphrase_for_operation() else {
+            return;
+        };
+        if self.security_dialog.recovery_media_path.trim().is_empty() {
+            self.set_notice("请选择该 vault 对应的离线恢复介质绝对路径".into(), true);
+            return;
+        }
+        if self.profile_identity(&profile) != Some(expected_identity) {
+            self.set_notice("主机配置已变化，请刷新后重试".into(), true);
+            return;
+        }
+        let media_path = PathBuf::from(self.security_dialog.recovery_media_path.trim());
+        let operation = self
+            .operations
+            .begin(Some(profile.clone()), format!("正在离线恢复 {profile}…"))
+            .with_profile_identity(expected_identity);
+        self.send_future(ctx, async move {
+            let task_profile = profile.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let media = read_recovery_media(&media_path)?;
+                vault::recover_profile_with_media(
+                    &task_profile,
+                    &media,
+                    admin.as_deref().map(String::as_str),
+                    &new,
+                    Some(expected_identity),
+                )
+                .map(|row| row.generation)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            UiMessage::ProfileRecovered {
+                operation,
+                profile,
+                result,
+            }
+        });
+    }
+
+    fn destructively_reset_profile(&mut self, ctx: &egui::Context) {
+        if self
+            .security_dialog
+            .replacement_profile_passphrase
+            .is_empty()
+            || self.security_dialog.replacement_profile_passphrase
+                != self
+                    .security_dialog
+                    .replacement_profile_passphrase_confirmation
+        {
+            self.set_notice("请填写一致的新独立口令".into(), true);
+            return;
+        }
+        let new = Zeroizing::new(std::mem::take(
+            &mut self.security_dialog.replacement_profile_passphrase,
+        ));
+        self.security_dialog
+            .replacement_profile_passphrase_confirmation
+            .zeroize();
+        let profile = self.security_dialog.profile.clone();
+        let Some(expected_identity) = self.security_dialog_identity(&profile) else {
+            return;
+        };
+        self.submit_destructive_profile_reset(ctx, new, expected_identity);
+    }
+
+    fn prepare_random_destructive_profile_reset(&mut self) {
+        let profile = self.security_dialog.profile.clone();
+        if self.tunnel_for_profile_is_active_or_stopping(&profile)
+            || self.shell_profile.as_deref() == Some(profile.as_str())
+            || self.owned_daemons.contains_key(&profile)
+        {
+            self.set_notice(
+                "请先断开该 profile 的 daemon、Bash 与隧道再重置".into(),
+                true,
+            );
+            return;
+        }
+        let Some(_admin) = self.admin_passphrase_for_operation() else {
+            return;
+        };
+        if self.security_dialog.destructive_confirm_text != profile {
+            self.set_notice("请输入完整 profile 名称以确认不可恢复重置".into(), true);
+            return;
+        }
+        match self.security_dialog.replacement_port.parse::<u16>() {
+            Ok(port) if port > 0 => {}
+            _ => {
+                self.set_notice("替换 SSH 端口必须为 1–65535".into(), true);
+                return;
+            }
+        }
+        if self.security_dialog.replacement_host.trim().is_empty()
+            || self.security_dialog.replacement_user.trim().is_empty()
+            || self.security_dialog.replacement_ssh_password.is_empty()
+        {
+            self.set_notice("请完整填写替换 SSH 凭据".into(), true);
+            return;
+        }
+        if self.security_dialog_identity(&profile).is_none() {
+            return;
+        }
+        self.stage_random_profile_passphrase(PendingRandomProfileAction::DestructiveReset);
+    }
+
+    fn submit_destructive_profile_reset(
+        &mut self,
+        ctx: &egui::Context,
+        new: Zeroizing<String>,
+        expected_identity: vault::ProfileIdentity,
+    ) {
+        let profile = self.security_dialog.profile.clone();
+        if self.tunnel_for_profile_is_active_or_stopping(&profile)
+            || self.shell_profile.as_deref() == Some(profile.as_str())
+            || self.owned_daemons.contains_key(&profile)
+        {
+            self.set_notice(
+                "请先断开该 profile 的 daemon、Bash 与隧道再重置".into(),
+                true,
+            );
+            return;
+        }
+        let Some(admin) = self.admin_passphrase_for_operation() else {
+            return;
+        };
+        if self.security_dialog.destructive_confirm_text != profile {
+            self.set_notice("请输入完整 profile 名称以确认不可恢复重置".into(), true);
+            return;
+        }
+        let port = match self.security_dialog.replacement_port.parse::<u16>() {
+            Ok(port) if port > 0 => port,
+            _ => {
+                self.set_notice("替换 SSH 端口必须为 1–65535".into(), true);
+                return;
+            }
+        };
+        if self.security_dialog.replacement_host.trim().is_empty()
+            || self.security_dialog.replacement_user.trim().is_empty()
+            || self.security_dialog.replacement_ssh_password.is_empty()
+        {
+            self.set_notice("请完整填写替换 SSH 凭据".into(), true);
+            return;
+        }
+        if self.profile_identity(&profile) != Some(expected_identity) {
+            self.set_notice("主机配置已变化，请刷新后重试".into(), true);
+            return;
+        }
+        let creds = vault::Creds {
+            host: self.security_dialog.replacement_host.trim().to_owned(),
+            port,
+            user: self.security_dialog.replacement_user.trim().to_owned(),
+            password: std::mem::take(&mut self.security_dialog.replacement_ssh_password),
+            host_key: None,
+        };
+        self.security_dialog.destructive_confirm_text.zeroize();
+        let operation = self
+            .operations
+            .begin(
+                Some(profile.clone()),
+                format!("正在不可恢复地替换 {profile}…"),
+            )
+            .with_profile_identity(expected_identity);
+        self.send_future(ctx, async move {
+            let task_profile = profile.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                vault::admin_reset_profile(
+                    &task_profile,
+                    &creds,
+                    &new,
+                    admin.as_deref().map(String::as_str),
+                    Some(expected_identity),
+                )
+                .map(|row| row.generation)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            UiMessage::ProfileReset {
+                operation,
+                profile,
+                result,
+            }
         });
     }
 
@@ -1057,38 +3034,61 @@ impl SerctlApp {
             self.set_notice("请输入要执行的命令".into(), true);
             return;
         }
+        let Some((expected_generation, master)) = self.required_authorized_profile_grant(&profile)
+        else {
+            return;
+        };
         self.command.zeroize();
-        let master = Zeroizing::new(std::mem::take(&mut self.master));
         self.output.zeroize();
         self.exit_code = None;
         let operation = self
             .operations
-            .begin(Some(profile.clone()), format!("正在 {profile} 上执行…"));
+            .begin(Some(profile.clone()), format!("正在 {profile} 上执行…"))
+            .with_profile_identity(expected_generation);
         self.send_future(ctx, async move {
             UiMessage::Command {
                 operation,
-                result: client::exec_capture(&profile, command.as_str(), Some(&master))
-                    .await
-                    .map_err(|e| e.to_string()),
+                result: client::exec_capture_at_generation(
+                    &profile,
+                    command.as_str(),
+                    &master,
+                    expected_generation,
+                )
+                .await
+                .map_err(|e| e.to_string()),
             }
         });
     }
 
     fn refresh_directory(&mut self, ctx: &egui::Context, profile: String, path: String) {
-        let request =
-            self.directory_requests
-                .begin(profile, path, self.operations.profile_generation);
+        let Some((expected_generation, master)) = self.required_authorized_profile_grant(&profile)
+        else {
+            return;
+        };
+        let request = self.directory_requests.begin(
+            profile,
+            path,
+            self.operations.profile_generation,
+            expected_generation,
+        );
         let request_profile = request.profile.clone();
         let request_path = request.path.clone();
-        let master = Zeroizing::new(std::mem::take(&mut self.master));
-        let operation = self.operations.begin(
-            Some(request_profile.clone()),
-            format!("正在读取 {request_path}…"),
-        );
+        let operation = self
+            .operations
+            .begin(
+                Some(request_profile.clone()),
+                format!("正在读取 {request_path}…"),
+            )
+            .with_profile_identity(expected_generation);
         self.send_future(ctx, async move {
-            let result = client::list_dir(&request_profile, &request_path, Some(&master))
-                .await
-                .map_err(|e| e.to_string());
+            let result = client::list_dir_at_generation(
+                &request_profile,
+                &request_path,
+                &master,
+                expected_generation,
+            )
+            .await
+            .map_err(|e| e.to_string());
             UiMessage::Directory {
                 operation,
                 request,
@@ -1098,27 +3098,33 @@ impl SerctlApp {
     }
 
     fn create_remote_directory(&mut self, ctx: &egui::Context, profile: String) {
-        let name = self.new_directory.trim();
+        let name = self.new_directory.trim().to_owned();
         if name.is_empty() || name.contains('/') || name.contains('\\') {
             self.set_notice("目录名称不能为空，也不能包含路径分隔符".into(), true);
             return;
         }
-        let path = join_remote_path(&self.remote_path, name);
+        let Some((expected_generation, master)) = self.required_authorized_profile_grant(&profile)
+        else {
+            return;
+        };
+        let path = join_remote_path(&self.remote_path, &name);
         let current = self.remote_path.clone();
         let context = self.directory_requests.context(
             profile.clone(),
             current.clone(),
             self.operations.profile_generation,
+            expected_generation,
         );
-        let master = Zeroizing::new(std::mem::take(&mut self.master));
         let operation = self
             .operations
-            .begin(Some(profile.clone()), format!("正在创建目录 {path}…"));
+            .begin(Some(profile.clone()), format!("正在创建目录 {path}…"))
+            .with_profile_identity(expected_generation);
         self.send_future(ctx, async move {
-            let result = client::create_dir(&profile, &path, Some(&master))
-                .await
-                .map(|_| current)
-                .map_err(|e| e.to_string());
+            let result =
+                client::create_dir_at_generation(&profile, &path, &master, expected_generation)
+                    .await
+                    .map(|_| "目录已创建".to_owned())
+                    .map_err(|e| e.to_string());
             UiMessage::DirectoryCreated {
                 operation,
                 context,
@@ -1144,27 +3150,27 @@ impl SerctlApp {
         } else {
             join_remote_path(&self.remote_path, self.remote_upload.trim())
         };
-        let refresh = self.directory_requests.context(
-            profile.clone(),
-            self.remote_path.clone(),
-            self.operations.profile_generation,
-        );
-        let master = Zeroizing::new(std::mem::take(&mut self.master));
+        let Some((expected_generation, master)) = self.required_authorized_profile_grant(&profile)
+        else {
+            return;
+        };
         let operation = self
             .operations
-            .begin(Some(profile.clone()), format!("正在上传到 {remote}…"));
+            .begin(Some(profile.clone()), format!("正在上传到 {remote}…"))
+            .with_profile_identity(expected_generation);
         let operation_id = operation.id;
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
         let tx = self.tx.clone();
         let repaint = ctx.clone();
         let handle = self.runtime().spawn(async move {
-            let result = client::upload_with_timeout_and_master_cancellable(
+            let result = client::upload_with_timeout_at_generation_cancellable(
                 &profile,
                 &local,
                 &remote,
                 Duration::from_millis(crate::ipc::DEFAULT_SFTP_TIMEOUT_MS),
-                Some(master),
+                master,
+                expected_generation,
                 worker_cancellation,
             )
             .await
@@ -1172,7 +3178,7 @@ impl SerctlApp {
             .map_err(|e| e.to_string());
             let _ = tx.send(UiMessage::Transfer {
                 operation,
-                refresh: Some(refresh),
+                refresh: None,
                 result,
             });
             repaint.request_repaint();
@@ -1199,24 +3205,29 @@ impl SerctlApp {
             self.set_notice("请输入本地保存路径".into(), true);
             return;
         }
+        let Some((expected_generation, master)) = self.required_authorized_profile_grant(&profile)
+        else {
+            return;
+        };
         let local = std::path::PathBuf::from(self.local_download.trim());
-        let master = Zeroizing::new(std::mem::take(&mut self.master));
         let remote = entry.path;
         let operation = self
             .operations
-            .begin(Some(profile.clone()), format!("正在下载 {remote}…"));
+            .begin(Some(profile.clone()), format!("正在下载 {remote}…"))
+            .with_profile_identity(expected_generation);
         let operation_id = operation.id;
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
         let tx = self.tx.clone();
         let repaint = ctx.clone();
         let handle = self.runtime().spawn(async move {
-            let result = client::download_with_timeout_and_master_cancellable(
+            let result = client::download_with_timeout_at_generation_cancellable(
                 &profile,
                 &remote,
                 &local,
                 Duration::from_millis(crate::ipc::DEFAULT_SFTP_TIMEOUT_MS),
-                Some(master),
+                master,
+                expected_generation,
                 worker_cancellation,
             )
             .await
@@ -1239,20 +3250,232 @@ impl SerctlApp {
     }
 
     fn start_shell(&mut self, ctx: &egui::Context, profile: String) {
-        let master = Zeroizing::new(std::mem::take(&mut self.master));
-        let operation = self.operations.begin(
-            Some(profile.clone()),
-            format!("正在打开 {profile} 的 Bash…"),
-        );
+        let Some((expected_generation, master)) = self.required_authorized_profile_grant(&profile)
+        else {
+            return;
+        };
+        let operation = self
+            .operations
+            .begin(
+                Some(profile.clone()),
+                format!("正在打开 {profile} 的 Bash…"),
+            )
+            .with_profile_identity(expected_generation);
         self.send_future(ctx, async move {
             UiMessage::ShellOpened {
                 operation,
-                result: client::open_gui_shell(&profile, Some(&master))
-                    .await
-                    .map(|shell| (profile, shell))
-                    .map_err(|e| e.to_string()),
+                result: client::open_gui_shell_at_generation(
+                    &profile,
+                    &master,
+                    expected_generation,
+                )
+                .await
+                .map(|shell| (profile, shell))
+                .map_err(|e| e.to_string()),
             }
         });
+    }
+
+    fn build_tunnel_spec(&mut self) -> Option<client::TunnelSpec> {
+        let bind_port = match self.tunnel_bind_port.trim().parse::<u16>() {
+            Ok(port) => port,
+            Err(_) => {
+                self.set_notice("隧道监听端口必须是 0–65535 之间的数字".into(), true);
+                return None;
+            }
+        };
+        let max_connections = match self.tunnel_max_connections.trim().parse::<u16>() {
+            Ok(value) if (1..=MAX_UI_TUNNEL_CONNECTIONS).contains(&value) => value,
+            _ => {
+                self.set_notice(
+                    format!("隧道最大连接数必须是 1–{MAX_UI_TUNNEL_CONNECTIONS} 之间的数字"),
+                    true,
+                );
+                return None;
+            }
+        };
+        let target_port = if self.tunnel_mode == client::TunnelMode::Dynamic {
+            0
+        } else {
+            match self.tunnel_target_port.trim().parse::<u16>() {
+                Ok(port) if port > 0 => port,
+                _ => {
+                    self.set_notice("隧道目标端口必须是 1–65535 之间的数字".into(), true);
+                    return None;
+                }
+            }
+        };
+
+        Some(client::TunnelSpec {
+            mode: self.tunnel_mode,
+            bind_port,
+            target_port,
+            max_connections,
+        })
+    }
+
+    fn start_tunnel(&mut self, ctx: &egui::Context, profile: String) {
+        if self.tunnel.is_some()
+            || self.pending_tunnel_start.is_some()
+            || !self.pending_tunnel_stops.is_empty()
+        {
+            self.set_notice(
+                "一次只能运行一个隧道；请先等待当前隧道完全停止".into(),
+                true,
+            );
+            return;
+        }
+        let Some(spec) = self.build_tunnel_spec() else {
+            return;
+        };
+        let Some((expected_generation, master)) = self.required_authorized_profile_grant(&profile)
+        else {
+            return;
+        };
+        let operation = self
+            .operations
+            .begin(
+                Some(profile.clone()),
+                format!("正在启动 {profile} 的 SSH 隧道…"),
+            )
+            .with_profile_identity(expected_generation);
+        let context = TunnelContext {
+            profile: profile.clone(),
+            profile_generation: self.operations.profile_generation,
+            profile_identity: expected_generation,
+            instance: self.operations.next_tunnel_instance(),
+        };
+        let task_operation = operation.clone();
+        let task_context = context.clone();
+        let task_spec = clone_tunnel_spec(&spec);
+        let tx = self.tx.clone();
+        let repaint = ctx.clone();
+        let handle = self.runtime().spawn(async move {
+            let result = client::open_gui_tunnel_at_generation(
+                &profile,
+                task_spec,
+                master,
+                expected_generation,
+            )
+            .await
+            .map_err(|error| error.to_string());
+            let _ = tx.send(UiMessage::TunnelStarted {
+                operation: task_operation,
+                context: task_context,
+                spec,
+                result,
+            });
+            repaint.request_repaint();
+        });
+        self.pending_tunnel_start = Some(PendingTunnelStart {
+            context,
+            operation,
+            handle,
+        });
+    }
+
+    fn cancel_pending_tunnel_start(&mut self) {
+        let Some(mut pending) = self.pending_tunnel_start.take() else {
+            return;
+        };
+        self.operations.finish(&pending.operation);
+        zeroize_operation_context(&mut pending.operation);
+        pending.handle.abort();
+        let context = pending.context;
+        let pending_context = context.clone();
+        let instance = context.instance;
+        let tx = self.tx.clone();
+        let handle = self.runtime().spawn(async move {
+            let result = match tokio::time::timeout(TUNNEL_EXIT_GRACE, pending.handle).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) if error.is_cancelled() => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("隧道启动清理超过 8 秒等待上限".into()),
+            };
+            let _ = tx.send(UiMessage::TunnelEnded { context, result });
+        });
+        self.pending_tunnel_stops.insert(
+            instance,
+            PendingTunnelStop {
+                context: pending_context,
+                handle,
+            },
+        );
+    }
+
+    fn stop_active_tunnel(&mut self) {
+        let Some(mut active) = self.tunnel.take() else {
+            return;
+        };
+        active.tunnel.cancel();
+        let context = active.context;
+        let pending_context = context.clone();
+        let instance = context.instance;
+        zeroize_tunnel_spec(&mut active.spec);
+        zeroize_option_string(&mut active.last_error);
+        let tx = self.tx.clone();
+        let handle = self.runtime().spawn(async move {
+            let result = match tokio::time::timeout(TUNNEL_EXIT_GRACE, active.tunnel.wait()).await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("隧道停止超过 8 秒等待上限；后台任务已取消".into()),
+            };
+            let _ = tx.send(UiMessage::TunnelEnded { context, result });
+        });
+        self.pending_tunnel_stops.insert(
+            instance,
+            PendingTunnelStop {
+                context: pending_context,
+                handle,
+            },
+        );
+    }
+
+    fn stop_tunnel_for_profile(&mut self, _ctx: &egui::Context, profile: &str) {
+        if self
+            .pending_tunnel_start
+            .as_ref()
+            .is_some_and(|pending| pending.context.profile == profile)
+        {
+            self.cancel_pending_tunnel_start();
+        }
+        if self
+            .tunnel
+            .as_ref()
+            .is_some_and(|active| active.context.profile == profile)
+        {
+            self.stop_active_tunnel();
+        }
+    }
+
+    fn receive_tunnel_events(&mut self, ctx: &egui::Context) {
+        let mut closed = false;
+        if let Some(active) = &mut self.tunnel {
+            while let Ok(event) = active.tunnel.events.try_recv() {
+                match event {
+                    client::TunnelEvent::Ready {
+                        mut bind_host,
+                        bind_port,
+                    } => {
+                        bind_host.zeroize();
+                        active.bind_port = bind_port;
+                    }
+                    client::TunnelEvent::Error(mut error) => {
+                        zeroize_option_string(&mut active.last_error);
+                        active.last_error = Some(std::mem::take(&mut error));
+                    }
+                    client::TunnelEvent::Closed => closed = true,
+                }
+            }
+        }
+        if closed {
+            self.stop_active_tunnel();
+        }
+        if self.tunnel.is_some()
+            || self.pending_tunnel_start.is_some()
+            || !self.pending_tunnel_stops.is_empty()
+        {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     fn send_shell_bytes(&mut self, mut bytes: Vec<u8>) {
@@ -1312,36 +3535,41 @@ impl SerctlApp {
 
     fn start_daemon(&mut self, ctx: &egui::Context, profile: String) {
         let startup_deadline = tokio::time::Instant::now() + daemon::CONTROL_SETUP_TIMEOUT;
-        if self.master.is_empty() {
-            self.set_notice("连接前请输入主口令".into(), true);
+        let Some((expected_generation, master)) = self.required_authorized_profile_grant(&profile)
+        else {
             return;
-        }
-        let master = Zeroizing::new(std::mem::take(&mut self.master));
+        };
         let operation = self
             .operations
-            .begin(Some(profile.clone()), format!("正在连接 {profile}…"));
+            .begin(Some(profile.clone()), format!("正在连接 {profile}…"))
+            .with_profile_identity(expected_generation);
         let instance = self.operations.next_daemon_instance();
         let tx = self.tx.clone();
         let repaint = ctx.clone();
         self.runtime().spawn(async move {
-            let status =
-                match tokio::time::timeout_at(startup_deadline, client::daemon_status(&profile))
-                    .await
-                {
-                    Ok(status) => status,
-                    Err(_) => {
-                        let _ = tx.send(UiMessage::DaemonStarted {
-                            operation,
-                            profile,
-                            instance,
-                            result: Err("连接未能在 30 秒内就绪".into()),
-                        });
-                        repaint.request_repaint();
-                        return;
-                    }
-                };
+            let status = match tokio::time::timeout_at(
+                startup_deadline,
+                client::daemon_status_at_generation(&profile, &master, expected_generation),
+            )
+            .await
+            {
+                Ok(status) => status,
+                Err(_) => {
+                    let _ = tx.send(UiMessage::DaemonStarted {
+                        operation,
+                        profile,
+                        instance,
+                        result: Err("连接未能在 30 秒内就绪".into()),
+                    });
+                    repaint.request_repaint();
+                    return;
+                }
+            };
             match status {
                 Ok(Some(_)) => {
+                    // daemon_status already performed the exact Status
+                    // call-key authorization for this profile and master.
+                    drop(master);
                     let _ = tx.send(UiMessage::DaemonStarted {
                         operation,
                         profile,
@@ -1367,10 +3595,11 @@ impl SerctlApp {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let daemon_profile = profile.clone();
             let mut daemon_task = tokio::spawn(async move {
-                daemon::run_with_ready_until(
+                daemon::run_with_ready_until_at_generation(
                     &daemon_profile,
                     master,
                     Some(ready_tx),
+                    expected_generation,
                     startup_deadline,
                 )
                 .await
@@ -1453,12 +3682,18 @@ impl SerctlApp {
     }
 
     fn stop_daemon(&mut self, ctx: &egui::Context, profile: String) {
+        let Some((expected_generation, master)) = self.required_authorized_profile_grant(&profile)
+        else {
+            return;
+        };
+        self.stop_tunnel_for_profile(ctx, &profile);
         let operation = self
             .operations
-            .begin(Some(profile.clone()), format!("正在断开 {profile}…"));
+            .begin(Some(profile.clone()), format!("正在断开 {profile}…"))
+            .with_profile_identity(expected_generation);
         let instance = self.owned_daemons.get(&profile).copied();
         self.send_future(ctx, async move {
-            let result = client::down_quiet(&profile)
+            let result = client::down_quiet_at_generation(&profile, &master, expected_generation)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string());
@@ -1474,6 +3709,194 @@ impl SerctlApp {
     fn receive_messages(&mut self, ctx: &egui::Context) {
         while let Ok(mut message) = self.rx.try_recv() {
             match message.message_mut() {
+                UiMessage::Authorization { operation, result } => {
+                    let current = self.operation_is_current(operation);
+                    self.operations.finish(operation);
+                    zeroize_operation_context(operation);
+                    if !current {
+                        continue;
+                    }
+                    match std::mem::replace(result, Err(String::new())) {
+                        Ok(grant) => {
+                            let profile = grant.profile.clone();
+                            self.authorizations.grant(
+                                grant.profile,
+                                grant.identity,
+                                grant.passphrase,
+                                grant.verified_at,
+                            );
+                            self.set_notice(
+                                format!("{profile} 的独立口令授权已生效，有效期 5 分钟"),
+                                false,
+                            );
+                            self.refresh(ctx);
+                            ctx.request_repaint();
+                        }
+                        Err(mut error) => {
+                            let message = format!("独立口令验证失败：{error}");
+                            error.zeroize();
+                            self.set_notice(message, true);
+                        }
+                    }
+                }
+                UiMessage::AdminAuthorization { operation, result } => {
+                    let current = self.operation_is_current(operation);
+                    self.operations.finish(operation);
+                    zeroize_operation_context(operation);
+                    if !current {
+                        continue;
+                    }
+                    match std::mem::replace(result, Err(String::new())) {
+                        Ok(grant) => {
+                            self.admin_authorization
+                                .grant(grant.passphrase, grant.verified_at);
+                            self.set_notice("超管授权已生效，有效期 2 分钟".into(), false);
+                        }
+                        Err(mut error) => {
+                            let message = format!("超管授权失败：{error}");
+                            error.zeroize();
+                            self.set_notice(message, true);
+                        }
+                    }
+                }
+                UiMessage::AdminStatus { operation, result } => {
+                    let current = self.operation_is_current(operation);
+                    self.operations.finish(operation);
+                    zeroize_operation_context(operation);
+                    if !current {
+                        continue;
+                    }
+                    match result {
+                        Ok(status) => self.admin_dialog.status = Some(status.clone()),
+                        Err(error) => self.set_notice(std::mem::take(error), true),
+                    }
+                }
+                UiMessage::AdminInitialized { operation, result } => {
+                    self.operations.finish(operation);
+                    zeroize_operation_context(operation);
+                    match result {
+                        Ok(path) => {
+                            self.admin_dialog.clear_secrets();
+                            self.admin_authorization.revoke();
+                            self.set_notice(
+                                format!("超管与离线恢复已初始化；恢复介质已写入 {path}"),
+                                false,
+                            );
+                            self.open_admin_dialog(ctx);
+                            self.refresh_migration_state();
+                        }
+                        Err(error) => self.set_notice(std::mem::take(error), true),
+                    }
+                }
+                UiMessage::AdminPasswordChanged { operation, result } => {
+                    self.operations.finish(operation);
+                    zeroize_operation_context(operation);
+                    self.admin_authorization.revoke();
+                    match result {
+                        Ok(()) => {
+                            self.admin_dialog.clear_secrets();
+                            self.set_notice("超管密码已更改；请重新授权".into(), false);
+                        }
+                        Err(error) => self.set_notice(std::mem::take(error), true),
+                    }
+                }
+                UiMessage::RecoveryRotated { operation, result } => {
+                    self.operations.finish(operation);
+                    zeroize_operation_context(operation);
+                    self.admin_authorization.revoke();
+                    match result {
+                        Ok(path) => self.set_notice(
+                            format!("恢复介质已轮转并写入 {path}；旧介质已失效"),
+                            false,
+                        ),
+                        Err(error) => self.set_notice(std::mem::take(error), true),
+                    }
+                }
+                UiMessage::ProfileRecovered {
+                    operation,
+                    profile,
+                    result,
+                }
+                | UiMessage::ProfileReset {
+                    operation,
+                    profile,
+                    result,
+                } => {
+                    let current = self.operation_is_current(operation);
+                    self.operations.finish(operation);
+                    zeroize_operation_context(operation);
+                    self.authorizations.revoke_profile(profile.as_str());
+                    self.admin_authorization.revoke();
+                    match result {
+                        Ok(_) => {
+                            self.clear_protected_profile_workspace(profile.as_str());
+                            self.security_dialog.clear();
+                            if current {
+                                self.set_notice(
+                                    format!("{profile} 已重置；请使用新独立口令授权"),
+                                    false,
+                                );
+                            }
+                            self.refresh(ctx);
+                        }
+                        Err(error) if current => {
+                            self.set_notice(std::mem::take(error), true);
+                        }
+                        Err(_) => {}
+                    }
+                    profile.zeroize();
+                }
+                UiMessage::Migrated { operation, result } => {
+                    self.operations.finish(operation);
+                    zeroize_operation_context(operation);
+                    match result {
+                        Ok(count) => {
+                            self.migration.clear_secrets();
+                            self.migration.visible = false;
+                            self.set_notice(format!("已原子迁移 {count} 个 profile"), false);
+                            self.refresh_migration_state();
+                            self.refresh(ctx);
+                        }
+                        Err(error) => self.set_notice(std::mem::take(error), true),
+                    }
+                }
+                UiMessage::MigrationProgress {
+                    operation_id,
+                    progress,
+                } => {
+                    let mut activity = match progress {
+                        vault::MigrationProgress::Validating => "正在校验迁移输入…".to_owned(),
+                        vault::MigrationProgress::WaitingForExclusiveAccess => {
+                            "正在取得凭证库独占访问权…".to_owned()
+                        }
+                        vault::MigrationProgress::AuthenticatedLegacyVault => {
+                            "旧主口令验证完成，正在准备 v4 恢复策略…".to_owned()
+                        }
+                        vault::MigrationProgress::MigratingProfile {
+                            completed,
+                            total,
+                            profile,
+                        } => format!(
+                            "正在迁移 profile {}/{}：{}",
+                            completed.saturating_add(1),
+                            total,
+                            profile
+                        ),
+                        vault::MigrationProgress::PersistingRecoveryMedia => {
+                            "正在写入并校验离线恢复介质…".to_owned()
+                        }
+                        vault::MigrationProgress::CommittingVault => {
+                            "正在原子提交 v4 凭证库…".to_owned()
+                        }
+                    };
+                    let updated = self
+                        .operations
+                        .update_activity(*operation_id, activity.clone());
+                    if updated {
+                        ctx.request_repaint();
+                    }
+                    activity.zeroize();
+                }
                 UiMessage::Profiles {
                     operation,
                     epoch,
@@ -1496,16 +3919,58 @@ impl SerctlApp {
                                         (Some(previous), Some(refreshed)) => {
                                             previous.host != refreshed.host
                                                 || previous.port != refreshed.port
+                                                || previous.identity() != refreshed.identity()
                                         }
                                         (Some(_), None) => true,
                                         _ => false,
                                     }
                             });
+                            let security_dialog_stale = self.security_dialog.visible
+                                && self
+                                    .security_dialog
+                                    .expected_identity
+                                    .is_none_or(|expected| {
+                                        rows.iter()
+                                            .find(|row| row.name == self.security_dialog.profile)
+                                            .is_none_or(|row| row.identity() != expected)
+                                    });
+                            let editor_stale = self.editor.visible
+                                && self.editor.original_name.as_ref().is_some_and(|name| {
+                                    self.editor.expected_identity.is_none_or(|expected| {
+                                        rows.iter()
+                                            .find(|row| &row.name == name)
+                                            .is_none_or(|row| row.identity() != expected)
+                                    })
+                                });
                             for profile in &mut self.profiles {
                                 zeroize_profile_row(profile);
                             }
                             self.profiles.clear();
                             self.profiles.append(rows);
+                            if security_dialog_stale {
+                                self.security_dialog.clear();
+                            }
+                            if editor_stale {
+                                self.editor.clear();
+                            }
+                            let grants_invalidated =
+                                self.authorizations.retain_current_profiles(&self.profiles);
+                            if grants_invalidated {
+                                let selected_lost_authorization =
+                                    self.selected.clone().filter(|selected| {
+                                        self.profile_identity(selected).is_some_and(|identity| {
+                                            !self.profile_is_authorized_at(
+                                                selected,
+                                                identity,
+                                                Instant::now(),
+                                            )
+                                        })
+                                    });
+                                if let Some(mut selected) = selected_lost_authorization {
+                                    self.clear_protected_profile_workspace(&selected);
+                                    selected.zeroize();
+                                }
+                            }
                             if self.selected.as_ref().is_none_or(|name| {
                                 !self.profiles.iter().any(|profile| &profile.name == name)
                             }) {
@@ -1528,6 +3993,10 @@ impl SerctlApp {
                     zeroize_operation_context(operation);
                     match result {
                         Ok(name) => {
+                            if let Some(original) = original_name.as_deref() {
+                                self.authorizations.revoke_profile(original);
+                            }
+                            self.authorizations.revoke_profile(name.as_str());
                             let selected_was_updated = self.selected.as_deref()
                                 == Some(name.as_str())
                                 || original_name
@@ -1556,12 +4025,41 @@ impl SerctlApp {
                         Err(_) => {}
                     }
                 }
+                UiMessage::ProfilePassphraseChanged {
+                    operation,
+                    profile,
+                    result,
+                } => {
+                    let current = self.operation_is_current(operation);
+                    self.operations.finish(operation);
+                    zeroize_operation_context(operation);
+                    self.authorizations.revoke_profile(profile.as_str());
+                    match result {
+                        Ok(_) => {
+                            self.clear_protected_profile_workspace(profile.as_str());
+                            if current {
+                                self.security_dialog.clear();
+                                self.set_notice(
+                                    format!("{profile} 的独立口令已轮转；请使用新口令重新授权"),
+                                    false,
+                                );
+                            }
+                            self.refresh(ctx);
+                        }
+                        Err(error) if current => {
+                            self.set_notice(std::mem::take(error), true);
+                        }
+                        Err(_) => {}
+                    }
+                    profile.zeroize();
+                }
                 UiMessage::Removed { operation, result } => {
                     let current = self.operation_is_current(operation);
                     self.operations.finish(operation);
                     zeroize_operation_context(operation);
                     match result {
                         Ok(name) => {
+                            self.authorizations.revoke_profile(name.as_str());
                             if let Some((mut owned_name, _)) =
                                 self.owned_daemons.remove_entry(name.as_str())
                             {
@@ -1583,7 +4081,7 @@ impl SerctlApp {
                     }
                 }
                 UiMessage::Command { operation, result } => {
-                    let current = self.operation_is_current(operation);
+                    let current = self.protected_operation_is_current_at(operation, Instant::now());
                     self.operations.finish(operation);
                     zeroize_operation_context(operation);
                     if !current {
@@ -1613,7 +4111,7 @@ impl SerctlApp {
                     instance,
                     result,
                 } => {
-                    let current = self.operation_is_current(operation);
+                    let current = self.protected_operation_is_current_at(operation, Instant::now());
                     self.operations.finish(operation);
                     zeroize_operation_context(operation);
                     match result {
@@ -1660,6 +4158,9 @@ impl SerctlApp {
                             {
                                 self.close_shell();
                             }
+                            if lifecycle_current {
+                                self.stop_tunnel_for_profile(ctx, profile.as_str());
+                            }
                             if current && lifecycle_current {
                                 self.set_notice(format!("{profile} 已断开"), false);
                             }
@@ -1684,6 +4185,7 @@ impl SerctlApp {
                         if self.shell_profile.as_deref() == Some(profile.as_str()) {
                             self.close_shell();
                         }
+                        self.stop_tunnel_for_profile(ctx, profile.as_str());
                         if current {
                             self.set_notice(format!("{profile}: {error}"), true);
                         }
@@ -1695,7 +4197,7 @@ impl SerctlApp {
                     request,
                     result,
                 } => {
-                    let current = self.operation_is_current(operation)
+                    let current = self.protected_operation_is_current_at(operation, Instant::now())
                         && self.directory_request_is_current(request);
                     self.operations.finish(operation);
                     zeroize_operation_context(operation);
@@ -1718,7 +4220,7 @@ impl SerctlApp {
                     context,
                     result,
                 } => {
-                    let current = self.operation_is_current(operation)
+                    let current = self.protected_operation_is_current_at(operation, Instant::now())
                         && self.directory_request_is_current(context);
                     self.operations.finish(operation);
                     zeroize_operation_context(operation);
@@ -1726,10 +4228,7 @@ impl SerctlApp {
                         match result {
                             Ok(path) => {
                                 self.new_directory.zeroize();
-                                self.set_notice("目录已创建".into(), false);
-                                let profile = std::mem::take(&mut context.profile);
-                                let path = std::mem::take(path);
-                                self.refresh_directory(ctx, profile, path);
+                                self.set_notice(std::mem::take(path), false);
                             }
                             Err(error) => {
                                 self.set_notice(std::mem::take(error), true);
@@ -1743,21 +4242,13 @@ impl SerctlApp {
                     result,
                 } => {
                     self.pending_transfers.remove(&operation.id);
-                    let current = self.operation_is_current(operation);
+                    let current = self.protected_operation_is_current_at(operation, Instant::now());
                     self.operations.finish(operation);
                     zeroize_operation_context(operation);
                     if current {
                         match result {
                             Ok(message) => {
                                 self.set_notice(std::mem::take(message), false);
-                                if let Some(mut context) = refresh.take() {
-                                    if self.directory_request_is_current(&context) {
-                                        let profile = std::mem::take(&mut context.profile);
-                                        let path = std::mem::take(&mut context.path);
-                                        self.refresh_directory(ctx, profile, path);
-                                    }
-                                    zeroize_directory_request(&mut context);
-                                }
                             }
                             Err(error) => {
                                 self.set_notice(std::mem::take(error), true);
@@ -1769,22 +4260,103 @@ impl SerctlApp {
                     }
                 }
                 UiMessage::ShellOpened { operation, result } => {
-                    let current = self.operation_is_current(operation);
+                    let current = self.protected_operation_is_current_at(operation, Instant::now());
                     self.operations.finish(operation);
                     zeroize_operation_context(operation);
-                    if current {
-                        match std::mem::replace(result, Err(String::new())) {
-                            Ok((profile, shell)) => {
-                                let mut profile = Zeroizing::new(profile);
-                                self.close_shell();
-                                self.shell = Some(shell);
-                                self.shell_profile = Some(std::mem::take(&mut *profile));
-                                self.shell_output.zeroize();
-                                self.shell_output = "Bash 会话已打开。".into();
-                                self.set_notice("Bash 会话已打开".into(), false);
-                            }
-                            Err(error) => self.set_notice(error, true),
+                    if !current {
+                        if let Ok((profile, shell)) = result {
+                            profile.zeroize();
+                            shell.cancel();
                         }
+                        continue;
+                    }
+                    match std::mem::replace(result, Err(String::new())) {
+                        Ok((profile, shell)) => {
+                            let mut profile = Zeroizing::new(profile);
+                            self.close_shell();
+                            self.shell = Some(shell);
+                            self.shell_profile = Some(std::mem::take(&mut *profile));
+                            self.shell_output.zeroize();
+                            self.shell_output = "Bash 会话已打开。".into();
+                            self.set_notice("Bash 会话已打开".into(), false);
+                        }
+                        Err(error) => self.set_notice(error, true),
+                    }
+                }
+                UiMessage::TunnelStarted {
+                    operation,
+                    context,
+                    spec,
+                    result,
+                } => {
+                    let current = self.protected_operation_is_current_at(operation, Instant::now());
+                    let adopt = tunnel_start_may_be_adopted(
+                        self.selected.as_deref(),
+                        self.operations.profile_generation,
+                        self.profile_identity(&context.profile),
+                        self.pending_tunnel_start
+                            .as_ref()
+                            .map(|pending| &pending.context),
+                        self.tunnel.as_ref().map(|active| &active.context),
+                        context,
+                    );
+                    let pending_matches = self
+                        .pending_tunnel_start
+                        .as_ref()
+                        .is_some_and(|pending| pending.context == *context);
+                    if pending_matches {
+                        if let Some(mut pending) = self.pending_tunnel_start.take() {
+                            zeroize_tunnel_context(&mut pending.context);
+                            zeroize_operation_context(&mut pending.operation);
+                        }
+                    }
+                    self.operations.finish(operation);
+                    zeroize_operation_context(operation);
+                    if !current || !adopt {
+                        if let Ok(tunnel) = result {
+                            tunnel.cancel();
+                        }
+                        continue;
+                    }
+                    match std::mem::replace(result, Err(String::new())) {
+                        Ok(tunnel) => {
+                            let ready = tunnel.ready();
+                            let bind_port = ready.bind_port;
+                            self.tunnel = Some(ActiveTunnel {
+                                context: context.clone(),
+                                spec: clone_tunnel_spec(spec),
+                                bind_port,
+                                last_error: None,
+                                tunnel,
+                            });
+                            self.set_notice("SSH 隧道已启动".into(), false);
+                        }
+                        Err(error) => self.set_notice(error, true),
+                    }
+                }
+                UiMessage::TunnelEnded { context, result } => {
+                    let current = tunnel_context_is_current(
+                        self.selected.as_deref(),
+                        self.operations.profile_generation,
+                        self.profile_identity(&context.profile),
+                        context,
+                    );
+                    let matched = self
+                        .pending_tunnel_stops
+                        .remove(&context.instance)
+                        .is_some_and(|mut pending| {
+                            let matched =
+                                tunnel_end_matches_pending(Some(&pending.context), context);
+                            zeroize_tunnel_context(&mut pending.context);
+                            matched
+                        });
+                    zeroize_tunnel_context(context);
+                    if !matched || !current {
+                        continue;
+                    }
+                    match result {
+                        Ok(()) => self.set_notice("SSH 隧道已停止".into(), false),
+                        Err(error) => self.set_notice(std::mem::take(error), true),
                     }
                 }
                 #[cfg(test)]
@@ -1800,6 +4372,7 @@ impl SerctlApp {
         self.editor.visible = true;
         if let Some(mut profile) = profile {
             self.editor.original_name = Some(profile.name.clone());
+            self.editor.expected_identity = Some(profile.identity());
             self.editor.name = std::mem::take(&mut profile.name);
             self.editor.host = std::mem::take(&mut profile.host);
             self.editor.port = profile.port.to_string();
@@ -1821,6 +4394,10 @@ impl SerctlApp {
     }
 
     fn invalidate_profile_context(&mut self) {
+        // A tunnel is a live local capability. Revoke it before advancing the
+        // profile generation so no hidden listener survives a profile switch.
+        self.cancel_pending_tunnel_start();
+        self.stop_active_tunnel();
         self.operations.advance_profile_generation();
         for transfer in self.pending_transfers.values() {
             transfer.cancellation.cancel();
@@ -1831,7 +4408,8 @@ impl SerctlApp {
         self.remote_path = ".".into();
         self.command.zeroize();
         self.command = "uname -a && whoami".into();
-        self.master.zeroize();
+        self.profile_passphrase_input.zeroize();
+        self.security_dialog.clear();
         self.output.zeroize();
         self.output = "选择一个主机，然后执行命令。".into();
         self.exit_code = None;
@@ -1840,6 +4418,12 @@ impl SerctlApp {
         self.remote_upload.zeroize();
         self.local_download.zeroize();
         self.close_shell();
+        self.tunnel_mode = client::TunnelMode::Local;
+        self.tunnel_bind_port.zeroize();
+        self.tunnel_bind_port = "0".into();
+        self.tunnel_target_port.zeroize();
+        self.tunnel_max_connections.zeroize();
+        self.tunnel_max_connections = "32".into();
         self.workspace_tab = WorkspaceTab::Command;
 
         if let Some(mut candidate) = self.delete_candidate.take() {
@@ -1909,9 +4493,21 @@ impl SerctlApp {
         }
         zeroize_option_string(&mut self.selected);
         self.editor.zeroize_sensitive_state();
+        self.security_dialog.clear();
+        self.admin_dialog.close();
+        zeroize_admin_status(&mut self.admin_dialog.status);
+        self.admin_authorization.revoke();
+        self.migration.clear_secrets();
+        for profile in &mut self.migration.profiles {
+            profile.zeroize();
+        }
+        self.migration.profiles.clear();
+        self.migration.recovery_media_path.zeroize();
+        zeroize_migration_state(&mut self.migration_state);
         zeroize_option_string(&mut self.delete_candidate);
         self.command.zeroize();
-        self.master.zeroize();
+        self.profile_passphrase_input.zeroize();
+        self.authorizations.revoke_all();
         self.output.zeroize();
         self.remote_path.zeroize();
         self.clear_remote_entries();
@@ -1926,6 +4522,24 @@ impl SerctlApp {
         self.shell_input.zeroize();
         self.shell_bytes.zeroize();
         self.shell_output.zeroize();
+        self.tunnel_bind_port.zeroize();
+        self.tunnel_target_port.zeroize();
+        self.tunnel_max_connections.zeroize();
+        if let Some(mut pending) = self.pending_tunnel_start.take() {
+            pending.handle.abort();
+            zeroize_tunnel_context(&mut pending.context);
+            zeroize_operation_context(&mut pending.operation);
+        }
+        if let Some(mut active) = self.tunnel.take() {
+            active.tunnel.cancel();
+            zeroize_tunnel_context(&mut active.context);
+            zeroize_tunnel_spec(&mut active.spec);
+            zeroize_option_string(&mut active.last_error);
+        }
+        for (_, mut pending) in std::mem::take(&mut self.pending_tunnel_stops) {
+            pending.handle.abort();
+            zeroize_tunnel_context(&mut pending.context);
+        }
         for activity in self.operations.active.values_mut() {
             activity.zeroize();
         }
@@ -1938,18 +4552,140 @@ impl SerctlApp {
     fn operation_is_current(&self, operation: &OperationContext) -> bool {
         self.operations
             .is_current(self.selected.as_deref(), operation)
+            && operation.profile_identity.is_none_or(|expected| {
+                operation
+                    .profile
+                    .as_deref()
+                    .and_then(|profile| self.profile_identity(profile))
+                    == Some(expected)
+            })
+    }
+
+    fn protected_operation_is_current_at(
+        &self,
+        operation: &OperationContext,
+        now: Instant,
+    ) -> bool {
+        if !self.operation_is_current(operation) {
+            return false;
+        }
+        let (Some(profile), Some(identity)) =
+            (operation.profile.as_deref(), operation.profile_identity)
+        else {
+            return false;
+        };
+        self.authorizations.get(profile, identity, now).is_some()
     }
 
     fn directory_request_is_current(&self, request: &DirectoryRequest) -> bool {
         self.directory_requests.is_current(
             self.selected.as_deref(),
             self.operations.profile_generation,
+            self.profile_identity(&request.profile),
             request,
         )
     }
 
+    fn authorization_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        busy: bool,
+        profile: Option<&ProfileRow>,
+    ) {
+        self.expire_authorizations_and_protected_sessions(Instant::now());
+        let remaining = profile.and_then(|profile| {
+            self.authorizations
+                .remaining_at(&profile.name, profile.identity(), Instant::now())
+        });
+        if remaining.is_some() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("主机独立授权").strong());
+                match (profile, remaining) {
+                    (Some(profile), Some(remaining)) => {
+                        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+                        let minutes = seconds / 60;
+                        let seconds = seconds % 60;
+                        ui.label(
+                            RichText::new(format!(
+                                "● {} 已授权 · 剩余 {minutes:02}:{seconds:02}",
+                                profile.name
+                            ))
+                                .color(Color32::from_rgb(76, 205, 140)),
+                        );
+                    }
+                    (Some(profile), None) => {
+                        ui.label(
+                            RichText::new(format!("○ {} 未授权", profile.name))
+                                .color(Color32::GRAY),
+                        );
+                    }
+                    (None, _) => {
+                        ui.label(RichText::new("选择主机后授权").color(Color32::GRAY));
+                    }
+                }
+                if remaining.is_some()
+                    && ui.add_enabled(!busy, egui::Button::new("撤销此主机")).clicked()
+                {
+                    if let Some(profile) = profile {
+                        self.revoke_profile_authorization(&profile.name);
+                    }
+                }
+                if self.authorizations.grants.len() > 1
+                    && ui
+                        .add_enabled(!busy, egui::Button::new("全部锁定"))
+                        .clicked()
+                {
+                    self.revoke_all_authorizations();
+                }
+            });
+            if profile.is_some() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let response = add_secret_password_edit(
+                        ui,
+                        !busy,
+                        "profile-workspace-passphrase",
+                        &mut self.profile_passphrase_input,
+                        if remaining.is_some() {
+                            "重新输入该主机独立口令"
+                        } else {
+                            "输入该主机独立口令"
+                        },
+                    );
+                    let authorize = ui.add_enabled(
+                        !busy,
+                        egui::Button::new(if remaining.is_some() {
+                            "重新授权"
+                        } else {
+                            "授权 5 分钟"
+                        }),
+                    );
+                    if !busy
+                        && (authorize.clicked()
+                            || (response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter))))
+                    {
+                        self.authorize(ctx);
+                    }
+                });
+            }
+            ui.label(
+                RichText::new(
+                    "授权只适用于当前 profile 与当前 generation；有效期固定 5 分钟且不会因操作续期。",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+        });
+    }
+
     fn sidebar(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
+        self.expire_authorizations_and_protected_sessions(Instant::now());
         let mut profiles = self.profiles.clone();
         let busy = self.operations.is_busy();
         egui::Panel::left("profiles")
@@ -1978,10 +4714,16 @@ impl SerctlApp {
                     }
                     if ui
                         .add_enabled(!busy, egui::Button::new("⟳"))
-                        .on_hover_text("刷新状态")
+                        .on_hover_text("刷新本地目录；仅探测已授权主机的状态")
                         .clicked()
                     {
                         self.refresh(&ctx);
+                    }
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("安全与恢复"))
+                        .clicked()
+                    {
+                        self.open_admin_dialog(&ctx);
                     }
                 });
                 ui.add_space(12.0);
@@ -1993,18 +4735,36 @@ impl SerctlApp {
                 }
                 for profile in &profiles {
                     let selected = self.selected.as_deref() == Some(&profile.name);
-                    let status = if profile.daemon.is_some() {
+                    let remaining = self.authorizations.remaining_at(
+                        &profile.name,
+                        profile.identity(),
+                        Instant::now(),
+                    );
+                    let authorized = remaining.is_some();
+                    let status = if !authorized {
+                        "◆"
+                    } else if profile.daemon.is_some() {
                         "●"
                     } else {
                         "○"
                     };
-                    let color = if profile.daemon.is_some() {
+                    let color = if !authorized {
+                        Color32::from_gray(105)
+                    } else if profile.daemon.is_some() {
                         Color32::from_rgb(76, 205, 140)
                     } else {
                         Color32::from_gray(115)
                     };
+                    let authorization_label = remaining.map_or_else(
+                        || "已锁定".to_owned(),
+                        |remaining| {
+                            let seconds =
+                                remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+                            format!("授权 {:02}:{:02}", seconds / 60, seconds % 60)
+                        },
+                    );
                     let mut label = format!(
-                        "{status}  {}\n     {}:{}",
+                        "{status}  {}  · {authorization_label}\n     {}:{}",
                         profile.name, profile.host, profile.port
                     );
                     let clicked = ui
@@ -2032,13 +4792,31 @@ impl SerctlApp {
 
     fn central_panel(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
+        self.expire_authorizations_and_protected_sessions(Instant::now());
         let busy = self.operations.is_busy();
         let mut profile = self.selected_profile();
         egui::CentralPanel::default().show(root, |ui| {
             ui.add_space(18.0);
+            self.authorization_controls(ui, &ctx, busy, profile.as_ref());
+            ui.add_space(14.0);
+            let profile_authorized = profile.as_ref().is_some_and(|profile| {
+                self.profile_is_authorized_at(&profile.name, profile.identity(), Instant::now())
+            });
+            if profile.is_some() && !profile_authorized {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(110.0);
+                    ui.label(RichText::new("此主机工作区已锁定").size(24.0));
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("验证该主机的独立口令后，才会查询其连接状态或执行远程操作。")
+                            .color(Color32::GRAY),
+                    );
+                });
+                return;
+            }
             let Some(profile) = profile.as_ref() else {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(170.0);
+                    ui.add_space(110.0);
                     ui.label(RichText::new("选择或新建一台主机").size(24.0));
                     ui.add_space(8.0);
                     ui.label(
@@ -2066,6 +4844,13 @@ impl SerctlApp {
                     if ui.add_enabled(!busy, egui::Button::new("删除")).clicked() {
                         self.delete_candidate = Some(profile.name.clone());
                     }
+                    if ui
+                        .add_enabled(!busy && profile.daemon.is_none(), egui::Button::new("安全"))
+                        .on_hover_text("轮转此 profile 的独立口令")
+                        .clicked()
+                    {
+                        self.open_security_dialog(profile);
+                    }
                     let edit = ui
                         .add_enabled(!busy && profile.daemon.is_none(), egui::Button::new("编辑"));
                     let edit_clicked = edit.clicked();
@@ -2091,38 +4876,19 @@ impl SerctlApp {
             ui.add_space(18.0);
             ui.separator();
             ui.add_space(14.0);
-
-            ui.label(RichText::new("主口令").strong());
-            add_secret_password_edit(
-                ui,
-                !busy,
-                "workspace-master",
-                &mut self.master,
-                if profile.daemon.is_some() {
-                    "已有守护连接，执行命令无需口令"
-                } else {
-                    "用于解密本机凭据"
-                },
-            );
-            ui.add_space(12.0);
-            let previous_tab = self.workspace_tab;
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.workspace_tab, WorkspaceTab::Command, "命令");
                 ui.selectable_value(&mut self.workspace_tab, WorkspaceTab::Files, "文件");
                 ui.selectable_value(&mut self.workspace_tab, WorkspaceTab::Bash, "Bash");
+                ui.selectable_value(&mut self.workspace_tab, WorkspaceTab::Tunnel, "隧道");
             });
-            if !busy
-                && previous_tab != self.workspace_tab
-                && self.workspace_tab == WorkspaceTab::Files
-            {
-                self.refresh_directory(&ctx, profile.name.clone(), self.remote_path.clone());
-            }
             ui.separator();
             ui.add_space(8.0);
             match self.workspace_tab {
                 WorkspaceTab::Command => self.command_workspace(ui, &ctx, profile),
                 WorkspaceTab::Files => self.files_workspace(ui, &ctx, profile),
                 WorkspaceTab::Bash => self.bash_workspace(ui, &ctx, profile),
+                WorkspaceTab::Tunnel => self.tunnel_workspace(ui, &ctx, profile),
             }
         });
         if let Some(mut profile) = profile.take() {
@@ -2397,7 +5163,856 @@ impl SerctlApp {
         });
     }
 
+    fn tunnel_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, profile: &ProfileRow) {
+        let busy = self.operations.is_busy();
+        let starting = self
+            .pending_tunnel_start
+            .as_ref()
+            .is_some_and(|pending| pending.context.profile == profile.name);
+        let running = self
+            .tunnel
+            .as_ref()
+            .is_some_and(|active| active.context.profile == profile.name);
+        let stopping = !self.pending_tunnel_stops.is_empty();
+        let editable = !busy && !starting && !running && !stopping;
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("模式").strong());
+            ui.add_enabled_ui(editable, |ui| {
+                ui.selectable_value(&mut self.tunnel_mode, client::TunnelMode::Local, "本地 L");
+                ui.selectable_value(&mut self.tunnel_mode, client::TunnelMode::Remote, "远程 R");
+                ui.selectable_value(
+                    &mut self.tunnel_mode,
+                    client::TunnelMode::Dynamic,
+                    "动态 D / SOCKS5",
+                );
+            });
+        });
+        ui.add_space(8.0);
+        ui.add_enabled_ui(editable, |ui| {
+            egui::Grid::new("tunnel-form")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("监听地址");
+                    ui.label(
+                        RichText::new("127.0.0.1（强制回环）")
+                            .color(Color32::from_rgb(76, 205, 140)),
+                    );
+                    ui.end_row();
+                    ui.label("监听端口");
+                    add_ephemeral_text_edit(
+                        ui,
+                        "tunnel-bind-port",
+                        TextEdit::singleline(&mut self.tunnel_bind_port)
+                            .hint_text("0 表示自动选择"),
+                    );
+                    ui.end_row();
+                    if self.tunnel_mode != client::TunnelMode::Dynamic {
+                        ui.label(if self.tunnel_mode == client::TunnelMode::Local {
+                            "SSH 主机目标端口"
+                        } else {
+                            "本机目标端口"
+                        });
+                        add_ephemeral_text_edit(
+                            ui,
+                            "tunnel-target-port",
+                            TextEdit::singleline(&mut self.tunnel_target_port)
+                                .desired_width(100.0)
+                                .hint_text("1–65535"),
+                        );
+                        ui.end_row();
+                    }
+                    ui.label("最大连接数");
+                    add_ephemeral_text_edit(
+                        ui,
+                        "tunnel-max-connections",
+                        TextEdit::singleline(&mut self.tunnel_max_connections).hint_text("32"),
+                    );
+                    ui.end_row();
+                });
+        });
+        ui.label(
+            RichText::new(match self.tunnel_mode {
+                client::TunnelMode::Local => {
+                    "L：本机 127.0.0.1 → 已连接 SSH 主机的 127.0.0.1:目标端口"
+                }
+                client::TunnelMode::Remote => "R：SSH 主机 127.0.0.1 → 本机 127.0.0.1:目标端口",
+                client::TunnelMode::Dynamic => {
+                    "D：在本机 127.0.0.1 启动 SOCKS5；不接受外部网络连接"
+                }
+            })
+            .small()
+            .color(Color32::GRAY),
+        );
+        ui.add_space(10.0);
+
+        if let Some(active) = self
+            .tunnel
+            .as_ref()
+            .filter(|active| active.context.profile == profile.name)
+        {
+            let mut status = format!("● 正在监听 127.0.0.1:{}", active.bind_port);
+            ui.label(RichText::new(status.as_str()).color(Color32::from_rgb(76, 205, 140)));
+            status.zeroize();
+            if let Some(error) = active.last_error.as_deref() {
+                ui.label(RichText::new(format!("最近错误：{error}")).color(Color32::YELLOW));
+            }
+        } else if starting {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("正在验证此主机的独立口令并启动隧道…");
+            });
+        } else if stopping {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("正在停止隧道并回收连接…");
+            });
+        } else {
+            ui.label(RichText::new("○ 隧道未运行").color(Color32::GRAY));
+        }
+
+        ui.horizontal(|ui| {
+            if running || starting {
+                if ui
+                    .add_enabled(!stopping, egui::Button::new("停止隧道"))
+                    .clicked()
+                {
+                    self.stop_tunnel_for_profile(ctx, &profile.name);
+                }
+            } else if ui
+                .add_enabled(editable, egui::Button::new("启动隧道"))
+                .clicked()
+            {
+                self.start_tunnel(ctx, profile.name.clone());
+            }
+        });
+        ui.label(
+            RichText::new(
+                "启动需要此 profile 当前 generation 的 5 分钟独立授权；隧道始终仅监听回环地址。",
+            )
+            .small()
+            .color(Color32::GRAY),
+        );
+    }
+
+    fn migration_overlay(&mut self, ctx: &egui::Context) -> bool {
+        let Some(vault::VaultMigrationState::LegacyV2 { .. }) = &self.migration_state else {
+            return false;
+        };
+        self.migration.visible = true;
+        #[cfg(unix)]
+        {
+            // Do not render editable secret fields for a platform on which
+            // migration is deliberately unavailable. This makes the
+            // "fails before collecting secrets" boundary true in memory as
+            // well as at the submit handler.
+            self.migration.clear_secrets();
+            egui::Window::new("必须迁移凭证库")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new("v2 共享主口令 → v4 每主机独立口令与随机身份").size(20.0).strong());
+                    ui.label(
+                        RichText::new(
+                            "Linux 迁移当前失败关闭：必须先配置 root-owned 系统 share store 与明确的目标用户边界。此界面不会采集旧主口令或新 profile 口令。",
+                        )
+                        .color(Color32::YELLOW),
+                    );
+                });
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            let busy = self.operations.is_busy();
+            let profiles = self.migration.profiles.clone();
+            let ready = profiles
+                .iter()
+                .filter(|profile| {
+                    let value = self.migration.profile_passphrases.get(*profile);
+                    let confirmation = self.migration.profile_confirmations.get(*profile);
+                    value.is_some_and(|value| !value.is_empty()) && value == confirmation
+                })
+                .count();
+            let mut submit = false;
+            egui::Window::new("必须迁移凭证库")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("v2 共享主口令 → v4 每主机独立口令与随机身份").size(20.0).strong());
+                ui.label(
+                    RichText::new(
+                        "迁移一次性、全有或全无：任何 profile 缺少新口令或认证失败时，旧 vault 保持不变。迁移期间不会连接任何远端主机。",
+                    )
+                    .color(Color32::GRAY),
+                );
+                if let Some((notice, error)) = self.notice.as_ref() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(notice)
+                            .color(if *error {
+                                Color32::from_rgb(245, 104, 104)
+                            } else {
+                                Color32::from_rgb(76, 205, 140)
+                            })
+                            .strong(),
+                    );
+                }
+                ui.add_space(10.0);
+                ui.label(format!("输入完成：{ready}/{} 个 profile", profiles.len()));
+                ui.add(egui::ProgressBar::new(if profiles.is_empty() {
+                    1.0
+                } else {
+                    ready as f32 / profiles.len() as f32
+                }));
+                if busy {
+                    ui.add_space(8.0);
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                self.operations
+                                    .activity()
+                                    .unwrap_or("正在执行离线迁移…"),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(
+                                "正在执行高强度 Argon2 校验与重加密；窗口仍可响应，请勿关闭。",
+                            )
+                            .small()
+                            .color(Color32::GRAY),
+                        );
+                    });
+                }
+                ui.add_space(8.0);
+                ui.label("旧 v2 共享主口令");
+                add_secret_password_edit(
+                    ui,
+                    !busy,
+                    "migration-old-master",
+                    &mut self.migration.old_master,
+                    "仅用于本次离线迁移",
+                );
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(245.0).show(ui, |ui| {
+                    for profile in &profiles {
+                        ui.group(|ui| {
+                            ui.label(RichText::new(profile).strong());
+                            let value = self
+                                .migration
+                                .profile_passphrases
+                                .get_mut(profile)
+                                .expect("migration profile passphrase exists");
+                            add_secret_password_edit_with_id(
+                                ui,
+                                !busy,
+                                egui::Id::new(("migration-profile-passphrase", profile)),
+                                value,
+                                "新独立口令（至少 12 字节）",
+                            );
+                            let confirmation = self
+                                .migration
+                                .profile_confirmations
+                                .get_mut(profile)
+                                .expect("migration profile confirmation exists");
+                            add_secret_password_edit_with_id(
+                                ui,
+                                !busy,
+                                egui::Id::new(("migration-profile-confirmation", profile)),
+                                confirmation,
+                                "再次输入",
+                            );
+                        });
+                    }
+                });
+                ui.separator();
+                ui.label(RichText::new("Windows 超管密码").strong());
+                add_secret_password_edit(
+                    ui,
+                    !busy,
+                    "migration-admin-password",
+                    &mut self.migration.administrator_password,
+                    "设置新超管密码",
+                );
+                add_secret_password_edit(
+                    ui,
+                    !busy,
+                    "migration-admin-confirmation",
+                    &mut self.migration.administrator_confirmation,
+                    "再次输入超管密码",
+                );
+                ui.label("新离线恢复介质文件");
+                add_ephemeral_text_edit(
+                    ui,
+                    "migration-media-path",
+                    TextEdit::singleline(&mut self.migration.recovery_media_path)
+                        .hint_text("U 盘上的绝对路径；不会覆盖已有文件"),
+                );
+                ui.add_space(10.0);
+                submit = ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new("验证全部内容并原子迁移"),
+                    )
+                    .clicked();
+            });
+            if submit {
+                self.submit_v2_migration(ctx);
+            }
+            true
+        }
+    }
+
+    fn admin_overlay(&mut self, ctx: &egui::Context) {
+        if !self.admin_dialog.visible {
+            return;
+        }
+        let busy = self.operations.is_busy();
+        let status = self.admin_dialog.status.clone();
+        let remaining = self.admin_authorization.remaining_at(Instant::now());
+        if remaining.is_some() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+        let mut visible = true;
+        let mut cancel = false;
+        let mut authorize = false;
+        let mut initialize = false;
+        let mut change_password = false;
+        let mut rotate_recovery = false;
+        egui::Window::new("安全与恢复")
+            .open(&mut visible)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(540.0)
+            .show(ctx, |ui| {
+                ui.heading("超管与离线恢复");
+                ui.label(
+                    RichText::new(
+                        "超管只能设置、重置或轮转 profile 口令，不能查看已有口令。恢复旧凭据必须同时提供匹配的离线介质。",
+                    )
+                    .color(Color32::GRAY),
+                );
+                ui.label(
+                    RichText::new(
+                        "本地 profile 名称和 endpoint 属于目录元数据，在工作区锁定时仍可见；SSH 凭据不会显示。",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                ui.separator();
+                match status.as_ref() {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("正在读取安全策略…");
+                        });
+                    }
+                    Some(vault::AdminStatus::Uninitialized {
+                        platform_requires_password: true,
+                    }) => {
+                        ui.label(
+                            RichText::new("○ 尚未初始化 Windows 超管与恢复策略")
+                                .color(Color32::YELLOW),
+                        );
+                        ui.label("必须先初始化，之后才能创建首个 profile。");
+                        add_secret_password_edit(
+                            ui,
+                            !busy,
+                            "admin-init-new-password",
+                            &mut self.admin_dialog.new_password,
+                            "新超管密码（至少 12 字节）",
+                        );
+                        add_secret_password_edit(
+                            ui,
+                            !busy,
+                            "admin-init-confirmation",
+                            &mut self.admin_dialog.new_password_confirmation,
+                            "再次输入",
+                        );
+                        add_ephemeral_text_edit(
+                            ui,
+                            "admin-init-media-path",
+                            TextEdit::singleline(&mut self.admin_dialog.media_path)
+                                .hint_text("U 盘上的新文件绝对路径；不会覆盖已有文件"),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "介质文件只是 2-of-2 的一半，单独不能解密；请在确认 U 盘路径后再初始化。",
+                            )
+                            .small()
+                            .color(Color32::GRAY),
+                        );
+                        initialize = ui
+                            .add_enabled(!busy, egui::Button::new("初始化并写入恢复介质"))
+                            .clicked();
+                    }
+                    Some(vault::AdminStatus::Uninitialized {
+                        platform_requires_password: false,
+                    }) => {
+                        ui.label("Linux 管理授权使用有效 UID 0，不设置独立超管密码。");
+                        ui.label(
+                            RichText::new(
+                                "离线恢复当前失败关闭：尚未配置 root-owned 系统 share store 与目标用户 vault 边界。",
+                            )
+                            .color(Color32::YELLOW),
+                        );
+                        authorize = ui
+                            .add_enabled(!busy, egui::Button::new("验证 root 授权 2 分钟"))
+                            .clicked();
+                    }
+                    Some(vault::AdminStatus::Ready {
+                        platform_requires_password,
+                        recovery_id,
+                    }) => {
+                        let id_prefix = recovery_id.chars().take(12).collect::<String>();
+                        ui.label(
+                            RichText::new(format!("● 恢复策略已配置 · ID {id_prefix}…"))
+                                .color(Color32::from_rgb(76, 205, 140)),
+                        );
+                        match remaining {
+                            Some(remaining) => {
+                                let seconds = remaining.as_secs()
+                                    + u64::from(remaining.subsec_nanos() > 0);
+                                ui.label(format!(
+                                    "超管授权剩余 {:02}:{:02}（固定 2 分钟，不续期）",
+                                    seconds / 60,
+                                    seconds % 60
+                                ));
+                                if ui.small_button("立即撤销超管授权").clicked() {
+                                    self.admin_authorization.revoke();
+                                }
+                            }
+                            None => {
+                                if *platform_requires_password {
+                                    add_secret_password_edit(
+                                        ui,
+                                        !busy,
+                                        "admin-authorization-password",
+                                        &mut self.admin_dialog.password_input,
+                                        "输入超管密码",
+                                    );
+                                }
+                                authorize = ui
+                                    .add_enabled(
+                                        !busy,
+                                        egui::Button::new(if *platform_requires_password {
+                                            "授权 2 分钟"
+                                        } else {
+                                            "验证 root 授权 2 分钟"
+                                        }),
+                                    )
+                                    .clicked();
+                            }
+                        }
+                        if *platform_requires_password {
+                            ui.separator();
+                            ui.label(RichText::new("更改超管密码").strong());
+                            add_secret_password_edit(
+                                ui,
+                                !busy && remaining.is_some(),
+                                "admin-change-new-password",
+                                &mut self.admin_dialog.new_password,
+                                "新超管密码",
+                            );
+                            add_secret_password_edit(
+                                ui,
+                                !busy && remaining.is_some(),
+                                "admin-change-confirmation",
+                                &mut self.admin_dialog.new_password_confirmation,
+                                "再次输入",
+                            );
+                            change_password = ui
+                                .add_enabled(
+                                    !busy && remaining.is_some(),
+                                    egui::Button::new("更改超管密码"),
+                                )
+                                .clicked();
+                            ui.separator();
+                            ui.label(RichText::new("轮转离线恢复介质").strong());
+                            add_ephemeral_text_edit(
+                                ui,
+                                "admin-old-media-path",
+                                TextEdit::singleline(&mut self.admin_dialog.old_media_path)
+                                    .hint_text("当前恢复介质绝对路径"),
+                            );
+                            add_ephemeral_text_edit(
+                                ui,
+                                "admin-new-media-path",
+                                TextEdit::singleline(&mut self.admin_dialog.new_media_path)
+                                    .hint_text("新介质文件绝对路径；不会覆盖"),
+                            );
+                            rotate_recovery = ui
+                                .add_enabled(
+                                    !busy && remaining.is_some(),
+                                    egui::Button::new("验证旧介质并轮转"),
+                                )
+                                .clicked();
+                        }
+                    }
+                }
+                ui.separator();
+                if ui.button("关闭").clicked() {
+                    cancel = true;
+                }
+            });
+        if authorize {
+            self.authorize_admin(ctx);
+        }
+        if initialize {
+            self.initialize_admin_and_recovery(ctx);
+        }
+        if change_password {
+            self.change_admin_password(ctx);
+        }
+        if rotate_recovery {
+            self.rotate_recovery_media(ctx);
+        }
+        if (cancel || !visible) && busy {
+            self.admin_dialog.visible = true;
+            self.set_notice("请等待当前安全操作完成后再关闭窗口".into(), true);
+        } else if cancel || !visible {
+            self.admin_dialog.close();
+        }
+    }
+
     fn overlays(&mut self, ctx: &egui::Context) {
+        if self.migration_overlay(ctx) {
+            return;
+        }
+        self.admin_overlay(ctx);
+        if self.admin_dialog.visible {
+            return;
+        }
+        if self.security_dialog.visible {
+            let mut visible = true;
+            let mut rotate_manual = false;
+            let mut rotate_random = false;
+            let mut preserve = false;
+            let mut preserve_random = false;
+            let mut destructive_reset = false;
+            let mut destructive_random = false;
+            let mut open_admin = false;
+            let mut commit_random = false;
+            let mut discard_random = false;
+            let mut cancel = false;
+            egui::Window::new("Profile 安全")
+                .open(&mut visible)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(520.0)
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new(format!("{} · 安全操作", self.security_dialog.profile))
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "任何成功的口令变更都会推进 vault generation，并立即撤销该 profile 的旧授权。",
+                        )
+                        .small()
+                        .color(Color32::GRAY),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.security_section,
+                            SecuritySection::ProfilePassphrase,
+                            "口令轮转",
+                        );
+                        ui.selectable_value(
+                            &mut self.security_section,
+                            SecuritySection::PreserveRecovery,
+                            "保留式恢复",
+                        );
+                        ui.selectable_value(
+                            &mut self.security_section,
+                            SecuritySection::DestructiveReset,
+                            "破坏性重置",
+                        );
+                    });
+                    ui.separator();
+                    if let Some(random) = self.security_dialog.random_passphrase_once.as_ref() {
+                        let action = self
+                            .security_dialog
+                            .pending_random_action
+                            .unwrap_or(PendingRandomProfileAction::RotatePassphrase);
+                        ui.label(
+                            RichText::new(format!(
+                                "待确认：{}（vault 尚未修改）",
+                                action.description()
+                            ))
+                            .color(Color32::YELLOW)
+                            .strong(),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "先离线保存下列口令，再勾选确认并提交。关闭或取消会清零口令且不会修改 vault。",
+                            )
+                            .small()
+                            .color(Color32::GRAY),
+                        );
+                        ui.monospace(random.as_str());
+                        ui.checkbox(
+                            &mut self.security_dialog.random_saved_confirmation,
+                            "我已将新口令保存到安全位置",
+                        );
+                        ui.horizontal(|ui| {
+                            commit_random = ui
+                                .add_enabled(
+                                    self.security_dialog.random_saved_confirmation
+                                        && !self.operations.is_busy(),
+                                    egui::Button::new(action.commit_label()),
+                                )
+                                .clicked();
+                            discard_random = ui
+                                .add_enabled(
+                                    !self.operations.is_busy(),
+                                    egui::Button::new("取消并清零（不修改 vault）"),
+                                )
+                                .clicked();
+                        });
+                    } else {
+                        match self.security_section {
+                        SecuritySection::ProfilePassphrase => {
+                            ui.label("当前独立口令");
+                            add_secret_password_edit(
+                                ui,
+                                !self.operations.is_busy(),
+                                "profile-security-current",
+                                &mut self.security_dialog.current_passphrase,
+                                "当前口令",
+                            );
+                            ui.add_space(6.0);
+                            ui.label("手动设置");
+                            add_secret_password_edit(
+                                ui,
+                                !self.operations.is_busy(),
+                                "profile-security-new",
+                                &mut self.security_dialog.new_passphrase,
+                                "至少 12 字节",
+                            );
+                            add_secret_password_edit(
+                                ui,
+                                !self.operations.is_busy(),
+                                "profile-security-confirmation",
+                                &mut self.security_dialog.new_passphrase_confirmation,
+                                "再次输入",
+                            );
+                            ui.horizontal(|ui| {
+                                rotate_manual = ui
+                                    .add_enabled(
+                                        !self.operations.is_busy(),
+                                        egui::Button::new("设置新独立口令"),
+                                    )
+                                    .clicked();
+                                rotate_random = ui
+                                    .add_enabled(
+                                        !self.operations.is_busy(),
+                                        egui::Button::new("生成随机口令（先确认后轮转）"),
+                                    )
+                                    .clicked();
+                            });
+                        }
+                        SecuritySection::PreserveRecovery => {
+                            ui.label(
+                                RichText::new(
+                                    "保留原 SSH 凭据：必须同时使用超管/root 授权与匹配的离线介质。普通管理员密码单独无法解密。",
+                                )
+                                .color(Color32::from_rgb(76, 205, 140)),
+                            );
+                            #[cfg(unix)]
+                            ui.label(
+                                RichText::new(
+                                    "Linux 离线恢复当前失败关闭，直到配置 root-owned 系统 share store。",
+                                )
+                                .color(Color32::YELLOW),
+                            );
+                            #[cfg(windows)]
+                            {
+                                let admin_valid =
+                                    self.admin_authorization.is_valid_at(Instant::now());
+                                if !admin_valid {
+                                    open_admin = ui.button("先取得超管授权…").clicked();
+                                }
+                                ui.label("离线恢复介质");
+                                add_ephemeral_text_edit(
+                                    ui,
+                                    "profile-recovery-media-path",
+                                    TextEdit::singleline(
+                                        &mut self.security_dialog.recovery_media_path,
+                                    )
+                                    .hint_text("U 盘介质文件绝对路径"),
+                                );
+                                add_secret_password_edit(
+                                    ui,
+                                    !self.operations.is_busy(),
+                                    "profile-recovery-new-passphrase",
+                                    &mut self.security_dialog.new_passphrase,
+                                    "恢复后的新独立口令",
+                                );
+                                add_secret_password_edit(
+                                    ui,
+                                    !self.operations.is_busy(),
+                                    "profile-recovery-confirmation",
+                                    &mut self.security_dialog.new_passphrase_confirmation,
+                                    "再次输入",
+                                );
+                                ui.horizontal(|ui| {
+                                    preserve = ui
+                                        .add_enabled(
+                                            !self.operations.is_busy() && admin_valid,
+                                            egui::Button::new("使用手动口令恢复"),
+                                        )
+                                        .clicked();
+                                    preserve_random = ui
+                                        .add_enabled(
+                                            !self.operations.is_busy() && admin_valid,
+                                            egui::Button::new("生成随机口令（先确认后恢复）"),
+                                        )
+                                        .clicked();
+                                });
+                            }
+                        }
+                        SecuritySection::DestructiveReset => {
+                            ui.label(
+                                RichText::new(
+                                    "危险：此操作永久丢弃原 SSH 凭据、主机指纹和旧密钥包。无法撤销，也不使用恢复介质。",
+                                )
+                                .color(Color32::from_rgb(245, 104, 104))
+                                .strong(),
+                            );
+                            let admin_valid = self.admin_authorization.is_valid_at(Instant::now());
+                            if !admin_valid {
+                                open_admin = ui.button("先取得超管/root 授权…").clicked();
+                            }
+                            egui::Grid::new("destructive-reset-form")
+                                .num_columns(2)
+                                .show(ui, |ui| {
+                                    ui.label("替换地址");
+                                    ui.text_edit_singleline(
+                                        &mut self.security_dialog.replacement_host,
+                                    );
+                                    ui.end_row();
+                                    ui.label("端口");
+                                    ui.text_edit_singleline(
+                                        &mut self.security_dialog.replacement_port,
+                                    );
+                                    ui.end_row();
+                                    ui.label("SSH 用户");
+                                    ui.text_edit_singleline(
+                                        &mut self.security_dialog.replacement_user,
+                                    );
+                                    ui.end_row();
+                                    ui.label("新 SSH 密码");
+                                    add_secret_password_edit(
+                                        ui,
+                                        !self.operations.is_busy(),
+                                        "destructive-reset-ssh-password",
+                                        &mut self.security_dialog.replacement_ssh_password,
+                                        "替换凭据",
+                                    );
+                                    ui.end_row();
+                                    ui.label("新独立口令");
+                                    add_secret_password_edit(
+                                        ui,
+                                        !self.operations.is_busy(),
+                                        "destructive-reset-profile-passphrase",
+                                        &mut self
+                                            .security_dialog
+                                            .replacement_profile_passphrase,
+                                        "至少 12 字节",
+                                    );
+                                    ui.end_row();
+                                    ui.label("确认新口令");
+                                    add_secret_password_edit(
+                                        ui,
+                                        !self.operations.is_busy(),
+                                        "destructive-reset-profile-confirmation",
+                                        &mut self
+                                            .security_dialog
+                                            .replacement_profile_passphrase_confirmation,
+                                        "再次输入",
+                                    );
+                                    ui.end_row();
+                                });
+                            ui.label(format!(
+                                "输入 profile 名称“{}”确认永久替换",
+                                self.security_dialog.profile
+                            ));
+                            ui.text_edit_singleline(
+                                &mut self.security_dialog.destructive_confirm_text,
+                            );
+                            let confirmed = self.security_dialog.destructive_confirm_text
+                                == self.security_dialog.profile;
+                            ui.horizontal(|ui| {
+                                destructive_reset = ui
+                                    .add_enabled(
+                                        !self.operations.is_busy() && admin_valid && confirmed,
+                                        egui::Button::new(
+                                            RichText::new("使用手动口令永久替换")
+                                                .color(Color32::from_rgb(245, 104, 104)),
+                                        ),
+                                    )
+                                    .clicked();
+                                destructive_random = ui
+                                    .add_enabled(
+                                        !self.operations.is_busy() && admin_valid && confirmed,
+                                        egui::Button::new(
+                                            RichText::new("生成随机口令（确认后永久替换）")
+                                                .color(Color32::from_rgb(245, 104, 104)),
+                                        ),
+                                    )
+                                    .clicked();
+                            });
+                        }
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("关闭").clicked() {
+                        cancel = true;
+                    }
+                });
+            if rotate_manual {
+                self.change_profile_passphrase(ctx);
+            }
+            if rotate_random {
+                self.prepare_random_profile_passphrase_rotation();
+            }
+            if preserve {
+                self.recover_profile_preserving_credentials(ctx);
+            }
+            if preserve_random {
+                self.prepare_random_profile_recovery();
+            }
+            if destructive_reset {
+                self.destructively_reset_profile(ctx);
+            }
+            if destructive_random {
+                self.prepare_random_destructive_profile_reset();
+            }
+            if open_admin {
+                self.open_admin_dialog(ctx);
+            }
+            if commit_random {
+                self.commit_pending_random_profile_action(ctx);
+            }
+            if discard_random {
+                self.discard_pending_random_profile_action();
+                self.set_notice("已清零未提交的随机口令；vault 未修改".into(), false);
+            } else if (cancel || !visible) && self.operations.is_busy() {
+                self.security_dialog.visible = true;
+                self.set_notice("请等待当前 profile 安全操作完成".into(), true);
+            } else if cancel || !visible {
+                let discarded = self.discard_pending_random_profile_action();
+                self.security_dialog.clear();
+                if discarded {
+                    self.set_notice("已取消并清零随机口令；vault 未修改".into(), false);
+                }
+            }
+        }
+
         if self.editor.visible {
             let mut visible = true;
             egui::Window::new(if self.editor.original_name.is_some() {
@@ -2451,18 +6066,41 @@ impl SerctlApp {
                             "",
                         );
                         ui.end_row();
-                        ui.label("主口令");
-                        add_secret_password_edit(
+                        ui.label("预期主机指纹（可选）");
+                        add_ephemeral_text_edit(
                             ui,
-                            true,
-                            "profile-master",
-                            &mut self.editor.master,
-                            "",
+                            "profile-host-key-sha256",
+                            TextEdit::singleline(&mut self.editor.host_key_sha256)
+                                .hint_text("SHA256:..."),
                         );
                         ui.end_row();
+                        if self.editor.original_name.is_none() {
+                            ui.label("主机独立口令");
+                            add_secret_password_edit(
+                                ui,
+                                true,
+                                "profile-independent-passphrase",
+                                &mut self.editor.profile_passphrase,
+                                "至少 12 字节；仅用于此主机",
+                            );
+                            ui.end_row();
+                            ui.label("确认独立口令");
+                            add_secret_password_edit(
+                                ui,
+                                true,
+                                "profile-independent-passphrase-confirmation",
+                                &mut self.editor.profile_passphrase_confirmation,
+                                "再次输入",
+                            );
+                            ui.end_row();
+                        }
                     });
                 ui.add_space(8.0);
-                ui.label(RichText::new("保存时会使用 Argon2id + ChaCha20-Poly1305 加密凭据。编辑配置时需重新输入用户和密码。").small().color(Color32::GRAY));
+                ui.label(RichText::new(if self.editor.original_name.is_some() {
+                    "保存要求此 profile 当前 generation 的有效独立授权；保存成功会使旧授权立即失效。编辑配置时需重新输入 SSH 用户和密码。"
+                } else {
+                    "每台主机使用独立口令；它不会授权其他 profile。口令不明文保存，也不能查看或还原。"
+                }).small().color(Color32::GRAY));
                 ui.add_space(10.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -2489,6 +6127,7 @@ impl SerctlApp {
                     let mut prompt = format!("确定删除主机“{name}”吗？此操作无法撤销。");
                     ui.label(prompt.as_str());
                     prompt.zeroize();
+                    ui.label("删除需要该主机当前 generation 的有效独立口令授权。");
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("取消").clicked() {
@@ -2549,12 +6188,53 @@ impl eframe::App for SerctlApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let now = Instant::now();
+        if self.expire_authorizations_and_protected_sessions(now)
+            || self.expire_admin_authorization(now)
+        {
+            ctx.request_repaint();
+        }
         self.receive_messages(ctx);
         self.receive_shell_events(ctx);
+        self.receive_tunnel_events(ctx);
+        // Native event-loop wakeups are best effort. Poll while an operation
+        // is active so progress/completion messages cannot remain queued
+        // indefinitely after the worker has gone idle.
+        schedule_active_operation_poll(ctx, self.operations.is_busy());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if matches!(
+            self.migration_state,
+            Some(vault::VaultMigrationState::LegacyV2 { .. })
+        ) {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(90.0);
+                    ui.heading("凭证库必须先完成离线迁移");
+                    ui.label("迁移提交前，主机工作区和所有网络操作均保持禁用。");
+                });
+            });
+            self.status_panel(ui);
+            self.overlays(&ctx);
+            return;
+        }
+        if self.admin_dialog.visible
+            || self.security_dialog.visible
+            || self.editor.visible
+            || self.delete_candidate.is_some()
+        {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(100.0);
+                    ui.label(RichText::new("安全对话框打开期间工作区暂停").color(Color32::GRAY));
+                });
+            });
+            self.status_panel(ui);
+            self.overlays(&ctx);
+            return;
+        }
         self.sidebar(ui);
         self.status_panel(ui);
         self.central_panel(ui);
@@ -2569,8 +6249,30 @@ impl eframe::App for SerctlApp {
         for transfer in self.pending_transfers.values() {
             transfer.cancellation.cancel();
         }
+        if let Some(pending) = &self.pending_tunnel_start {
+            pending.handle.abort();
+        }
+        if let Some(active) = &self.tunnel {
+            active.tunnel.cancel();
+        }
         let transfers = std::mem::take(&mut self.pending_transfers);
+        let tunnel_start = self.pending_tunnel_start.take();
+        let tunnel = self.tunnel.take();
+        let tunnel_stops = std::mem::take(&mut self.pending_tunnel_stops);
         let owned = std::mem::take(&mut self.owned_daemons);
+        // Shutdown is independently authorized for each profile. Never reuse
+        // one profile's passphrase for another daemon and never retain a
+        // separate cleanup credential past that profile's fixed UI TTL.
+        let now = Instant::now();
+        let shutdown_authorizations = owned
+            .keys()
+            .filter_map(|profile| {
+                let identity = self.profile_identity(profile)?;
+                self.authorizations
+                    .passphrase(profile, identity, now)
+                    .map(|passphrase| (profile.clone(), (identity, passphrase)))
+            })
+            .collect::<BTreeMap<_, _>>();
         self.zeroize_sensitive_state();
         let Some(runtime) = self.runtime.take() else {
             return;
@@ -2583,12 +6285,35 @@ impl eframe::App for SerctlApp {
                     "[serctl] {aborted} transfer worker(s) exceeded the shutdown cleanup grace"
                 );
             }
+            let aborted_tunnels = cancel_tunnels_and_wait(
+                tunnel_start,
+                tunnel,
+                tunnel_stops,
+                TUNNEL_EXIT_GRACE,
+            )
+            .await;
+            if aborted_tunnels > 0 {
+                eprintln!(
+                    "[serctl] {aborted_tunnels} tunnel worker(s) exceeded the shutdown cleanup grace"
+                );
+            }
             let mut shutdowns = JoinSet::new();
             for (mut profile, _) in owned {
-                shutdowns.spawn(async move {
-                    let _ = client::down_quiet(&profile).await;
+                if let Some((identity, master)) = shutdown_authorizations.get(&profile) {
+                    let master = Zeroizing::new(master.as_str().to_owned());
+                    let identity = *identity;
+                    shutdowns.spawn(async move {
+                        let _ = client::down_quiet_at_generation(
+                            &profile,
+                            &master,
+                            identity,
+                        )
+                        .await;
+                        profile.zeroize();
+                    });
+                } else {
                     profile.zeroize();
-                });
+                }
             }
             while shutdowns.join_next().await.is_some() {
                 // Each down_quiet call has its own hard deadline; running them
@@ -2639,6 +6364,57 @@ async fn cancel_pending_transfers_and_wait(
     for (transfer, needs_join) in pending.iter_mut().zip(needs_abort_join) {
         if needs_join {
             let _ = wait_for_task_until(&mut transfer.handle, abort_deadline).await;
+        }
+    }
+    aborted
+}
+
+async fn cancel_tunnels_and_wait(
+    pending_start: Option<PendingTunnelStart>,
+    active: Option<ActiveTunnel>,
+    pending_stops: BTreeMap<u64, PendingTunnelStop>,
+    grace: Duration,
+) -> usize {
+    let mut handles = Vec::with_capacity(
+        usize::from(pending_start.is_some()) + usize::from(active.is_some()) + pending_stops.len(),
+    );
+    if let Some(mut pending) = pending_start {
+        pending.handle.abort();
+        zeroize_tunnel_context(&mut pending.context);
+        zeroize_operation_context(&mut pending.operation);
+        handles.push(pending.handle);
+    }
+    if let Some(mut active) = active {
+        active.tunnel.cancel();
+        zeroize_tunnel_context(&mut active.context);
+        zeroize_tunnel_spec(&mut active.spec);
+        zeroize_option_string(&mut active.last_error);
+        handles.push(tokio::spawn(async move {
+            let _ = active.tunnel.wait().await;
+        }));
+    }
+    for (_, mut pending) in pending_stops {
+        zeroize_tunnel_context(&mut pending.context);
+        handles.push(pending.handle);
+    }
+
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut aborted = 0;
+    let mut needs_abort_join = vec![false; handles.len()];
+    for (index, handle) in handles.iter_mut().enumerate() {
+        if tokio::time::timeout_at(deadline, &mut *handle)
+            .await
+            .is_err()
+        {
+            aborted += 1;
+            handle.abort();
+            needs_abort_join[index] = true;
+        }
+    }
+    let abort_deadline = tokio::time::Instant::now() + ABORT_JOIN_GRACE;
+    for (handle, needs_join) in handles.iter_mut().zip(needs_abort_join) {
+        if needs_join {
+            let _ = wait_for_task_until(handle, abort_deadline).await;
         }
     }
     aborted
@@ -2844,20 +6620,911 @@ mod tests {
         (SerctlApp::with_channels(runtime, tx.clone(), rx), tx)
     }
 
+    fn test_identity(generation: u64) -> vault::ProfileIdentity {
+        vault::ProfileIdentity {
+            profile_id: [generation as u8; 16],
+            generation,
+        }
+    }
+
+    fn add_test_profile(app: &mut SerctlApp, name: &str, generation: u64) {
+        app.profiles.push(ProfileRow {
+            name: name.into(),
+            host: "example.test".into(),
+            port: 22,
+            generation,
+            profile_id: test_identity(generation).profile_id,
+            daemon: None,
+        });
+    }
+
+    fn grant_test_profile(
+        app: &mut SerctlApp,
+        name: &str,
+        generation: u64,
+        passphrase: &str,
+        verified_at: Instant,
+    ) {
+        app.authorizations.grant(
+            name.into(),
+            test_identity(generation),
+            Zeroizing::new(passphrase.into()),
+            verified_at,
+        );
+    }
+
+    fn queue_shell_open_result(
+        tx: &UiMessageSender,
+        operation: OperationContext,
+        profile: &str,
+    ) -> CancellationToken {
+        let (input, _input_rx) = tokio::sync::mpsc::channel(1);
+        let (_event_tx, events) = tokio::sync::mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let observed = cancellation.clone();
+        tx.send(UiMessage::ShellOpened {
+            operation,
+            result: Ok((
+                profile.to_owned(),
+                client::GuiShell {
+                    input,
+                    events,
+                    cancellation,
+                },
+            )),
+        })
+        .expect("queue shell-open result");
+        observed
+    }
+
+    #[test]
+    fn recovery_media_io_is_bounded_verified_regular_and_never_overwritten() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("ui-recovery-media-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let media_path = directory.join("vault.srrec");
+        let payload = b"test 2-of-2 recovery share";
+
+        persist_recovery_media_new(&media_path, payload).unwrap();
+        assert_eq!(
+            read_recovery_media(&media_path).unwrap().as_slice(),
+            payload
+        );
+
+        let collision = persist_recovery_media_new(&media_path, b"replacement").unwrap_err();
+        assert!(format!("{collision:#}").contains("创建新的恢复介质"));
+        assert_eq!(std::fs::read(&media_path).unwrap(), payload);
+
+        // Guard the UI/CLI contract: valid media above the former 4 KiB UI
+        // ceiling remains accepted under the shared 4 MiB safety bound.
+        let above_old_ui_limit_path = directory.join("above-old-ui-limit.srrec");
+        let above_old_ui_limit = vec![0x5a_u8; 8 * 1024];
+        persist_recovery_media_new(&above_old_ui_limit_path, &above_old_ui_limit).unwrap();
+        assert_eq!(
+            read_recovery_media(&above_old_ui_limit_path)
+                .unwrap()
+                .as_slice(),
+            above_old_ui_limit
+        );
+
+        let oversized_path = directory.join("oversized.srrec");
+        let oversized = vec![0_u8; MAX_RECOVERY_MEDIA_FILE_BYTES as usize + 1];
+        assert!(persist_recovery_media_new(&oversized_path, &oversized).is_err());
+        assert!(!oversized_path.exists());
+        std::fs::write(&oversized_path, &oversized).unwrap();
+        assert!(read_recovery_media(&oversized_path).is_err());
+
+        let empty_path = directory.join("empty.srrec");
+        std::fs::write(&empty_path, []).unwrap();
+        assert!(read_recovery_media(&empty_path).is_err());
+        assert!(read_recovery_media(&directory).is_err());
+
+        std::fs::remove_file(media_path).unwrap();
+        std::fs::remove_file(above_old_ui_limit_path).unwrap();
+        std::fs::remove_file(oversized_path).unwrap();
+        std::fs::remove_file(empty_path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_media_paths_inside_the_vault_directory_are_rejected() {
+        let vault_directory = vault::home_dir().unwrap().join(".serctl");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let forbidden_output = vault_directory.join(format!(
+            "ui-recovery-must-not-create-{}-{unique}.srrec",
+            std::process::id()
+        ));
+
+        let output_error =
+            persist_recovery_media_new(&forbidden_output, b"offline recovery share").unwrap_err();
+        assert!(!forbidden_output.exists());
+        let input_error = read_recovery_media(&vault_directory).unwrap_err();
+
+        // If the configured directory already exists, both paths reach the
+        // shared CLI/UI containment check. If it does not, canonicalizing its
+        // parent/input still fails closed before any file can be created or read.
+        if vault_directory.exists() {
+            assert!(format!("{output_error:#}")
+                .contains("must not be stored inside the serctl vault directory"));
+            assert!(format!("{input_error:#}")
+                .contains("must not be stored inside the serctl vault directory"));
+        }
+    }
+
     #[test]
     fn editor_clear_restores_default_port() {
         let mut editor = ProfileEditor {
             visible: true,
             port: "2200".into(),
             password: "secret".into(),
-            master: "master".into(),
+            host_key_sha256: "SHA256:expected-host-key".into(),
             ..ProfileEditor::default()
         };
         editor.clear();
         assert!(!editor.visible);
         assert_eq!(editor.port, "22");
         assert!(editor.password.is_empty());
-        assert!(editor.master.is_empty());
+        assert!(editor.host_key_sha256.is_empty());
+        assert!(editor.profile_passphrase.is_empty());
+        assert!(editor.profile_passphrase_confirmation.is_empty());
+    }
+
+    #[test]
+    fn local_catalog_refresh_can_be_scheduled_without_any_profile_authorization() {
+        let (mut app, _) = test_app();
+        assert!(app.authorizations.grants.is_empty());
+        assert!(app.profiles.is_empty());
+        assert!(app.selected.is_none());
+        assert_eq!(app.operations.refresh_epoch, 0);
+        assert!(app.operations.active.is_empty());
+
+        app.refresh(&egui::Context::default());
+        assert_eq!(app.operations.refresh_epoch, 1);
+        assert!(app.operations.is_busy());
+    }
+
+    #[test]
+    fn authorization_has_a_fixed_non_sliding_five_minute_ttl() {
+        let mut authorization = UiAuthorization::default();
+        let verified_at = Instant::now();
+        authorization.grant(Zeroizing::new("authorized-master".into()), verified_at);
+        let expires_at = authorization.expires_at.expect("expiry");
+
+        let first = authorization
+            .passphrase()
+            .expect("authorization should still be valid");
+        assert_eq!(
+            authorization.remaining_at(verified_at + Duration::from_secs(60)),
+            Some(Duration::from_secs(4 * 60))
+        );
+        let second = authorization
+            .passphrase()
+            .expect("authorization should still be valid");
+        assert_eq!(
+            authorization.remaining_at(verified_at + Duration::from_secs(4 * 60)),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(first.as_str(), "authorized-master");
+        assert_eq!(second.as_str(), "authorized-master");
+        assert_eq!(authorization.expires_at, Some(expires_at));
+        assert!(authorization.is_expired_at(verified_at + UI_AUTHORIZATION_TTL));
+        assert_eq!(
+            authorization.remaining_at(verified_at + UI_AUTHORIZATION_TTL),
+            None
+        );
+    }
+
+    #[test]
+    fn administrator_authorization_has_a_fixed_two_minute_ttl() {
+        let verified_at = Instant::now();
+        let mut authorization = AdminAuthorization::default();
+        authorization.grant(
+            Some(Zeroizing::new("administrator-passphrase".into())),
+            verified_at,
+        );
+
+        assert_eq!(
+            authorization.remaining_at(verified_at + Duration::from_secs(30)),
+            Some(Duration::from_secs(90))
+        );
+        assert!(authorization
+            .passphrase_at(verified_at + Duration::from_secs(119))
+            .is_some());
+        assert!(authorization
+            .passphrase_at(verified_at + UI_ADMIN_AUTHORIZATION_TTL)
+            .is_none());
+        authorization.revoke();
+        assert!(authorization.passphrase.is_none());
+    }
+
+    #[test]
+    fn authorized_profile_passphrase_is_copied_without_consuming_the_grant() {
+        let (mut app, _) = test_app();
+        add_test_profile(&mut app, "alpha", 7);
+        grant_test_profile(&mut app, "alpha", 7, "cached-alpha", Instant::now());
+        let first = app
+            .required_authorized_profile_passphrase("alpha")
+            .expect("first copy");
+        let second = app
+            .required_authorized_profile_passphrase("alpha")
+            .expect("second copy");
+        assert_eq!(first.as_str(), "cached-alpha");
+        assert_eq!(second.as_str(), "cached-alpha");
+        assert_eq!(app.authorizations.grants.len(), 1);
+    }
+
+    #[test]
+    fn remote_operation_grant_captures_persistent_catalog_generation_not_ui_epoch() {
+        let (mut app, _) = test_app();
+        add_test_profile(&mut app, "alpha", 7);
+        grant_test_profile(&mut app, "alpha", 7, "cached-alpha", Instant::now());
+        app.operations.profile_generation = 91;
+
+        let (identity, passphrase) = app
+            .required_authorized_profile_grant("alpha")
+            .expect("generation-bound remote-operation grant");
+
+        assert_eq!(identity, test_identity(7));
+        assert_ne!(identity.generation, app.operations.profile_generation);
+        assert_eq!(passphrase.as_str(), "cached-alpha");
+
+        // A same-name catalog replacement immediately makes the old grant
+        // unusable even before the asynchronous refresh reducer removes it.
+        app.profiles[0].generation = 8;
+        assert!(app.required_authorized_profile_grant("alpha").is_none());
+    }
+
+    #[test]
+    fn profile_authorization_is_bound_to_name_generation_and_random_identity() {
+        let mut authorizations = UiAuthorizations::default();
+        let verified_at = Instant::now();
+        authorizations.grant(
+            "alpha".into(),
+            test_identity(7),
+            Zeroizing::new("alpha-passphrase".into()),
+            verified_at,
+        );
+
+        assert!(authorizations
+            .passphrase("alpha", test_identity(7), verified_at)
+            .is_some());
+        assert!(authorizations
+            .passphrase("alpha", test_identity(8), verified_at)
+            .is_none());
+        assert!(authorizations
+            .passphrase("beta", test_identity(7), verified_at)
+            .is_none());
+        let recreated = vault::ProfileIdentity {
+            profile_id: [0xa5; 16],
+            generation: 7,
+        };
+        assert!(
+            authorizations
+                .passphrase("alpha", recreated, verified_at)
+                .is_none(),
+            "same-name/same-generation recreation must not revive an old grant"
+        );
+    }
+
+    #[test]
+    fn catalog_refresh_removes_grants_for_deleted_or_changed_generations() {
+        let mut authorizations = UiAuthorizations::default();
+        let now = Instant::now();
+        authorizations.grant(
+            "alpha".into(),
+            test_identity(1),
+            Zeroizing::new("alpha-passphrase".into()),
+            now,
+        );
+        authorizations.grant(
+            "beta".into(),
+            test_identity(3),
+            Zeroizing::new("beta-passphrase".into()),
+            now,
+        );
+        let rows = vec![ProfileRow {
+            name: "alpha".into(),
+            host: "new.example".into(),
+            port: 22,
+            generation: 2,
+            profile_id: test_identity(2).profile_id,
+            daemon: None,
+        }];
+
+        assert!(authorizations.retain_current_profiles(&rows));
+        assert!(authorizations.grants.is_empty());
+    }
+
+    #[test]
+    fn revoking_one_profile_does_not_revoke_another_profile() {
+        let mut authorizations = UiAuthorizations::default();
+        let now = Instant::now();
+        authorizations.grant(
+            "alpha".into(),
+            test_identity(1),
+            Zeroizing::new("alpha-passphrase".into()),
+            now,
+        );
+        authorizations.grant(
+            "beta".into(),
+            test_identity(4),
+            Zeroizing::new("beta-passphrase".into()),
+            now,
+        );
+
+        assert!(authorizations.revoke_profile("alpha"));
+        assert!(authorizations
+            .passphrase("alpha", test_identity(1), now)
+            .is_none());
+        assert!(authorizations
+            .passphrase("beta", test_identity(4), now)
+            .is_some());
+    }
+
+    #[test]
+    fn randomized_profile_passphrase_is_staged_then_cancelled_without_commit() {
+        let (mut app, _) = test_app();
+        add_test_profile(&mut app, "alpha", 1);
+        app.selected = Some("alpha".into());
+        app.open_security_dialog(&app.profiles[0].clone());
+        grant_test_profile(&mut app, "alpha", 1, "old-alpha-passphrase", Instant::now());
+
+        app.security_dialog.current_passphrase = "old-alpha-passphrase".into();
+        app.prepare_random_profile_passphrase_rotation();
+
+        assert_eq!(
+            app.security_dialog.pending_random_action,
+            Some(PendingRandomProfileAction::RotatePassphrase)
+        );
+        assert!(app.security_dialog.random_passphrase_once.is_some());
+        assert!(!app.security_dialog.random_saved_confirmation);
+        assert!(
+            !app.operations.is_busy(),
+            "generation must not commit at staging"
+        );
+        assert!(app
+            .authorizations
+            .passphrase("alpha", test_identity(1), Instant::now())
+            .is_some());
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| !notice.contains(
+                app.security_dialog
+                    .random_passphrase_once
+                    .as_deref()
+                    .expect("staged passphrase")
+                    .as_str()
+            )));
+
+        assert!(app.discard_pending_random_profile_action());
+        assert!(app.security_dialog.random_passphrase_once.is_none());
+        assert!(app.security_dialog.pending_random_action.is_none());
+        assert!(
+            !app.operations.is_busy(),
+            "cancel must not schedule a commit"
+        );
+        assert!(app
+            .authorizations
+            .passphrase("alpha", test_identity(1), Instant::now())
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_v2_migration_rejects_before_consuming_any_secret() {
+        let (mut app, _) = test_app();
+        app.migration.reset_profiles(vec!["alpha".into()]);
+        app.migration.old_master = "legacy-master-passphrase".into();
+        app.migration
+            .profile_passphrases
+            .insert("alpha".into(), "new-alpha-passphrase".into());
+        app.migration
+            .profile_confirmations
+            .insert("alpha".into(), "new-alpha-passphrase".into());
+        app.migration.recovery_media_path = "/tmp/new-recovery-media.srrec".into();
+
+        let ctx = egui::Context::default();
+        app.submit_v2_migration(&ctx);
+
+        assert!(!app.operations.is_busy());
+        assert!(ctx.has_requested_repaint());
+        assert_eq!(app.migration.old_master, "legacy-master-passphrase");
+        assert_eq!(
+            app.migration
+                .profile_passphrases
+                .get("alpha")
+                .map(String::as_str),
+            Some("new-alpha-passphrase")
+        );
+        assert!(app.notice.as_ref().is_some_and(|(notice, error)| {
+            *error && notice.contains("不会采集或提交迁移秘密")
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn incomplete_v2_migration_never_schedules_a_partial_commit() {
+        let (mut app, _) = test_app();
+        app.migration
+            .reset_profiles(vec!["alpha".into(), "beta".into()]);
+        app.migration.old_master = "legacy-master-passphrase".into();
+        app.migration.recovery_media_path = std::env::temp_dir()
+            .join(format!(
+                "serctl-recovery-incomplete-{}-{}.json",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .display()
+            .to_string();
+        app.migration
+            .profile_passphrases
+            .insert("alpha".into(), "new-alpha-passphrase".into());
+        app.migration
+            .profile_confirmations
+            .insert("alpha".into(), "new-alpha-passphrase".into());
+        #[cfg(windows)]
+        {
+            app.migration.administrator_password = "new-administrator-passphrase".into();
+            app.migration.administrator_confirmation = "new-administrator-passphrase".into();
+        }
+
+        let ctx = egui::Context::default();
+        app.submit_v2_migration(&ctx);
+
+        assert!(!app.operations.is_busy());
+        assert!(ctx.has_requested_repaint());
+        assert_eq!(app.migration.old_master, "legacy-master-passphrase");
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, error)| *error && notice.contains("每个 profile")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn migration_rejects_an_existing_media_path_before_consuming_secrets() {
+        let (mut app, _) = test_app();
+        app.migration.reset_profiles(vec!["alpha".into()]);
+        app.migration.old_master = "legacy-master-passphrase".into();
+        app.migration
+            .profile_passphrases
+            .insert("alpha".into(), "new-alpha-passphrase".into());
+        app.migration
+            .profile_confirmations
+            .insert("alpha".into(), "new-alpha-passphrase".into());
+        app.migration.administrator_password = "new-administrator-passphrase".into();
+        app.migration.administrator_confirmation = "new-administrator-passphrase".into();
+        let media_path = std::env::temp_dir().join(format!(
+            "serctl-existing-migration-media-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&media_path, b"existing").unwrap();
+        app.migration.recovery_media_path = media_path.display().to_string();
+
+        app.submit_v2_migration(&egui::Context::default());
+
+        assert!(!app.operations.is_busy());
+        assert_eq!(app.migration.old_master, "legacy-master-passphrase");
+        assert_eq!(
+            app.migration
+                .profile_passphrases
+                .get("alpha")
+                .map(String::as_str),
+            Some("new-alpha-passphrase")
+        );
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, error)| { *error && notice.contains("不会覆盖") }));
+        std::fs::remove_file(media_path).unwrap();
+    }
+
+    #[test]
+    fn migration_progress_updates_the_visible_activity_without_finishing_it() {
+        let (mut app, tx) = test_app();
+        let operation = app
+            .operations
+            .begin(None, "正在原子迁移 3 个 profile…".into());
+        let ctx = egui::Context::default();
+        send_migration_progress(
+            &tx,
+            &ctx,
+            operation.id,
+            vault::MigrationProgress::MigratingProfile {
+                completed: 1,
+                total: 3,
+                profile: "NewAPI-Serv".into(),
+            },
+        );
+        assert!(ctx.has_requested_repaint());
+
+        app.receive_messages(&ctx);
+
+        assert!(app.operations.is_busy());
+        assert_eq!(
+            app.operations.activity(),
+            Some("正在迁移 profile 2/3：NewAPI-Serv")
+        );
+        assert!(app.operations.finish(&operation));
+    }
+
+    #[test]
+    fn expired_profile_authorization_is_cleared_and_operations_are_rejected() {
+        let (mut app, _) = test_app();
+        add_test_profile(&mut app, "alpha", 1);
+        grant_test_profile(
+            &mut app,
+            "alpha",
+            1,
+            "expired-alpha",
+            Instant::now() - UI_AUTHORIZATION_TTL,
+        );
+        assert!(app
+            .required_authorized_profile_passphrase("alpha")
+            .is_none());
+        assert!(app.authorizations.grants.is_empty());
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|(message, error)| *error && message.contains("过期")));
+    }
+
+    #[test]
+    fn late_shell_open_after_authorization_expiry_is_cancelled_and_not_adopted() {
+        let (mut app, tx) = test_app();
+        add_test_profile(&mut app, "alpha", 1);
+        app.selected = Some("alpha".into());
+        grant_test_profile(
+            &mut app,
+            "alpha",
+            1,
+            "expired-alpha",
+            Instant::now() - UI_AUTHORIZATION_TTL,
+        );
+        let operation = app
+            .operations
+            .begin(Some("alpha".into()), "opening shell".into())
+            .with_profile_identity(test_identity(1));
+        let command_operation = app
+            .operations
+            .begin(Some("alpha".into()), "running command".into())
+            .with_profile_identity(test_identity(1));
+
+        assert!(app.expire_authorizations_and_protected_sessions(Instant::now()));
+        let cancellation = queue_shell_open_result(&tx, operation, "alpha");
+        tx.send(UiMessage::Command {
+            operation: command_operation,
+            result: Ok(client::CommandOutput {
+                stdout: b"late remote secret".to_vec(),
+                stderr: Vec::new(),
+                code: Some(0),
+            }),
+        })
+        .expect("queue late command result");
+        app.receive_messages(&egui::Context::default());
+
+        assert!(app.shell.is_none());
+        assert!(app.shell_profile.is_none());
+        assert!(cancellation.is_cancelled());
+        assert!(!app.output.contains("late remote secret"));
+        assert_eq!(app.exit_code, None);
+        assert!(!app.operations.is_busy());
+    }
+
+    #[test]
+    fn late_shell_open_after_explicit_revoke_is_cancelled_and_not_adopted() {
+        let (mut app, tx) = test_app();
+        add_test_profile(&mut app, "alpha", 1);
+        app.selected = Some("alpha".into());
+        grant_test_profile(&mut app, "alpha", 1, "authorized-alpha", Instant::now());
+        let operation = app
+            .operations
+            .begin(Some("alpha".into()), "opening shell".into())
+            .with_profile_identity(test_identity(1));
+
+        app.revoke_profile_authorization("alpha");
+        let cancellation = queue_shell_open_result(&tx, operation, "alpha");
+        app.receive_messages(&egui::Context::default());
+
+        assert!(app.shell.is_none());
+        assert!(app.shell_profile.is_none());
+        assert!(cancellation.is_cancelled());
+        assert!(!app.operations.is_busy());
+    }
+
+    #[test]
+    fn expired_authorization_cannot_schedule_a_daemon_stop() {
+        let (mut app, _) = test_app();
+        add_test_profile(&mut app, "alpha", 1);
+        grant_test_profile(
+            &mut app,
+            "alpha",
+            1,
+            "expired-alpha",
+            Instant::now() - UI_AUTHORIZATION_TTL,
+        );
+
+        app.stop_daemon(&egui::Context::default(), "alpha".into());
+
+        assert!(!app.operations.is_busy());
+        assert!(app.authorizations.grants.is_empty());
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|(message, error)| *error && message.contains("过期")));
+    }
+
+    #[test]
+    fn expiry_clears_workspace_and_stops_shell_transfer_and_pending_tunnel() {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (mut app, _) = test_app();
+        grant_test_profile(
+            &mut app,
+            "alpha",
+            1,
+            "expired-alpha",
+            Instant::now() - UI_AUTHORIZATION_TTL,
+        );
+        app.profiles.push(ProfileRow {
+            name: "alpha".into(),
+            host: "secret.example".into(),
+            port: 22,
+            generation: 1,
+            profile_id: test_identity(1).profile_id,
+            daemon: None,
+        });
+        app.selected = Some("alpha".into());
+        app.output = "remote secret".into();
+        app.remote_entries.push(RemoteEntry {
+            name: "secret.txt".into(),
+            path: "/secret.txt".into(),
+            is_dir: false,
+            is_symlink: false,
+            size: 1,
+            modified_unix: None,
+        });
+
+        let (shell_input, _shell_input_rx) = tokio::sync::mpsc::channel(1);
+        let (_shell_event_tx, shell_events) = tokio::sync::mpsc::channel(1);
+        let shell_cancellation = CancellationToken::new();
+        let observed_shell_cancellation = shell_cancellation.clone();
+        app.shell = Some(client::GuiShell {
+            input: shell_input,
+            events: shell_events,
+            cancellation: shell_cancellation,
+        });
+        app.shell_profile = Some("alpha".into());
+
+        let transfer_cancellation = CancellationToken::new();
+        let observed_transfer_cancellation = transfer_cancellation.clone();
+        let transfer_handle = app.runtime().spawn(std::future::pending::<()>());
+        app.pending_transfers.insert(
+            77,
+            PendingTransfer {
+                cancellation: transfer_cancellation,
+                handle: transfer_handle,
+            },
+        );
+
+        let tunnel_task_dropped = Arc::new(AtomicBool::new(false));
+        let task_drop = tunnel_task_dropped.clone();
+        let tunnel_handle = app.runtime().spawn(async move {
+            let _drop = DropFlag(task_drop);
+            std::future::pending::<()>().await;
+        });
+        app.runtime().block_on(tokio::task::yield_now());
+        let tunnel_operation = app
+            .operations
+            .begin(Some("alpha".into()), "starting tunnel".into());
+        app.pending_tunnel_start = Some(PendingTunnelStart {
+            context: TunnelContext {
+                profile: "alpha".into(),
+                profile_generation: app.operations.profile_generation,
+                profile_identity: test_identity(1),
+                instance: 9,
+            },
+            operation: tunnel_operation,
+            handle: tunnel_handle,
+        });
+
+        assert!(app.expire_authorizations_and_protected_sessions(Instant::now()));
+        app.runtime().block_on(tokio::task::yield_now());
+
+        assert!(app.authorizations.grants.is_empty());
+        assert_eq!(app.profiles.len(), 1);
+        assert_eq!(app.selected.as_deref(), Some("alpha"));
+        assert!(app.remote_entries.is_empty());
+        assert!(!app.output.contains("remote secret"));
+        assert!(app.shell.is_none());
+        assert!(observed_shell_cancellation.is_cancelled());
+        assert!(observed_transfer_cancellation.is_cancelled());
+        assert!(app.pending_tunnel_start.is_none());
+        assert!(!app.pending_tunnel_stops.is_empty());
+        assert!(tunnel_task_dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn wrong_profile_passphrase_result_does_not_create_an_authorization() {
+        let (mut app, tx) = test_app();
+        let operation = app.operations.begin(None, "verify".into());
+        tx.send(UiMessage::Authorization {
+            operation,
+            result: Err("独立口令错误".into()),
+        })
+        .expect("queue authorization failure");
+        app.receive_messages(&egui::Context::default());
+        assert!(app.authorizations.grants.is_empty());
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|(message, error)| *error && message.contains("验证失败")));
+    }
+
+    #[test]
+    fn successful_verification_grants_and_explicit_revoke_clears_authorization() {
+        let (mut app, tx) = test_app();
+        add_test_profile(&mut app, "alpha", 3);
+        app.selected = Some("alpha".into());
+        let verified_at = Instant::now();
+        let operation = app.operations.begin(Some("alpha".into()), "verify".into());
+        tx.send(UiMessage::Authorization {
+            operation,
+            result: Ok(AuthorizationGrant {
+                profile: "alpha".into(),
+                identity: test_identity(3),
+                passphrase: Zeroizing::new("verified-alpha".into()),
+                verified_at,
+            }),
+        })
+        .expect("queue authorization success");
+        app.receive_messages(&egui::Context::default());
+        let grant = app
+            .authorizations
+            .get("alpha", test_identity(3), verified_at)
+            .expect("profile grant");
+        assert_eq!(
+            grant.passphrase.as_deref().map(String::as_str),
+            Some("verified-alpha")
+        );
+        assert_eq!(grant.expires_at, Some(verified_at + UI_AUTHORIZATION_TTL));
+        assert_eq!(app.operations.refresh_epoch, 1);
+        assert!(app.operations.is_busy());
+
+        app.revoke_profile_authorization("alpha");
+        assert!(app.authorizations.grants.is_empty());
+    }
+
+    #[test]
+    fn profile_mutations_require_a_current_authorization() {
+        let (mut app, _) = test_app();
+        add_test_profile(&mut app, "alpha", 1);
+        app.selected = Some("alpha".into());
+        app.editor.visible = true;
+        app.editor.original_name = Some("alpha".into());
+        app.editor.expected_identity = Some(test_identity(1));
+        app.editor.name = "alpha".into();
+        app.editor.host = "example.test".into();
+        app.editor.port = "22".into();
+        app.editor.user = "alice".into();
+        app.editor.password = "ssh-secret".into();
+        app.save_profile(&egui::Context::default());
+        assert!(!app.operations.is_busy());
+        assert_eq!(app.editor.password, "ssh-secret");
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|(message, error)| *error && message.contains("独立口令")));
+
+        app.notice = None;
+        app.remove_profile(&egui::Context::default(), "alpha".into());
+        assert_eq!(app.delete_candidate.as_deref(), Some("alpha"));
+        assert!(!app.operations.is_busy());
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|(message, error)| *error && message.contains("授权")));
+    }
+
+    #[test]
+    fn tunnel_form_contains_only_loopback_ports_and_limits() {
+        let (mut app, _) = test_app();
+        app.tunnel_mode = client::TunnelMode::Local;
+        app.tunnel_bind_port = "0".into();
+        app.tunnel_target_port = "5432".into();
+        let spec = app.build_tunnel_spec().expect("valid loopback spec");
+        assert_eq!(spec.mode, client::TunnelMode::Local);
+        assert_eq!(spec.bind_port, 0);
+        assert_eq!(spec.target_port, 5432);
+        assert_eq!(spec.max_connections, 32);
+    }
+
+    #[test]
+    fn tunnel_reducer_rejects_cross_profile_generation_and_old_instances() {
+        let current = TunnelContext {
+            profile: "alpha".into(),
+            profile_generation: 7,
+            profile_identity: test_identity(3),
+            instance: 9,
+        };
+        let old_instance = TunnelContext {
+            instance: 8,
+            ..current.clone()
+        };
+        let old_generation = TunnelContext {
+            profile_generation: 6,
+            ..current.clone()
+        };
+        let other_profile = TunnelContext {
+            profile: "beta".into(),
+            ..current.clone()
+        };
+
+        assert!(tunnel_start_may_be_adopted(
+            Some("alpha"),
+            7,
+            Some(current.profile_identity),
+            Some(&current),
+            None,
+            &current,
+        ));
+        assert!(!tunnel_start_may_be_adopted(
+            Some("alpha"),
+            7,
+            Some(current.profile_identity),
+            Some(&current),
+            None,
+            &old_instance,
+        ));
+        assert!(!tunnel_start_may_be_adopted(
+            Some("alpha"),
+            7,
+            Some(old_generation.profile_identity),
+            Some(&old_generation),
+            None,
+            &old_generation,
+        ));
+        assert!(!tunnel_start_may_be_adopted(
+            Some("alpha"),
+            7,
+            Some(other_profile.profile_identity),
+            Some(&other_profile),
+            None,
+            &other_profile,
+        ));
+        assert!(!tunnel_start_may_be_adopted(
+            Some("alpha"),
+            7,
+            Some(current.profile_identity),
+            Some(&current),
+            Some(&old_instance),
+            &current,
+        ));
+        assert!(tunnel_end_matches_pending(Some(&current), &current));
+        assert!(!tunnel_end_matches_pending(Some(&current), &old_instance));
     }
 
     #[test]
@@ -2867,6 +7534,8 @@ mod tests {
             name: "secret-profile".into(),
             host: "secret-host".into(),
             port: 22,
+            generation: 1,
+            profile_id: test_identity(1).profile_id,
             daemon: Some(client::DaemonStatus {
                 profile: "secret-profile".into(),
                 host: "secret-host".into(),
@@ -2883,10 +7552,35 @@ mod tests {
         app.editor.port = "2222".into();
         app.editor.user = "secret-user".into();
         app.editor.password = "secret-password".into();
-        app.editor.master = "secret-master".into();
+        app.editor.host_key_sha256 = "SHA256:secret-host-key".into();
+        app.editor.profile_passphrase = "new-secret-profile-passphrase".into();
+        app.editor.profile_passphrase_confirmation = "new-secret-profile-passphrase".into();
+        app.security_dialog.visible = true;
+        app.security_dialog.profile = "secret-profile".into();
+        app.security_dialog.random_passphrase_once = Some(Zeroizing::new("random-secret".into()));
+        app.security_dialog.recovery_media_path = "X:\\secret-recovery.json".into();
+        app.admin_dialog.visible = true;
+        app.admin_dialog.password_input = "secret-admin-password".into();
+        app.admin_dialog.media_path = "X:\\secret-media.json".into();
+        app.admin_authorization.grant(
+            Some(Zeroizing::new("cached-secret-admin".into())),
+            Instant::now(),
+        );
+        app.migration.old_master = "secret-legacy-master".into();
+        app.migration
+            .profile_passphrases
+            .insert("secret-profile".into(), "secret-new-passphrase".into());
+        app.migration.recovery_media_path = "X:\\migration-media.json".into();
         app.delete_candidate = Some("secret-profile".into());
         app.command = "printf secret-command".into();
-        app.master = "secret-master".into();
+        app.profile_passphrase_input = "secret-profile-passphrase".into();
+        grant_test_profile(
+            &mut app,
+            "secret-profile",
+            1,
+            "cached-secret-profile-passphrase",
+            Instant::now(),
+        );
         app.output = "secret-output".into();
         app.remote_path = "/secret/path".into();
         app.remote_entries.push(RemoteEntry {
@@ -2906,6 +7600,9 @@ mod tests {
         app.shell_input = "secret-shell-input".into();
         app.shell_bytes = b"secret-shell-bytes".to_vec();
         app.shell_output = "secret-shell-output".into();
+        app.tunnel_bind_port = "12345".into();
+        app.tunnel_target_port = "5432".into();
+        app.tunnel_max_connections = "17".into();
         app.operations
             .active
             .insert(1, Zeroizing::new("secret activity".into()));
@@ -2923,10 +7620,23 @@ mod tests {
         assert!(app.editor.port.is_empty());
         assert!(app.editor.user.is_empty());
         assert!(app.editor.password.is_empty());
-        assert!(app.editor.master.is_empty());
+        assert!(app.editor.host_key_sha256.is_empty());
+        assert!(app.editor.profile_passphrase.is_empty());
+        assert!(app.editor.profile_passphrase_confirmation.is_empty());
+        assert!(!app.security_dialog.visible);
+        assert!(app.security_dialog.random_passphrase_once.is_none());
+        assert!(app.security_dialog.recovery_media_path.is_empty());
+        assert!(!app.admin_dialog.visible);
+        assert!(app.admin_dialog.password_input.is_empty());
+        assert!(app.admin_dialog.media_path.is_empty());
+        assert!(app.admin_authorization.passphrase.is_none());
+        assert!(app.migration.old_master.is_empty());
+        assert!(app.migration.profile_passphrases.is_empty());
+        assert!(app.migration.recovery_media_path.is_empty());
         assert!(app.delete_candidate.is_none());
         assert!(app.command.is_empty());
-        assert!(app.master.is_empty());
+        assert!(app.profile_passphrase_input.is_empty());
+        assert!(app.authorizations.grants.is_empty());
         assert!(app.output.is_empty());
         assert!(app.remote_path.is_empty());
         assert!(app.remote_entries.is_empty());
@@ -2939,6 +7649,12 @@ mod tests {
         assert!(app.shell_input.is_empty());
         assert!(app.shell_bytes.is_empty());
         assert!(app.shell_output.is_empty());
+        assert!(app.tunnel_bind_port.is_empty());
+        assert!(app.tunnel_target_port.is_empty());
+        assert!(app.tunnel_max_connections.is_empty());
+        assert!(app.tunnel.is_none());
+        assert!(app.pending_tunnel_start.is_none());
+        assert!(app.pending_tunnel_stops.is_empty());
         assert!(app.operations.active.is_empty());
         assert!(app.notice.is_none());
     }
@@ -2950,12 +7666,14 @@ mod tests {
                 id: 1,
                 profile: Some("secret-profile".into()),
                 profile_generation: 2,
+                profile_identity: Some(test_identity(2)),
             },
             request: DirectoryRequest {
                 profile: "secret-profile".into(),
                 path: "/secret/request".into(),
                 generation: 3,
                 profile_generation: 2,
+                profile_identity: test_identity(2),
             },
             result: Ok((
                 "/secret/result".into(),
@@ -2992,12 +7710,14 @@ mod tests {
                 id: 4,
                 profile: Some("secret-profile".into()),
                 profile_generation: 2,
+                profile_identity: Some(test_identity(2)),
             },
             refresh: Some(DirectoryRequest {
                 profile: "secret-profile".into(),
                 path: "/secret/refresh".into(),
                 generation: 5,
                 profile_generation: 2,
+                profile_identity: test_identity(2),
             }),
             result: Err("secret remote error".into()),
         };
@@ -3132,7 +7852,7 @@ mod tests {
                     handle: transfer_handle,
                 },
             );
-            app.master = "secret-master".into();
+            app.profile_passphrase_input = "secret-profile-passphrase".into();
             panic!("exercise SerctlApp::drop during unwind");
         }));
 
@@ -3203,17 +7923,19 @@ mod tests {
     #[test]
     fn directory_requests_require_latest_generation_and_selected_profile() {
         let mut requests = DirectoryRequests::default();
-        let first = requests.begin("alpha".into(), "/one".into(), 4);
-        let second = requests.begin("alpha".into(), "/two".into(), 4);
+        let identity = test_identity(9);
+        let first = requests.begin("alpha".into(), "/one".into(), 4, identity);
+        let second = requests.begin("alpha".into(), "/two".into(), 4, identity);
 
         assert!(second.generation > first.generation);
-        assert!(!requests.is_current(Some("alpha"), 4, &first));
-        assert!(requests.is_current(Some("alpha"), 4, &second));
-        assert!(!requests.is_current(Some("beta"), 4, &second));
-        assert!(!requests.is_current(Some("alpha"), 5, &second));
+        assert!(!requests.is_current(Some("alpha"), 4, Some(identity), &first));
+        assert!(requests.is_current(Some("alpha"), 4, Some(identity), &second));
+        assert!(!requests.is_current(Some("beta"), 4, Some(identity), &second));
+        assert!(!requests.is_current(Some("alpha"), 5, Some(identity), &second));
+        assert!(!requests.is_current(Some("alpha"), 4, Some(test_identity(10)), &second));
 
         requests.invalidate();
-        assert!(!requests.is_current(Some("alpha"), 4, &second));
+        assert!(!requests.is_current(Some("alpha"), 4, Some(identity), &second));
     }
 
     #[test]
@@ -3297,6 +8019,8 @@ mod tests {
                 name: "new".into(),
                 host: "new.example".into(),
                 port: 22,
+                generation: 2,
+                profile_id: test_identity(2).profile_id,
                 daemon: None,
             }]),
         })
@@ -3308,6 +8032,8 @@ mod tests {
                 name: "old".into(),
                 host: "old.example".into(),
                 port: 22,
+                generation: 1,
+                profile_id: test_identity(1).profile_id,
                 daemon: None,
             }]),
         })
@@ -3327,6 +8053,8 @@ mod tests {
             name: "alpha".into(),
             host: "old.example".into(),
             port: 22,
+            generation: 1,
+            profile_id: test_identity(1).profile_id,
             daemon: None,
         });
         app.selected = Some("alpha".into());
@@ -3375,6 +8103,7 @@ mod tests {
             id: app.operations.next_id,
             profile: None,
             profile_generation: app.operations.profile_generation,
+            profile_identity: None,
         };
         tx.send(UiMessage::Profiles {
             operation: refresh,
@@ -3410,7 +8139,14 @@ mod tests {
         let (mut app, _) = test_app();
         app.selected = Some("alpha".into());
         app.command = "cat /secret".into();
-        app.master = "master-secret".into();
+        app.profile_passphrase_input = "alpha-passphrase-input".into();
+        grant_test_profile(
+            &mut app,
+            "alpha",
+            1,
+            "cached-alpha-passphrase",
+            Instant::now(),
+        );
         app.output = "remote secret".into();
         app.exit_code = Some(17);
         app.remote_path = "/private".into();
@@ -3421,6 +8157,10 @@ mod tests {
         app.shell_input = "export TOKEN=secret".into();
         app.shell_bytes = b"terminal secret".to_vec();
         app.shell_output = "terminal secret".into();
+        app.tunnel_mode = client::TunnelMode::Remote;
+        app.tunnel_bind_port = "8443".into();
+        app.tunnel_target_port = "443".into();
+        app.tunnel_max_connections = "64".into();
         let (shell_input, _shell_input_rx) = tokio::sync::mpsc::channel(1);
         let (_shell_event_tx, shell_events) = tokio::sync::mpsc::channel(1);
         let shell_cancellation = CancellationToken::new();
@@ -3447,7 +8187,8 @@ mod tests {
 
         assert_eq!(app.selected.as_deref(), Some("beta"));
         assert_eq!(app.command, "uname -a && whoami");
-        assert!(app.master.is_empty());
+        assert!(app.profile_passphrase_input.is_empty());
+        assert_eq!(app.authorizations.grants.len(), 1);
         assert!(!app.output.contains("remote secret"));
         assert_eq!(app.exit_code, None);
         assert_eq!(app.remote_path, ".");
@@ -3461,6 +8202,10 @@ mod tests {
         assert!(app.shell.is_none());
         assert!(app.shell_profile.is_none());
         assert!(observed_shell_cancellation.is_cancelled());
+        assert_eq!(app.tunnel_mode, client::TunnelMode::Local);
+        assert_eq!(app.tunnel_bind_port, "0");
+        assert!(app.tunnel_target_port.is_empty());
+        assert_eq!(app.tunnel_max_connections, "32");
         assert_eq!(app.workspace_tab, WorkspaceTab::Command);
         assert!(observed_cancellation.is_cancelled());
     }
@@ -3643,6 +8388,8 @@ mod tests {
                     name,
                     host,
                     port,
+                    generation: 1,
+                    profile_id: test_identity(1).profile_id,
                     daemon: None,
                 }
             }
