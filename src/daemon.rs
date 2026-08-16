@@ -1,7 +1,6 @@
 //! Daemon: loads a profile, holds one long-lived SSH session, serves IPC.
-use crate::vault::{self, now_unix, Creds, LockInfo};
+use crate::vault::{self, now_unix, Creds, LockInfo, ProfileCallKey};
 use anyhow::{bail, Context, Result};
-use fs2::FileExt;
 use russh::ChannelMsg;
 use russh_sftp::protocol::OpenFlags;
 use std::fmt;
@@ -33,6 +32,8 @@ const POST_AUTH_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SHELL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 const BUFFERED_HEAVY_OPERATION_LIMIT: usize = 8;
+const TUNNEL_CONTROL_LIMIT: usize = 8;
+const TUNNEL_COMPLETION_POLL: Duration = Duration::from_millis(100);
 
 fn terminal_safe_field(value: &str) -> String {
     value.escape_debug().to_string()
@@ -83,6 +84,25 @@ struct ConnInfo {
     token: Arc<Zeroizing<String>>,
 }
 
+#[derive(Clone)]
+struct HandlerContext {
+    sessions: Arc<SessionManager>,
+    info: ConnInfo,
+    shutdown: watch::Sender<bool>,
+    buffered_operation_slots: Arc<Semaphore>,
+    tunnel_control_slots: Arc<Semaphore>,
+    call_key: Arc<ProfileCallKey>,
+}
+
+fn status_info_frame(info: &ConnInfo) -> ipc::Frame {
+    ipc::Frame::StatusInfo {
+        profile: info.profile.clone(),
+        host: info.host.clone(),
+        user: info.user.clone(),
+        started_unix: info.started,
+    }
+}
+
 struct RuntimeLockGuard {
     cleanup: Option<RuntimeLockCleanup>,
 }
@@ -90,7 +110,7 @@ struct RuntimeLockGuard {
 struct RuntimeLockCleanup {
     profile: String,
     token: Arc<Zeroizing<String>>,
-    lease: std::fs::File,
+    lease: vault::ProfileLease,
 }
 
 struct PublishedRuntime {
@@ -231,7 +251,7 @@ impl Drop for PublishedRuntime {
 impl RuntimeLockCleanup {
     fn run(self) -> Result<()> {
         let remove = vault::remove_lock_if_token_while_leased(&self.profile, self.token.as_str());
-        let unlock = FileExt::unlock(&self.lease).context("release daemon runtime lease");
+        let unlock = self.lease.unlock().context("release daemon runtime lease");
         remove.context("remove daemon runtime lock")?;
         unlock?;
         Ok(())
@@ -239,7 +259,7 @@ impl RuntimeLockCleanup {
 }
 
 impl RuntimeLockGuard {
-    fn new(profile: String, token: Arc<Zeroizing<String>>, lease: std::fs::File) -> Self {
+    fn new(profile: String, token: Arc<Zeroizing<String>>, lease: vault::ProfileLease) -> Self {
         Self {
             cleanup: Some(RuntimeLockCleanup {
                 profile,
@@ -294,7 +314,7 @@ where
 
 async fn publish_runtime_until(
     profile: &str,
-    lease: std::fs::File,
+    lease: vault::ProfileLease,
     deadline: Instant,
 ) -> Result<PublishedRuntime> {
     let profile = profile.to_owned();
@@ -417,6 +437,36 @@ pub(crate) async fn run_with_ready_until(
     ready: Option<oneshot::Sender<()>>,
     setup_deadline: Instant,
 ) -> Result<()> {
+    run_with_ready_until_at_optional_generation(profile, master, ready, None, setup_deadline).await
+}
+
+/// Start an in-process daemon using a generation-bound UI authorization.
+/// The generation check and credential/call-key unwrap happen in one vault
+/// snapshot while the exclusive profile lease is held.
+pub(crate) async fn run_with_ready_until_at_generation(
+    profile: &str,
+    master: Zeroizing<String>,
+    ready: Option<oneshot::Sender<()>>,
+    expected_generation: vault::ProfileIdentity,
+    setup_deadline: Instant,
+) -> Result<()> {
+    run_with_ready_until_at_optional_generation(
+        profile,
+        master,
+        ready,
+        Some(expected_generation),
+        setup_deadline,
+    )
+    .await
+}
+
+async fn run_with_ready_until_at_optional_generation(
+    profile: &str,
+    master: Zeroizing<String>,
+    ready: Option<oneshot::Sender<()>>,
+    expected_generation: Option<vault::ProfileIdentity>,
+    setup_deadline: Instant,
+) -> Result<()> {
     if setup_deadline <= Instant::now() {
         bail!("daemon startup exceeded its setup deadline");
     }
@@ -432,21 +482,35 @@ pub(crate) async fn run_with_ready_until(
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .context("daemon credential snapshot exceeded its setup deadline")?;
-        let creds = vault::decrypt_with_lock_timeout(&profile_owned, &master, lock_timeout)?;
-        Ok::<_, anyhow::Error>((creds, master, lease))
+        let (creds, call_key) = vault::decrypt_with_call_key_with_lock_timeout(
+            &profile_owned,
+            &master,
+            expected_generation,
+            lock_timeout,
+        )?;
+        Ok::<_, anyhow::Error>((creds, call_key, master, lease))
     });
-    let (creds, master, lease) = match tokio::time::timeout_at(setup_deadline, &mut snapshot).await
-    {
-        Ok(result) => result.context("join daemon credential snapshot worker")??,
-        Err(_) => {
-            // `spawn_blocking` cannot preempt active filesystem/KDF work. The
-            // worker retains the exclusive lease and Zeroizing master until
-            // it finishes, so a late snapshot cannot race profile mutation.
-            snapshot.abort();
-            bail!("daemon credential snapshot exceeded its setup deadline")
-        }
-    };
-    run_with_ready_and_lease(profile, creds, master, ready, lease, setup_deadline).await
+    let (creds, call_key, master, lease) =
+        match tokio::time::timeout_at(setup_deadline, &mut snapshot).await {
+            Ok(result) => result.context("join daemon credential snapshot worker")??,
+            Err(_) => {
+                // `spawn_blocking` cannot preempt active filesystem/KDF work. The
+                // worker retains the exclusive lease and Zeroizing master until
+                // it finishes, so a late snapshot cannot race profile mutation.
+                snapshot.abort();
+                bail!("daemon credential snapshot exceeded its setup deadline")
+            }
+        };
+    run_with_ready_and_lease(
+        profile,
+        creds,
+        call_key,
+        master,
+        ready,
+        lease,
+        setup_deadline,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -467,7 +531,37 @@ pub async fn run_with_ready_creds_for_test(
             bail!("daemon runtime-lease acquisition exceeded its setup deadline")
         }
     };
-    run_with_ready_and_lease(profile, creds, master, ready, lease, setup_deadline).await
+    let profile_owned = profile.to_owned();
+    let key_master = Zeroizing::new(master.as_str().to_owned());
+    let mut key_task = tokio::task::spawn_blocking(move || {
+        let lock_timeout = setup_deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .context("daemon test call-key snapshot exceeded its setup deadline")?;
+        vault::derive_profile_call_key_with_lock_timeout(
+            &profile_owned,
+            &key_master,
+            None,
+            lock_timeout,
+        )
+    });
+    let call_key = match tokio::time::timeout_at(setup_deadline, &mut key_task).await {
+        Ok(result) => result.context("join daemon test call-key snapshot worker")??,
+        Err(_) => {
+            key_task.abort();
+            bail!("daemon test call-key snapshot exceeded its setup deadline")
+        }
+    };
+    run_with_ready_and_lease(
+        profile,
+        creds,
+        call_key,
+        master,
+        ready,
+        lease,
+        setup_deadline,
+    )
+    .await
 }
 
 fn recover_invalid_startup_lock_read<T, C, R>(
@@ -488,7 +582,7 @@ where
             // on that legacy record rather than start a second daemon.
             Ok(true) => reread(),
             Ok(false) => Err(read_error
-                .context("invalid runtime lock was not eligible for safe protocol-v3 recovery")),
+                .context("invalid runtime lock was not eligible for safe protocol-v5 recovery")),
             Err(cleanup_error) => Err(anyhow::anyhow!(
                 "{read_error:#}; malformed runtime-lock recovery failed: {cleanup_error:#}"
             )),
@@ -499,16 +593,17 @@ where
 async fn run_with_ready_and_lease(
     profile: &str,
     creds: Creds,
+    call_key: ProfileCallKey,
     master: Zeroizing<String>,
     ready: Option<oneshot::Sender<()>>,
-    lease: std::fs::File,
+    lease: vault::ProfileLease,
     connect_deadline: Instant,
 ) -> Result<()> {
     let profile_owned = profile.to_owned();
     let mut lock_read = tokio::task::spawn_blocking(move || {
         let existing = recover_invalid_startup_lock_read(
             vault::read_lock(&profile_owned),
-            || vault::remove_invalid_hashed_v3_lock_while_leased(&profile_owned),
+            || vault::remove_invalid_hashed_v5_lock_while_leased(&profile_owned),
             || vault::read_lock(&profile_owned),
         )?;
         Ok::<_, anyhow::Error>((lease, existing))
@@ -552,6 +647,7 @@ async fn run_with_ready_and_lease(
         return run_after_startup_lock_reconciliation(
             profile,
             creds,
+            call_key,
             master,
             ready,
             lease,
@@ -559,16 +655,25 @@ async fn run_with_ready_and_lease(
         )
         .await;
     }
-    run_after_startup_lock_reconciliation(profile, creds, master, ready, lease, connect_deadline)
-        .await
+    run_after_startup_lock_reconciliation(
+        profile,
+        creds,
+        call_key,
+        master,
+        ready,
+        lease,
+        connect_deadline,
+    )
+    .await
 }
 
 async fn run_after_startup_lock_reconciliation(
     profile: &str,
     mut creds: Creds,
+    call_key: ProfileCallKey,
     master: Zeroizing<String>,
     ready: Option<oneshot::Sender<()>>,
-    lease: std::fs::File,
+    lease: vault::ProfileLease,
     connect_deadline: Instant,
 ) -> Result<()> {
     let expect = creds.host_key.clone();
@@ -588,6 +693,7 @@ async fn run_after_startup_lock_reconciliation(
                 persisted_fp,
                 &pin_master,
                 lock_timeout,
+                &lease,
             )?;
             // Keep the exclusive runtime lease in the worker. If the async
             // setup deadline fires while a blocking filesystem/KDF operation
@@ -626,6 +732,7 @@ async fn run_after_startup_lock_reconciliation(
     // The master password is only needed to decrypt the profile and persist a
     // first-use host-key pin. Do not retain it for the daemon lifetime.
     drop(master);
+    let call_key = Arc::new(call_key);
     let host = creds.host.clone();
     let user = creds.user.clone();
     let session = Arc::new(SessionManager::new(creds, session));
@@ -678,6 +785,7 @@ async fn run_after_startup_lock_reconciliation(
     let mut daemon_shutdown = shutdown_rx.clone();
     let connection_slots = Arc::new(Semaphore::new(64));
     let buffered_operation_slots = Arc::new(Semaphore::new(BUFFERED_HEAVY_OPERATION_LIMIT));
+    let tunnel_control_slots = Arc::new(Semaphore::new(TUNNEL_CONTROL_LIMIT));
     let mut handlers = JoinSet::new();
 
     let mut listener_error = None;
@@ -700,22 +808,18 @@ async fn run_after_startup_lock_reconciliation(
                     continue;
                 };
                 log::debug!("local IPC connection accepted");
-                let s = session.clone();
-                let i = info.clone();
-                let shutdown = shutdown_tx.clone();
                 let handler_shutdown = shutdown_rx.clone();
-                let buffered_operations = Arc::clone(&buffered_operation_slots);
+                let context = HandlerContext {
+                    sessions: session.clone(),
+                    info: info.clone(),
+                    shutdown: shutdown_tx.clone(),
+                    buffered_operation_slots: Arc::clone(&buffered_operation_slots),
+                    tunnel_control_slots: Arc::clone(&tunnel_control_slots),
+                    call_key: Arc::clone(&call_key),
+                };
                 handlers.spawn(async move {
                     let _permit = permit;
-                    handle_conn(
-                        s,
-                        stream,
-                        i,
-                        shutdown,
-                        handler_shutdown,
-                        buffered_operations,
-                    )
-                    .await
+                    handle_conn(stream, handler_shutdown, context).await
                 });
             }
             _ = tokio::signal::ctrl_c() => {
@@ -799,6 +903,8 @@ where
         ipc::Frame::Ack
         | ipc::Frame::TransferDone { .. }
         | ipc::Frame::StatusInfo { .. }
+        | ipc::Frame::TunnelReady { .. }
+        | ipc::Frame::TunnelClosed
         | ipc::Frame::Error { .. } => ipc::MAX_CONTROL_FRAME,
         _ => ipc::MAX_RESPONSE_FRAME,
     };
@@ -920,6 +1026,7 @@ fn validate_request_frame(frame: &ipc::Frame) -> Result<()> {
         ipc::Frame::UploadChunk { data } if data.len() > MAX_UPLOAD_CHUNK_BYTES => {
             bail!("upload chunk exceeds {MAX_UPLOAD_CHUNK_BYTES} bytes");
         }
+        ipc::Frame::TunnelOpen { spec } => spec.validate()?,
         _ => {}
     }
     Ok(())
@@ -950,12 +1057,13 @@ async fn authenticate_incoming_protocol<S>(
     stream: &mut S,
     profile: &str,
     token: &str,
+    call_key: &ProfileCallKey,
     deadline: Instant,
-) -> Result<()>
+) -> Result<ipc::AuthContext>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    ipc::authenticate_server(stream, profile, token, deadline).await
+    ipc::authenticate_server(stream, profile, token, call_key, deadline).await
 }
 
 /// Exec and directory listing retain their complete result until it has been
@@ -987,43 +1095,95 @@ where
     }
 }
 
+/// Tunnel control connections are long lived, so cap them independently from
+/// short IPC handlers. A peer that disappears while waiting must not consume a
+/// slot or reach SSH/listener setup.
+async fn acquire_tunnel_control_slot<R>(
+    slots: Arc<Semaphore>,
+    reader: &mut R,
+    shutdown: &mut watch::Receiver<bool>,
+    deadline: Instant,
+) -> Result<Option<OwnedSemaphorePermit>>
+where
+    R: AsyncRead + Unpin,
+{
+    if *shutdown.borrow() {
+        return Ok(None);
+    }
+    tokio::select! {
+        biased;
+        _ = shutdown.changed() => Ok(None),
+        _ = reader.read_u8() => Ok(None),
+        result = tokio::time::timeout_at(deadline, slots.acquire_owned()) => match result {
+            Ok(Ok(permit)) => Ok(Some(permit)),
+            Ok(Err(_)) => bail!("tunnel-control capacity is unavailable"),
+            Err(_) => bail!("waiting for tunnel-control capacity exceeded the setup deadline"),
+        },
+    }
+}
+
 async fn handle_conn<S>(
-    sessions: Arc<SessionManager>,
     mut stream: S,
-    info: ConnInfo,
-    shutdown: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
-    buffered_operation_slots: Arc<Semaphore>,
+    context: HandlerContext,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let HandlerContext {
+        sessions,
+        info,
+        shutdown,
+        buffered_operation_slots,
+        tunnel_control_slots,
+        call_key,
+    } = context;
     let authentication_deadline = Instant::now() + Duration::from_secs(2);
     let authentication = tokio::select! {
         result = authenticate_incoming_protocol(
             &mut stream,
             &info.profile,
             info.token.as_str(),
+            &call_key,
             authentication_deadline,
         ) => result,
         _ = shutdown_rx.changed() => return Ok(()),
     };
-    if let Err(error) = authentication {
-        // Authentication failures are intentionally indistinguishable to the
-        // peer: close without sending a structured error oracle.
-        log::warn!(
-            "rejected local IPC authentication: {}",
-            terminal_safe_error(&error)
-        );
-        return Ok(());
-    }
+    let mut auth_context = match authentication {
+        Ok(context) => context,
+        Err(error) => {
+            // Authentication failures are intentionally indistinguishable to the
+            // peer: close without sending a structured error oracle.
+            log::warn!(
+                "rejected local IPC authentication: {}",
+                terminal_safe_error(&error)
+            );
+            return Ok(());
+        }
+    };
     let (mut rd, mut wr) = tokio::io::split(stream);
+    let mut handled_root_request = false;
     loop {
+        if handled_root_request {
+            break;
+        }
         let frame =
             read_authenticated_request(&mut rd, &mut shutdown_rx, POST_AUTH_IDLE_TIMEOUT).await?;
         let Some(mut frame) = frame else {
             break;
         };
+        if let Err(error) = auth_context.verify_request(&call_key, &frame) {
+            frame.zeroize_sensitive();
+            // Authorization failures are deliberately closed without a
+            // structured response. In particular, a mismatched intent must
+            // not reach validation, SSH, or local listener setup.
+            log::warn!(
+                "rejected local IPC request authorization: {}",
+                terminal_safe_error(&error)
+            );
+            return Ok(());
+        }
+        handled_root_request = true;
         if let Err(error) = validate_request_frame(&frame) {
             frame.zeroize_sensitive();
             write_owned_frame_or_shutdown(
@@ -1366,30 +1526,12 @@ where
             }
             ipc::Frame::Status => {
                 let deadline = Instant::now() + CONTROL_SETUP_TIMEOUT;
-                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => return Ok(()),
-                    Err(error) => {
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            deadline,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        continue;
-                    }
-                }
+                // Status is exact-intent call-key authorized before dispatch.
+                // It still reports only daemon lifetime metadata and never
+                // probes SSH health or reconnects with the retained password.
                 write_owned_frame_or_shutdown(
                     &mut wr,
-                    ipc::Frame::StatusInfo {
-                        profile: info.profile.clone(),
-                        host: info.host.clone(),
-                        user: info.user.clone(),
-                        started_unix: info.started,
-                    },
+                    status_info_frame(&info),
                     deadline,
                     &mut shutdown_rx,
                 )
@@ -1701,6 +1843,40 @@ where
                 // new request header.
                 return Ok(());
             }
+            ipc::Frame::TunnelOpen { spec } => {
+                let deadline = Instant::now() + CONTROL_SETUP_TIMEOUT;
+                let _tunnel_control_permit = match acquire_tunnel_control_slot(
+                    Arc::clone(&tunnel_control_slots),
+                    &mut rd,
+                    &mut shutdown_rx,
+                    deadline,
+                )
+                .await
+                {
+                    Ok(Some(permit)) => permit,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        write_tunnel_terminal(&mut wr, &mut shutdown_rx, Err(error)).await?;
+                        continue;
+                    }
+                };
+                let session =
+                    match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline)
+                        .await
+                    {
+                        Ok(Some(session)) => session,
+                        Ok(None) => return Ok(()),
+                        Err(error) => {
+                            write_tunnel_terminal(&mut wr, &mut shutdown_rx, Err(error)).await?;
+                            continue;
+                        }
+                    };
+                // This dedicated IPC connection owns the complete tunnel
+                // lifetime. EOF, TunnelStop, or daemon shutdown all cancel it
+                // and wait for bounded SSH/listener cleanup.
+                return serve_tunnel(session, &mut rd, &mut wr, spec, &mut shutdown_rx, deadline)
+                    .await;
+            }
             ipc::Frame::Shutdown => {
                 write_frame_or_shutdown(
                     &mut wr,
@@ -1727,6 +1903,183 @@ where
         }
     }
     Ok(())
+}
+
+async fn write_tunnel_terminal<W>(
+    writer: &mut W,
+    shutdown: &mut watch::Receiver<bool>,
+    outcome: Result<()>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Err(error) = outcome {
+        write_owned_frame_or_shutdown(
+            writer,
+            ipc::Frame::Error {
+                msg: error.to_string(),
+            },
+            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+            shutdown,
+        )
+        .await?;
+    }
+    write_frame_or_shutdown(
+        writer,
+        &ipc::Frame::TunnelClosed,
+        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+        shutdown,
+    )
+    .await
+}
+
+async fn stop_tunnel_and_report<W, F>(
+    writer: &mut W,
+    shutdown: &mut watch::Receiver<bool>,
+    stop: F,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    F: std::future::Future<Output = Result<()>>,
+{
+    write_tunnel_terminal(writer, shutdown, stop.await).await
+}
+
+enum TunnelControlWait {
+    WorkerFinished,
+    Shutdown,
+    Frame(Option<ipc::Frame>),
+}
+
+/// Keep one framed control read alive across completion-poll ticks. Recreating
+/// `read_frame_limited` after a tick would cancel a partially-read length
+/// prefix or JSON payload and permanently desynchronize the IPC stream.
+async fn wait_for_tunnel_control_or_completion<R, F>(
+    reader: &mut R,
+    shutdown: &mut watch::Receiver<bool>,
+    poll_interval: Duration,
+    mut worker_is_finished: F,
+) -> Result<TunnelControlWait>
+where
+    R: AsyncRead + Unpin,
+    F: FnMut() -> bool,
+{
+    let control_read = ipc::read_frame_limited(reader, ipc::MAX_CONTROL_FRAME);
+    tokio::pin!(control_read);
+    let mut completion_poll = tokio::time::interval(poll_interval);
+    completion_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if worker_is_finished() {
+            return Ok(TunnelControlWait::WorkerFinished);
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return Ok(TunnelControlWait::Shutdown),
+            control = &mut control_read => return Ok(TunnelControlWait::Frame(control?)),
+            _ = completion_poll.tick() => {}
+        }
+    }
+}
+
+/// Own one daemon-routed tunnel for exactly the lifetime of its authenticated
+/// control connection. Tunnel payload never traverses IPC: this handler only
+/// reports readiness and observes stop/EOF/daemon-shutdown signals.
+async fn serve_tunnel<R, W>(
+    session: Arc<SshSession>,
+    reader: &mut R,
+    writer: &mut W,
+    spec: crate::ssh::TunnelSpec,
+    shutdown: &mut watch::Receiver<bool>,
+    setup_deadline: Instant,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let tunnel = tokio::select! {
+        result = session.start_tunnel(spec, setup_deadline) => Some(result),
+        _ = reader.read_u8() => None,
+        _ = shutdown.changed() => None,
+    };
+    let Some(tunnel) = tunnel else {
+        return Ok(());
+    };
+    let tunnel = match tunnel {
+        Ok(tunnel) => tunnel,
+        Err(error) => return write_tunnel_terminal(writer, shutdown, Err(error)).await,
+    };
+    let ready = tunnel.ready().clone();
+    if let Err(error) = write_frame_or_shutdown(
+        writer,
+        &ipc::Frame::TunnelReady { ready },
+        setup_deadline,
+        shutdown,
+    )
+    .await
+    {
+        if let Err(cleanup_error) = tunnel.stop().await {
+            log::warn!(
+                "tunnel cleanup after readiness write failure: {}",
+                terminal_safe_error(&cleanup_error)
+            );
+        }
+        return Err(error);
+    }
+
+    match wait_for_tunnel_control_or_completion(reader, shutdown, TUNNEL_COMPLETION_POLL, || {
+        tunnel.is_finished()
+    })
+    .await
+    {
+        Ok(TunnelControlWait::WorkerFinished) => {
+            write_tunnel_terminal(writer, shutdown, tunnel.wait().await).await
+        }
+        Ok(TunnelControlWait::Shutdown) => {
+            if let Err(error) = tunnel.stop().await {
+                log::warn!(
+                    "tunnel cleanup during daemon shutdown: {}",
+                    terminal_safe_error(&error)
+                );
+            }
+            Ok(())
+        }
+        Ok(TunnelControlWait::Frame(Some(ipc::Frame::TunnelStop))) => {
+            stop_tunnel_and_report(writer, shutdown, tunnel.stop()).await
+        }
+        Ok(TunnelControlWait::Frame(Some(mut unexpected))) => {
+            unexpected.zeroize_sensitive();
+            if let Err(cleanup_error) = tunnel.stop().await {
+                log::warn!(
+                    "tunnel cleanup after unexpected control frame: {}",
+                    terminal_safe_error(&cleanup_error)
+                );
+            }
+            write_tunnel_terminal(
+                writer,
+                shutdown,
+                Err(anyhow::anyhow!("unexpected frame during tunnel session")),
+            )
+            .await
+        }
+        Ok(TunnelControlWait::Frame(None)) => {
+            if let Err(error) = tunnel.stop().await {
+                log::warn!(
+                    "tunnel cleanup after IPC EOF: {}",
+                    terminal_safe_error(&error)
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(cleanup_error) = tunnel.stop().await {
+                log::warn!(
+                    "tunnel cleanup after IPC read failure: {}",
+                    terminal_safe_error(&cleanup_error)
+                );
+            }
+            Err(error).context("read tunnel control frame")
+        }
+    }
 }
 
 async fn current_or_disconnect<R>(
@@ -2121,12 +2474,6 @@ where
             ),
         )
         .await?;
-        if !commit.used_hardlink {
-            log::warn!(
-                "SFTP server lacks hardlink@openssh.com; upload no-replace commit relies on \
-                 compliant SFTP v3 RENAME semantics"
-            );
-        }
         if commit.partial_removed || cleanup_remote_partial(session, &partial).await {
             partial_may_exist = false;
         } else {
@@ -2297,13 +2644,14 @@ fn validated_sftp_timeout(timeout_ms: u64) -> Result<std::time::Duration> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_buffered_operation_slot, authenticate_incoming_protocol,
-        await_owned_blocking_until, daemon_up_line, exec_outcome_unknown_wire_message,
-        exec_request_rejected_wire_message, handoff_readiness, read_authenticated_request,
-        read_shell_frame_pump, read_shell_frame_pump_inner, recover_invalid_startup_lock_read,
+        acquire_buffered_operation_slot, acquire_tunnel_control_slot,
+        authenticate_incoming_protocol, await_owned_blocking_until, daemon_up_line,
+        exec_outcome_unknown_wire_message, exec_request_rejected_wire_message, handoff_readiness,
+        read_authenticated_request, read_shell_frame_pump, read_shell_frame_pump_inner,
+        recover_invalid_startup_lock_read, status_info_frame, stop_tunnel_and_report,
         terminal_safe_error, validate_request_frame, validated_exec_timeout,
-        validated_sftp_timeout, write_all_until_or_shutdown, write_frame_or_shutdown,
-        MAX_UPLOAD_CHUNK_BYTES,
+        validated_sftp_timeout, wait_for_tunnel_control_or_completion, write_all_until_or_shutdown,
+        write_frame_or_shutdown, ConnInfo, TunnelControlWait, MAX_UPLOAD_CHUNK_BYTES,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2346,6 +2694,34 @@ mod tests {
         assert!(!live.load(Ordering::SeqCst));
         assert!(!lock_published.load(Ordering::SeqCst));
         assert!(!lease_held.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn authorized_status_response_is_always_daemon_metadata() {
+        // This response helper accepts no SessionManager or SshSession. The
+        // Status branch therefore cannot inspect health, reconnect, or use the
+        // retained password on behalf of its call-key-authorized caller.
+        let info = ConnInfo {
+            profile: "prod".into(),
+            host: "ssh.example".into(),
+            user: "alice".into(),
+            started: 123,
+            token: Arc::new(zeroize::Zeroizing::new("unused-token".into())),
+        };
+        match status_info_frame(&info) {
+            crate::ipc::Frame::StatusInfo {
+                profile,
+                host,
+                user,
+                started_unix,
+            } => {
+                assert_eq!(profile, "prod");
+                assert_eq!(host, "ssh.example");
+                assert_eq!(user, "alice");
+                assert_eq!(started_unix, 123);
+            }
+            other => panic!("unexpected authorized status response: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2521,28 +2897,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_protocol_helper_verifies_v3_client_proof() {
+    async fn daemon_protocol_helper_verifies_v5_client_proof() {
         let (mut client, mut server) = tokio::io::duplex(8 * 1024);
         let token = crate::vault::new_ipc_token();
+        let call_key = crate::vault::ProfileCallKey::from_bytes_for_test([0x5a; 32]);
         let deadline = Instant::now() + Duration::from_secs(1);
         let (client_result, server_result) = tokio::join!(
             crate::ipc::authenticate_client(&mut client, "prod", &token, deadline),
-            authenticate_incoming_protocol(&mut server, "prod", &token, deadline),
+            authenticate_incoming_protocol(&mut server, "prod", &token, &call_key, deadline),
         );
         client_result.unwrap();
         server_result.unwrap();
     }
 
     #[tokio::test]
+    async fn token_only_daemon_auth_rejects_all_business_requests() {
+        for request in [
+            crate::ipc::Frame::Status,
+            crate::ipc::Frame::Shutdown,
+            crate::ipc::Frame::TunnelOpen {
+                spec: crate::ssh::TunnelSpec::local(0, 22),
+            },
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(8 * 1024);
+            let token = crate::vault::new_ipc_token();
+            let call_key = crate::vault::ProfileCallKey::from_bytes_for_test([0x3c; 32]);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let (client_result, server_result) = tokio::join!(
+                crate::ipc::authenticate_client(&mut client, "prod", &token, deadline),
+                authenticate_incoming_protocol(&mut server, "prod", &token, &call_key, deadline),
+            );
+            client_result.unwrap();
+            let mut context = server_result.unwrap();
+            let error = context.verify_request(&call_key, &request).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("requires master-passphrase authorization"));
+        }
+    }
+
+    #[tokio::test]
+    async fn tunnel_control_waiter_releases_cleanly_on_ipc_eof() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = slots.clone().acquire_owned().await.unwrap();
+        let (mut reader, peer) = tokio::io::duplex(16);
+        drop(peer);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let acquired = acquire_tunnel_control_slot(
+            Arc::clone(&slots),
+            &mut reader,
+            &mut shutdown_rx,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(acquired.is_none());
+        assert_eq!(slots.available_permits(), 0);
+        drop(held);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn fragmented_tunnel_stop_survives_poll_ticks_and_reports_closed() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let client_task = tokio::spawn(async move {
+            let payload = serde_json::to_vec(&crate::ipc::Frame::TunnelStop).unwrap();
+            let mut wire = (payload.len() as u32).to_be_bytes().to_vec();
+            wire.extend_from_slice(&payload);
+
+            // Split both the length prefix and payload across delays longer
+            // than the production completion-poll interval.
+            client.write_all(&wire[..2]).await.unwrap();
+            client.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            client.write_all(&wire[2..5]).await.unwrap();
+            client.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            client.write_all(&wire[5..]).await.unwrap();
+            client.flush().await.unwrap();
+
+            crate::ipc::read_frame_limited(&mut client, crate::ipc::MAX_CONTROL_FRAME)
+                .await
+                .unwrap()
+        });
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let control = wait_for_tunnel_control_or_completion(
+            &mut server,
+            &mut shutdown_rx,
+            Duration::from_millis(100),
+            || false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            control,
+            TunnelControlWait::Frame(Some(crate::ipc::Frame::TunnelStop))
+        ));
+
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = Arc::clone(&cleaned);
+        stop_tunnel_and_report(&mut server, &mut shutdown_rx, async move {
+            cleanup_flag.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), client_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(response, Some(crate::ipc::Frame::TunnelClosed)));
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn invalid_client_proof_is_closed_without_a_structured_error() {
         let (mut client, mut server) = tokio::io::duplex(8 * 1024);
         let token = crate::vault::new_ipc_token();
+        let call_key = crate::vault::ProfileCallKey::from_bytes_for_test([0x5a; 32]);
         let deadline = Instant::now() + Duration::from_secs(1);
 
         let server_task = async move {
-            let error = authenticate_incoming_protocol(&mut server, "prod", &token, deadline)
-                .await
-                .unwrap_err();
+            let error =
+                authenticate_incoming_protocol(&mut server, "prod", &token, &call_key, deadline)
+                    .await
+                    .err()
+                    .expect("invalid proof unexpectedly authenticated");
             assert!(error.to_string().contains("proof mismatch"));
             // Production handle_conn takes this same error branch and drops
             // the stream without serializing Frame::Error.
@@ -2554,6 +3035,7 @@ mod tests {
                 &crate::ipc::Frame::AuthHello {
                     version: crate::ipc::IPC_PROTOCOL_VERSION,
                     client_nonce: crate::vault::new_ipc_token(),
+                    intent_commitment: None,
                 },
                 crate::ipc::MAX_AUTH_FRAME,
             )
@@ -2569,6 +3051,7 @@ mod tests {
                 &mut client,
                 &crate::ipc::Frame::AuthResponse {
                     client_proof: crate::vault::new_ipc_token(),
+                    client_call_proof: None,
                 },
                 crate::ipc::MAX_AUTH_FRAME,
             )
