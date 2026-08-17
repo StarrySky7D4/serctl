@@ -653,7 +653,7 @@ pub fn harden_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn harden_open_directory(directory: &File) -> Result<()> {
+pub(crate) fn harden_open_directory(directory: &File) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = directory

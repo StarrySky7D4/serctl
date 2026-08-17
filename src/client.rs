@@ -10,6 +10,7 @@ use russh_sftp::protocol::OpenFlags;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -23,9 +24,11 @@ use crate::ssh::{
     protected_upload_file_attributes, temporary_remote_path, validate_remote_command,
     validate_remote_path, validate_shell_dimensions, validate_upload_remote_path,
     CreateDirOutcomeUnknown, CreateDirSubmissionState, ExecOutcomeUnknown, ExecSubmissionState,
-    RemoteEntry, SshSession, MAX_TRANSFER_BYTES,
+    RemoteEntry, RunningTunnel, SshSession, MAX_TRANSFER_BYTES,
 };
 use crate::vault::{self, now_unix, Creds, LockInfo};
+
+pub use crate::ssh::{TunnelMode, TunnelReady, TunnelSpec};
 
 const DIRECT_SHELL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const IPC_SHELL_SETUP_TIMEOUT: Duration = Duration::from_secs(32);
@@ -40,6 +43,14 @@ const CONTROL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(3);
 // scheduling margin so an acknowledged, healthy shutdown is not misreported.
 const DAEMON_LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 const IPC_CONNECT_AUTH_TIMEOUT: Duration = Duration::from_secs(2);
+const DIRECT_TUNNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+const IPC_TUNNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(32);
+const TUNNEL_CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+// Daemon-routed cancellation can spend up to 2 seconds writing TunnelStop
+// and then 4 seconds waiting for the daemon's bounded SSH cleanup response.
+// Leave scheduling margin before aborting the client worker.
+const GUI_TUNNEL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(7);
+const GUI_TUNNEL_ABORT_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_SHELL_INPUT_BYTES: usize = 64 * 1024;
 const LOCAL_PARTIAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -211,6 +222,79 @@ impl Drop for GuiShell {
     }
 }
 
+#[derive(Debug)]
+pub enum TunnelEvent {
+    Ready { bind_host: String, bind_port: u16 },
+    Error(String),
+    Closed,
+}
+
+impl TunnelEvent {
+    fn zeroize_sensitive(&mut self) {
+        match self {
+            Self::Ready { bind_host, .. } => bind_host.zeroize(),
+            Self::Error(error) => error.zeroize(),
+            Self::Closed => {}
+        }
+    }
+}
+
+fn try_send_tunnel_event(sender: &mpsc::Sender<TunnelEvent>, event: TunnelEvent) {
+    if let Err(error) = sender.try_send(event) {
+        let mut rejected = error.into_inner();
+        rejected.zeroize_sensitive();
+    }
+}
+
+/// A GUI-friendly tunnel lease. The initial bind address is available
+/// synchronously after setup; later connection-count, error, and closure
+/// notifications arrive through `events`. Dropping or cancelling the lease
+/// closes its daemon control stream or direct SSH forwarding task.
+pub struct GuiTunnel {
+    ready: TunnelReady,
+    pub events: mpsc::Receiver<TunnelEvent>,
+    cancellation: CancellationToken,
+    worker: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
+impl GuiTunnel {
+    pub fn ready(&self) -> &TunnelReady {
+        &self.ready
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub async fn wait(mut self) -> Result<()> {
+        let mut worker = self.worker.take().context("tunnel worker is missing")?;
+        if !self.cancellation.is_cancelled() {
+            tokio::select! {
+                result = &mut worker => return result.context("join tunnel worker")?,
+                _ = self.cancellation.cancelled() => {}
+            }
+        }
+        match tokio::time::timeout(GUI_TUNNEL_CLEANUP_TIMEOUT, &mut worker).await {
+            Ok(result) => result.context("join tunnel worker")?,
+            Err(_) => {
+                worker.abort();
+                let _ = tokio::time::timeout(GUI_TUNNEL_ABORT_JOIN_TIMEOUT, &mut worker).await;
+                bail!("tunnel worker cleanup exceeded its deadline")
+            }
+        }
+    }
+}
+
+impl Drop for GuiTunnel {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.events.close();
+        while let Ok(mut event) = self.events.try_recv() {
+            event.zeroize_sensitive();
+        }
+    }
+}
+
 struct DaemonConnection {
     stream: ipc::ClientStream,
     endpoint: String,
@@ -240,12 +324,12 @@ where
     match read {
         Ok(lock) => Ok(lock),
         Err(read_error) => match cleanup() {
-            // Removing the hashed current-v3 record can expose a raw legacy
+            // Removing the hashed current-v5 record can expose a raw legacy
             // Unix lock that was previously shadowed. Re-read the complete
             // namespace before deciding that no daemon exists.
             Ok(true) => reread(),
             Ok(false) => Err(read_error
-                .context("invalid runtime lock was not eligible for safe protocol-v3 recovery")),
+                .context("invalid runtime lock was not eligible for safe protocol-v5 recovery")),
             Err(cleanup_error) => Err(anyhow!(
                 "{read_error:#}; malformed runtime-lock recovery failed: {cleanup_error:#}"
             )),
@@ -256,7 +340,7 @@ where
 fn read_daemon_lock_with_recovery(profile: &str) -> Result<Option<LockInfo>> {
     recover_invalid_daemon_lock_read(
         vault::read_lock(profile),
-        || vault::remove_invalid_hashed_v3_lock(profile),
+        || vault::remove_invalid_hashed_v5_lock(profile),
         || vault::read_lock(profile),
     )
 }
@@ -300,6 +384,19 @@ async fn read_daemon_lock_with_recovery_until(
         tokio::task::spawn_blocking(move || read_daemon_lock_with_recovery(&profile)),
         deadline,
         "runtime-lock read/recovery",
+    )
+    .await
+}
+
+async fn read_daemon_lock_without_recovery_until(
+    profile: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Option<LockInfo>> {
+    let profile = profile.to_owned();
+    join_blocking_until(
+        tokio::task::spawn_blocking(move || vault::read_lock(&profile)),
+        deadline,
+        "runtime-lock read",
     )
     .await
 }
@@ -361,12 +458,97 @@ async fn probe_runtime_lease_until(
     .await
 }
 
-async fn connect_daemon_until(
+async fn derive_profile_call_key_until(
     profile: &str,
+    master: &str,
+    expected_generation: Option<vault::ProfileIdentity>,
+    deadline: tokio::time::Instant,
+) -> Result<vault::ProfileCallKey> {
+    let profile = profile.to_owned();
+    let master = Zeroizing::new(master.to_owned());
+    let task = tokio::task::spawn_blocking(move || {
+        let lock_timeout = remaining_deadline_budget(deadline, "master-passphrase verification")?;
+        vault::derive_profile_call_key_with_lock_timeout(
+            &profile,
+            &master,
+            expected_generation,
+            lock_timeout,
+        )
+    });
+    join_blocking_until(task, deadline, "master-passphrase verification").await
+}
+
+/// Connect to a published daemon and authorize exactly `request`. The vault
+/// verification happens before connecting, so a wrong master passphrase
+/// causes zero IPC bytes. Once a valid daemon identity has been reached, an
+/// authentication failure is returned directly and can never become a direct
+/// SSH fallback.
+async fn connect_daemon_for_request_until(
+    profile: &str,
+    master: &str,
+    expected_generation: Option<vault::ProfileIdentity>,
+    request: &ipc::Frame,
     request_deadline: tokio::time::Instant,
 ) -> Result<Option<DaemonConnection>> {
-    let Some(mut lock) = read_daemon_lock_with_recovery_until(profile, request_deadline).await?
-    else {
+    // A cleanly absent lock has no recovery or IPC side effect; let the direct
+    // route authenticate while decrypting its single credential snapshot.
+    // Every present or erroneous lock state must authenticate first. In
+    // particular, a wrong master may neither delete a malformed current-v5
+    // lock nor use old-version/ACL/parse errors as an unauthenticated oracle.
+    let initial_lock = read_daemon_lock_without_recovery_until(profile, request_deadline).await;
+    if matches!(initial_lock, Ok(None)) {
+        return Ok(None);
+    }
+    let call_key =
+        derive_profile_call_key_until(profile, master, expected_generation, request_deadline)
+            .await?;
+    connect_daemon_for_request_with_key_and_lock_until(
+        profile,
+        &call_key,
+        request,
+        request_deadline,
+        initial_lock,
+    )
+    .await
+}
+
+/// Authorize a daemon-only control request. Unlike remote-operation routing,
+/// control calls have no direct fallback, so verify the profile master even
+/// when no daemon lock exists. This preserves the "every invocation"
+/// contract while still deriving the expensive key only once.
+async fn connect_daemon_for_control_request_until(
+    profile: &str,
+    master: &str,
+    expected_generation: Option<vault::ProfileIdentity>,
+    request: &ipc::Frame,
+    request_deadline: tokio::time::Instant,
+) -> Result<Option<DaemonConnection>> {
+    let call_key =
+        derive_profile_call_key_until(profile, master, expected_generation, request_deadline)
+            .await?;
+    let initial_lock = read_daemon_lock_without_recovery_until(profile, request_deadline).await;
+    connect_daemon_for_request_with_key_and_lock_until(
+        profile,
+        &call_key,
+        request,
+        request_deadline,
+        initial_lock,
+    )
+    .await
+}
+
+async fn connect_daemon_for_request_with_key_and_lock_until(
+    profile: &str,
+    call_key: &vault::ProfileCallKey,
+    request: &ipc::Frame,
+    request_deadline: tokio::time::Instant,
+    initial_lock: Result<Option<LockInfo>>,
+) -> Result<Option<DaemonConnection>> {
+    let recovered_lock = match initial_lock {
+        Ok(lock) => lock,
+        Err(_) => read_daemon_lock_with_recovery_until(profile, request_deadline).await?,
+    };
+    let Some(mut lock) = recovered_lock else {
         return Ok(None);
     };
     ipc::validate_endpoint(profile, &lock.token, &lock.endpoint)?;
@@ -398,15 +580,18 @@ async fn connect_daemon_until(
             return Ok(None);
         }
     };
-    if let Err(error) =
-        authenticate_connected_daemon(&mut stream, profile, &lock.token, deadline, |stream| {
-            ipc::validate_server_identity(stream, lock.pid)
-        })
-        .await
-    {
-        handle_unreachable_daemon_lock_until(profile, lock, error, request_deadline).await?;
-        return Ok(None);
-    }
+
+    authenticate_connected_daemon_for_request(
+        &mut stream,
+        profile,
+        &lock.token,
+        call_key,
+        request,
+        deadline,
+        |stream| ipc::validate_server_identity(stream, lock.pid),
+    )
+    .await?;
+
     Ok(Some(DaemonConnection {
         stream,
         endpoint: lock.endpoint.clone(),
@@ -414,6 +599,7 @@ async fn connect_daemon_until(
     }))
 }
 
+#[cfg(test)]
 async fn authenticate_connected_daemon<S, F>(
     stream: &mut S,
     profile: &str,
@@ -430,6 +616,25 @@ where
     // business request.
     validate_identity(stream)?;
     ipc::authenticate_client(stream, profile, token, deadline).await
+}
+
+async fn authenticate_connected_daemon_for_request<S, F>(
+    stream: &mut S,
+    profile: &str,
+    token: &str,
+    call_key: &vault::ProfileCallKey,
+    request: &ipc::Frame,
+    deadline: tokio::time::Instant,
+    validate_identity: F,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(&S) -> Result<()>,
+{
+    // Do not disclose even AuthHello to a process whose PID/UID does not
+    // match the protected runtime record.
+    validate_identity(stream)?;
+    ipc::authenticate_client_for_request(stream, profile, token, call_key, request, deadline).await
 }
 
 fn handle_unreachable_daemon_lock(
@@ -475,13 +680,32 @@ fn ask_master() -> Result<Zeroizing<String>> {
     )?))
 }
 
+#[derive(Clone, Copy)]
+struct PendingProfileAuthorization<'a> {
+    passphrase: Option<&'a str>,
+    prompt_if_missing: bool,
+    expected_generation: Option<vault::ProfileIdentity>,
+}
+
+struct OwnedPendingProfileAuthorization {
+    passphrase: Option<Zeroizing<String>>,
+    prompt_if_missing: bool,
+    expected_generation: Option<vault::ProfileIdentity>,
+}
+
+#[derive(Clone, Copy)]
+struct ProfileAuthorizationRef<'a> {
+    passphrase: &'a str,
+    expected_generation: Option<vault::ProfileIdentity>,
+}
+
 async fn direct_connect_until(
     profile: &str,
     creds: &Creds,
     master: &str,
     deadline: tokio::time::Instant,
-    profile_lease: std::fs::File,
-) -> Result<(SshSession, std::fs::File)> {
+    profile_lease: vault::ProfileLease,
+) -> Result<(SshSession, vault::ProfileLease)> {
     let expect = creds.host_key.clone();
     let staged = SshSession::connect_key_exchange_until(creds, expect, deadline).await?;
     let fp = staged.observed_fingerprint().to_owned();
@@ -491,7 +715,13 @@ async fn direct_connect_until(
         let master = Zeroizing::new(master.to_owned());
         let task = tokio::task::spawn_blocking(move || {
             let lock_timeout = remaining_deadline_budget(deadline, "host-key pin persistence")?;
-            vault::set_pinned_fp_with_lock_timeout(&profile, persisted_fp, &master, lock_timeout)?;
+            vault::set_pinned_fp_with_lock_timeout(
+                &profile,
+                persisted_fp,
+                &master,
+                lock_timeout,
+                &profile_lease,
+            )?;
             // The exclusive TOFU lease stays in this blocking worker even if
             // the async caller reaches its deadline. A late atomic pin can
             // therefore never race profile replacement or another unpinned
@@ -523,7 +753,7 @@ async fn direct_connect_until(
 
 struct DirectSession {
     session: SshSession,
-    _profile_lease: std::fs::File,
+    _profile_lease: vault::ProfileLease,
 }
 
 fn acquire_direct_profile_snapshot_with<L, S, E, D>(
@@ -556,8 +786,9 @@ where
 async fn acquire_direct_profile_snapshot_until(
     profile: &str,
     master: &str,
+    expected_generation: Option<vault::ProfileIdentity>,
     deadline: tokio::time::Instant,
-) -> Result<(Creds, std::fs::File)> {
+) -> Result<(Creds, vault::ProfileLease)> {
     let profile = profile.to_owned();
     let master = Zeroizing::new(master.to_owned());
     let task = tokio::task::spawn_blocking(move || {
@@ -571,7 +802,12 @@ async fn acquire_direct_profile_snapshot_until(
             || {
                 let lock_timeout =
                     remaining_deadline_budget(deadline, "direct credential snapshot")?;
-                vault::decrypt_with_lock_timeout(&profile, &master, lock_timeout)
+                vault::decrypt_with_lock_timeout(
+                    &profile,
+                    &master,
+                    expected_generation,
+                    lock_timeout,
+                )
             },
         )
     });
@@ -581,10 +817,12 @@ async fn acquire_direct_profile_snapshot_until(
 async fn connect_direct_profile_until(
     profile: &str,
     master: &str,
+    expected_generation: Option<vault::ProfileIdentity>,
     deadline: tokio::time::Instant,
 ) -> Result<DirectSession> {
     let (creds, profile_lease) =
-        acquire_direct_profile_snapshot_until(profile, master, deadline).await?;
+        acquire_direct_profile_snapshot_until(profile, master, expected_generation, deadline)
+            .await?;
     let (session, profile_lease) =
         direct_connect_until(profile, &creds, master, deadline, profile_lease).await?;
     Ok(DirectSession {
@@ -604,6 +842,7 @@ pub async fn exec_with_timeout_and_master(
         cmd,
         master.as_ref().map(|value| value.as_str()),
         master.is_none(),
+        None,
         timeout,
     )
     .await?;
@@ -642,8 +881,10 @@ where
     Ok(())
 }
 
-/// Execute a command without touching process stdio. UI callers provide the
-/// master passphrase only when no daemon is available.
+/// Execute a command without touching process stdio. Every remote operation,
+/// including one routed through a resident daemon, requires the master
+/// passphrase supplied by the caller.
+#[allow(dead_code)] // compatibility entry; the UI uses the generation-bound variant
 pub async fn exec_capture(profile: &str, cmd: &str, master: Option<&str>) -> Result<CommandOutput> {
     exec_capture_with_timeout(
         profile,
@@ -654,13 +895,35 @@ pub async fn exec_capture(profile: &str, cmd: &str, master: Option<&str>) -> Res
     .await
 }
 
+#[allow(dead_code)] // exercised by the integrated daemon/direct route tests
 pub async fn exec_capture_with_timeout(
     profile: &str,
     cmd: &str,
     master: Option<&str>,
     timeout: Duration,
 ) -> Result<CommandOutput> {
-    exec_capture_with_timeout_inner(profile, cmd, master, false, timeout).await
+    exec_capture_with_timeout_inner(profile, cmd, master, false, None, timeout).await
+}
+
+/// Execute on behalf of a generation-bound UI grant. Both daemon
+/// authorization and direct fallback derive credentials from exactly that
+/// profile generation, so a stale cached passphrase cannot authorize a newly
+/// replaced same-name profile.
+pub(crate) async fn exec_capture_at_generation(
+    profile: &str,
+    cmd: &str,
+    master: &str,
+    expected_generation: vault::ProfileIdentity,
+) -> Result<CommandOutput> {
+    exec_capture_with_timeout_inner(
+        profile,
+        cmd,
+        Some(master),
+        false,
+        Some(expected_generation),
+        Duration::from_millis(ipc::DEFAULT_EXEC_TIMEOUT_MS),
+    )
+    .await
 }
 
 async fn exec_capture_with_timeout_inner(
@@ -668,6 +931,7 @@ async fn exec_capture_with_timeout_inner(
     cmd: &str,
     master: Option<&str>,
     prompt_if_direct: bool,
+    expected_generation: Option<vault::ProfileIdentity>,
     timeout: Duration,
 ) -> Result<CommandOutput> {
     validate_remote_command(cmd)?;
@@ -675,16 +939,40 @@ async fn exec_capture_with_timeout_inner(
         .ok()
         .filter(|value| (1..=ipc::MAX_EXEC_TIMEOUT_MS).contains(value))
         .ok_or_else(|| anyhow!("exec timeout is outside the supported range"))?;
-    let mut deadline = tokio::time::Instant::now() + timeout;
-    let daemon =
-        match tokio::time::timeout_at(deadline, connect_daemon_until(profile, deadline)).await {
-            Ok(result) => result?,
-            Err(_) => bail!("remote command exceeded its deadline of {timeout_ms} ms"),
-        };
+    let prompted_master = if master.is_none() && prompt_if_direct {
+        Some(ask_master()?)
+    } else {
+        None
+    };
+    let master = master
+        .or_else(|| prompted_master.as_ref().map(|value| value.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("master passphrase is required"))?;
+    // Human input is outside the remote-operation deadline.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let request = ZeroizingRequestFrame(ipc::Frame::Exec {
+        cmd: cmd.to_owned(),
+        timeout_ms,
+    });
+    let daemon = match tokio::time::timeout_at(
+        deadline,
+        connect_daemon_for_request_until(
+            profile,
+            master,
+            expected_generation,
+            &request.0,
+            deadline,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => bail!("remote command exceeded its deadline of {timeout_ms} ms"),
+    };
     if let Some(daemon) = daemon {
         let mut s = daemon.stream;
         let mut submission = ExecSubmissionState::BeforeRequest;
-        write_daemon_exec_request_until(&mut s, cmd, timeout_ms, deadline, &mut submission).await?;
+        write_daemon_exec_frame_until(&mut s, &request.0, timeout_ms, deadline, &mut submission)
+            .await?;
         let result = match tokio::time::timeout_at(deadline, read_exec_response(&mut s)).await {
             Ok(result) => result,
             Err(_) => Err(anyhow!(
@@ -693,18 +981,8 @@ async fn exec_capture_with_timeout_inner(
         };
         result.map_err(|error| classify_daemon_exec_read_error(submission, error))
     } else {
-        let prompted_master = if master.is_none() && prompt_if_direct {
-            Some(ask_master()?)
-        } else {
-            None
-        };
-        let master = master
-            .or_else(|| prompted_master.as_ref().map(|value| value.as_str()))
-            .ok_or_else(|| anyhow::anyhow!("master passphrase is required"))?;
-        if prompted_master.is_some() {
-            deadline = tokio::time::Instant::now() + timeout;
-        }
-        let direct = connect_direct_profile_until(profile, master, deadline).await?;
+        let direct =
+            connect_direct_profile_until(profile, master, expected_generation, deadline).await?;
         let r = direct
             .session
             .exec_until(cmd, deadline)
@@ -800,6 +1078,7 @@ where
     }
 }
 
+#[cfg(test)]
 async fn write_daemon_exec_request_until<W>(
     writer: &mut W,
     cmd: &str,
@@ -810,11 +1089,28 @@ async fn write_daemon_exec_request_until<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let deadline_message = format!("remote command exceeded its deadline of {timeout_ms} ms");
     let request = ZeroizingRequestFrame(ipc::Frame::Exec {
         cmd: cmd.to_string(),
         timeout_ms,
     });
+    write_daemon_exec_frame_until(writer, &request.0, timeout_ms, deadline, submission).await
+}
+
+async fn write_daemon_exec_frame_until<W>(
+    writer: &mut W,
+    request: &ipc::Frame,
+    timeout_ms: u64,
+    deadline: tokio::time::Instant,
+    submission: &mut ExecSubmissionState,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    ensure!(
+        matches!(request, ipc::Frame::Exec { .. }),
+        "daemon exec writer received a non-exec root request"
+    );
+    let deadline_message = format!("remote command exceeded its deadline of {timeout_ms} ms");
     let result = {
         let mut deadline_writer = DeadlineAwareWriter {
             writer,
@@ -823,7 +1119,7 @@ where
         };
         let write = ipc::write_frame_limited_with_written_callback(
             &mut deadline_writer,
-            &request.0,
+            request,
             ipc::MAX_REQUEST_FRAME,
             || submission.request_started(),
         );
@@ -889,8 +1185,8 @@ async fn read_exec_response<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<C
     }
 }
 
-pub async fn status(profile: &str) -> Result<()> {
-    if let Some(info) = daemon_status(profile).await? {
+pub async fn status(profile: &str, master: &str) -> Result<()> {
+    if let Some(info) = daemon_status(profile, master).await? {
         println!("{}", daemon_status_line(&info, now_unix()));
     } else {
         println!("{}", daemon_absent_line(profile));
@@ -902,13 +1198,52 @@ fn elapsed_nonnegative_seconds(now: i64, started: i64) -> i64 {
     now.saturating_sub(started).max(0)
 }
 
-pub async fn daemon_status(profile: &str) -> Result<Option<DaemonStatus>> {
+pub async fn daemon_status(profile: &str, master: &str) -> Result<Option<DaemonStatus>> {
+    daemon_status_at_optional_generation(profile, master, None).await
+}
+
+pub(crate) async fn daemon_status_at_generation(
+    profile: &str,
+    master: &str,
+    expected_generation: vault::ProfileIdentity,
+) -> Result<Option<DaemonStatus>> {
+    daemon_status_at_optional_generation(profile, master, Some(expected_generation)).await
+}
+
+async fn daemon_status_at_optional_generation(
+    profile: &str,
+    master: &str,
+    expected_generation: Option<vault::ProfileIdentity>,
+) -> Result<Option<DaemonStatus>> {
     let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
+    let call_key =
+        derive_profile_call_key_until(profile, master, expected_generation, deadline).await?;
+    daemon_status_with_call_key_until(profile, &call_key, deadline).await
+}
+
+/// Query daemon metadata with a call key obtained from an already-authorized
+/// vault snapshot. UI refresh can derive all profile keys in one blocking
+/// snapshot instead of running one memory-hard KDF per status row.
+pub(crate) async fn daemon_status_with_call_key_until(
+    profile: &str,
+    call_key: &vault::ProfileCallKey,
+    deadline: tokio::time::Instant,
+) -> Result<Option<DaemonStatus>> {
+    let request = ipc::Frame::Status;
     let operation = async {
-        if let Some(daemon) = connect_daemon_until(profile, deadline).await? {
+        let initial_lock = read_daemon_lock_without_recovery_until(profile, deadline).await;
+        if let Some(daemon) = connect_daemon_for_request_with_key_and_lock_until(
+            profile,
+            call_key,
+            &request,
+            deadline,
+            initial_lock,
+        )
+        .await?
+        {
             let endpoint = daemon.endpoint;
             let mut s = daemon.stream;
-            ipc::write_frame_limited(&mut s, &ipc::Frame::Status, ipc::MAX_CONTROL_FRAME).await?;
+            ipc::write_frame_limited(&mut s, &request, ipc::MAX_CONTROL_FRAME).await?;
             match ipc::read_frame_limited(&mut s, ipc::MAX_CONTROL_FRAME).await? {
                 Some(ipc::Frame::StatusInfo {
                     profile,
@@ -938,20 +1273,45 @@ pub async fn daemon_status(profile: &str) -> Result<Option<DaemonStatus>> {
     }
 }
 
-pub async fn down(profile: &str) -> Result<()> {
-    let stopped = down_quiet(profile).await?;
+pub async fn down(profile: &str, master: &str) -> Result<()> {
+    let stopped = down_quiet(profile, master).await?;
     println!("{}", daemon_down_line(profile, stopped));
     Ok(())
 }
 
 /// Stop a daemon without writing to stdout. Returns whether a live daemon was
 /// contacted, which makes it suitable for both CLI and GUI frontends.
-pub async fn down_quiet(profile: &str) -> Result<bool> {
+pub async fn down_quiet(profile: &str, master: &str) -> Result<bool> {
+    down_quiet_at_optional_generation(profile, master, None).await
+}
+
+pub(crate) async fn down_quiet_at_generation(
+    profile: &str,
+    master: &str,
+    expected_generation: vault::ProfileIdentity,
+) -> Result<bool> {
+    down_quiet_at_optional_generation(profile, master, Some(expected_generation)).await
+}
+
+async fn down_quiet_at_optional_generation(
+    profile: &str,
+    master: &str,
+    expected_generation: Option<vault::ProfileIdentity>,
+) -> Result<bool> {
     let mut shutdown_sent = false;
     let mut expected_token = Zeroizing::new(String::new());
     let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
+    let request = ipc::Frame::Shutdown;
     let exchange = async {
-        if let Some(daemon) = connect_daemon_until(profile, deadline).await? {
+        if let Some(daemon) = connect_daemon_for_control_request_until(
+            profile,
+            master,
+            expected_generation,
+            &request,
+            deadline,
+        )
+        .await?
+        {
             expected_token = daemon.expected_token;
             let mut s = daemon.stream;
             shutdown_daemon_exchange(&mut s, &mut shutdown_sent, deadline).await?;
@@ -1165,6 +1525,7 @@ fn validated_sftp_timeout_ms(timeout: Duration) -> Result<u64> {
         .ok_or_else(|| anyhow!("SFTP timeout is outside the supported range"))
 }
 
+#[allow(dead_code)] // compatibility entry; the UI uses the generation-bound variant
 pub async fn list_dir(
     profile: &str,
     path: &str,
@@ -1179,6 +1540,7 @@ pub async fn list_dir(
     .await
 }
 
+#[allow(dead_code)] // exercised by the integrated daemon/direct route tests
 pub async fn list_dir_with_timeout(
     profile: &str,
     path: &str,
@@ -1187,34 +1549,62 @@ pub async fn list_dir_with_timeout(
 ) -> Result<(String, Vec<RemoteEntry>)> {
     let timeout_ms = validated_sftp_timeout_ms(timeout)?;
     let deadline = tokio::time::Instant::now() + timeout;
-    list_dir_inner(profile, path, master, timeout_ms, deadline).await
+    list_dir_inner(profile, path, master, None, timeout_ms, deadline).await
+}
+
+pub(crate) async fn list_dir_at_generation(
+    profile: &str,
+    path: &str,
+    master: &str,
+    expected_generation: vault::ProfileIdentity,
+) -> Result<(String, Vec<RemoteEntry>)> {
+    let timeout = Duration::from_millis(ipc::DEFAULT_SFTP_TIMEOUT_MS);
+    let timeout_ms = validated_sftp_timeout_ms(timeout)?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    list_dir_inner(
+        profile,
+        path,
+        Some(master),
+        Some(expected_generation),
+        timeout_ms,
+        deadline,
+    )
+    .await
 }
 
 async fn list_dir_inner(
     profile: &str,
     path: &str,
     master: Option<&str>,
+    expected_generation: Option<vault::ProfileIdentity>,
     timeout_ms: u64,
     deadline: tokio::time::Instant,
 ) -> Result<(String, Vec<RemoteEntry>)> {
     validate_remote_path(path, true)?;
-    let daemon =
-        match tokio::time::timeout_at(deadline, connect_daemon_until(profile, deadline)).await {
-            Ok(result) => result?,
-            Err(_) => bail!("SFTP directory listing exceeded its deadline of {timeout_ms} ms"),
-        };
+    let master = master.ok_or_else(|| anyhow!("master passphrase is required"))?;
+    let request = ZeroizingRequestFrame(ipc::Frame::ListDir {
+        path: path.to_owned(),
+        timeout_ms,
+    });
+    let daemon = match tokio::time::timeout_at(
+        deadline,
+        connect_daemon_for_request_until(
+            profile,
+            master,
+            expected_generation,
+            &request.0,
+            deadline,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => bail!("SFTP directory listing exceeded its deadline of {timeout_ms} ms"),
+    };
     if let Some(daemon) = daemon {
         let mut stream = daemon.stream;
         let operation = async {
-            ipc::write_frame_limited(
-                &mut stream,
-                &ipc::Frame::ListDir {
-                    path: path.to_owned(),
-                    timeout_ms,
-                },
-                ipc::MAX_REQUEST_FRAME,
-            )
-            .await?;
+            ipc::write_frame_limited(&mut stream, &request.0, ipc::MAX_REQUEST_FRAME).await?;
             match ipc::read_frame_limited(&mut stream, ipc::MAX_RESPONSE_FRAME).await? {
                 Some(ipc::Frame::DirList { path, entries }) => Ok((path, entries)),
                 Some(ipc::Frame::Error { msg }) => bail!(msg),
@@ -1231,11 +1621,12 @@ async fn list_dir_inner(
         };
     }
 
-    let master = master.ok_or_else(|| anyhow!("master passphrase is required"))?;
-    let direct = connect_direct_profile_until(profile, master, deadline).await?;
+    let direct =
+        connect_direct_profile_until(profile, master, expected_generation, deadline).await?;
     direct.session.list_dir_until(path, deadline).await
 }
 
+#[allow(dead_code)] // compatibility entry; the UI uses the generation-bound variant
 pub async fn create_dir(profile: &str, path: &str, master: Option<&str>) -> Result<()> {
     create_dir_with_timeout(
         profile,
@@ -1246,6 +1637,7 @@ pub async fn create_dir(profile: &str, path: &str, master: Option<&str>) -> Resu
     .await
 }
 
+#[allow(dead_code)] // compatibility entry; the UI uses the generation-bound variant
 pub async fn create_dir_with_timeout(
     profile: &str,
     path: &str,
@@ -1254,9 +1646,30 @@ pub async fn create_dir_with_timeout(
 ) -> Result<()> {
     let timeout_ms = validated_sftp_timeout_ms(timeout)?;
     let deadline = tokio::time::Instant::now() + timeout;
-    create_dir_inner(profile, path, master, timeout_ms, deadline).await
+    create_dir_inner(profile, path, master, None, timeout_ms, deadline).await
 }
 
+pub(crate) async fn create_dir_at_generation(
+    profile: &str,
+    path: &str,
+    master: &str,
+    expected_generation: vault::ProfileIdentity,
+) -> Result<()> {
+    let timeout = Duration::from_millis(ipc::DEFAULT_SFTP_TIMEOUT_MS);
+    let timeout_ms = validated_sftp_timeout_ms(timeout)?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    create_dir_inner(
+        profile,
+        path,
+        Some(master),
+        Some(expected_generation),
+        timeout_ms,
+        deadline,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn write_daemon_create_dir_request_until<W>(
     writer: &mut W,
     path: &str,
@@ -1267,12 +1680,29 @@ async fn write_daemon_create_dir_request_until<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let deadline_message =
-        format!("SFTP create-directory exceeded its deadline of {timeout_ms} ms");
     let request = ZeroizingRequestFrame(ipc::Frame::CreateDir {
         path: path.to_owned(),
         timeout_ms,
     });
+    write_daemon_create_dir_frame_until(writer, &request.0, timeout_ms, deadline, submission).await
+}
+
+async fn write_daemon_create_dir_frame_until<W>(
+    writer: &mut W,
+    request: &ipc::Frame,
+    timeout_ms: u64,
+    deadline: tokio::time::Instant,
+    submission: &mut CreateDirSubmissionState,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    ensure!(
+        matches!(request, ipc::Frame::CreateDir { .. }),
+        "daemon create-directory writer received a non-create root request"
+    );
+    let deadline_message =
+        format!("SFTP create-directory exceeded its deadline of {timeout_ms} ms");
     let result = {
         let mut deadline_writer = DeadlineAwareWriter {
             writer,
@@ -1281,7 +1711,7 @@ where
         };
         let write = ipc::write_frame_limited_with_written_callback(
             &mut deadline_writer,
-            &request.0,
+            request,
             ipc::MAX_REQUEST_FRAME,
             || submission.request_started(),
         );
@@ -1348,21 +1778,37 @@ async fn create_dir_inner(
     profile: &str,
     path: &str,
     master: Option<&str>,
+    expected_generation: Option<vault::ProfileIdentity>,
     timeout_ms: u64,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
     validate_remote_path(path, false)?;
-    let daemon =
-        match tokio::time::timeout_at(deadline, connect_daemon_until(profile, deadline)).await {
-            Ok(result) => result?,
-            Err(_) => bail!("SFTP create-directory exceeded its deadline of {timeout_ms} ms"),
-        };
+    let master = master.ok_or_else(|| anyhow!("master passphrase is required"))?;
+    let request = ZeroizingRequestFrame(ipc::Frame::CreateDir {
+        path: path.to_owned(),
+        timeout_ms,
+    });
+    let daemon = match tokio::time::timeout_at(
+        deadline,
+        connect_daemon_for_request_until(
+            profile,
+            master,
+            expected_generation,
+            &request.0,
+            deadline,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => bail!("SFTP create-directory exceeded its deadline of {timeout_ms} ms"),
+    };
     if let Some(daemon) = daemon {
         let mut stream = daemon.stream;
         let mut submission = CreateDirSubmissionState::BeforeRequest;
-        write_daemon_create_dir_request_until(
+        write_daemon_create_dir_frame_until(
             &mut stream,
-            path,
+            &request.0,
             timeout_ms,
             deadline,
             &mut submission,
@@ -1377,8 +1823,8 @@ async fn create_dir_inner(
         .await;
     }
 
-    let master = master.ok_or_else(|| anyhow!("master passphrase is required"))?;
-    let direct = connect_direct_profile_until(profile, master, deadline).await?;
+    let direct =
+        connect_direct_profile_until(profile, master, expected_generation, deadline).await?;
     direct.session.create_dir_until(path, deadline).await
 }
 
@@ -1418,8 +1864,35 @@ pub async fn upload_with_timeout_and_master_cancellable(
         profile,
         local,
         remote,
-        master.as_ref().map(|value| value.as_str()),
-        prompt_if_direct,
+        PendingProfileAuthorization {
+            passphrase: master.as_ref().map(|value| value.as_str()),
+            prompt_if_missing: prompt_if_direct,
+            expected_generation: None,
+        },
+        timeout,
+        cancellation,
+    )
+    .await
+}
+
+pub(crate) async fn upload_with_timeout_at_generation_cancellable(
+    profile: &str,
+    local: &Path,
+    remote: &str,
+    timeout: Duration,
+    master: Zeroizing<String>,
+    expected_generation: vault::ProfileIdentity,
+    cancellation: CancellationToken,
+) -> Result<u64> {
+    upload_file_with_timeout_inner(
+        profile,
+        local,
+        remote,
+        PendingProfileAuthorization {
+            passphrase: Some(master.as_str()),
+            prompt_if_missing: false,
+            expected_generation: Some(expected_generation),
+        },
         timeout,
         cancellation,
     )
@@ -1430,32 +1903,54 @@ async fn upload_file_with_timeout_inner(
     profile: &str,
     local: &Path,
     remote: &str,
-    master: Option<&str>,
-    prompt_if_direct: bool,
+    authorization: PendingProfileAuthorization<'_>,
     timeout: Duration,
     cancellation: CancellationToken,
 ) -> Result<u64> {
     validate_upload_remote_path(remote)?;
     let timeout_ms = validated_sftp_timeout_ms(timeout)?;
+    let prompted_master = if authorization.passphrase.is_none() && authorization.prompt_if_missing {
+        Some(ask_master()?)
+    } else {
+        None
+    };
+    let master = authorization
+        .passphrase
+        .or_else(|| prompted_master.as_ref().map(|value| value.as_str()))
+        .ok_or_else(|| anyhow!("master passphrase is required"))?;
     let deadline = tokio::time::Instant::now() + timeout;
     let (source, size) =
         open_local_upload_source(local, deadline, &cancellation, timeout_ms).await?;
-    let daemon =
-        match tokio::time::timeout_at(deadline, connect_daemon_until(profile, deadline)).await {
-            Ok(result) => result?,
-            Err(_) => bail!("SFTP upload exceeded its deadline of {timeout_ms} ms"),
-        };
+    let request = ZeroizingRequestFrame(ipc::Frame::UploadBegin {
+        path: remote.to_owned(),
+        size,
+        timeout_ms,
+    });
+    let daemon = match tokio::time::timeout_at(
+        deadline,
+        connect_daemon_for_request_until(
+            profile,
+            master,
+            authorization.expected_generation,
+            &request.0,
+            deadline,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => bail!("SFTP upload exceeded its deadline of {timeout_ms} ms"),
+    };
 
     if let Some(daemon) = daemon {
-        let remote = remote.to_owned();
         let worker_cancel = cancellation.clone();
         let worker = tokio::spawn(async move {
             upload_file_via_daemon(
                 daemon,
                 source,
                 size,
-                &remote,
                 timeout_ms,
+                request,
                 deadline,
                 worker_cancel,
             )
@@ -1464,30 +1959,16 @@ async fn upload_file_with_timeout_inner(
         return await_owned_upload_worker(worker, cancellation).await;
     }
 
-    let prompted_master = if master.is_none() && prompt_if_direct {
-        Some(ask_master()?)
-    } else {
-        None
-    };
-    let master = master
-        .or_else(|| prompted_master.as_ref().map(|value| value.as_str()))
-        .ok_or_else(|| anyhow!("master passphrase is required"))?;
-    // Human input is not a network operation. Once the CLI has prompted, give
-    // the direct SSH/SFTP path the full configured deadline.
-    let deadline = if prompted_master.is_some() {
-        tokio::time::Instant::now() + timeout
-    } else {
-        deadline
-    };
-    let direct = connect_direct_profile_until(profile, master, deadline)
-        .await
-        .map_err(|error| {
-            if error.to_string() == "SSH connection exceeded its deadline" {
-                anyhow!("SFTP upload exceeded its deadline of {timeout_ms} ms")
-            } else {
-                error
-            }
-        })?;
+    let direct =
+        connect_direct_profile_until(profile, master, authorization.expected_generation, deadline)
+            .await
+            .map_err(|error| {
+                if error.to_string() == "SSH connection exceeded its deadline" {
+                    anyhow!("SFTP upload exceeded its deadline of {timeout_ms} ms")
+                } else {
+                    error
+                }
+            })?;
     upload_file_direct_until(
         direct,
         source,
@@ -1761,8 +2242,8 @@ async fn upload_file_via_daemon(
     daemon: DaemonConnection,
     mut source: tokio::fs::File,
     size: u64,
-    remote: &str,
     timeout_ms: u64,
+    request: ZeroizingRequestFrame,
     deadline: tokio::time::Instant,
     cancellation: CancellationToken,
 ) -> Result<u64> {
@@ -1772,16 +2253,11 @@ async fn upload_file_via_daemon(
 
     let mut stream = daemon.stream;
     let operation = async {
-        ipc::write_frame_limited(
-            &mut stream,
-            &ipc::Frame::UploadBegin {
-                path: remote.to_owned(),
-                size,
-                timeout_ms,
-            },
-            ipc::MAX_REQUEST_FRAME,
-        )
-        .await?;
+        ensure!(
+            matches!(&request.0, ipc::Frame::UploadBegin { .. }),
+            "daemon upload worker received a non-upload root request"
+        );
+        ipc::write_frame_limited(&mut stream, &request.0, ipc::MAX_REQUEST_FRAME).await?;
         match ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME).await? {
             Some(ipc::Frame::Ack) => {}
             Some(ipc::Frame::Error { msg }) => bail!(msg),
@@ -2064,12 +2540,6 @@ async fn upload_file_direct_worker(
             deadline_message.as_str(),
         )
         .await?;
-        if !commit.used_hardlink {
-            log::warn!(
-                "SFTP server lacks hardlink@openssh.com; upload no-replace commit relies on \
-                 compliant SFTP v3 RENAME semantics"
-            );
-        }
         if commit.partial_removed || cleanup_remote_partial(&session, &partial, false).await {
             partial_may_exist.store(false, std::sync::atomic::Ordering::Release);
         } else {
@@ -2195,8 +2665,35 @@ pub async fn download_with_timeout_and_master_cancellable(
         profile,
         remote,
         local,
-        master,
-        prompt_if_direct,
+        OwnedPendingProfileAuthorization {
+            passphrase: master,
+            prompt_if_missing: prompt_if_direct,
+            expected_generation: None,
+        },
+        timeout,
+        cancellation,
+    )
+    .await
+}
+
+pub(crate) async fn download_with_timeout_at_generation_cancellable(
+    profile: &str,
+    remote: &str,
+    local: &Path,
+    timeout: Duration,
+    master: Zeroizing<String>,
+    expected_generation: vault::ProfileIdentity,
+    cancellation: CancellationToken,
+) -> Result<u64> {
+    download_file_with_timeout_owned(
+        profile,
+        remote,
+        local,
+        OwnedPendingProfileAuthorization {
+            passphrase: Some(master),
+            prompt_if_missing: false,
+            expected_generation: Some(expected_generation),
+        },
         timeout,
         cancellation,
     )
@@ -2207,8 +2704,7 @@ async fn download_file_with_timeout_owned(
     profile: &str,
     remote: &str,
     local: &Path,
-    master: Option<Zeroizing<String>>,
-    prompt_if_direct: bool,
+    authorization: OwnedPendingProfileAuthorization,
     timeout: Duration,
     cancellation: CancellationToken,
 ) -> Result<u64> {
@@ -2222,8 +2718,7 @@ async fn download_file_with_timeout_owned(
             &profile,
             &remote,
             &local,
-            master,
-            prompt_if_direct,
+            authorization,
             timeout,
             worker_cancellation,
         )
@@ -2236,8 +2731,7 @@ async fn download_file_worker(
     profile: &str,
     remote: &str,
     local: &Path,
-    master: Option<Zeroizing<String>>,
-    prompt_if_direct: bool,
+    authorization: OwnedPendingProfileAuthorization,
     timeout: Duration,
     cancellation: CancellationToken,
 ) -> Result<u64> {
@@ -2256,15 +2750,7 @@ async fn download_file_worker(
     if exists {
         bail!("local destination already exists: {}", local.display());
     }
-    let daemon = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => bail!("SFTP download cancelled"),
-        result = tokio::time::timeout_at(deadline, connect_daemon_until(profile, deadline)) => match result {
-            Ok(result) => result?,
-            Err(_) => bail!("SFTP download exceeded its deadline of {timeout_ms} ms"),
-        },
-    };
-    let prompted_master = if daemon.is_none() && master.is_none() && prompt_if_direct {
+    let prompted_master = if authorization.passphrase.is_none() && authorization.prompt_if_missing {
         Some(ask_master()?)
     } else {
         None
@@ -2272,10 +2758,33 @@ async fn download_file_worker(
     if prompted_master.is_some() {
         deadline = tokio::time::Instant::now() + timeout;
     }
-    let master = master
+    let master = authorization
+        .passphrase
         .as_ref()
         .map(|value| value.as_str())
-        .or_else(|| prompted_master.as_ref().map(|value| value.as_str()));
+        .or_else(|| prompted_master.as_ref().map(|value| value.as_str()))
+        .ok_or_else(|| anyhow!("master passphrase is required"))?;
+    let root_request = ZeroizingRequestFrame(ipc::Frame::Download {
+        path: remote.to_owned(),
+        timeout_ms,
+    });
+    let daemon = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => bail!("SFTP download cancelled"),
+        result = tokio::time::timeout_at(
+            deadline,
+            connect_daemon_for_request_until(
+                profile,
+                master,
+                authorization.expected_generation,
+                &root_request.0,
+                deadline,
+            ),
+        ) => match result {
+            Ok(result) => result?,
+            Err(_) => bail!("SFTP download exceeded its deadline of {timeout_ms} ms"),
+        },
+    };
     if cancellation.is_cancelled() {
         bail!("SFTP download cancelled");
     }
@@ -2284,7 +2793,9 @@ async fn download_file_worker(
         remote,
         local,
         daemon,
-        master,
+        root_request,
+        master: Some(master),
+        expected_generation: authorization.expected_generation,
         timeout_ms,
         deadline,
         cancellation,
@@ -2294,7 +2805,7 @@ async fn download_file_worker(
 
 async fn download_via_daemon_until(
     daemon: DaemonConnection,
-    remote: &str,
+    root_request: ZeroizingRequestFrame,
     destination: &mut tokio::fs::File,
     timeout_ms: u64,
     deadline: tokio::time::Instant,
@@ -2302,16 +2813,12 @@ async fn download_via_daemon_until(
 ) -> Result<u64> {
     let mut stream = daemon.stream;
     let operation = async {
+        ensure!(
+            matches!(&root_request.0, ipc::Frame::Download { .. }),
+            "daemon download worker received a non-download root request"
+        );
         let mut received = 0_u64;
-        ipc::write_frame_limited(
-            &mut stream,
-            &ipc::Frame::Download {
-                path: remote.to_owned(),
-                timeout_ms,
-            },
-            ipc::MAX_REQUEST_FRAME,
-        )
-        .await?;
+        ipc::write_frame_limited(&mut stream, &root_request.0, ipc::MAX_REQUEST_FRAME).await?;
         loop {
             match ipc::read_frame_limited(&mut stream, ipc::MAX_RESPONSE_FRAME).await? {
                 Some(ipc::Frame::FileChunk { data }) => {
@@ -2362,7 +2869,7 @@ async fn download_via_daemon_until(
 async fn download_direct_until(
     profile: &str,
     remote: &str,
-    master: &str,
+    authorization: ProfileAuthorizationRef<'_>,
     destination: &mut tokio::fs::File,
     timeout_ms: u64,
     deadline: tokio::time::Instant,
@@ -2371,7 +2878,12 @@ async fn download_direct_until(
     let direct = tokio::select! {
         biased;
         _ = cancellation.cancelled() => bail!("SFTP download cancelled"),
-        result = connect_direct_profile_until(profile, master, deadline) => result.map_err(|error| {
+        result = connect_direct_profile_until(
+            profile,
+            authorization.passphrase,
+            authorization.expected_generation,
+            deadline,
+        ) => result.map_err(|error| {
             if error.to_string() == "SSH connection exceeded its deadline" {
                 anyhow!("SFTP download exceeded its deadline of {timeout_ms} ms")
             } else {
@@ -2430,7 +2942,9 @@ struct DownloadRequest<'a> {
     remote: &'a str,
     local: &'a Path,
     daemon: Option<DaemonConnection>,
+    root_request: ZeroizingRequestFrame,
     master: Option<&'a str>,
+    expected_generation: Option<vault::ProfileIdentity>,
     timeout_ms: u64,
     deadline: tokio::time::Instant,
     cancellation: CancellationToken,
@@ -2442,7 +2956,9 @@ async fn download_file_inner(request: DownloadRequest<'_>) -> Result<u64> {
         remote,
         local,
         daemon,
+        root_request,
         master,
+        expected_generation,
         timeout_ms,
         deadline,
         cancellation,
@@ -2484,7 +3000,7 @@ async fn download_file_inner(request: DownloadRequest<'_>) -> Result<u64> {
     let transfer: Result<u64> = if let Some(daemon) = daemon {
         download_via_daemon_until(
             daemon,
-            remote,
+            root_request,
             &mut destination,
             timeout_ms,
             deadline,
@@ -2497,7 +3013,10 @@ async fn download_file_inner(request: DownloadRequest<'_>) -> Result<u64> {
                 download_direct_until(
                     profile,
                     remote,
-                    master,
+                    ProfileAuthorizationRef {
+                        passphrase: master,
+                        expected_generation,
+                    },
                     &mut destination,
                     timeout_ms,
                     deadline,
@@ -3293,6 +3812,7 @@ async fn run_gui_ipc_shell<R, W>(
     try_send_shell_event(&event_tx, ShellEvent::Closed);
 }
 
+#[cfg(test)]
 async fn start_ipc_shell_until<R, W>(
     rd: &mut R,
     wr: &mut W,
@@ -3305,9 +3825,26 @@ where
     W: AsyncWrite + Unpin,
 {
     validate_shell_dimensions(cols, rows)?;
+    let request = ipc::Frame::Shell { cols, rows };
+    start_ipc_shell_frame_until(rd, wr, &request, deadline).await
+}
+
+async fn start_ipc_shell_frame_until<R, W>(
+    rd: &mut R,
+    wr: &mut W,
+    request: &ipc::Frame,
+    deadline: tokio::time::Instant,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    ensure!(
+        matches!(request, ipc::Frame::Shell { .. }),
+        "daemon shell setup received a non-shell root request"
+    );
     let setup = async {
-        ipc::write_frame_limited(wr, &ipc::Frame::Shell { cols, rows }, ipc::MAX_SHELL_FRAME)
-            .await?;
+        ipc::write_frame_limited(wr, request, ipc::MAX_SHELL_FRAME).await?;
         match ipc::read_frame_limited(rd, ipc::MAX_SHELL_FRAME).await? {
             Some(ipc::Frame::Ack) => Ok(()),
             Some(ipc::Frame::Error { msg }) => bail!(msg),
@@ -3345,17 +3882,47 @@ async fn open_direct_shell_until(
     }
 }
 
+#[allow(dead_code)] // compatibility entry; the UI uses the generation-bound variant
 pub async fn open_gui_shell(profile: &str, master: Option<&str>) -> Result<GuiShell> {
+    open_gui_shell_at_optional_generation(profile, master, None).await
+}
+
+pub(crate) async fn open_gui_shell_at_generation(
+    profile: &str,
+    master: &str,
+    expected_generation: vault::ProfileIdentity,
+) -> Result<GuiShell> {
+    open_gui_shell_at_optional_generation(profile, Some(master), Some(expected_generation)).await
+}
+
+async fn open_gui_shell_at_optional_generation(
+    profile: &str,
+    master: Option<&str>,
+    expected_generation: Option<vault::ProfileIdentity>,
+) -> Result<GuiShell> {
     validate_shell_dimensions(120, 36)?;
+    let master = master.ok_or_else(|| anyhow!("master passphrase is required"))?;
     let (input_tx, mut input_rx) = mpsc::channel::<Zeroizing<Vec<u8>>>(64);
     let (event_tx, event_rx) = mpsc::channel::<ShellEvent>(128);
     let cancellation = CancellationToken::new();
 
     let ipc_setup_deadline = tokio::time::Instant::now() + IPC_SHELL_SETUP_TIMEOUT;
-    if let Some(daemon) = connect_daemon_until(profile, ipc_setup_deadline).await? {
+    let request = ZeroizingRequestFrame(ipc::Frame::Shell {
+        cols: 120,
+        rows: 36,
+    });
+    if let Some(daemon) = connect_daemon_for_request_until(
+        profile,
+        master,
+        expected_generation,
+        &request.0,
+        ipc_setup_deadline,
+    )
+    .await?
+    {
         let stream = daemon.stream;
         let (mut rd, mut wr) = tokio::io::split(stream);
-        start_ipc_shell_until(&mut rd, &mut wr, 120, 36, ipc_setup_deadline).await?;
+        start_ipc_shell_frame_until(&mut rd, &mut wr, &request.0, ipc_setup_deadline).await?;
         let worker_cancellation = cancellation.clone();
         tokio::spawn(run_gui_ipc_shell(
             rd,
@@ -3365,9 +3932,10 @@ pub async fn open_gui_shell(profile: &str, master: Option<&str>) -> Result<GuiSh
             worker_cancellation,
         ));
     } else {
-        let master = master.ok_or_else(|| anyhow!("master passphrase is required"))?;
         let setup_deadline = tokio::time::Instant::now() + DIRECT_SHELL_SETUP_TIMEOUT;
-        let direct = connect_direct_profile_until(profile, master, setup_deadline).await?;
+        let direct =
+            connect_direct_profile_until(profile, master, expected_generation, setup_deadline)
+                .await?;
         let mut channel =
             open_direct_shell_until(&direct.session, "dumb", 120, 36, setup_deadline).await?;
         let mut writer = channel.make_writer();
@@ -3459,6 +4027,245 @@ pub async fn open_gui_shell(profile: &str, master: Option<&str>) -> Result<GuiSh
     })
 }
 
+async fn read_daemon_tunnel_ready_until<S>(
+    stream: &mut S,
+    request: &ipc::Frame,
+    expected_mode: TunnelMode,
+    deadline: tokio::time::Instant,
+) -> Result<TunnelReady>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let setup = async {
+        ipc::write_frame_limited(stream, request, ipc::MAX_REQUEST_FRAME).await?;
+        match ipc::read_frame_limited(stream, ipc::MAX_CONTROL_FRAME).await? {
+            Some(ipc::Frame::TunnelReady { ready }) => {
+                ensure!(
+                    ready.mode == expected_mode,
+                    "daemon returned a tunnel mode different from the authorized request"
+                );
+                Ok(ready)
+            }
+            Some(ipc::Frame::Error { msg }) => bail!(msg),
+            Some(mut frame) => {
+                frame.zeroize_sensitive();
+                bail!("daemon returned an unexpected tunnel setup response")
+            }
+            None => bail!("daemon disconnected during tunnel setup"),
+        }
+    };
+    match tokio::time::timeout_at(deadline, setup).await {
+        Ok(result) => result,
+        Err(_) => bail!("daemon IPC tunnel setup timed out"),
+    }
+}
+
+async fn read_ipc_tunnel_until_closed<S>(stream: &mut S) -> Result<()>
+where
+    S: AsyncRead + Unpin,
+{
+    match ipc::read_frame_limited(stream, ipc::MAX_CONTROL_FRAME).await? {
+        Some(ipc::Frame::TunnelClosed) | None => Ok(()),
+        Some(ipc::Frame::Error { msg }) => Err(anyhow!(msg)),
+        Some(mut frame) => {
+            frame.zeroize_sensitive();
+            bail!("daemon returned an unexpected tunnel control response")
+        }
+    }
+}
+
+async fn run_gui_ipc_tunnel<S>(
+    stream: S,
+    events: mpsc::Sender<TunnelEvent>,
+    cancellation: CancellationToken,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    // Keep one decoder alive for the whole control session. A fragmented
+    // TunnelClosed/Error may already have consumed bytes when cancellation
+    // arrives; rebuilding the decoder would interpret the remaining payload
+    // as a new length header and lose protocol synchronization.
+    let mut terminal = Box::pin(read_ipc_tunnel_until_closed(&mut reader));
+    let result = tokio::select! {
+        biased;
+        result = &mut terminal => result,
+        _ = cancellation.cancelled() => {
+            let write_deadline = tokio::time::Instant::now() + TUNNEL_CONTROL_WRITE_TIMEOUT;
+            match tokio::time::timeout_at(
+                write_deadline,
+                ipc::write_frame_limited(
+                    &mut writer,
+                    &ipc::Frame::TunnelStop,
+                    ipc::MAX_CONTROL_FRAME,
+                ),
+            ).await {
+                Ok(Ok(())) => {
+                    let close_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+                    match tokio::time::timeout_at(
+                        close_deadline,
+                        &mut terminal,
+                    ).await {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow!("daemon tunnel cleanup exceeded its deadline")),
+                    }
+                }
+                Ok(Err(error)) => Err(error).context("send daemon tunnel stop request"),
+                Err(_) => Err(anyhow!("daemon tunnel stop request timed out")),
+            }
+        }
+    };
+    if let Err(error) = &result {
+        try_send_tunnel_event(&events, TunnelEvent::Error(error.to_string()));
+    }
+    try_send_tunnel_event(&events, TunnelEvent::Closed);
+    result
+}
+
+fn gui_tunnel_from_direct(running: RunningTunnel, profile_lease: vault::ProfileLease) -> GuiTunnel {
+    let ready = running.ready().clone();
+    let cancellation = running.cancellation_token();
+    let (event_tx, event_rx) = mpsc::channel(128);
+    try_send_tunnel_event(
+        &event_tx,
+        TunnelEvent::Ready {
+            bind_host: ready.bind_host.clone(),
+            bind_port: ready.bind_port,
+        },
+    );
+    let worker = tokio::spawn(async move {
+        let result = running.wait().await;
+        if let Err(error) = &result {
+            try_send_tunnel_event(&event_tx, TunnelEvent::Error(error.to_string()));
+        }
+        try_send_tunnel_event(&event_tx, TunnelEvent::Closed);
+        drop(profile_lease);
+        result
+    });
+    GuiTunnel {
+        ready,
+        events: event_rx,
+        cancellation,
+        worker: Some(worker),
+    }
+}
+
+/// Start an SSH tunnel for the GUI and return only after its listener or
+/// remote forward is ready. The master passphrase authorizes this one tunnel
+/// start even when the SSH transport is owned by the daemon.
+pub async fn open_gui_tunnel(
+    profile: &str,
+    spec: TunnelSpec,
+    master: Zeroizing<String>,
+) -> Result<GuiTunnel> {
+    open_gui_tunnel_at_optional_generation(profile, spec, master, None).await
+}
+
+pub(crate) async fn open_gui_tunnel_at_generation(
+    profile: &str,
+    spec: TunnelSpec,
+    master: Zeroizing<String>,
+    expected_generation: vault::ProfileIdentity,
+) -> Result<GuiTunnel> {
+    open_gui_tunnel_at_optional_generation(profile, spec, master, Some(expected_generation)).await
+}
+
+async fn open_gui_tunnel_at_optional_generation(
+    profile: &str,
+    spec: TunnelSpec,
+    master: Zeroizing<String>,
+    expected_generation: Option<vault::ProfileIdentity>,
+) -> Result<GuiTunnel> {
+    spec.validate()?;
+    let requested_mode = spec.mode();
+    let request = ZeroizingRequestFrame(ipc::Frame::TunnelOpen { spec: spec.clone() });
+    let ipc_deadline = tokio::time::Instant::now() + IPC_TUNNEL_SETUP_TIMEOUT;
+    if let Some(mut daemon) = connect_daemon_for_request_until(
+        profile,
+        &master,
+        expected_generation,
+        &request.0,
+        ipc_deadline,
+    )
+    .await?
+    {
+        let ready = read_daemon_tunnel_ready_until(
+            &mut daemon.stream,
+            &request.0,
+            requested_mode,
+            ipc_deadline,
+        )
+        .await?;
+        let cancellation = CancellationToken::new();
+        let (event_tx, event_rx) = mpsc::channel(128);
+        try_send_tunnel_event(
+            &event_tx,
+            TunnelEvent::Ready {
+                bind_host: ready.bind_host.clone(),
+                bind_port: ready.bind_port,
+            },
+        );
+        let worker_cancellation = cancellation.clone();
+        let worker = tokio::spawn(run_gui_ipc_tunnel(
+            daemon.stream,
+            event_tx,
+            worker_cancellation,
+        ));
+        return Ok(GuiTunnel {
+            ready,
+            events: event_rx,
+            cancellation,
+            worker: Some(worker),
+        });
+    }
+
+    let direct_deadline = tokio::time::Instant::now() + DIRECT_TUNNEL_SETUP_TIMEOUT;
+    let DirectSession {
+        session,
+        _profile_lease: profile_lease,
+    } = connect_direct_profile_until(profile, &master, expected_generation, direct_deadline)
+        .await?;
+    let session = Arc::new(session);
+    let running = session.start_tunnel(spec, direct_deadline).await?;
+    Ok(gui_tunnel_from_direct(running, profile_lease))
+}
+
+/// Run a tunnel in the foreground until Ctrl+C or remote closure.
+pub async fn tunnel_with_master(
+    profile: &str,
+    spec: TunnelSpec,
+    master: Zeroizing<String>,
+) -> Result<()> {
+    let mut tunnel = open_gui_tunnel(profile, spec, master).await?;
+    let ready = tunnel.ready().clone();
+    println!(
+        "tunnel ready: {:?} {}:{}",
+        ready.mode,
+        terminal_safe_field(&ready.bind_host),
+        ready.bind_port
+    );
+    let mut interrupted = false;
+    loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c(), if !interrupted => {
+                signal.context("wait for Ctrl+C")?;
+                interrupted = true;
+                tunnel.cancel();
+            }
+            event = tunnel.events.recv() => match event {
+                Some(TunnelEvent::Error(mut error)) => {
+                    eprintln!("[serctl] tunnel error: {}", terminal_safe_field(&error));
+                    error.zeroize();
+                }
+                Some(TunnelEvent::Closed) | None => break,
+                Some(TunnelEvent::Ready { mut bind_host, .. }) => bind_host.zeroize(),
+            }
+        }
+    }
+    tunnel.wait().await
+}
+
 struct StdinPump {
     receiver: mpsc::Receiver<Zeroizing<Vec<u8>>>,
     cancellation: CancellationToken,
@@ -3542,34 +4349,37 @@ fn spawn_stdin_pump() -> StdinPump {
 pub async fn shell_with_master(profile: &str, master: Option<Zeroizing<String>>) -> Result<()> {
     let (cols, rows) = term_size();
     validate_shell_dimensions(cols, rows)?;
-    let ipc_setup_deadline = tokio::time::Instant::now() + IPC_SHELL_SETUP_TIMEOUT;
-    if let Some(daemon) = connect_daemon_until(profile, ipc_setup_deadline).await? {
-        shell_via_ipc(daemon.stream, cols, rows, ipc_setup_deadline).await
+    let prompted_master = if master.is_none() {
+        Some(ask_master()?)
     } else {
-        let prompted_master = if master.is_none() {
-            Some(ask_master()?)
-        } else {
-            None
-        };
-        let master = master
-            .as_ref()
-            .map(|value| value.as_str())
-            .or_else(|| prompted_master.as_ref().map(|value| value.as_str()))
-            .ok_or_else(|| anyhow!("master passphrase is required"))?;
+        None
+    };
+    let master = master
+        .as_ref()
+        .map(|value| value.as_str())
+        .or_else(|| prompted_master.as_ref().map(|value| value.as_str()))
+        .ok_or_else(|| anyhow!("master passphrase is required"))?;
+    let ipc_setup_deadline = tokio::time::Instant::now() + IPC_SHELL_SETUP_TIMEOUT;
+    let request = ZeroizingRequestFrame(ipc::Frame::Shell { cols, rows });
+    if let Some(daemon) =
+        connect_daemon_for_request_until(profile, master, None, &request.0, ipc_setup_deadline)
+            .await?
+    {
+        shell_via_ipc(daemon.stream, &request.0, ipc_setup_deadline).await
+    } else {
         let setup_deadline = tokio::time::Instant::now() + DIRECT_SHELL_SETUP_TIMEOUT;
-        let direct = connect_direct_profile_until(profile, master, setup_deadline).await?;
+        let direct = connect_direct_profile_until(profile, master, None, setup_deadline).await?;
         shell_direct(&direct.session, cols, rows, setup_deadline).await
     }
 }
 
 async fn shell_via_ipc(
     stream: ipc::ClientStream,
-    cols: u32,
-    rows: u32,
+    request: &ipc::Frame,
     setup_deadline: tokio::time::Instant,
 ) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(stream);
-    start_ipc_shell_until(&mut rd, &mut wr, cols, rows, setup_deadline).await?;
+    start_ipc_shell_frame_until(&mut rd, &mut wr, request, setup_deadline).await?;
 
     let _raw_mode = enter_raw_mode()?;
     shell_loop_ipc(&mut rd, &mut wr).await
@@ -3740,21 +4550,23 @@ mod tests {
         elapsed_nonnegative_seconds, enter_raw_mode_with, exec_capture_with_timeout_inner,
         finalize_local_download, join_blocking_until, key_to_bytes, list_dir_inner,
         open_local_upload_source, open_local_upload_source_with,
-        read_daemon_create_dir_response_until, read_exec_response, read_shell_frame_pump,
-        read_shell_frame_pump_inner, reconcile_shutdown_exchange, recover_invalid_daemon_lock_read,
-        run_gui_ipc_shell, run_local_partial_cleanup_with, send_gui_shell_output_or_cancel,
-        shutdown_daemon_exchange, spawn_stdin_pump_with, start_ipc_shell_until,
-        terminal_safe_error, terminal_safe_field, upload_file_with_timeout_inner,
-        validate_shell_input, validated_sftp_timeout_ms, verify_owned_file_identities_until_with,
-        wait_for_daemon_lock_release_with, write_command_output_to,
-        write_daemon_create_dir_request_until, write_daemon_exec_request_until,
-        write_shutdown_request_until, CommandOutput, DaemonStatus, ShellEvent,
-        ShutdownLockObservation, UnclaimedLocalPartial, UploadCommitOutcomeUnknown,
+        read_daemon_create_dir_response_until, read_daemon_tunnel_ready_until, read_exec_response,
+        read_shell_frame_pump, read_shell_frame_pump_inner, reconcile_shutdown_exchange,
+        recover_invalid_daemon_lock_read, run_gui_ipc_shell, run_gui_ipc_tunnel,
+        run_local_partial_cleanup_with, send_gui_shell_output_or_cancel, shutdown_daemon_exchange,
+        spawn_stdin_pump_with, start_ipc_shell_until, terminal_safe_error, terminal_safe_field,
+        upload_file_with_timeout_inner, validate_shell_input, validated_sftp_timeout_ms,
+        verify_owned_file_identities_until_with, wait_for_daemon_lock_release_with,
+        write_command_output_to, write_daemon_create_dir_request_until,
+        write_daemon_exec_request_until, write_shutdown_request_until, CommandOutput, DaemonStatus,
+        OwnedPendingProfileAuthorization, PendingProfileAuthorization, ShellEvent,
+        ShutdownLockObservation, TunnelEvent, UnclaimedLocalPartial, UploadCommitOutcomeUnknown,
         DAEMON_LOCK_RELEASE_TIMEOUT, MAX_SHELL_INPUT_BYTES,
     };
     use crate::ipc::{self, Frame};
     use crate::ssh::{
         CreateDirOutcomeUnknown, CreateDirSubmissionState, ExecOutcomeUnknown, ExecSubmissionState,
+        TunnelMode, TunnelReady, TunnelSpec,
     };
     use crate::vault::{LockInfo, RuntimeLeaseLiveness};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -4221,16 +5033,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_daemon_protocol_helper_uses_v3_mutual_authentication() {
+    async fn client_daemon_protocol_helper_uses_v5_mutual_authentication() {
         let (mut client, mut server) = tokio::io::duplex(8 * 1024);
         let token = crate::vault::new_ipc_token();
+        let call_key = crate::vault::ProfileCallKey::from_bytes_for_test([0x5a; 32]);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         let (client_result, server_result) = tokio::join!(
             authenticate_connected_daemon(&mut client, "prod", &token, deadline, |_| Ok(())),
-            ipc::authenticate_server(&mut server, "prod", &token, deadline),
+            ipc::authenticate_server(&mut server, "prod", &token, &call_key, deadline),
         );
         client_result.unwrap();
         server_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_tunnel_setup_sends_the_authorized_root_frame_before_ready() {
+        let (mut client, mut server) = tokio::io::duplex(8 * 1024);
+        let spec = TunnelSpec::local(0, 5432);
+        let request = Frame::TunnelOpen { spec: spec.clone() };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let server_task = tokio::spawn(async move {
+            match ipc::read_frame_limited(&mut server, ipc::MAX_REQUEST_FRAME)
+                .await
+                .unwrap()
+            {
+                Some(Frame::TunnelOpen { spec: received }) => assert_eq!(received, spec),
+                other => panic!("unexpected tunnel root request: {other:?}"),
+            }
+            ipc::write_frame_limited(
+                &mut server,
+                &Frame::TunnelReady {
+                    ready: TunnelReady {
+                        mode: TunnelMode::Local,
+                        bind_host: "127.0.0.1".into(),
+                        bind_port: 45123,
+                    },
+                },
+                ipc::MAX_CONTROL_FRAME,
+            )
+            .await
+            .unwrap();
+        });
+
+        let ready =
+            read_daemon_tunnel_ready_until(&mut client, &request, TunnelMode::Local, deadline)
+                .await
+                .unwrap();
+        assert_eq!(ready.bind_host, "127.0.0.1");
+        assert_eq!(ready.bind_port, 45123);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_ipc_tunnel_sends_stop_and_waits_for_closed() {
+        let (client, mut server) = tokio::io::duplex(8 * 1024);
+        let cancellation = CancellationToken::new();
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let worker_cancel = cancellation.clone();
+        let worker = tokio::spawn(run_gui_ipc_tunnel(client, event_tx, worker_cancel));
+
+        cancellation.cancel();
+        assert!(matches!(
+            ipc::read_frame_limited(&mut server, ipc::MAX_CONTROL_FRAME)
+                .await
+                .unwrap(),
+            Some(Frame::TunnelStop)
+        ));
+        ipc::write_frame_limited(&mut server, &Frame::TunnelClosed, ipc::MAX_CONTROL_FRAME)
+            .await
+            .unwrap();
+
+        worker.await.unwrap().unwrap();
+        assert!(matches!(event_rx.recv().await, Some(TunnelEvent::Closed)));
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_ipc_tunnel_preserves_a_partially_read_terminal_frame() {
+        // Capacity one forces the first write to make progress only as the
+        // client's pinned decoder consumes it. Cancellation therefore lands
+        // after a partial length header has definitely been read.
+        let (client, server) = tokio::io::duplex(1);
+        let (mut server_reader, mut server_writer) = tokio::io::split(server);
+        let cancellation = CancellationToken::new();
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let worker_cancel = cancellation.clone();
+        let worker = tokio::spawn(run_gui_ipc_tunnel(client, event_tx, worker_cancel));
+
+        let json = serde_json::to_vec(&Frame::TunnelClosed).unwrap();
+        let mut wire = Vec::with_capacity(4 + json.len());
+        wire.extend_from_slice(&(json.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&json);
+        server_writer.write_all(&wire[..3]).await.unwrap();
+        cancellation.cancel();
+
+        let remaining = wire[3..].to_vec();
+        let terminal_writer = tokio::spawn(async move {
+            server_writer.write_all(&remaining).await.unwrap();
+        });
+        assert!(matches!(
+            ipc::read_frame_limited(&mut server_reader, ipc::MAX_CONTROL_FRAME)
+                .await
+                .unwrap(),
+            Some(Frame::TunnelStop)
+        ));
+        terminal_writer.await.unwrap();
+
+        worker.await.unwrap().unwrap();
+        assert!(matches!(event_rx.recv().await, Some(TunnelEvent::Closed)));
     }
 
     #[tokio::test]
@@ -5033,6 +5942,7 @@ mod tests {
             &oversized_command,
             None,
             false,
+            None,
             timeout,
         )
         .await
@@ -5044,6 +5954,7 @@ mod tests {
             "echo\0hidden",
             None,
             false,
+            None,
             timeout,
         )
         .await
@@ -5055,6 +5966,7 @@ mod tests {
             "profile-that-must-not-be-read",
             "bad\0path",
             None,
+            None,
             1,
             deadline,
         )
@@ -5063,7 +5975,7 @@ mod tests {
         .to_string()
         .contains("NUL"));
         assert!(
-            create_dir_inner("profile-that-must-not-be-read", "", None, 1, deadline,)
+            create_dir_inner("profile-that-must-not-be-read", "", None, None, 1, deadline,)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -5073,8 +5985,11 @@ mod tests {
             "profile-that-must-not-be-read",
             std::path::Path::new("unused"),
             "",
-            None,
-            false,
+            PendingProfileAuthorization {
+                passphrase: None,
+                prompt_if_missing: false,
+                expected_generation: None,
+            },
             timeout,
             CancellationToken::new(),
         )
@@ -5086,8 +6001,11 @@ mod tests {
             "profile-that-must-not-be-read",
             "",
             std::path::Path::new("unused"),
-            None,
-            false,
+            OwnedPendingProfileAuthorization {
+                passphrase: None,
+                prompt_if_missing: false,
+                expected_generation: None,
+            },
             timeout,
             CancellationToken::new(),
         )

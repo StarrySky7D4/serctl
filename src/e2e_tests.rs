@@ -1,11 +1,11 @@
-use crate::{client, daemon, ipc, vault};
+use crate::{client, daemon, ipc, security, vault};
 use rand::{rngs::OsRng, RngCore as Rand08RngCore};
 use russh::keys::{
     ssh_key::{self, rand_core},
     Algorithm, PrivateKey,
 };
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
-use russh::{Channel, ChannelId, Disconnect};
+use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect};
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version,
 };
@@ -13,10 +13,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify};
 use zeroize::Zeroizing;
+
+const E2E_PROFILE_PASSPHRASE: &str = "daemon-profile-passphrase";
+const TOFU_PROFILE_PASSPHRASE: &str = "tofu-profile-passphrase";
+const LEGACY_LOCK_PROFILE_PASSPHRASE: &str = "legacy-lock-profile-passphrase";
+const DIRECT_PROFILE_PASSPHRASE: &str = "direct-profile-passphrase";
+const PID_MISMATCH_PROFILE_PASSPHRASE: &str = "pid-mismatch-profile-passphrase";
+const E2E_ADMINISTRATOR_PASSPHRASE: &str = "e2e-administrator-passphrase";
 
 struct CompatibleOsRng(OsRng);
 
@@ -58,6 +65,26 @@ struct UploadPartialOpen {
     path: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RemoteForwardKey {
+    connection: u64,
+    address: String,
+    port: u16,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteForwardEvent {
+    generation: u64,
+    key: RemoteForwardKey,
+}
+
+struct RemoteForwardRegistration {
+    generation: u64,
+    cancellation: tokio_util::sync::CancellationToken,
+    listener_identity: std::net::SocketAddr,
+    stopped: tokio::sync::oneshot::Receiver<std::net::SocketAddr>,
+}
+
 #[derive(Default)]
 struct ExecEvents {
     generation: u64,
@@ -69,6 +96,16 @@ struct ExecEvents {
 struct UploadPartialEvents {
     generation: u64,
     opened: Vec<UploadPartialOpen>,
+}
+
+#[derive(Default)]
+struct RemoteForwardEvents {
+    generation: u64,
+    started: Vec<RemoteForwardEvent>,
+    cancelled: Vec<RemoteForwardEvent>,
+    active: HashMap<RemoteForwardKey, RemoteForwardRegistration>,
+    accepted: HashMap<u64, u64>,
+    bridged: HashMap<u64, u64>,
 }
 
 #[derive(Default)]
@@ -88,6 +125,8 @@ struct TestState {
     upload_partial_remove_changed: Notify,
     upload_partial_permissions: AtomicU64,
     hardlink_race_target: AtomicBool,
+    remote_forward_events: Mutex<RemoteForwardEvents>,
+    remote_forward_changed: Notify,
 }
 
 impl TestState {
@@ -138,6 +177,37 @@ impl TestState {
                 String::from_utf8_lossy(command)
             )
         })
+    }
+
+    async fn assert_no_exec_start(&self, after: u64, command: &[u8], context: &str) {
+        let observed = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                let changed = self.exec_changed.notified();
+                if self
+                    .exec_events
+                    .lock()
+                    .await
+                    .started
+                    .iter()
+                    .any(|event| event.generation > after && event.command == command)
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await;
+        assert!(observed.is_err(), "unexpected remote exec during {context}");
+    }
+
+    async fn exec_start_count_after(&self, after: u64, command: &[u8]) -> usize {
+        self.exec_events
+            .lock()
+            .await
+            .started
+            .iter()
+            .filter(|event| event.generation > after && event.command == command)
+            .count()
     }
 
     async fn wait_for_cancel(&self, channel: ExecChannel, context: &str) {
@@ -196,12 +266,206 @@ impl TestState {
             )
         })
     }
+
+    async fn latest_remote_forward_generation(&self) -> u64 {
+        self.remote_forward_events.lock().await.generation
+    }
+
+    async fn register_remote_forward(
+        &self,
+        key: RemoteForwardKey,
+        cancellation: tokio_util::sync::CancellationToken,
+        listener_identity: std::net::SocketAddr,
+        stopped: tokio::sync::oneshot::Receiver<std::net::SocketAddr>,
+    ) -> anyhow::Result<u64> {
+        let mut events = self.remote_forward_events.lock().await;
+        if events.active.contains_key(&key) {
+            return Err(anyhow::anyhow!(
+                "duplicate test remote forward {}:{}",
+                key.address,
+                key.port
+            ));
+        }
+        events.generation += 1;
+        let generation = events.generation;
+        events.started.push(RemoteForwardEvent {
+            generation,
+            key: key.clone(),
+        });
+        events.active.insert(
+            key,
+            RemoteForwardRegistration {
+                generation,
+                cancellation,
+                listener_identity,
+                stopped,
+            },
+        );
+        drop(events);
+        self.remote_forward_changed.notify_waiters();
+        Ok(generation)
+    }
+
+    async fn finish_remote_forward(&self, key: &RemoteForwardKey, generation: u64) {
+        let mut events = self.remote_forward_events.lock().await;
+        if events
+            .active
+            .get(key)
+            .is_some_and(|active| active.generation == generation)
+        {
+            events.active.remove(key);
+        }
+        drop(events);
+        self.remote_forward_changed.notify_waiters();
+    }
+
+    async fn cancel_remote_forward(&self, key: &RemoteForwardKey) -> anyhow::Result<bool> {
+        let registration = self.remote_forward_events.lock().await.active.remove(key);
+        let Some(registration) = registration else {
+            return Ok(false);
+        };
+        registration.cancellation.cancel();
+        // The listener task sends this only after dropping its TcpListener.
+        // Waiting here makes the SSH cancellation reply an exact cleanup
+        // acknowledgement rather than a scheduling hint.
+        let stopped_identity = registration
+            .stopped
+            .await
+            .map_err(|_| anyhow::anyhow!("remote-forward listener task dropped its stop proof"))?;
+        if stopped_identity != registration.listener_identity || stopped_identity.port() != key.port
+        {
+            return Err(anyhow::anyhow!(
+                "remote-forward listener stop proof identified the wrong socket"
+            ));
+        }
+        let mut events = self.remote_forward_events.lock().await;
+        events.cancelled.push(RemoteForwardEvent {
+            generation: registration.generation,
+            key: key.clone(),
+        });
+        drop(events);
+        self.remote_forward_changed.notify_waiters();
+        Ok(true)
+    }
+
+    async fn record_remote_forward_accept(&self, generation: u64) {
+        let mut events = self.remote_forward_events.lock().await;
+        *events.accepted.entry(generation).or_default() += 1;
+        drop(events);
+        self.remote_forward_changed.notify_waiters();
+    }
+
+    async fn record_remote_forward_bridge(&self, generation: u64) {
+        let mut events = self.remote_forward_events.lock().await;
+        *events.bridged.entry(generation).or_default() += 1;
+        drop(events);
+        self.remote_forward_changed.notify_waiters();
+    }
+
+    async fn remote_forward_flow_counts(&self, generation: u64) -> (u64, u64) {
+        let events = self.remote_forward_events.lock().await;
+        (
+            events.accepted.get(&generation).copied().unwrap_or(0),
+            events.bridged.get(&generation).copied().unwrap_or(0),
+        )
+    }
+
+    async fn wait_for_remote_forward(&self, after: u64, address: &str) -> RemoteForwardEvent {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = self.remote_forward_changed.notified();
+                if let Some(event) = self
+                    .remote_forward_events
+                    .lock()
+                    .await
+                    .started
+                    .iter()
+                    .find(|event| event.generation > after && event.key.address == address)
+                    .cloned()
+                {
+                    return event;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("remote-forward listener was not registered")
+    }
+
+    async fn wait_for_remote_forward_cancel(&self, generation: u64) -> RemoteForwardEvent {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = self.remote_forward_changed.notified();
+                if let Some(event) = self
+                    .remote_forward_events
+                    .lock()
+                    .await
+                    .cancelled
+                    .iter()
+                    .find(|event| event.generation == generation)
+                    .cloned()
+                {
+                    return event;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("remote-forward cancellation was not observed")
+    }
 }
 
 struct TestSsh {
     state: Arc<TestState>,
     connection: u64,
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
+}
+
+async fn run_test_remote_forward_listener(
+    listener: TcpListener,
+    handle: russh::server::Handle,
+    state: Arc<TestState>,
+    key: RemoteForwardKey,
+    generation: u64,
+    cancellation: tokio_util::sync::CancellationToken,
+    stopped: tokio::sync::oneshot::Sender<std::net::SocketAddr>,
+) {
+    let listener_identity = listener
+        .local_addr()
+        .expect("registered remote-forward listener lost its socket identity");
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        };
+        let Ok((mut socket, peer)) = accepted else {
+            break;
+        };
+        state.record_remote_forward_accept(generation).await;
+        let handle = handle.clone();
+        let state = Arc::clone(&state);
+        let connected_address = key.address.clone();
+        let connected_port = u32::from(key.port);
+        tokio::spawn(async move {
+            let channel = handle
+                .channel_open_forwarded_tcpip(
+                    connected_address,
+                    connected_port,
+                    peer.ip().to_string(),
+                    u32::from(peer.port()),
+                )
+                .await;
+            if let Ok(channel) = channel {
+                state.record_remote_forward_bridge(generation).await;
+                let mut channel = channel.into_stream();
+                let _ = tokio::io::copy_bidirectional(&mut socket, &mut channel).await;
+            }
+        });
+    }
+    drop(listener);
+    state.finish_remote_forward(&key, generation).await;
+    let _ = stopped.send(listener_identity);
 }
 
 impl russh::server::Handler for TestSsh {
@@ -232,6 +496,100 @@ impl russh::server::Handler for TestSsh {
         Ok(())
     }
 
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let port = u16::try_from(port_to_connect)
+            .map_err(|_| anyhow::anyhow!("direct-tcpip port exceeds u16"))?;
+        let mut target = match TcpStream::connect((host_to_connect, port)).await {
+            Ok(target) => target,
+            Err(_) => {
+                reply.reject(ChannelOpenFailure::ConnectFailed).await;
+                return Ok(());
+            }
+        };
+        reply.accept().await;
+        tokio::spawn(async move {
+            let mut channel = channel.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut channel, &mut target).await;
+        });
+        Ok(())
+    }
+
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // Production must never ask the server to expose a remote-forward
+        // listener beyond IPv4 loopback.
+        if address != "127.0.0.1" {
+            return Ok(false);
+        }
+        let Ok(requested_port) = u16::try_from(*port) else {
+            return Ok(false);
+        };
+        let listener = match TcpListener::bind((address, requested_port)).await {
+            Ok(listener) => listener,
+            Err(_) => return Ok(false),
+        };
+        let listener_identity = listener.local_addr()?;
+        let effective_port = listener_identity.port();
+        *port = u32::from(effective_port);
+        let key = RemoteForwardKey {
+            connection: self.connection,
+            address: address.to_owned(),
+            port: effective_port,
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let generation = self
+            .state
+            .register_remote_forward(
+                key.clone(),
+                cancellation.clone(),
+                listener_identity,
+                stopped_rx,
+            )
+            .await?;
+        tokio::spawn(run_test_remote_forward_listener(
+            listener,
+            session.handle(),
+            Arc::clone(&self.state),
+            key,
+            generation,
+            cancellation,
+            stopped_tx,
+        ));
+        Ok(true)
+    }
+
+    async fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let Ok(port) = u16::try_from(port) else {
+            return Ok(false);
+        };
+        self.state
+            .cancel_remote_forward(&RemoteForwardKey {
+                connection: self.connection,
+                address: address.to_owned(),
+                port,
+            })
+            .await
+    }
+
     async fn exec_request(
         &mut self,
         channel: ChannelId,
@@ -239,6 +597,11 @@ impl russh::server::Handler for TestSsh {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
+        let exec_channel = ExecChannel {
+            connection: self.connection,
+            channel,
+        };
+        self.state.record_exec_start(exec_channel, command).await;
         match command {
             b"ok" => {
                 session.data(channel, b"evidence\n".to_vec())?;
@@ -247,38 +610,14 @@ impl russh::server::Handler for TestSsh {
                 session.close(channel)?;
             }
             b"disconnect" => {
-                let exec_channel = ExecChannel {
-                    connection: self.connection,
-                    channel,
-                };
-                self.state.record_exec_start(exec_channel, command).await;
                 session.disconnect(Disconnect::ByApplication, "test disconnect", "en-US")?;
                 // A transport disconnect ends every channel without a later
                 // per-channel EOF callback, so record that terminal state at
                 // the point where the test server queues the disconnect.
                 self.state.record_cancel(exec_channel).await;
             }
-            b"hang" => {
-                self.state
-                    .record_exec_start(
-                        ExecChannel {
-                            connection: self.connection,
-                            channel,
-                        },
-                        command,
-                    )
-                    .await;
-            }
+            b"hang" | b"replay-probe" => {}
             b"overflow" => {
-                self.state
-                    .record_exec_start(
-                        ExecChannel {
-                            connection: self.connection,
-                            channel,
-                        },
-                        command,
-                    )
-                    .await;
                 for _ in 0..257 {
                     session.data(channel, vec![b'x'; 32 * 1024])?;
                 }
@@ -629,6 +968,127 @@ async fn authenticated_stream(endpoint: &str, token: &str) -> anyhow::Result<ipc
     Ok(stream)
 }
 
+async fn authorized_stream(
+    endpoint: &str,
+    token: &str,
+    request: &ipc::Frame,
+) -> anyhow::Result<ipc::ClientStream> {
+    let call_key = tokio::task::spawn_blocking(|| {
+        vault::derive_profile_call_key_with_lock_timeout(
+            "e2e",
+            E2E_PROFILE_PASSPHRASE,
+            None,
+            Duration::from_secs(5),
+        )
+    })
+    .await??;
+    let mut stream = ipc::connect(endpoint).await?;
+    ipc::authenticate_client_for_request(
+        &mut stream,
+        "e2e",
+        token,
+        &call_key,
+        request,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+    )
+    .await?;
+    Ok(stream)
+}
+
+async fn assert_tcp_echo(bind_host: &str, bind_port: u16, evidence: &[u8]) {
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(2),
+        TcpStream::connect((bind_host, bind_port)),
+    )
+    .await
+    .expect("tunnel listener did not accept promptly")
+    .unwrap();
+    stream.write_all(evidence).await.unwrap();
+    let mut echoed = vec![0_u8; evidence.len()];
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
+        .await
+        .expect("tunnel echo did not return promptly")
+        .unwrap();
+    assert_eq!(echoed, evidence);
+}
+
+async fn assert_remote_forward_unusable(
+    state: &TestState,
+    generation: u64,
+    bind_host: &str,
+    bind_port: u16,
+) {
+    let counts_before = state.remote_forward_flow_counts(generation).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    if let Ok(Ok(mut socket)) =
+        tokio::time::timeout_at(deadline, TcpStream::connect((bind_host, bind_port))).await
+    {
+        // Windows may complete a handshake that was already queued before the
+        // listener handle was dropped. Prove that such a socket is not a usable
+        // orphaned forward by attempting a fresh, unique round trip under the
+        // same absolute deadline.
+        let mut nonce = [0_u8; 32];
+        OsRng.fill_bytes(&mut nonce);
+        if matches!(
+            tokio::time::timeout_at(deadline, socket.write_all(&nonce)).await,
+            Ok(Ok(()))
+        ) {
+            let mut response = [0_u8; 32];
+            if let Ok(Ok(_)) =
+                tokio::time::timeout_at(deadline, socket.read_exact(&mut response)).await
+            {
+                assert_ne!(
+                    response, nonce,
+                    "cancelled remote forward still echoed a fresh post-cancel nonce"
+                );
+                panic!("cancelled remote forward returned a complete post-cancel response");
+            }
+        }
+    }
+    assert_eq!(
+        state.remote_forward_flow_counts(generation).await,
+        counts_before,
+        "post-cancel connection created a new remote-forward accept or SSH bridge"
+    );
+}
+
+async fn assert_socks5_echo(bind_host: &str, bind_port: u16, target_port: u16) {
+    let mut stream = TcpStream::connect((bind_host, bind_port)).await.unwrap();
+    stream.write_all(&[5, 1, 0]).await.unwrap();
+    let mut greeting = [0_u8; 2];
+    stream.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [5, 0]);
+
+    let [port_high, port_low] = target_port.to_be_bytes();
+    stream
+        .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, port_high, port_low])
+        .await
+        .unwrap();
+    let mut response_head = [0_u8; 4];
+    stream.read_exact(&mut response_head).await.unwrap();
+    assert_eq!(&response_head[..3], &[5, 0, 0]);
+    let remaining = match response_head[3] {
+        1 => 6,
+        4 => 18,
+        3 => {
+            let length = stream.read_u8().await.unwrap() as usize;
+            length + 2
+        }
+        atyp => panic!("unexpected SOCKS5 response address type {atyp}"),
+    };
+    let mut bound_address = vec![0_u8; remaining];
+    stream.read_exact(&mut bound_address).await.unwrap();
+
+    let evidence = b"dynamic tunnel evidence";
+    stream.write_all(evidence).await.unwrap();
+    let mut echoed = vec![0_u8; evidence.len()];
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
+        .await
+        .expect("SOCKS5 echo did not return promptly")
+        .unwrap();
+    assert_eq!(echoed, evidence);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     let unique = SystemTime::now()
@@ -641,6 +1101,23 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .join(format!("e2e-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&test_home).unwrap();
     vault::set_test_home(Some(test_home.clone()));
+    // Start from a real empty v4 vault. On Windows the administrator policy
+    // and the removable-media half of 2-of-2 recovery must exist before the
+    // first profile can be created. Keep the media only in this test's memory;
+    // the vault never contains enough material to recover a profile alone.
+    #[cfg(windows)]
+    let mut recovery_media = Zeroizing::new(Vec::new());
+    #[cfg(windows)]
+    vault::initialize_admin_password(E2E_ADMINISTRATOR_PASSPHRASE, |media| {
+        recovery_media.extend_from_slice(media);
+        Ok(())
+    })
+    .unwrap();
+    let administrator_passphrase = if cfg!(windows) {
+        Some(E2E_ADMINISTRATOR_PASSPHRASE)
+    } else {
+        None
+    };
 
     let state = Arc::new(TestState::default());
     let mut rng = CompatibleOsRng(OsRng);
@@ -672,6 +1149,25 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             });
         }
     });
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = echo_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    if socket.write_all(&buffer[..read]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
 
     // A first-use connection is split at the security boundary: KEX observes
     // the host key, pin persistence runs while the exclusive profile lease is
@@ -679,10 +1175,8 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     // persistence failure and prove the fake SSH server never receives an
     // authentication request on that transport.
     let tofu_profile = "tofu-auth-order";
-    // The vault has one global master verifier; reuse the master used by the
-    // later direct-route cases in this integration test.
-    let tofu_master = "direct-test-master";
-    vault::add_or_update(
+    let tofu_passphrase = TOFU_PROFILE_PASSPHRASE;
+    vault::create_profile(
         tofu_profile,
         &vault::Creds {
             host: "127.0.0.1".into(),
@@ -691,11 +1185,12 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             password: "password".into(),
             host_key: None,
         },
-        tofu_master,
+        tofu_passphrase,
+        administrator_passphrase,
     )
     .unwrap();
     let tofu_lease = vault::acquire_runtime_lease(tofu_profile).unwrap();
-    let tofu_creds = vault::decrypt(tofu_profile, tofu_master).unwrap();
+    let tofu_creds = vault::decrypt(tofu_profile, tofu_passphrase).unwrap();
     let auth_before_failed_pin = state.password_auth_attempts.load(Ordering::SeqCst);
     let staged = crate::ssh::SshSession::connect_key_exchange_until(
         &tofu_creds,
@@ -710,32 +1205,42 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         fingerprint.clone(),
         "definitely-wrong-master",
         Duration::from_secs(1),
+        &tofu_lease,
     )
     .unwrap_err();
-    assert!(pin_error.to_string().contains("wrong master passphrase"));
+    assert!(pin_error.to_string().contains("wrong profile passphrase"));
     staged.abort().await;
     assert_eq!(
         state.password_auth_attempts.load(Ordering::SeqCst),
         auth_before_failed_pin,
         "password authentication was sent before the host-key pin persisted"
     );
-    assert!(vault::decrypt(tofu_profile, tofu_master)
+    assert!(vault::decrypt(tofu_profile, tofu_passphrase)
         .unwrap()
         .host_key
         .is_none());
     drop(tofu_lease);
 
+    let daemon_creds = vault::Creds {
+        host: "127.0.0.1".into(),
+        port: ssh_port,
+        user: "tester".into(),
+        password: "password".into(),
+        host_key: Some(fingerprint.clone()),
+    };
+    vault::create_profile(
+        "e2e",
+        &daemon_creds,
+        E2E_PROFILE_PASSPHRASE,
+        administrator_passphrase,
+    )
+    .unwrap();
+
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let daemon_task = tokio::spawn(daemon::run_with_ready_creds_for_test(
         "e2e",
-        vault::Creds {
-            host: "127.0.0.1".into(),
-            port: ssh_port,
-            user: "tester".into(),
-            password: "password".into(),
-            host_key: Some(fingerprint.clone()),
-        },
-        Zeroizing::new("unused-test-master".to_owned()),
+        daemon_creds,
+        Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned()),
         Some(ready_tx),
     ));
     tokio::time::timeout(Duration::from_secs(5), ready_rx)
@@ -746,7 +1251,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     assert_eq!(lock.protocol, ipc::IPC_PROTOCOL_VERSION);
     assert_eq!(lock.port, 0);
     assert!(!lock.endpoint.is_empty());
-    let mutation_error = vault::add_or_update(
+    let mutation_error = vault::update_profile(
         "e2e",
         &vault::Creds {
             host: "changed.example".into(),
@@ -755,21 +1260,36 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             password: "replacement".into(),
             host_key: None,
         },
-        "unused-test-master",
+        E2E_PROFILE_PASSPHRASE,
+        None,
     )
     .unwrap_err();
     assert!(mutation_error.to_string().contains("daemon"));
-    assert!(vault::remove("e2e")
+    assert!(vault::remove_profile("e2e", E2E_PROFILE_PASSPHRASE, None)
         .unwrap_err()
         .to_string()
         .contains("daemon"));
+    let vault_before_daemon_rekey = std::fs::read(vault::vault_path().unwrap()).unwrap();
+    let daemon_rekey_error = vault::change_profile_passphrase(
+        "e2e",
+        E2E_PROFILE_PASSPHRASE,
+        "must-not-commit-daemon-rekey",
+        None,
+    )
+    .unwrap_err();
+    assert!(daemon_rekey_error.to_string().contains("daemon"));
+    assert_eq!(
+        std::fs::read(vault::vault_path().unwrap()).unwrap(),
+        vault_before_daemon_rekey,
+        "a contended daemon lease allowed profile rekeying to modify the vault"
+    );
     #[cfg(windows)]
-    assert!(lock.endpoint.starts_with(r"\\.\pipe\serctl-v3-"));
+    assert!(lock.endpoint.starts_with(r"\\.\pipe\serctl-v5-"));
     #[cfg(unix)]
     assert!(std::path::Path::new(&lock.endpoint)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("serctl-v3-") && name.ends_with(".sock")));
+        .is_some_and(|name| name.starts_with("serctl-v5-") && name.ends_with(".sock")));
 
     let mut rejected = ipc::connect(&lock.endpoint).await.unwrap();
     let rejected_auth = ipc::authenticate_client(
@@ -797,15 +1317,232 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         Err(_) => panic!("daemon did not close failed authentication promptly"),
     }
 
-    let output = client::exec_capture_with_timeout("e2e", "ok", None, Duration::from_secs(1))
+    // Token mutual authentication alone is not a business capability. Even
+    // Status must carry an exact call-key intent, otherwise a same-user
+    // process that copied the protected runtime token could query metadata or
+    // stop the daemon without this profile's passphrase.
+    let mut status_stream = authenticated_stream(&lock.endpoint, &lock.token)
         .await
         .unwrap();
+    ipc::write_frame_limited(
+        &mut status_stream,
+        &ipc::Frame::Status,
+        ipc::MAX_CONTROL_FRAME,
+    )
+    .await
+    .unwrap();
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        ipc::read_frame_limited(&mut status_stream, ipc::MAX_CONTROL_FRAME),
+    )
+    .await
+    {
+        Ok(Ok(None)) | Ok(Err(_)) => {}
+        Ok(Ok(Some(frame))) => panic!("token-only Status returned a business frame: {frame:?}"),
+        Err(_) => panic!("daemon did not close token-only Status promptly"),
+    }
+    assert!(matches!(
+        client::daemon_status("e2e", E2E_PROFILE_PASSPHRASE)
+            .await
+            .unwrap(),
+        Some(client::DaemonStatus { profile, .. }) if profile == "e2e"
+    ));
+    let wrong_status = client::daemon_status("e2e", "definitely-wrong-master")
+        .await
+        .unwrap_err();
+    assert!(wrong_status
+        .to_string()
+        .contains("wrong profile passphrase"));
+
+    // A wrong profile passphrase is rejected by client-side verification before
+    // it connects to IPC. Observe the SSH server rather than trusting only the
+    // returned error: no remote exec request may appear afterward.
+    let wrong_passphrase_after = state.latest_exec_generation().await;
+    let wrong_passphrase = client::exec_capture_with_timeout(
+        "e2e",
+        "wrong-master-probe",
+        Some("definitely-wrong-master"),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap_err();
+    assert!(wrong_passphrase
+        .to_string()
+        .contains("wrong profile passphrase"));
+    state
+        .assert_no_exec_start(
+            wrong_passphrase_after,
+            b"wrong-master-probe",
+            "wrong-profile-passphrase daemon authorization",
+        )
+        .await;
+
+    // The authorization commitment covers the complete root frame. Authenticate
+    // for one command and send another; the daemon must close without allowing
+    // the mismatched command to reach SSH.
+    let authorized_intent = ipc::Frame::Exec {
+        cmd: "authorized-intent".into(),
+        timeout_ms: 2_000,
+    };
+    let mut intent_stream = authorized_stream(&lock.endpoint, &lock.token, &authorized_intent)
+        .await
+        .unwrap();
+    let intent_after = state.latest_exec_generation().await;
+    ipc::write_frame(
+        &mut intent_stream,
+        &ipc::Frame::Exec {
+            cmd: "intent-mismatch-probe".into(),
+            timeout_ms: 2_000,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), ipc::read_frame(&mut intent_stream)).await,
+        Ok(Ok(None)) | Ok(Err(_))
+    ));
+    state
+        .assert_no_exec_start(
+            intent_after,
+            b"intent-mismatch-probe",
+            "mismatched IPC request intent",
+        )
+        .await;
+
+    // One authorization context is consumable exactly once. Buffering the
+    // same root frame twice on one authenticated connection must yield one and
+    // only one SSH exec request.
+    let replay_request = ipc::Frame::Exec {
+        cmd: "replay-probe".into(),
+        timeout_ms: 2_000,
+    };
+    let mut replay_stream = authorized_stream(&lock.endpoint, &lock.token, &replay_request)
+        .await
+        .unwrap();
+    let replay_after = state.latest_exec_generation().await;
+    ipc::write_frame(&mut replay_stream, &replay_request)
+        .await
+        .unwrap();
+    let replay_channel = state
+        .wait_for_exec_start(replay_after, b"replay-probe")
+        .await;
+    let _ = ipc::write_frame(&mut replay_stream, &replay_request).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Ok(Some(mut frame)) = ipc::read_frame(&mut replay_stream).await {
+            frame.zeroize_sensitive();
+        }
+    })
+    .await
+    .expect("replayed IPC root did not close promptly");
+    assert_eq!(
+        state
+            .exec_start_count_after(replay_after, b"replay-probe")
+            .await,
+        1,
+        "one call authorization executed a replayed root request"
+    );
+    state
+        .wait_for_cancel(replay_channel, "replayed IPC root")
+        .await;
+
+    // Daemon-routed local forwarding carries data directly over SSH rather
+    // than through IPC. Port zero also proves readiness reports the effective
+    // listener selected by the operating system.
+    let daemon_tunnel = tokio::time::timeout(
+        Duration::from_secs(5),
+        client::open_gui_tunnel(
+            "e2e",
+            client::TunnelSpec::local(0, echo_port),
+            Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned()),
+        ),
+    )
+    .await
+    .expect("daemon local tunnel did not become ready")
+    .unwrap();
+    let daemon_tunnel_ready = daemon_tunnel.ready().clone();
+    assert_eq!(daemon_tunnel_ready.bind_host, "127.0.0.1");
+    assert_ne!(daemon_tunnel_ready.bind_port, 0);
+    assert_tcp_echo(
+        &daemon_tunnel_ready.bind_host,
+        daemon_tunnel_ready.bind_port,
+        b"daemon local tunnel evidence",
+    )
+    .await;
+    daemon_tunnel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), daemon_tunnel.wait())
+        .await
+        .expect("daemon local tunnel did not stop promptly")
+        .unwrap();
+
+    // Remote forwarding binds on the SSH server, then opens a
+    // forwarded-tcpip channel back to a target local to serctl. The test
+    // server tracks the exact address/allocated port and does not acknowledge
+    // cancellation until its listener object has been dropped.
+    let remote_forward_after = state.latest_remote_forward_generation().await;
+    let daemon_remote_tunnel = tokio::time::timeout(
+        Duration::from_secs(5),
+        client::open_gui_tunnel(
+            "e2e",
+            client::TunnelSpec::remote(0, echo_port),
+            Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned()),
+        ),
+    )
+    .await
+    .expect("daemon remote tunnel did not become ready")
+    .unwrap();
+    let daemon_remote_ready = daemon_remote_tunnel.ready().clone();
+    assert_eq!(daemon_remote_ready.bind_host, "127.0.0.1");
+    assert_ne!(
+        daemon_remote_ready.bind_port, echo_port,
+        "remote readiness reported the local echo target instead of the server listener"
+    );
+    let remote_forward = state
+        .wait_for_remote_forward(remote_forward_after, &daemon_remote_ready.bind_host)
+        .await;
+    assert_eq!(remote_forward.key.port, daemon_remote_ready.bind_port);
+    assert_tcp_echo(
+        &daemon_remote_ready.bind_host,
+        daemon_remote_ready.bind_port,
+        b"daemon remote tunnel evidence",
+    )
+    .await;
+    daemon_remote_tunnel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), daemon_remote_tunnel.wait())
+        .await
+        .expect("daemon remote tunnel did not stop promptly")
+        .unwrap();
+    let remote_cancel = state
+        .wait_for_remote_forward_cancel(remote_forward.generation)
+        .await;
+    assert_eq!(remote_cancel.key, remote_forward.key);
+    assert_remote_forward_unusable(
+        &state,
+        remote_forward.generation,
+        &daemon_remote_ready.bind_host,
+        daemon_remote_ready.bind_port,
+    )
+    .await;
+
+    let output = client::exec_capture_with_timeout(
+        "e2e",
+        "ok",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
     assert_eq!(output.stdout, b"evidence\n");
     assert_eq!(output.code, Some(0));
 
     let overflow_after = state.latest_exec_generation().await;
     let overflow_task = tokio::spawn(async {
-        client::exec_capture_with_timeout("e2e", "overflow", None, Duration::from_secs(10)).await
+        client::exec_capture_with_timeout(
+            "e2e",
+            "overflow",
+            Some(E2E_PROFILE_PASSPHRASE),
+            Duration::from_secs(10),
+        )
+        .await
     });
     let overflow_channel = state.wait_for_exec_start(overflow_after, b"overflow").await;
     let overflow = overflow_task.await.unwrap().unwrap_err();
@@ -819,10 +1556,14 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .wait_for_cancel(overflow_channel, "output-limit failure")
         .await;
 
-    let disconnected =
-        client::exec_capture_with_timeout("e2e", "disconnect", None, Duration::from_secs(1))
-            .await
-            .unwrap_err();
+    let disconnected = client::exec_capture_with_timeout(
+        "e2e",
+        "disconnect",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
     assert!(disconnected.is::<crate::ssh::ExecOutcomeUnknown>());
     assert!(
         disconnected.to_string().contains("outcome unknown")
@@ -832,7 +1573,13 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     );
     let reconnected = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            match client::exec_capture_with_timeout("e2e", "ok", None, Duration::from_secs(1)).await
+            match client::exec_capture_with_timeout(
+                "e2e",
+                "ok",
+                Some(E2E_PROFILE_PASSPHRASE),
+                Duration::from_secs(1),
+            )
+            .await
             {
                 Ok(output) => break output,
                 Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
@@ -846,7 +1593,13 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
 
     let timeout_after = state.latest_exec_generation().await;
     let timeout_task = tokio::spawn(async {
-        client::exec_capture_with_timeout("e2e", "hang", None, Duration::from_millis(50)).await
+        client::exec_capture_with_timeout(
+            "e2e",
+            "hang",
+            Some(E2E_PROFILE_PASSPHRASE),
+            Duration::from_secs(1),
+        )
+        .await
     });
     let timeout_channel = state.wait_for_exec_start(timeout_after, b"hang").await;
     let timeout = timeout_task.await.unwrap().unwrap_err();
@@ -859,19 +1612,17 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .wait_for_cancel(timeout_channel, "command deadline")
         .await;
 
-    let mut disconnected = authenticated_stream(&lock.endpoint, &lock.token)
+    let disconnected_request = ipc::Frame::Exec {
+        cmd: "hang".into(),
+        timeout_ms: 10_000,
+    };
+    let mut disconnected = authorized_stream(&lock.endpoint, &lock.token, &disconnected_request)
         .await
         .unwrap();
     let disconnect_after = state.latest_exec_generation().await;
-    ipc::write_frame(
-        &mut disconnected,
-        &ipc::Frame::Exec {
-            cmd: "hang".into(),
-            timeout_ms: 10_000,
-        },
-    )
-    .await
-    .unwrap();
+    ipc::write_frame(&mut disconnected, &disconnected_request)
+        .await
+        .unwrap();
     let disconnected_channel = state.wait_for_exec_start(disconnect_after, b"hang").await;
     disconnected.shutdown().await.unwrap();
     drop(disconnected);
@@ -884,19 +1635,17 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     state
         .upload_partial_remove_delay
         .store(true, Ordering::SeqCst);
-    let mut timed_upload = authenticated_stream(&lock.endpoint, &lock.token)
+    let timed_upload_request = ipc::Frame::UploadBegin {
+        path: "/daemon-timeout.txt".into(),
+        size: 15,
+        timeout_ms: 100,
+    };
+    let mut timed_upload = authorized_stream(&lock.endpoint, &lock.token, &timed_upload_request)
         .await
         .unwrap();
-    ipc::write_frame(
-        &mut timed_upload,
-        &ipc::Frame::UploadBegin {
-            path: "/daemon-timeout.txt".into(),
-            size: 15,
-            timeout_ms: 100,
-        },
-    )
-    .await
-    .unwrap();
+    ipc::write_frame(&mut timed_upload, &timed_upload_request)
+        .await
+        .unwrap();
     assert!(matches!(
         ipc::read_frame(&mut timed_upload).await.unwrap(),
         Some(ipc::Frame::Ack)
@@ -950,7 +1699,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             &upload_source,
             "/evidence.txt",
             Duration::from_secs(5),
-            None,
+            Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
         )
         .await
         .unwrap(),
@@ -980,7 +1729,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             &upload_source,
             "/committed-before-cleanup.txt",
             Duration::from_millis(500),
-            None,
+            Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
         ),
     )
     .await
@@ -1007,7 +1756,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         &upload_source,
         "/hardlink-race.txt",
         Duration::from_secs(5),
-        None,
+        Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
     )
     .await
     .unwrap_err();
@@ -1016,19 +1765,28 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         b"concurrent winner"
     );
 
-    let (listed_path, entries) =
-        client::list_dir_with_timeout("e2e", "/", None, Duration::from_secs(2))
-            .await
-            .unwrap();
+    let (listed_path, entries) = client::list_dir_with_timeout(
+        "e2e",
+        "/",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
     assert_eq!(listed_path, "/");
     assert!(entries
         .iter()
         .any(|entry| entry.name == "evidence.txt" && entry.size == 15));
 
     state.sftp_large_dir.store(true, Ordering::SeqCst);
-    let large_directory = client::list_dir_with_timeout("e2e", "/", None, Duration::from_secs(5))
-        .await
-        .unwrap_err();
+    let large_directory = client::list_dir_with_timeout(
+        "e2e",
+        "/",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
     assert!(
         large_directory
             .to_string()
@@ -1036,10 +1794,14 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         "unexpected large-directory result: {large_directory:#}"
     );
     state.sftp_large_dir.store(false, Ordering::SeqCst);
-    let after_large_directory =
-        client::exec_capture_with_timeout("e2e", "ok", None, Duration::from_secs(1))
-            .await
-            .unwrap();
+    let after_large_directory = client::exec_capture_with_timeout(
+        "e2e",
+        "ok",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
     assert_eq!(after_large_directory.code, Some(0));
 
     // A download client that authenticates and then stops reading must lose
@@ -1052,24 +1814,27 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .await
         .insert("/ipc-backpressure.bin".into(), vec![b'b'; 12 * 1024 * 1024]);
     let ssh_connections_before_backpressure = state.next_connection.load(Ordering::SeqCst);
-    let mut stalled_download = authenticated_stream(&lock.endpoint, &lock.token)
+    let stalled_download_request = ipc::Frame::Download {
+        path: "/ipc-backpressure.bin".into(),
+        timeout_ms: 10_000,
+    };
+    let mut stalled_download =
+        authorized_stream(&lock.endpoint, &lock.token, &stalled_download_request)
+            .await
+            .unwrap();
+    ipc::write_frame(&mut stalled_download, &stalled_download_request)
         .await
         .unwrap();
-    ipc::write_frame(
-        &mut stalled_download,
-        &ipc::Frame::Download {
-            path: "/ipc-backpressure.bin".into(),
-            timeout_ms: 10_000,
-        },
+    tokio::time::sleep(Duration::from_millis(2_750)).await;
+    drop(stalled_download);
+    let after_backpressure = client::exec_capture_with_timeout(
+        "e2e",
+        "ok",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(1),
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(2_750)).await;
-    drop(stalled_download);
-    let after_backpressure =
-        client::exec_capture_with_timeout("e2e", "ok", None, Duration::from_secs(1))
-            .await
-            .unwrap();
     assert_eq!(after_backpressure.code, Some(0));
     assert_eq!(
         state.next_connection.load(Ordering::SeqCst),
@@ -1085,7 +1850,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             "/evidence.txt",
             &download_target,
             Duration::from_secs(5),
-            None,
+            Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
         )
         .await
         .unwrap(),
@@ -1098,8 +1863,8 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         "e2e",
         &upload_source,
         "/hung-upload.txt",
-        Duration::from_millis(50),
-        None,
+        Duration::from_millis(500),
+        Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
     )
     .await
     .unwrap_err();
@@ -1110,8 +1875,8 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         "e2e",
         "/evidence.txt",
         &timed_download,
-        Duration::from_millis(50),
-        None,
+        Duration::from_millis(500),
+        Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
     )
     .await
     .unwrap_err();
@@ -1125,28 +1890,42 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     }));
 
     state.sftp_hang.store(false, Ordering::SeqCst);
-    let after_timeout =
-        client::exec_capture_with_timeout("e2e", "ok", None, Duration::from_secs(1))
-            .await
-            .unwrap();
-    assert_eq!(after_timeout.code, Some(0));
-
-    let mut shutdown_exec = authenticated_stream(&lock.endpoint, &lock.token)
-        .await
-        .unwrap();
-    let shutdown_after = state.latest_exec_generation().await;
-    ipc::write_frame(
-        &mut shutdown_exec,
-        &ipc::Frame::Exec {
-            cmd: "hang".into(),
-            timeout_ms: 10_000,
-        },
+    let after_timeout = client::exec_capture_with_timeout(
+        "e2e",
+        "ok",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(1),
     )
     .await
     .unwrap();
+    assert_eq!(after_timeout.code, Some(0));
+
+    let shutdown_request = ipc::Frame::Exec {
+        cmd: "hang".into(),
+        timeout_ms: 10_000,
+    };
+    let mut shutdown_exec = authorized_stream(&lock.endpoint, &lock.token, &shutdown_request)
+        .await
+        .unwrap();
+    let shutdown_after = state.latest_exec_generation().await;
+    ipc::write_frame(&mut shutdown_exec, &shutdown_request)
+        .await
+        .unwrap();
     let shutdown_channel = state.wait_for_exec_start(shutdown_after, b"hang").await;
 
-    assert!(client::down_quiet("e2e").await.unwrap());
+    let wrong_shutdown = client::down_quiet("e2e", "definitely-wrong-master")
+        .await
+        .unwrap_err();
+    assert!(wrong_shutdown
+        .to_string()
+        .contains("wrong profile passphrase"));
+    assert!(client::daemon_status("e2e", E2E_PROFILE_PASSPHRASE)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(client::down_quiet("e2e", E2E_PROFILE_PASSPHRASE)
+        .await
+        .unwrap());
     tokio::time::timeout(Duration::from_secs(5), daemon_task)
         .await
         .expect("daemon did not drain active handlers during shutdown")
@@ -1159,10 +1938,108 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .wait_for_cancel(shutdown_channel, "daemon shutdown")
         .await;
 
+    // A malformed current-v5 lock must not become an oracle or a side effect
+    // for an unauthenticated caller. Keep a real local endpoint listening so
+    // the test can prove that a wrong profile passphrase reaches neither IPC nor SSH,
+    // while the protected lock remains byte-for-byte unchanged. Once the
+    // existing profile is authenticated, the same lock is eligible for safe
+    // recovery and the request may proceed over direct SSH.
+    let malformed_token = Zeroizing::new(vault::new_ipc_token());
+    let mut malformed_listener = ipc::LocalListener::bind("e2e", &malformed_token).unwrap();
+    let malformed_lock = vault::LockInfo {
+        profile: "e2e".into(),
+        protocol: ipc::IPC_PROTOCOL_VERSION,
+        pid: std::process::id(),
+        port: 0,
+        endpoint: malformed_listener.endpoint().to_owned(),
+        host: "forbidden-current-v5-metadata".into(),
+        user: String::new(),
+        started_unix: vault::now_unix(),
+        token: malformed_token.as_str().to_owned(),
+    };
+    let malformed_json = Zeroizing::new(serde_json::to_vec(&malformed_lock).unwrap());
+    let malformed_path = vault::lock_path("e2e").unwrap();
+    assert!(
+        !malformed_path.exists(),
+        "daemon shutdown left the e2e runtime lock behind"
+    );
+    security::write_protected_atomic(&malformed_path, &malformed_json).unwrap();
+    let malformed_before = std::fs::read(&malformed_path).unwrap();
+    assert_eq!(malformed_before.as_slice(), malformed_json.as_slice());
+
+    let malformed_exec_after = state.latest_exec_generation().await;
+    let malformed_ssh_connections = state.next_connection.load(Ordering::SeqCst);
+    let malformed_password_attempts = state.password_auth_attempts.load(Ordering::SeqCst);
+    let malformed_wrong_passphrase = client::exec_capture_with_timeout(
+        "e2e",
+        "malformed-lock-wrong-master-probe",
+        Some("definitely-wrong-master"),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap_err();
+    let malformed_wrong_passphrase = malformed_wrong_passphrase.to_string();
+    assert!(malformed_wrong_passphrase.contains("wrong profile passphrase"));
+    assert!(!malformed_wrong_passphrase.contains("forbidden remote metadata"));
+    assert!(malformed_path.exists());
+    assert_eq!(std::fs::read(&malformed_path).unwrap(), malformed_before);
+    assert_eq!(
+        state.next_connection.load(Ordering::SeqCst),
+        malformed_ssh_connections,
+        "wrong profile passphrase opened SSH while recovering a malformed lock"
+    );
+    assert_eq!(
+        state.password_auth_attempts.load(Ordering::SeqCst),
+        malformed_password_attempts,
+        "wrong profile passphrase attempted SSH authentication during lock recovery"
+    );
+    state
+        .assert_no_exec_start(
+            malformed_exec_after,
+            b"malformed-lock-wrong-master-probe",
+            "wrong-profile-passphrase malformed-lock recovery",
+        )
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), malformed_listener.accept())
+            .await
+            .is_err(),
+        "wrong profile passphrase connected to the malformed lock's IPC endpoint"
+    );
+    drop(malformed_listener);
+
+    let recovered_direct = client::exec_capture_with_timeout(
+        "e2e",
+        "ok",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered_direct.code, Some(0));
+    assert_eq!(recovered_direct.stdout, b"evidence\n");
+    assert!(
+        !malformed_path.exists(),
+        "authenticated recovery left the malformed current-v5 lock behind"
+    );
+
     // Missing protocol means the legacy bearer-token handshake. It must fail
     // before even connecting to an endpoint, and diagnostics must not echo the
     // reusable token.
     let legacy_profile = "legacy-lock-e2e";
+    vault::create_profile(
+        legacy_profile,
+        &vault::Creds {
+            host: "127.0.0.1".into(),
+            port: ssh_port,
+            user: "tester".into(),
+            password: "password".into(),
+            host_key: Some(fingerprint.clone()),
+        },
+        LEGACY_LOCK_PROFILE_PASSPHRASE,
+        administrator_passphrase,
+    )
+    .unwrap();
     let legacy_token = Zeroizing::new(vault::new_ipc_token());
     let mut legacy_listener = ipc::LocalListener::bind(legacy_profile, &legacy_token).unwrap();
     let legacy_endpoint = legacy_listener.endpoint().to_owned();
@@ -1192,7 +2069,9 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     );
     let legacy_path = vault::lock_path(legacy_profile).unwrap();
     std::fs::write(&legacy_path, &legacy_json).unwrap();
-    let legacy_error = client::daemon_status(legacy_profile).await.unwrap_err();
+    let legacy_error = client::daemon_status(legacy_profile, LEGACY_LOCK_PROFILE_PASSPHRASE)
+        .await
+        .unwrap_err();
     assert!(legacy_error.to_string().contains("bearer-token IPC"));
     assert!(!legacy_error.to_string().contains(legacy_token.as_str()));
     assert!(
@@ -1202,7 +2081,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     );
 
     // Protocol v2 used an untagged Error frame for both definite rejection
-    // and post-submit uncertainty. A v3 client must reject its lock before
+    // and post-submit uncertainty. A v5 client must reject its lock before
     // connecting, disclose no authentication bytes, and retain the evidence
     // instead of treating it as a malformed current-version lock.
     let old_v2_lock = vault::LockInfo {
@@ -1218,7 +2097,9 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     };
     let old_v2_json = Zeroizing::new(serde_json::to_vec(&old_v2_lock).unwrap());
     std::fs::write(&legacy_path, &old_v2_json).unwrap();
-    let old_v2_error = client::daemon_status(legacy_profile).await.unwrap_err();
+    let old_v2_error = client::daemon_status(legacy_profile, LEGACY_LOCK_PROFILE_PASSPHRASE)
+        .await
+        .unwrap_err();
     assert!(old_v2_error
         .to_string()
         .contains("unsupported runtime lock IPC protocol 2"));
@@ -1230,7 +2111,37 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             .is_err()
     );
 
-    // A malformed current-v3 lock in the hashed namespace is recoverable only
+    // Protocol v4 predates the address-free, loopback-only tunnel intent. A
+    // v5 client must reject the old lock before connecting, sending an auth
+    // hello, or silently falling back to direct SSH.
+    let old_v4_lock = vault::LockInfo {
+        profile: legacy_profile.into(),
+        protocol: 4,
+        pid: std::process::id(),
+        port: 0,
+        endpoint: legacy_endpoint.clone(),
+        host: String::new(),
+        user: String::new(),
+        started_unix: vault::now_unix(),
+        token: legacy_token.as_str().to_owned(),
+    };
+    let old_v4_json = Zeroizing::new(serde_json::to_vec(&old_v4_lock).unwrap());
+    std::fs::write(&legacy_path, &old_v4_json).unwrap();
+    let old_v4_error = client::daemon_status(legacy_profile, LEGACY_LOCK_PROFILE_PASSPHRASE)
+        .await
+        .unwrap_err();
+    assert!(old_v4_error
+        .to_string()
+        .contains("unsupported runtime lock IPC protocol 4"));
+    assert!(!old_v4_error.to_string().contains(legacy_token.as_str()));
+    assert!(legacy_path.exists());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), legacy_listener.accept())
+            .await
+            .is_err()
+    );
+
+    // A malformed current-v5 lock in the hashed namespace is recoverable only
     // after the client obtains the exclusive runtime lease. Endpoint mismatch
     // is then deleted without connecting or sending authentication bytes.
     let tampered_lock = vault::LockInfo {
@@ -1246,10 +2157,12 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     };
     let tampered_json = Zeroizing::new(serde_json::to_vec(&tampered_lock).unwrap());
     std::fs::write(&legacy_path, &tampered_json).unwrap();
-    assert!(client::daemon_status(legacy_profile)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        client::daemon_status(legacy_profile, LEGACY_LOCK_PROFILE_PASSPHRASE)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(!legacy_path.exists());
     assert!(
         tokio::time::timeout(Duration::from_millis(75), legacy_listener.accept())
@@ -1260,7 +2173,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     #[cfg(unix)]
     {
         // The raw v1 name is consulted only after the hashed namespace has no
-        // record. A malformed hashed-v3 lock must therefore be removed and
+        // record. A malformed hashed-v5 lock must therefore be removed and
         // followed by a second read, which exposes (and rejects) this legacy
         // bearer-token lock instead of silently falling back to direct SSH.
         let raw_legacy_path = vault::run_dir()
@@ -1268,7 +2181,9 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             .join(format!("{legacy_profile}.lock"));
         std::fs::write(&raw_legacy_path, &legacy_json).unwrap();
         std::fs::write(&legacy_path, &tampered_json).unwrap();
-        let shadowed_legacy = client::daemon_status(legacy_profile).await.unwrap_err();
+        let shadowed_legacy = client::daemon_status(legacy_profile, LEGACY_LOCK_PROFILE_PASSPHRASE)
+            .await
+            .unwrap_err();
         assert!(shadowed_legacy.to_string().contains("bearer-token IPC"));
         assert!(!shadowed_legacy.to_string().contains(legacy_token.as_str()));
         assert!(!legacy_path.exists());
@@ -1287,6 +2202,19 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         // protected-lock PID must stop before AuthHello, and a held daemon
         // lease must prevent the client from deleting that lock as stale.
         let profile = "pid-mismatch-e2e";
+        vault::create_profile(
+            profile,
+            &vault::Creds {
+                host: "127.0.0.1".into(),
+                port: ssh_port,
+                user: "tester".into(),
+                password: "password".into(),
+                host_key: Some(fingerprint.clone()),
+            },
+            PID_MISMATCH_PROFILE_PASSPHRASE,
+            administrator_passphrase,
+        )
+        .unwrap();
         let token = Zeroizing::new(vault::new_ipc_token());
         let mut fake_listener = ipc::LocalListener::bind(profile, &token).unwrap();
         let endpoint = fake_listener.endpoint().to_owned();
@@ -1310,8 +2238,10 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         })
         .unwrap();
 
-        let pid_error = client::daemon_status(profile).await.unwrap_err();
-        assert!(pid_error.to_string().contains("still leased"));
+        let pid_error = client::daemon_status(profile, PID_MISMATCH_PROFILE_PASSPHRASE)
+            .await
+            .unwrap_err();
+        assert!(pid_error.to_string().contains("PID does not match"));
         let mut fake_server = fake_listener.accept().await.unwrap();
         assert!(matches!(
             ipc::read_frame_limited(&mut fake_server, ipc::MAX_AUTH_FRAME).await,
@@ -1325,7 +2255,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         );
     }
 
-    let direct_master = "direct-test-master";
+    let direct_passphrase = DIRECT_PROFILE_PASSPHRASE;
     let direct_creds = vault::Creds {
         host: "127.0.0.1".into(),
         port: ssh_port,
@@ -1334,17 +2264,70 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         host_key: None,
     };
     let direct_use_lease = vault::acquire_profile_use_lease("direct-e2e").unwrap();
-    let direct_mutation_error =
-        vault::add_or_update("direct-e2e", &direct_creds, direct_master).unwrap_err();
+    let direct_mutation_error = vault::create_profile(
+        "direct-e2e",
+        &direct_creds,
+        direct_passphrase,
+        administrator_passphrase,
+    )
+    .unwrap_err();
     assert!(direct_mutation_error.to_string().contains("daemon"));
     drop(direct_use_lease);
-    vault::add_or_update("direct-e2e", &direct_creds, direct_master).unwrap();
-    vault::set_pinned_fp("direct-e2e", fingerprint, direct_master).unwrap();
+    vault::create_profile(
+        "direct-e2e",
+        &direct_creds,
+        direct_passphrase,
+        administrator_passphrase,
+    )
+    .unwrap();
+    vault::set_pinned_fp("direct-e2e", fingerprint.clone(), direct_passphrase).unwrap();
+
+    let direct_local_tunnel = client::open_gui_tunnel(
+        "direct-e2e",
+        client::TunnelSpec::local(0, echo_port),
+        Zeroizing::new(direct_passphrase.to_owned()),
+    )
+    .await
+    .unwrap();
+    let direct_local_ready = direct_local_tunnel.ready().clone();
+    assert_eq!(direct_local_ready.bind_host, "127.0.0.1");
+    assert_tcp_echo(
+        &direct_local_ready.bind_host,
+        direct_local_ready.bind_port,
+        b"direct local tunnel evidence",
+    )
+    .await;
+    direct_local_tunnel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), direct_local_tunnel.wait())
+        .await
+        .expect("direct local tunnel did not stop promptly")
+        .unwrap();
+
+    let direct_dynamic_tunnel = client::open_gui_tunnel(
+        "direct-e2e",
+        client::TunnelSpec::dynamic(0),
+        Zeroizing::new(direct_passphrase.to_owned()),
+    )
+    .await
+    .unwrap();
+    let direct_dynamic_ready = direct_dynamic_tunnel.ready().clone();
+    assert_eq!(direct_dynamic_ready.bind_host, "127.0.0.1");
+    assert_socks5_echo(
+        &direct_dynamic_ready.bind_host,
+        direct_dynamic_ready.bind_port,
+        echo_port,
+    )
+    .await;
+    direct_dynamic_tunnel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), direct_dynamic_tunnel.wait())
+        .await
+        .expect("direct dynamic tunnel did not stop promptly")
+        .unwrap();
 
     let direct_exec = client::exec_capture_with_timeout(
         "direct-e2e",
         "ok",
-        Some(direct_master),
+        Some(direct_passphrase),
         Duration::from_secs(3),
     )
     .await
@@ -1357,7 +2340,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         client::exec_capture_with_timeout(
             "direct-e2e",
             "hang",
-            Some(direct_master),
+            Some(direct_passphrase),
             Duration::from_secs(3),
         )
         .await
@@ -1377,7 +2360,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         client::exec_capture_with_timeout(
             "direct-e2e",
             "disconnect",
-            Some(direct_master),
+            Some(direct_passphrase),
             Duration::from_secs(3),
         )
         .await
@@ -1401,7 +2384,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             "/evidence.txt",
             &direct_download_target,
             Duration::from_secs(5),
-            Some(Zeroizing::new(direct_master.to_owned())),
+            Some(Zeroizing::new(direct_passphrase.to_owned())),
         )
         .await
         .unwrap(),
@@ -1416,7 +2399,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         "/evidence.txt",
         &direct_download_target,
         Duration::from_secs(5),
-        Some(Zeroizing::new(direct_master.to_owned())),
+        Some(Zeroizing::new(direct_passphrase.to_owned())),
     )
     .await
     .unwrap_err();
@@ -1438,7 +2421,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             &direct_upload_source,
             "/direct-timeout.txt",
             Duration::from_secs(10),
-            Some(Zeroizing::new(direct_master.to_owned())),
+            Some(Zeroizing::new(direct_passphrase.to_owned())),
         )
         .await
     });
@@ -1459,6 +2442,142 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .any(|path| path.starts_with("/direct-timeout.txt.serctl-part-")));
     assert!(!state.files.lock().await.contains_key("/direct-timeout.txt"));
 
+    // Profile passphrase rotation is isolated: a use lease blocks rekeying
+    // only that profile and leaves the vault byte-identical, while another
+    // profile can still rotate independently.
+    let vault_path = vault::vault_path().unwrap();
+    let before_contended_rekey = std::fs::read(&vault_path).unwrap();
+    let rekey_use_lease = vault::acquire_profile_use_lease("direct-e2e").unwrap();
+    let rotated_direct_passphrase = "rotated-direct-profile-passphrase";
+    let contention = vault::change_profile_passphrase(
+        "direct-e2e",
+        direct_passphrase,
+        rotated_direct_passphrase,
+        None,
+    )
+    .unwrap_err();
+    assert!(contention
+        .to_string()
+        .contains("while it is in use by a direct operation or daemon"));
+    assert_eq!(std::fs::read(&vault_path).unwrap(), before_contended_rekey);
+
+    let tofu_identity = vault::verify_profile_identity(tofu_profile, tofu_passphrase).unwrap();
+    let rotated_tofu_passphrase = "rotated-tofu-profile-passphrase";
+    let rotated_tofu_generation = vault::change_profile_passphrase(
+        tofu_profile,
+        tofu_passphrase,
+        rotated_tofu_passphrase,
+        Some(tofu_identity),
+    )
+    .unwrap();
+    assert!(rotated_tofu_generation > tofu_identity.generation);
+    assert!(vault::verify_profile_passphrase(tofu_profile, tofu_passphrase).is_err());
+    assert_eq!(
+        vault::verify_profile_passphrase(tofu_profile, rotated_tofu_passphrase).unwrap(),
+        rotated_tofu_generation
+    );
+    drop(rekey_use_lease);
+
+    let direct_identity = vault::verify_profile_identity("direct-e2e", direct_passphrase).unwrap();
+    let rotated_direct_generation = vault::change_profile_passphrase(
+        "direct-e2e",
+        direct_passphrase,
+        rotated_direct_passphrase,
+        Some(direct_identity),
+    )
+    .unwrap();
+    assert!(rotated_direct_generation > direct_identity.generation);
+    assert!(vault::verify_profile_passphrase("direct-e2e", direct_passphrase).is_err());
+    assert_eq!(
+        vault::verify_profile_passphrase("direct-e2e", rotated_direct_passphrase).unwrap(),
+        rotated_direct_generation
+    );
+    assert_eq!(
+        vault::verify_profile_passphrase("e2e", E2E_PROFILE_PASSPHRASE).unwrap(),
+        vault::list_profile_metadata()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.name == "e2e")
+            .unwrap()
+            .generation
+    );
+    assert!(
+        vault::verify_profile_passphrase("e2e", rotated_direct_passphrase).is_err(),
+        "one profile's replacement passphrase unexpectedly authorized another profile"
+    );
+    let rotated_direct_identity =
+        vault::verify_profile_identity("direct-e2e", rotated_direct_passphrase).unwrap();
+
+    #[cfg(windows)]
+    {
+        // Offline preservation is genuinely 2-of-2: valid media with the
+        // wrong administrator password and valid administrator authorization
+        // with damaged media both fail without modifying the vault. Only the
+        // two valid halves together preserve the SSH credentials under a new
+        // independent profile passphrase.
+        let before_recovery_failures = std::fs::read(&vault_path).unwrap();
+        let recovered_passphrase = "recovered-direct-profile-passphrase";
+        let wrong_administrator = vault::recover_profile_with_media(
+            "direct-e2e",
+            recovery_media.as_slice(),
+            Some("definitely-wrong-administrator-password"),
+            recovered_passphrase,
+            Some(rotated_direct_identity),
+        )
+        .unwrap_err();
+        assert!(wrong_administrator.to_string().contains("administrator"));
+        assert_eq!(
+            std::fs::read(&vault_path).unwrap(),
+            before_recovery_failures
+        );
+
+        let mut damaged_media = Zeroizing::new(recovery_media.as_slice().to_vec());
+        let damaged_index = damaged_media.len() / 2;
+        damaged_media[damaged_index] ^= 0x5a;
+        let wrong_media = vault::recover_profile_with_media(
+            "direct-e2e",
+            damaged_media.as_slice(),
+            administrator_passphrase,
+            recovered_passphrase,
+            Some(rotated_direct_identity),
+        )
+        .unwrap_err();
+        assert!(
+            wrong_media.to_string().contains("recovery")
+                || wrong_media.to_string().contains("media")
+                || wrong_media.to_string().contains("JSON")
+        );
+        assert_eq!(
+            std::fs::read(&vault_path).unwrap(),
+            before_recovery_failures
+        );
+
+        let recovered = vault::recover_profile_with_media(
+            "direct-e2e",
+            recovery_media.as_slice(),
+            administrator_passphrase,
+            recovered_passphrase,
+            Some(rotated_direct_identity),
+        )
+        .unwrap();
+        assert!(recovered.generation > rotated_direct_generation);
+        assert!(vault::verify_profile_passphrase("direct-e2e", rotated_direct_passphrase).is_err());
+        assert_eq!(
+            vault::verify_profile_passphrase("direct-e2e", recovered_passphrase).unwrap(),
+            recovered.generation
+        );
+        let recovered_creds = vault::decrypt("direct-e2e", recovered_passphrase).unwrap();
+        assert_eq!(recovered_creds.host, direct_creds.host);
+        assert_eq!(recovered_creds.port, direct_creds.port);
+        assert_eq!(recovered_creds.user, direct_creds.user);
+        assert_eq!(recovered_creds.password, direct_creds.password);
+        assert_eq!(
+            recovered_creds.host_key.as_deref(),
+            Some(fingerprint.as_str())
+        );
+    }
+
+    echo_task.abort();
     ssh_task.abort();
     vault::set_test_home(None);
     std::fs::remove_dir_all(test_home).unwrap();

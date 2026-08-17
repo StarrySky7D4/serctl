@@ -2,23 +2,26 @@
 use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 use rand::{rngs::OsRng, RngCore};
-use russh::{client, keys::ssh_key, ChannelMsg};
+use russh::{client, keys::ssh_key, Channel, ChannelId, ChannelMsg, ChannelOpenFailure};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{
     Close, File, FileAttributes, Handle, Init, Name, OpenDir, Packet, ReadDir, RealPath, Status,
     StatusCode, VERSION,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -35,6 +38,299 @@ const SSH_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
 const TRANSPORT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const CHANNEL_OPERATION_TIMEOUT: Duration = Duration::from_millis(350);
 const CHANNEL_SIGNAL_GRACE: Duration = Duration::from_millis(100);
+pub const DEFAULT_TUNNEL_CONNECTIONS: usize = 32;
+pub const MAX_TUNNEL_CONNECTIONS: usize = 128;
+pub const MAX_TUNNEL_HOST_BYTES: usize = 255;
+/// Aggregate cap shared by every tunnel on one SSH transport. Per-tunnel
+/// limits preserve fairness without multiplying the daemon-wide live-flow
+/// bound across its long-lived tunnel control connections.
+const MAX_SESSION_TUNNEL_FLOWS: usize = 256;
+const MAX_REMOTE_FORWARD_PENDING: usize = 32;
+const TUNNEL_CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+const TUNNEL_REMOTE_TARGET_TIMEOUT: Duration = Duration::from_secs(10);
+const SOCKS5_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const TUNNEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const TUNNEL_STOP_TIMEOUT: Duration = Duration::from_secs(4);
+const TUNNEL_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+const TUNNEL_LOOPBACK_HOST: &str = "127.0.0.1";
+
+fn literal_socket_addr(host: &str, port: u16) -> Option<SocketAddr> {
+    let ip = host.parse::<IpAddr>().ok()?;
+    let ip = match ip {
+        IpAddr::V6(value) => value
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(value)),
+        value => value,
+    };
+    Some(SocketAddr::new(ip, port))
+}
+
+async fn connect_ssh_tcp_until(
+    host: &str,
+    port: u16,
+    deadline: tokio::time::Instant,
+) -> Result<tokio::net::TcpStream> {
+    let operation = async {
+        if let Some(address) = literal_socket_addr(host, port) {
+            let socket = match address {
+                SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+                SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+            }
+            .context("create SSH TCP socket")?;
+            Ok::<_, anyhow::Error>(socket.connect(address).await?)
+        } else {
+            Ok(tokio::net::TcpStream::connect((host, port)).await?)
+        }
+    };
+
+    match tokio::time::timeout_at(deadline, operation).await {
+        Ok(result) => result.context("connect SSH TCP socket"),
+        Err(_) => bail!("SSH connection exceeded its deadline"),
+    }
+}
+
+fn default_tunnel_connections_u16() -> u16 {
+    DEFAULT_TUNNEL_CONNECTIONS as u16
+}
+
+/// The SSH forwarding primitive used by a tunnel.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelMode {
+    Local,
+    Remote,
+    Dynamic,
+}
+
+/// A validated-at-startup SSH tunnel request.
+///
+/// Addresses are deliberately absent from this public type: local and dynamic
+/// listeners bind only to IPv4 loopback, remote listeners ask the SSH server
+/// to bind only to IPv4 loopback, and fixed L/R targets are IPv4 loopback on
+/// the opposite side of the SSH connection. This makes external exposure
+/// impossible to request through the CLI, UI, or IPC wire format.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelSpec {
+    pub mode: TunnelMode,
+    pub bind_port: u16,
+    #[serde(default)]
+    pub target_port: u16,
+    #[serde(default = "default_tunnel_connections_u16")]
+    pub max_connections: u16,
+}
+
+impl TunnelSpec {
+    #[cfg(test)]
+    pub fn local(bind_port: u16, target_port: u16) -> Self {
+        Self {
+            mode: TunnelMode::Local,
+            bind_port,
+            target_port,
+            max_connections: DEFAULT_TUNNEL_CONNECTIONS as u16,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn remote(bind_port: u16, target_port: u16) -> Self {
+        Self {
+            mode: TunnelMode::Remote,
+            bind_port,
+            target_port,
+            max_connections: DEFAULT_TUNNEL_CONNECTIONS as u16,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn dynamic(bind_port: u16) -> Self {
+        Self {
+            mode: TunnelMode::Dynamic,
+            bind_port,
+            target_port: 0,
+            max_connections: DEFAULT_TUNNEL_CONNECTIONS as u16,
+        }
+    }
+
+    pub fn mode(&self) -> TunnelMode {
+        self.mode
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ValidatedTunnelSpec::try_from(self.clone()).map(drop)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TunnelReady {
+    pub mode: TunnelMode,
+    pub bind_host: String,
+    pub bind_port: u16,
+}
+
+/// Owns the cancellation lease for one running tunnel. Dropping the handle
+/// requests cooperative cleanup; callers that need confirmation should use
+/// `stop` or `wait`.
+pub struct RunningTunnel {
+    ready: TunnelReady,
+    cancellation: CancellationToken,
+    task: Option<JoinHandle<Result<()>>>,
+}
+
+impl RunningTunnel {
+    pub fn ready(&self) -> &TunnelReady {
+        &self.ready
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    pub async fn wait(mut self) -> Result<()> {
+        let mut task = self.task.take().context("tunnel task is missing")?;
+        if !self.cancellation.is_cancelled() {
+            tokio::select! {
+                result = &mut task => return result.context("join SSH tunnel task")?,
+                _ = self.cancellation.cancelled() => {}
+            }
+        }
+        match tokio::time::timeout(TUNNEL_STOP_TIMEOUT, &mut task).await {
+            Ok(result) => result.context("join SSH tunnel task")?,
+            Err(_) => {
+                // Dropping an aborted remote-forward worker runs the armed
+                // lease guard: it removes the generation-bound registry entry
+                // and trips the SSH transport, so no remote listener can be
+                // left usable after this bounded stop returns.
+                task.abort();
+                let _ = task.await;
+                bail!("SSH tunnel cleanup exceeded its deadline")
+            }
+        }
+    }
+
+    pub async fn stop(self) -> Result<()> {
+        self.cancellation.cancel();
+        self.wait().await
+    }
+}
+
+impl Drop for RunningTunnel {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ValidatedTunnelSpec {
+    Local {
+        bind: SocketAddr,
+        target_port: u16,
+        max_connections: usize,
+    },
+    Remote {
+        bind_port: u16,
+        target_port: u16,
+        max_connections: usize,
+    },
+    Dynamic {
+        bind: SocketAddr,
+        max_connections: usize,
+    },
+}
+
+fn validate_tunnel_host(label: &str, host: &str) -> Result<()> {
+    ensure!(
+        !host.is_empty() && host.len() <= MAX_TUNNEL_HOST_BYTES,
+        "{label} must contain 1 to {MAX_TUNNEL_HOST_BYTES} bytes"
+    );
+    ensure!(host.is_ascii(), "{label} must contain only ASCII bytes");
+    ensure!(
+        !host
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace()),
+        "{label} contains whitespace or a control byte"
+    );
+    Ok(())
+}
+
+fn validate_tunnel_connections(max_connections: usize) -> Result<()> {
+    ensure!(
+        (1..=MAX_TUNNEL_CONNECTIONS).contains(&max_connections),
+        "tunnel connection limit must be between 1 and {MAX_TUNNEL_CONNECTIONS}"
+    );
+    Ok(())
+}
+
+fn tunnel_loopback_addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+fn remote_forward_channel_is_loopback_only(
+    connected_address: &str,
+    originator_address: &str,
+) -> bool {
+    let is_ipv4_localhost = |address: &str| {
+        matches!(
+            address.parse::<IpAddr>(),
+            Ok(IpAddr::V4(value)) if value == Ipv4Addr::LOCALHOST
+        )
+    };
+    is_ipv4_localhost(connected_address) && is_ipv4_localhost(originator_address)
+}
+
+impl TryFrom<TunnelSpec> for ValidatedTunnelSpec {
+    type Error = anyhow::Error;
+
+    fn try_from(spec: TunnelSpec) -> Result<Self> {
+        let TunnelSpec {
+            mode,
+            bind_port,
+            target_port,
+            max_connections,
+        } = spec;
+        let max_connections = usize::from(max_connections);
+        validate_tunnel_connections(max_connections)?;
+        match mode {
+            TunnelMode::Local => {
+                ensure!(
+                    target_port != 0,
+                    "local-forward target port must not be zero"
+                );
+                Ok(Self::Local {
+                    bind: tunnel_loopback_addr(bind_port),
+                    target_port,
+                    max_connections,
+                })
+            }
+            TunnelMode::Remote => {
+                ensure!(
+                    target_port != 0,
+                    "remote-forward target port must not be zero"
+                );
+                Ok(Self::Remote {
+                    bind_port,
+                    target_port,
+                    max_connections,
+                })
+            }
+            TunnelMode::Dynamic => {
+                ensure!(
+                    target_port == 0,
+                    "dynamic forwarding target port must be zero"
+                );
+                Ok(Self::Dynamic {
+                    bind: tunnel_loopback_addr(bind_port),
+                    max_connections,
+                })
+            }
+        }
+    }
+}
 
 // Directory listings are returned as one or more SSH_FXP_NAME packets. The
 // high-level russh-sftp `read_dir` API buffers every packet into one Vec before
@@ -330,7 +626,6 @@ pub fn protected_upload_file_attributes() -> FileAttributes {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RemoteUploadCommit {
-    pub used_hardlink: bool,
     pub partial_removed: bool,
 }
 
@@ -348,35 +643,29 @@ where
     RF: std::future::Future<Output = Result<()>>,
     UF: std::future::Future<Output = Result<()>>,
 {
+    // Keep the fallback closure injectable so tests can prove it is never
+    // invoked. Dropping it without polling is the fail-closed compatibility
+    // boundary for servers that lack the hardlink extension.
+    let _rename = rename;
     match hardlink().await? {
         true => {
             committed.store(true, Ordering::Release);
             let partial_removed = unlink_partial().await.is_ok();
             Ok(RemoteUploadCommit {
-                used_hardlink: true,
                 partial_removed,
             })
         }
-        false => {
-            // SFTP v3 RENAME specifies failure when `newpath` exists. This
-            // fallback is used only when the server did not advertise the
-            // OpenSSH hardlink extension, and therefore relies on a compliant
-            // server implementation for no-replace behavior.
-            rename().await?;
-            committed.store(true, Ordering::Release);
-            Ok(RemoteUploadCommit {
-                used_hardlink: false,
-                partial_removed: true,
-            })
-        }
+        false => bail!(
+            "SSH server does not support hardlink@openssh.com; refusing an upload commit whose no-overwrite semantics cannot be proven"
+        ),
     }
 }
 
 /// Commit a completed remote sibling without overwriting an existing target.
-/// Each remote mutation is guarded separately, including the rename fallback,
-/// so no SFTP request is polled after the caller's absolute deadline. An
-/// advertised hardlink extension is authoritative: any hardlink error is a safe
-/// failure and must never fall back to the less strongly implemented v3 RENAME.
+/// Each remote mutation is guarded separately so no SFTP request is polled
+/// after the caller's absolute deadline. The OpenSSH hardlink extension is
+/// required because SFTP v3 RENAME behavior is not sufficiently consistent
+/// across servers to prove no-overwrite semantics.
 pub async fn commit_remote_upload_no_replace_until(
     sftp: &SftpSession,
     partial: &str,
@@ -440,9 +729,124 @@ fn secure_client_algorithms() -> russh::Preferred {
     preferred
 }
 
+struct IncomingRemoteForward {
+    channel: Channel<client::Msg>,
+    reply: client::ChannelOpenHandle,
+}
+
+impl IncomingRemoteForward {
+    async fn reject(self, reason: ChannelOpenFailure) {
+        self.reply.reject(reason).await;
+    }
+}
+
+#[derive(Default)]
+struct RemoteForwardRegistry {
+    state: Mutex<RemoteForwardRegistryState>,
+}
+
+#[derive(Default)]
+struct RemoteForwardRegistryState {
+    next_generation: u64,
+    routes: HashMap<u16, RemoteForwardRoute>,
+}
+
+struct RemoteForwardRoute {
+    generation: u64,
+    sender: mpsc::Sender<IncomingRemoteForward>,
+}
+
+impl RemoteForwardRegistry {
+    fn contains_port(&self, port: u16) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .routes
+            .contains_key(&port)
+    }
+
+    fn register(
+        self: &Arc<Self>,
+        port: u16,
+        sender: mpsc::Sender<IncomingRemoteForward>,
+    ) -> Result<RemoteForwardRegistration> {
+        ensure!(port != 0, "remote-forward effective port must not be zero");
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        ensure!(
+            !state.routes.contains_key(&port),
+            "remote-forward port {port} is already registered on this SSH session"
+        );
+        state.next_generation = state
+            .next_generation
+            .checked_add(1)
+            .context("remote-forward registration generation exhausted")?;
+        let generation = state.next_generation;
+        state
+            .routes
+            .insert(port, RemoteForwardRoute { generation, sender });
+        Ok(RemoteForwardRegistration {
+            registry: Arc::clone(self),
+            port,
+            generation,
+            armed: true,
+        })
+    }
+
+    fn sender_for(&self, port: u32) -> Option<mpsc::Sender<IncomingRemoteForward>> {
+        let port = u16::try_from(port).ok()?;
+        if port == 0 {
+            return None;
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .routes
+            .get(&port)
+            .map(|route| route.sender.clone())
+    }
+
+    fn remove_if_generation(&self, port: u16, generation: u64) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state
+            .routes
+            .get(&port)
+            .is_some_and(|route| route.generation == generation)
+        {
+            state.routes.remove(&port);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct RemoteForwardRegistration {
+    registry: Arc<RemoteForwardRegistry>,
+    port: u16,
+    generation: u64,
+    armed: bool,
+}
+
+impl RemoteForwardRegistration {
+    fn remove(&mut self) {
+        if self.armed {
+            self.registry
+                .remove_if_generation(self.port, self.generation);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for RemoteForwardRegistration {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
 pub struct SshHandler {
     expect: Option<String>,
     seen: Arc<Mutex<Option<String>>>,
+    remote_forwards: Arc<RemoteForwardRegistry>,
 }
 
 fn require_server_fingerprint(observed: Option<String>) -> Result<String> {
@@ -472,12 +876,144 @@ impl client::Handler for SshHandler {
         };
         Ok(accept)
     }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        let incoming = IncomingRemoteForward { channel, reply };
+        // A server configured with OpenSSH GatewayPorts may replace the
+        // requested 127.0.0.1 listener with a wildcard listener. Refuse both
+        // a non-loopback connected address and every non-loopback originator,
+        // so such an externally reachable socket cannot become a usable
+        // serctl forwarding path even when the server overrides the bind.
+        if !remote_forward_channel_is_loopback_only(connected_address, originator_address) {
+            drop(incoming);
+            return Ok(());
+        }
+        let sender = self.remote_forwards.sender_for(connected_port);
+        match sender {
+            Some(sender) => match sender.try_send(incoming) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(incoming)) => {
+                    // This callback runs inside russh's session loop. An
+                    // awaited reject sends into a bounded queue drained by
+                    // that same loop and can self-deadlock when a hostile
+                    // server floods channel-open requests. Dropping the
+                    // handle uses russh's non-blocking fail-closed reject.
+                    drop(incoming);
+                }
+                Err(mpsc::error::TrySendError::Closed(incoming)) => {
+                    drop(incoming);
+                }
+            },
+            None => {
+                drop(incoming);
+            }
+        }
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        drop(reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        drop(reply);
+        Ok(())
+    }
+
+    async fn should_accept_unknown_server_channel(
+        &mut self,
+        _id: ChannelId,
+        _channel_type: &str,
+    ) -> bool {
+        false
+    }
+
+    async fn server_channel_open_unknown(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        drop(reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_session(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        drop(reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        drop(reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        drop(reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        drop(reply);
+        Ok(())
+    }
 }
 
 pub struct SshSession {
     handle: client::Handle<SshHandler>,
     invalidated: Arc<AtomicBool>,
     transport: TransportControl,
+    remote_forwards: Arc<RemoteForwardRegistry>,
+    remote_forward_setup: AsyncMutex<()>,
+    tunnel_flow_permits: Arc<Semaphore>,
 }
 
 pub struct ExecResult {
@@ -502,6 +1038,33 @@ impl TransportTrip {
     fn trip(&self) {
         self.invalidated.store(true, Ordering::Release);
         self.cancel.cancel();
+    }
+}
+
+/// Channel-open and global-request futures do not expose whether a cancelled
+/// wait left state inside russh or on the peer. Keep this guard armed across
+/// those awaits so outer task cancellation fails closed by dropping the whole
+/// transport instead of leaking an SSH channel or remote listener.
+struct TripTransportOnDrop {
+    trip: TransportTrip,
+    armed: bool,
+}
+
+impl TripTransportOnDrop {
+    fn new(trip: TransportTrip) -> Self {
+        Self { trip, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TripTransportOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.trip.trip();
+        }
     }
 }
 
@@ -748,6 +1311,7 @@ pub struct StagedSshSession {
     handle: Option<client::Handle<SshHandler>>,
     invalidated: Arc<AtomicBool>,
     transport: Option<TransportControl>,
+    remote_forwards: Arc<RemoteForwardRegistry>,
     observed_fingerprint: String,
 }
 
@@ -824,6 +1388,9 @@ impl StagedSshSession {
                     handle,
                     invalidated: self.invalidated.clone(),
                     transport,
+                    remote_forwards: Arc::clone(&self.remote_forwards),
+                    remote_forward_setup: AsyncMutex::new(()),
+                    tunnel_flow_permits: Arc::new(Semaphore::new(MAX_SESSION_TUNNEL_FLOWS)),
                 })
             }
             Ok(Some(Ok(_))) => {
@@ -856,6 +1423,7 @@ impl SshSession {
         deadline: tokio::time::Instant,
     ) -> Result<StagedSshSession> {
         let seen = Arc::new(Mutex::new(None));
+        let remote_forwards = Arc::new(RemoteForwardRegistry::default());
         let cfg = client::Config {
             // This is a second line of defence for pre-authentication stalls.
             // The external absolute deadline is enforced by the proxy below;
@@ -870,16 +1438,9 @@ impl SshSession {
         let handler = SshHandler {
             expect: expect.clone(),
             seen: seen.clone(),
+            remote_forwards: Arc::clone(&remote_forwards),
         };
-        let socket = match tokio::time::timeout_at(
-            deadline,
-            tokio::net::TcpStream::connect((creds.host.as_str(), creds.port)),
-        )
-        .await
-        {
-            Ok(result) => result.context("connect SSH TCP socket")?,
-            Err(_) => bail!("SSH connection exceeded its deadline"),
-        };
+        let socket = connect_ssh_tcp_until(creds.host.as_str(), creds.port, deadline).await?;
         if cfg.nodelay {
             socket.set_nodelay(true).context("set SSH TCP_NODELAY")?;
         }
@@ -927,6 +1488,7 @@ impl SshSession {
             handle: Some(handle),
             invalidated,
             transport: Some(transport),
+            remote_forwards,
             observed_fingerprint: fp,
         })
     }
@@ -983,6 +1545,312 @@ impl SshSession {
         )
         .await;
         let _ = self.transport.stop_and_wait().await;
+    }
+
+    /// Open a direct-tcpip channel within one absolute deadline. Cancellation
+    /// after this future has started is transport-fatal because russh does not
+    /// expose whether its channel-open request was already queued.
+    pub async fn open_direct_tcpip_until(
+        &self,
+        target_host: &str,
+        target_port: u16,
+        originator: SocketAddr,
+        deadline: tokio::time::Instant,
+    ) -> Result<Channel<client::Msg>> {
+        validate_tunnel_host("direct-tcpip target host", target_host)?;
+        ensure!(
+            target_port != 0,
+            "direct-tcpip target port must not be zero"
+        );
+        ensure!(
+            deadline > tokio::time::Instant::now(),
+            "direct-tcpip channel-open deadline expired"
+        );
+        let mut uncertain = TripTransportOnDrop::new(self.transport_trip());
+        let deadline_expired = AtomicBool::new(false);
+        let opened = poll_remote_mutation_until(
+            deadline,
+            self.handle.channel_open_direct_tcpip(
+                target_host,
+                u32::from(target_port),
+                originator.ip().to_string(),
+                u32::from(originator.port()),
+            ),
+            || {},
+            || deadline_expired.store(true, Ordering::Release),
+            "direct-tcpip channel open exceeded its deadline",
+        )
+        .await;
+        match opened {
+            Ok(channel) => {
+                uncertain.disarm();
+                Ok(channel)
+            }
+            Err(error) if !deadline_expired.load(Ordering::Acquire) => {
+                uncertain.disarm();
+                Err(error)
+            }
+            Err(error) => {
+                self.invalidate().await;
+                uncertain.disarm();
+                Err(error)
+            }
+        }
+    }
+
+    async fn request_remote_forward_until(
+        &self,
+        bind_host: &str,
+        bind_port: u16,
+        deadline: tokio::time::Instant,
+    ) -> Result<u16> {
+        validate_tunnel_host("remote tunnel bind host", bind_host)?;
+        ensure!(
+            deadline > tokio::time::Instant::now(),
+            "remote-forward setup deadline expired"
+        );
+        let mut uncertain = TripTransportOnDrop::new(self.transport_trip());
+        let deadline_expired = AtomicBool::new(false);
+        let requested = poll_remote_mutation_until(
+            deadline,
+            self.handle.tcpip_forward(bind_host, u32::from(bind_port)),
+            || {},
+            || deadline_expired.store(true, Ordering::Release),
+            "remote-forward request exceeded its deadline",
+        )
+        .await;
+        match requested {
+            Ok(returned_port) => {
+                let effective = if bind_port == 0 {
+                    u16::try_from(returned_port)
+                        .ok()
+                        .filter(|port| *port != 0)
+                        .context("SSH server did not return a valid allocated forwarding port")?
+                } else {
+                    ensure!(
+                        returned_port == 0,
+                        "SSH server returned unexpected data for a fixed forwarding port"
+                    );
+                    bind_port
+                };
+                uncertain.disarm();
+                Ok(effective)
+            }
+            Err(error) if !deadline_expired.load(Ordering::Acquire) => {
+                uncertain.disarm();
+                Err(error)
+            }
+            Err(error) => {
+                self.invalidate().await;
+                uncertain.disarm();
+                Err(error)
+            }
+        }
+    }
+
+    async fn cancel_remote_forward_until(
+        &self,
+        bind_host: &str,
+        effective_port: u16,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        ensure!(
+            effective_port != 0,
+            "remote-forward cancel port must not be zero"
+        );
+        if self.is_closed() {
+            return Ok(());
+        }
+        ensure!(
+            deadline > tokio::time::Instant::now(),
+            "remote-forward cancellation deadline expired"
+        );
+        let mut uncertain = TripTransportOnDrop::new(self.transport_trip());
+        let cancelled = poll_remote_mutation_until(
+            deadline,
+            self.handle
+                .cancel_tcpip_forward(bind_host, u32::from(effective_port)),
+            || {},
+            || {},
+            "remote-forward cancellation exceeded its deadline",
+        )
+        .await;
+        match cancelled {
+            Ok(()) => {
+                uncertain.disarm();
+                Ok(())
+            }
+            Err(error) => {
+                self.invalidate().await;
+                uncertain.disarm();
+                Err(error)
+            }
+        }
+    }
+
+    /// Validate and start one local, remote, or dynamic forwarding lease.
+    /// The returned handle owns cancellation; daemon reconnect policy remains
+    /// an upper-layer concern and can start a replacement tunnel on a new
+    /// `Arc<SshSession>` after this one finishes.
+    pub async fn start_tunnel(
+        self: &Arc<Self>,
+        spec: TunnelSpec,
+        setup_deadline: tokio::time::Instant,
+    ) -> Result<RunningTunnel> {
+        ensure!(
+            setup_deadline > tokio::time::Instant::now(),
+            "SSH tunnel setup deadline expired"
+        );
+        let validated = ValidatedTunnelSpec::try_from(spec)?;
+        let cancellation = CancellationToken::new();
+        match validated {
+            ValidatedTunnelSpec::Local {
+                bind,
+                target_port,
+                max_connections,
+            } => {
+                let listener = bind_tunnel_listener_until(bind, setup_deadline).await?;
+                let local = listener
+                    .local_addr()
+                    .context("query local tunnel listener")?;
+                let ready = TunnelReady {
+                    mode: TunnelMode::Local,
+                    bind_host: local.ip().to_string(),
+                    bind_port: local.port(),
+                };
+                let session = Arc::clone(self);
+                let session_permits = Arc::clone(&self.tunnel_flow_permits);
+                let worker_cancel = cancellation.clone();
+                let task = tokio::spawn(async move {
+                    run_local_forward(
+                        session,
+                        listener,
+                        target_port,
+                        max_connections,
+                        session_permits,
+                        worker_cancel,
+                    )
+                    .await
+                });
+                Ok(RunningTunnel {
+                    ready,
+                    cancellation,
+                    task: Some(task),
+                })
+            }
+            ValidatedTunnelSpec::Dynamic {
+                bind,
+                max_connections,
+            } => {
+                let listener = bind_tunnel_listener_until(bind, setup_deadline).await?;
+                let local = listener
+                    .local_addr()
+                    .context("query SOCKS5 tunnel listener")?;
+                let ready = TunnelReady {
+                    mode: TunnelMode::Dynamic,
+                    bind_host: local.ip().to_string(),
+                    bind_port: local.port(),
+                };
+                let session = Arc::clone(self);
+                let session_permits = Arc::clone(&self.tunnel_flow_permits);
+                let worker_cancel = cancellation.clone();
+                let task = tokio::spawn(async move {
+                    run_dynamic_forward(
+                        session,
+                        listener,
+                        max_connections,
+                        session_permits,
+                        worker_cancel,
+                    )
+                    .await
+                });
+                Ok(RunningTunnel {
+                    ready,
+                    cancellation,
+                    task: Some(task),
+                })
+            }
+            ValidatedTunnelSpec::Remote {
+                bind_port,
+                target_port,
+                max_connections,
+            } => {
+                let (lease, incoming, effective_port) = self
+                    .setup_remote_forward(bind_port, max_connections, setup_deadline)
+                    .await?;
+                let ready = TunnelReady {
+                    mode: TunnelMode::Remote,
+                    bind_host: TUNNEL_LOOPBACK_HOST.to_owned(),
+                    bind_port: effective_port,
+                };
+                let worker_cancel = cancellation.clone();
+                let session_permits = Arc::clone(&self.tunnel_flow_permits);
+                let task = tokio::spawn(async move {
+                    run_remote_forward(
+                        lease,
+                        incoming,
+                        target_port,
+                        max_connections,
+                        session_permits,
+                        worker_cancel,
+                    )
+                    .await
+                });
+                Ok(RunningTunnel {
+                    ready,
+                    cancellation,
+                    task: Some(task),
+                })
+            }
+        }
+    }
+
+    async fn setup_remote_forward(
+        self: &Arc<Self>,
+        bind_port: u16,
+        max_connections: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<(
+        RemoteForwardLease,
+        mpsc::Receiver<IncomingRemoteForward>,
+        u16,
+    )> {
+        let _setup = self.remote_forward_setup.lock().await;
+        if bind_port != 0 {
+            ensure!(
+                !self.remote_forwards.contains_port(bind_port),
+                "remote-forward port {bind_port} is already registered on this SSH session"
+            );
+        }
+        let effective_port = self
+            .request_remote_forward_until(TUNNEL_LOOPBACK_HOST, bind_port, deadline)
+            .await?;
+        if self.remote_forwards.contains_port(effective_port) {
+            // A server must not allocate a port already active on this same
+            // transport. Cancelling by port could tear down the legitimate
+            // older lease, so close the transport to retire both safely.
+            self.invalidate().await;
+            bail!("SSH server allocated a duplicate remote-forward port");
+        }
+        let (sender, incoming) = mpsc::channel(max_connections.min(MAX_REMOTE_FORWARD_PENDING));
+        let registration = match self.remote_forwards.register(effective_port, sender) {
+            Ok(registration) => registration,
+            Err(error) => {
+                self.invalidate().await;
+                return Err(error);
+            }
+        };
+        Ok((
+            RemoteForwardLease {
+                session: Arc::clone(self),
+                bind_host: TUNNEL_LOOPBACK_HOST.to_owned(),
+                effective_port,
+                registration: Some(registration),
+                armed: true,
+            },
+            incoming,
+            effective_port,
+        ))
     }
 
     /// Open a command channel without sending the exec request yet. This is
@@ -1184,6 +2052,605 @@ impl SshSession {
             }
         }
     }
+}
+
+struct RemoteForwardLease {
+    session: Arc<SshSession>,
+    bind_host: String,
+    effective_port: u16,
+    registration: Option<RemoteForwardRegistration>,
+    armed: bool,
+}
+
+impl RemoteForwardLease {
+    async fn stop(mut self) -> Result<()> {
+        // Reject new server-initiated channels before asking the server to
+        // retire the listener. Existing accepted channels are cancelled by
+        // the tunnel-wide cancellation token separately.
+        drop(self.registration.take());
+        if self.session.is_closed() {
+            self.armed = false;
+            return Ok(());
+        }
+        let result = self
+            .session
+            .cancel_remote_forward_until(
+                &self.bind_host,
+                self.effective_port,
+                tokio::time::Instant::now() + TUNNEL_CHANNEL_OPEN_TIMEOUT,
+            )
+            .await;
+        // cancel_remote_forward_until invalidates the transport on every
+        // uncertain/error result, so the Drop fallback is no longer needed.
+        self.armed = false;
+        result
+    }
+}
+
+impl Drop for RemoteForwardLease {
+    fn drop(&mut self) {
+        drop(self.registration.take());
+        if self.armed {
+            self.session.transport_trip().trip();
+        }
+    }
+}
+
+async fn bind_tunnel_listener_until(
+    bind: SocketAddr,
+    deadline: tokio::time::Instant,
+) -> Result<tokio::net::TcpListener> {
+    poll_remote_mutation_until(
+        deadline,
+        tokio::net::TcpListener::bind(bind),
+        || {},
+        || {},
+        "local tunnel listener setup exceeded its deadline",
+    )
+    .await
+    .context("bind local tunnel listener")
+}
+
+async fn bridge_streams<A, B>(
+    mut left: A,
+    mut right: B,
+    cancellation: CancellationToken,
+) -> Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            let _ = tokio::time::timeout(TUNNEL_DRAIN_TIMEOUT, async {
+                let _ = left.shutdown().await;
+                let _ = right.shutdown().await;
+            }).await;
+            Ok(())
+        }
+        result = tokio::io::copy_bidirectional(&mut left, &mut right) => {
+            result.context("bridge SSH tunnel stream")?;
+            Ok(())
+        }
+    }
+}
+
+async fn serve_local_forward_connection(
+    session: Arc<SshSession>,
+    socket: tokio::net::TcpStream,
+    peer: SocketAddr,
+    target_port: u16,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + TUNNEL_CHANNEL_OPEN_TIMEOUT;
+    let channel = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Ok(()),
+        opened = session.open_direct_tcpip_until(
+            TUNNEL_LOOPBACK_HOST,
+            target_port,
+            peer,
+            deadline,
+        ) => opened?,
+    };
+    bridge_streams(socket, channel.into_stream(), cancellation).await
+}
+
+fn log_tunnel_flow_result(result: Result<()>) {
+    if let Err(error) = result {
+        log::debug!("SSH tunnel connection ended: {error:#}");
+    }
+}
+
+fn log_tunnel_join_result(result: std::result::Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result {
+        if !error.is_cancelled() {
+            log::debug!("SSH tunnel connection task ended: {error}");
+        }
+    }
+}
+
+async fn drain_tunnel_flows(flows: &mut JoinSet<()>) {
+    let drained = tokio::time::timeout(TUNNEL_DRAIN_TIMEOUT, async {
+        while let Some(joined) = flows.join_next().await {
+            log_tunnel_join_result(joined);
+        }
+    })
+    .await;
+    if drained.is_err() {
+        flows.abort_all();
+        while let Some(joined) = flows.join_next().await {
+            log_tunnel_join_result(joined);
+        }
+    }
+}
+
+async fn run_local_forward(
+    session: Arc<SshSession>,
+    listener: tokio::net::TcpListener,
+    target_port: u16,
+    max_connections: usize,
+    session_permits: Arc<Semaphore>,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let permits = Arc::new(Semaphore::new(max_connections));
+    let mut flows = JoinSet::new();
+    let mut session_poll = tokio::time::interval(TUNNEL_SESSION_POLL_INTERVAL);
+    session_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let result = loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => break Ok(()),
+            _ = session_poll.tick() => {
+                if session.is_closed() {
+                    break Err(anyhow::anyhow!("SSH session closed while local tunnel was active"));
+                }
+            }
+            joined = flows.join_next(), if !flows.is_empty() => {
+                if let Some(joined) = joined {
+                    log_tunnel_join_result(joined);
+                }
+            }
+            accepted = listener.accept() => {
+                let (socket, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error).context("accept local tunnel connection"),
+                };
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    log::debug!("rejecting local tunnel connection: connection limit reached");
+                    drop(socket);
+                    continue;
+                };
+                let Ok(session_permit) = Arc::clone(&session_permits).try_acquire_owned() else {
+                    log::debug!("rejecting local tunnel connection: SSH-session flow limit reached");
+                    drop(socket);
+                    continue;
+                };
+                let flow_session = Arc::clone(&session);
+                let flow_cancel = cancellation.clone();
+                flows.spawn(async move {
+                    let _permit = permit;
+                    let _session_permit = session_permit;
+                    log_tunnel_flow_result(
+                        serve_local_forward_connection(
+                            flow_session,
+                            socket,
+                            peer,
+                            target_port,
+                            flow_cancel,
+                        )
+                        .await,
+                    );
+                });
+            }
+        }
+    };
+    cancellation.cancel();
+    drop(listener);
+    drain_tunnel_flows(&mut flows).await;
+    result
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SocksTarget {
+    host: String,
+    port: u16,
+}
+
+async fn socks_read_exact_until<S>(
+    stream: &mut S,
+    bytes: &mut [u8],
+    deadline: tokio::time::Instant,
+) -> Result<()>
+where
+    S: AsyncRead + Unpin,
+{
+    match tokio::time::timeout_at(deadline, stream.read_exact(bytes)).await {
+        Ok(result) => {
+            result.context("read SOCKS5 handshake")?;
+            Ok(())
+        }
+        Err(_) => bail!("SOCKS5 handshake exceeded its deadline"),
+    }
+}
+
+async fn socks_write_all_until<S>(
+    stream: &mut S,
+    bytes: &[u8],
+    deadline: tokio::time::Instant,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout_at(deadline, stream.write_all(bytes)).await {
+        Ok(result) => result.context("write SOCKS5 response"),
+        Err(_) => bail!("SOCKS5 response write exceeded its deadline"),
+    }
+}
+
+async fn write_socks5_reply<S>(
+    stream: &mut S,
+    reply: u8,
+    deadline: tokio::time::Instant,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    // russh does not expose the remote socket selected by direct-tcpip, so the
+    // RFC1928 BND fields are returned as an unspecified IPv4 address/port.
+    socks_write_all_until(stream, &[5, reply, 0, 1, 0, 0, 0, 0, 0, 0], deadline).await
+}
+
+fn validate_socks_domain(bytes: &[u8]) -> Result<String> {
+    ensure!(!bytes.is_empty(), "SOCKS5 domain is empty");
+    ensure!(
+        bytes.is_ascii(),
+        "SOCKS5 domain must contain only ASCII bytes"
+    );
+    ensure!(
+        bytes
+            .iter()
+            .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') }),
+        "SOCKS5 domain contains an unsupported byte"
+    );
+    let domain = std::str::from_utf8(bytes).context("decode SOCKS5 ASCII domain")?;
+    validate_tunnel_host("SOCKS5 domain", domain)?;
+    Ok(domain.to_owned())
+}
+
+/// Perform only the SOCKS5 negotiation and CONNECT request parsing. A `None`
+/// result means the request was rejected with a complete protocol response.
+async fn socks5_handshake<S>(
+    stream: &mut S,
+    deadline: tokio::time::Instant,
+) -> Result<Option<SocksTarget>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut greeting = [0_u8; 2];
+    socks_read_exact_until(stream, &mut greeting, deadline).await?;
+    ensure!(greeting[0] == 5, "unsupported SOCKS version");
+    ensure!(greeting[1] != 0, "SOCKS5 greeting contains no methods");
+    let mut methods = vec![0_u8; usize::from(greeting[1])];
+    socks_read_exact_until(stream, &mut methods, deadline).await?;
+    if !methods.contains(&0) {
+        socks_write_all_until(stream, &[5, 0xff], deadline).await?;
+        return Ok(None);
+    }
+    socks_write_all_until(stream, &[5, 0], deadline).await?;
+
+    let mut request = [0_u8; 4];
+    socks_read_exact_until(stream, &mut request, deadline).await?;
+    if request[0] != 5 || request[2] != 0 {
+        write_socks5_reply(stream, 1, deadline).await?;
+        return Ok(None);
+    }
+    if request[1] != 1 {
+        write_socks5_reply(stream, 7, deadline).await?;
+        return Ok(None);
+    }
+
+    let host = match request[3] {
+        1 => {
+            let mut address = [0_u8; 4];
+            socks_read_exact_until(stream, &mut address, deadline).await?;
+            IpAddr::from(address).to_string()
+        }
+        4 => {
+            let mut address = [0_u8; 16];
+            socks_read_exact_until(stream, &mut address, deadline).await?;
+            IpAddr::from(address).to_string()
+        }
+        3 => {
+            let mut length = [0_u8; 1];
+            socks_read_exact_until(stream, &mut length, deadline).await?;
+            if length[0] == 0 {
+                write_socks5_reply(stream, 8, deadline).await?;
+                return Ok(None);
+            }
+            let mut domain = vec![0_u8; usize::from(length[0])];
+            socks_read_exact_until(stream, &mut domain, deadline).await?;
+            match validate_socks_domain(&domain) {
+                Ok(domain) => domain,
+                Err(_) => {
+                    write_socks5_reply(stream, 8, deadline).await?;
+                    return Ok(None);
+                }
+            }
+        }
+        _ => {
+            write_socks5_reply(stream, 8, deadline).await?;
+            return Ok(None);
+        }
+    };
+    let mut port = [0_u8; 2];
+    socks_read_exact_until(stream, &mut port, deadline).await?;
+    let port = u16::from_be_bytes(port);
+    if port == 0 {
+        write_socks5_reply(stream, 1, deadline).await?;
+        return Ok(None);
+    }
+    Ok(Some(SocksTarget { host, port }))
+}
+
+fn socks5_reply_for_ssh_error(error: &anyhow::Error) -> u8 {
+    match error.downcast_ref::<russh::Error>() {
+        Some(russh::Error::ChannelOpenFailure(ChannelOpenFailure::AdministrativelyProhibited)) => 2,
+        Some(russh::Error::ChannelOpenFailure(ChannelOpenFailure::ConnectFailed)) => 5,
+        Some(russh::Error::ChannelOpenFailure(ChannelOpenFailure::ResourceShortage)) => 1,
+        _ if error.to_string().contains("deadline") => 6,
+        _ => 1,
+    }
+}
+
+async fn serve_dynamic_forward_connection(
+    session: Arc<SshSession>,
+    mut socket: tokio::net::TcpStream,
+    peer: SocketAddr,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let handshake_deadline = tokio::time::Instant::now() + SOCKS5_HANDSHAKE_TIMEOUT;
+    let target = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Ok(()),
+        result = socks5_handshake(&mut socket, handshake_deadline) => match result? {
+            Some(target) => target,
+            None => return Ok(()),
+        },
+    };
+    let channel_deadline = tokio::time::Instant::now() + TUNNEL_CHANNEL_OPEN_TIMEOUT;
+    let opened = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Ok(()),
+        result = session.open_direct_tcpip_until(
+            &target.host,
+            target.port,
+            peer,
+            channel_deadline,
+        ) => result,
+    };
+    let channel = match opened {
+        Ok(channel) => channel,
+        Err(error) => {
+            let reply = socks5_reply_for_ssh_error(&error);
+            let _ = write_socks5_reply(
+                &mut socket,
+                reply,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    write_socks5_reply(
+        &mut socket,
+        0,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+    )
+    .await?;
+    bridge_streams(socket, channel.into_stream(), cancellation).await
+}
+
+async fn run_dynamic_forward(
+    session: Arc<SshSession>,
+    listener: tokio::net::TcpListener,
+    max_connections: usize,
+    session_permits: Arc<Semaphore>,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let permits = Arc::new(Semaphore::new(max_connections));
+    let mut flows = JoinSet::new();
+    let mut session_poll = tokio::time::interval(TUNNEL_SESSION_POLL_INTERVAL);
+    session_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let result = loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => break Ok(()),
+            _ = session_poll.tick() => {
+                if session.is_closed() {
+                    break Err(anyhow::anyhow!("SSH session closed while SOCKS5 tunnel was active"));
+                }
+            }
+            joined = flows.join_next(), if !flows.is_empty() => {
+                if let Some(joined) = joined {
+                    log_tunnel_join_result(joined);
+                }
+            }
+            accepted = listener.accept() => {
+                let (socket, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error).context("accept SOCKS5 tunnel connection"),
+                };
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    log::debug!("rejecting SOCKS5 connection: connection limit reached");
+                    drop(socket);
+                    continue;
+                };
+                let Ok(session_permit) = Arc::clone(&session_permits).try_acquire_owned() else {
+                    log::debug!("rejecting SOCKS5 connection: SSH-session flow limit reached");
+                    drop(socket);
+                    continue;
+                };
+                let flow_session = Arc::clone(&session);
+                let flow_cancel = cancellation.clone();
+                flows.spawn(async move {
+                    let _permit = permit;
+                    let _session_permit = session_permit;
+                    log_tunnel_flow_result(
+                        serve_dynamic_forward_connection(
+                            flow_session,
+                            socket,
+                            peer,
+                            flow_cancel,
+                        )
+                        .await,
+                    );
+                });
+            }
+        }
+    };
+    cancellation.cancel();
+    drop(listener);
+    drain_tunnel_flows(&mut flows).await;
+    result
+}
+
+async fn reject_remote_forward_reply(
+    session: &SshSession,
+    reply: client::ChannelOpenHandle,
+    reason: ChannelOpenFailure,
+) {
+    let mut uncertain = TripTransportOnDrop::new(session.transport_trip());
+    if tokio::time::timeout(TUNNEL_REMOTE_TARGET_TIMEOUT, reply.reject(reason))
+        .await
+        .is_ok()
+    {
+        uncertain.disarm();
+    }
+}
+
+async fn serve_remote_forward_connection(
+    session: Arc<SshSession>,
+    incoming: IncomingRemoteForward,
+    target_port: u16,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let IncomingRemoteForward { channel, reply } = incoming;
+    let connect_deadline = tokio::time::Instant::now() + TUNNEL_REMOTE_TARGET_TIMEOUT;
+    let socket = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            reject_remote_forward_reply(
+                &session,
+                reply,
+                ChannelOpenFailure::AdministrativelyProhibited,
+            ).await;
+            return Ok(());
+        }
+        connected = poll_remote_mutation_until(
+            connect_deadline,
+            tokio::net::TcpStream::connect((TUNNEL_LOOPBACK_HOST, target_port)),
+            || {},
+            || {},
+            "remote-forward local target connection exceeded its deadline",
+        ) => match connected {
+            Ok(socket) => socket,
+            Err(error) => {
+                reject_remote_forward_reply(&session, reply, ChannelOpenFailure::ConnectFailed).await;
+                return Err(error).context("connect remote-forward local target");
+            }
+        },
+    };
+
+    let mut uncertain = TripTransportOnDrop::new(session.transport_trip());
+    let accepted = poll_remote_mutation_until(
+        connect_deadline,
+        async {
+            reply.accept().await;
+            Ok::<(), anyhow::Error>(())
+        },
+        || {},
+        || {},
+        "remote-forward channel acceptance exceeded its deadline",
+    )
+    .await;
+    match accepted {
+        Ok(()) => uncertain.disarm(),
+        Err(error) => {
+            session.invalidate().await;
+            uncertain.disarm();
+            return Err(error);
+        }
+    }
+    bridge_streams(socket, channel.into_stream(), cancellation).await
+}
+
+async fn run_remote_forward(
+    lease: RemoteForwardLease,
+    mut incoming: mpsc::Receiver<IncomingRemoteForward>,
+    target_port: u16,
+    max_connections: usize,
+    session_permits: Arc<Semaphore>,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let session = Arc::clone(&lease.session);
+    let permits = Arc::new(Semaphore::new(max_connections));
+    let mut flows = JoinSet::new();
+    let mut session_poll = tokio::time::interval(TUNNEL_SESSION_POLL_INTERVAL);
+    session_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let result = loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => break Ok(()),
+            _ = session_poll.tick() => {
+                if session.is_closed() {
+                    break Err(anyhow::anyhow!("SSH session closed while remote tunnel was active"));
+                }
+            }
+            joined = flows.join_next(), if !flows.is_empty() => {
+                if let Some(joined) = joined {
+                    log_tunnel_join_result(joined);
+                }
+            }
+            received = incoming.recv() => {
+                let Some(incoming) = received else {
+                    break Err(anyhow::anyhow!("remote-forward route closed unexpectedly"));
+                };
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    incoming.reject(ChannelOpenFailure::ResourceShortage).await;
+                    continue;
+                };
+                let Ok(session_permit) = Arc::clone(&session_permits).try_acquire_owned() else {
+                    incoming.reject(ChannelOpenFailure::ResourceShortage).await;
+                    continue;
+                };
+                let flow_session = Arc::clone(&session);
+                let flow_cancel = cancellation.clone();
+                flows.spawn(async move {
+                    let _permit = permit;
+                    let _session_permit = session_permit;
+                    log_tunnel_flow_result(
+                        serve_remote_forward_connection(
+                            flow_session,
+                            incoming,
+                            target_port,
+                            flow_cancel,
+                        )
+                        .await,
+                    );
+                });
+            }
+        }
+    };
+
+    // Closing the receiver rejects every queued ChannelOpenHandle by Drop.
+    incoming.close();
+    cancellation.cancel();
+    let cleanup = lease.stop().await;
+    drain_tunnel_flows(&mut flows).await;
+    result?;
+    cleanup
 }
 
 struct DirectoryBudget {
@@ -1710,28 +3177,43 @@ fn extend_command_output(target: &mut Vec<u8>, data: &[u8], other_len: usize) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        await_exec_request_queued_until, commit_remote_upload_no_replace_with,
-        extend_command_output, is_explicit_sftp_status, poll_remote_mutation_until,
-        protected_upload_file_attributes, push_directory_entry, read_sftp_packet,
-        require_server_fingerprint, secure_client_algorithms, status_error, temporary_remote_path,
+        await_exec_request_queued_until, bridge_streams, commit_remote_upload_no_replace_with,
+        extend_command_output, is_explicit_sftp_status, literal_socket_addr,
+        poll_remote_mutation_until, protected_upload_file_attributes, push_directory_entry,
+        read_sftp_packet, remote_forward_channel_is_loopback_only, require_server_fingerprint,
+        secure_client_algorithms, socks5_handshake, status_error, temporary_remote_path,
         validate_remote_command, validate_remote_path, validate_shell_dimensions,
         validate_upload_remote_path, BoundedSftpStream, CreateDirOutcomeUnknown,
         CreateDirSubmissionState, DirectoryBudget, DirectoryLimits, ExecOutcomeUnknown,
-        ExecSubmissionState, SshSession, TransportTrip, DIRECTORY_LIMITS, MAX_DIRECTORY_ENTRIES,
-        MAX_DIRECTORY_STRING_BYTES, MAX_REMOTE_COMMAND_BYTES, MAX_REMOTE_PATH_BYTES,
-        MAX_SFTP_PACKET_BYTES, MAX_SHELL_DIMENSION, REMOTE_PARTIAL_SUFFIX_BYTES,
+        ExecSubmissionState, RemoteForwardRegistry, SocksTarget, SshSession, TransportTrip,
+        TunnelMode, TunnelSpec, ValidatedTunnelSpec, DEFAULT_TUNNEL_CONNECTIONS, DIRECTORY_LIMITS,
+        MAX_DIRECTORY_ENTRIES, MAX_DIRECTORY_STRING_BYTES, MAX_REMOTE_COMMAND_BYTES,
+        MAX_REMOTE_PATH_BYTES, MAX_SFTP_PACKET_BYTES, MAX_SHELL_DIMENSION, MAX_TUNNEL_CONNECTIONS,
+        REMOTE_PARTIAL_SUFFIX_BYTES,
     };
     use crate::vault::Creds;
     use russh::keys::ssh_key;
     use russh_sftp::client::{Config as SftpConfig, SftpSession};
     use russh_sftp::protocol::{File, FileAttributes, Status, StatusCode};
     use std::future::Future;
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::task::Poll;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn literal_ssh_addresses_use_their_explicit_socket_family() {
+        let expected = SocketAddr::from(([8, 162, 3, 215], 22));
+        assert_eq!(literal_socket_addr("8.162.3.215", 22), Some(expected));
+        assert_eq!(
+            literal_socket_addr("::ffff:8.162.3.215", 22),
+            Some(expected)
+        );
+        assert_eq!(literal_socket_addr("server.example", 22), None);
+    }
 
     #[test]
     fn command_output_is_bounded_across_stdout_and_stderr() {
@@ -1779,6 +3261,255 @@ mod tests {
         assert!(validate_shell_dimensions(1, MAX_SHELL_DIMENSION).is_ok());
         assert!(validate_shell_dimensions(0, 24).is_err());
         assert!(validate_shell_dimensions(80, MAX_SHELL_DIMENSION + 1).is_err());
+    }
+
+    #[test]
+    fn tunnel_specs_make_external_binding_unrepresentable_and_enforce_limits() {
+        let local = TunnelSpec::local(0, 5432);
+        assert_eq!(local.mode(), TunnelMode::Local);
+        assert_eq!(
+            usize::from(local.max_connections),
+            DEFAULT_TUNNEL_CONNECTIONS
+        );
+        local.validate().unwrap();
+        match ValidatedTunnelSpec::try_from(local.clone()).unwrap() {
+            ValidatedTunnelSpec::Local { bind, .. } => {
+                assert_eq!(bind, SocketAddr::from(([127, 0, 0, 1], 0)));
+            }
+            _ => panic!("local tunnel changed validated mode"),
+        }
+
+        let serialized = serde_json::to_value(&local).unwrap();
+        let fields = serialized.as_object().unwrap();
+        assert_eq!(fields.len(), 4);
+        assert!(!fields.contains_key("bind_host"));
+        assert!(!fields.contains_key("target_host"));
+        assert!(!fields.contains_key("allow_non_loopback"));
+        for forbidden in ["bind_host", "target_host", "allow_non_loopback"] {
+            let mut legacy = serialized.clone();
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .insert(forbidden.into(), serde_json::json!("forbidden"));
+            assert!(serde_json::from_value::<TunnelSpec>(legacy).is_err());
+        }
+
+        let mut invalid_limit = local.clone();
+        invalid_limit.max_connections = 0;
+        assert!(invalid_limit.validate().is_err());
+        invalid_limit.max_connections = (MAX_TUNNEL_CONNECTIONS + 1) as u16;
+        assert!(invalid_limit.validate().is_err());
+
+        let mut zero_target = local.clone();
+        zero_target.target_port = 0;
+        assert!(zero_target.validate().is_err());
+
+        let remote = TunnelSpec::remote(0, 8080);
+        remote.validate().unwrap();
+        let dynamic = TunnelSpec::dynamic(0);
+        dynamic.validate().unwrap();
+        let mut dynamic_with_target = dynamic;
+        dynamic_with_target.target_port = 1;
+        assert!(dynamic_with_target.validate().is_err());
+    }
+
+    #[test]
+    fn remote_forward_channels_reject_gateway_ports_and_external_originators() {
+        assert!(remote_forward_channel_is_loopback_only(
+            "127.0.0.1",
+            "127.0.0.1"
+        ));
+        for (connected, originator) in [
+            ("0.0.0.0", "127.0.0.1"),
+            ("192.0.2.5", "127.0.0.1"),
+            ("127.0.0.1", "192.0.2.7"),
+            ("::1", "::1"),
+            ("localhost", "127.0.0.1"),
+            ("127.0.0.1", "localhost"),
+        ] {
+            assert!(
+                !remote_forward_channel_is_loopback_only(connected, originator),
+                "accepted connected={connected:?} originator={originator:?}"
+            );
+        }
+    }
+
+    async fn write_fragmented<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) {
+        for byte in bytes {
+            writer.write_all(&[*byte]).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn socks5_no_auth_connect_domain_accepts_fragmented_frames() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let handshake = tokio::spawn(async move {
+            socks5_handshake(
+                &mut server,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        });
+
+        write_fragmented(&mut client, &[5, 2, 2, 0]).await;
+        let mut method = [0_u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+
+        let domain = b"echo.internal";
+        let mut request = vec![5, 1, 0, 3, domain.len() as u8];
+        request.extend_from_slice(domain);
+        request.extend_from_slice(&8443_u16.to_be_bytes());
+        write_fragmented(&mut client, &request).await;
+
+        assert_eq!(
+            handshake.await.unwrap().unwrap(),
+            Some(SocksTarget {
+                host: "echo.internal".into(),
+                port: 8443,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn socks5_parses_ipv4_and_ipv6_connect_targets() {
+        for (request, expected) in [
+            (
+                vec![5, 1, 0, 1, 127, 0, 0, 1, 0, 80],
+                SocksTarget {
+                    host: "127.0.0.1".into(),
+                    port: 80,
+                },
+            ),
+            (
+                {
+                    let mut request = vec![5, 1, 0, 4];
+                    request.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+                    request.extend_from_slice(&443_u16.to_be_bytes());
+                    request
+                },
+                SocksTarget {
+                    host: "::1".into(),
+                    port: 443,
+                },
+            ),
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(128);
+            let handshake = tokio::spawn(async move {
+                socks5_handshake(
+                    &mut server,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+            });
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0_u8; 2];
+            client.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [5, 0]);
+            client.write_all(&request).await.unwrap();
+            assert_eq!(handshake.await.unwrap().unwrap(), Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn socks5_rejects_auth_command_address_type_and_slow_handshake() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let no_auth = tokio::spawn(async move {
+            socks5_handshake(
+                &mut server,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        });
+        client.write_all(&[5, 1, 2]).await.unwrap();
+        let mut selection = [0_u8; 2];
+        client.read_exact(&mut selection).await.unwrap();
+        assert_eq!(selection, [5, 0xff]);
+        assert_eq!(no_auth.await.unwrap().unwrap(), None);
+
+        for (request, expected_reply) in [([5, 2, 0, 1], 7), ([5, 1, 0, 9], 8)] {
+            let (mut client, mut server) = tokio::io::duplex(128);
+            let rejected = tokio::spawn(async move {
+                socks5_handshake(
+                    &mut server,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+            });
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            client.read_exact(&mut selection).await.unwrap();
+            client.write_all(&request).await.unwrap();
+            let mut response = [0_u8; 10];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(response[0], 5);
+            assert_eq!(response[1], expected_reply);
+            assert_eq!(rejected.await.unwrap().unwrap(), None);
+        }
+
+        let (_client, mut server) = tokio::io::duplex(16);
+        let error = socks5_handshake(
+            &mut server,
+            tokio::time::Instant::now() + Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+    }
+
+    #[tokio::test]
+    async fn bridge_streams_moves_bytes_both_ways_and_cancels() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(address).await.unwrap() });
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut client = client.await.unwrap();
+        let (bridge_side, mut ssh_side) = tokio::io::duplex(128);
+        let cancellation = CancellationToken::new();
+        let bridge_cancel = cancellation.clone();
+        let bridge =
+            tokio::spawn(async move { bridge_streams(socket, bridge_side, bridge_cancel).await });
+
+        client.write_all(b"toward-ssh").await.unwrap();
+        let mut toward_ssh = [0_u8; 10];
+        ssh_side.read_exact(&mut toward_ssh).await.unwrap();
+        assert_eq!(&toward_ssh, b"toward-ssh");
+
+        ssh_side.write_all(b"toward-local").await.unwrap();
+        let mut toward_local = [0_u8; 12];
+        client.read_exact(&mut toward_local).await.unwrap();
+        assert_eq!(&toward_local, b"toward-local");
+
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), bridge)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn remote_forward_registry_uses_bounded_generation_aware_routes() {
+        let registry = Arc::new(RemoteForwardRegistry::default());
+        let (first_sender, _first_receiver) = tokio::sync::mpsc::channel(1);
+        let mut first = registry.register(41000, first_sender).unwrap();
+        let first_generation = first.generation;
+        assert!(registry.contains_port(41000));
+        assert!(registry.sender_for(41000).is_some());
+
+        let (duplicate_sender, _duplicate_receiver) = tokio::sync::mpsc::channel(1);
+        assert!(registry.register(41000, duplicate_sender).is_err());
+        first.remove();
+
+        let (second_sender, _second_receiver) = tokio::sync::mpsc::channel(1);
+        let second = registry.register(41000, second_sender).unwrap();
+        assert_ne!(first_generation, second.generation);
+        assert!(!registry.remove_if_generation(41000, first_generation));
+        assert!(registry.contains_port(41000));
+        drop(second);
+        assert!(!registry.contains_port(41000));
+        assert!(registry.sender_for(u32::from(u16::MAX) + 1).is_none());
     }
 
     #[test]
@@ -2043,7 +3774,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(commit.used_hardlink);
         assert!(commit.partial_removed);
         assert!(!rename_called.load(Ordering::Acquire));
         assert!(unlink_called.load(Ordering::Acquire));
@@ -2051,13 +3781,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_hardlink_extension_uses_v3_rename_fallback() {
+    async fn missing_hardlink_extension_fails_closed_without_rename() {
         let rename_called = Arc::new(AtomicBool::new(false));
         let unlink_called = Arc::new(AtomicBool::new(false));
         let committed_state = AtomicBool::new(false);
         let rename_flag = Arc::clone(&rename_called);
         let unlink_flag = Arc::clone(&unlink_called);
-        let commit = commit_remote_upload_no_replace_with(
+        let error = commit_remote_upload_no_replace_with(
             || async { Ok(false) },
             move || {
                 rename_flag.store(true, Ordering::Release);
@@ -2070,13 +3800,12 @@ mod tests {
             &committed_state,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert!(!commit.used_hardlink);
-        assert!(commit.partial_removed);
-        assert!(rename_called.load(Ordering::Acquire));
+        assert!(error.to_string().contains("hardlink@openssh.com"));
+        assert!(!rename_called.load(Ordering::Acquire));
         assert!(!unlink_called.load(Ordering::Acquire));
-        assert!(committed_state.load(Ordering::Acquire));
+        assert!(!committed_state.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -2096,7 +3825,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(commit.used_hardlink);
         assert!(!commit.partial_removed);
         assert!(!rename_called.load(Ordering::Acquire));
         assert!(committed_state.load(Ordering::Acquire));
