@@ -155,7 +155,7 @@
     <p class="lede">面向开发、审计与运行人员的实现级说明。内容覆盖 vault/record v4 的逐 profile 独立口令与随机 128 位身份、Windows 超管 + U 盘 2-of-2 恢复、v2 全量迁移、Winit/Egui 分 profile 限时授权、IPC v5、SSH/SFTP、强制回环的 L/R/D 隧道、deadline/cancel、原子传输、测试证据与残余风险；当前功能工作树建立在已推送的 clean 基线 <code>94fb371</code> 上。</p>
     <div class="meta-row">
       <span class="meta"><span class="dot"></span>vault/record v4 / IPC v5：最终源码门禁通过</span>
-      <span class="meta">Rust 1.97.1 · 290/290 · build.rs 15/15</span>
+      <span class="meta">Rust 1.97.1 · 293/293 · build.rs 15/15</span>
       <span class="meta">clean 来源基线：<code>94fb37118f4b</code></span>
       <span class="meta">文档日期：2026-08-12</span>
       <span class="meta">dirty 制品：仅作本地验证，不作为正式发布</span>
@@ -198,7 +198,7 @@
         <div class="callout">
           <strong>结论：</strong>v4 不再存在可解锁全部主机的共享 master。profile 口令派生 KEK，只包裹该 profile 的随机 <code>{DEK, AuthSeed, profile_id, generation}</code>；Windows 超管密码只包裹 vault-local recovery share，必须再配合匹配的 U 盘 share 才能保留式恢复。IPC v5 让运行锁 token 只承担 daemon instance/endpoint 互认证，按 <code>(name, profile_id, generation)</code> 派生的 call key 与精确 intent commitment 把远程操作绑定到目标 profile 实例。桌面 UI 对每个 profile 缓存固定五分钟授权，超管授权独立固定两分钟。该设计降低横向解锁、同名重建复用授权、单份恢复材料丢失和 runtime-token 盗用风险，但仍不是防御进程注入、内存读取、键盘记录或管理员调试器的隔离执行环境。
         </div>
-        <p><span class="badge good">本机终验通过</span> Rust 1.97.1 下 fmt、diff、check、strict-clippy 通过，locked/offline all-target/all-feature 串行测试 290/290；依赖检查的离线数据库新鲜度边界见第 13 节。<span class="badge caution">产物边界</span>当前工作树尚未提交，任何本地二进制只能证明 dirty 工作树；最终大小与哈希放在仓库外交付记录，提交后仍须 clean 重建。</p>
+        <p><span class="badge good">本机终验通过</span> Rust 1.97.1 下 fmt、diff、check、strict-clippy 通过，locked/offline all-target/all-feature 串行测试 293/293；依赖检查的离线数据库新鲜度边界见第 13 节。<span class="badge caution">产物边界</span>当前工作树尚未提交，任何本地二进制只能证明 dirty 工作树；最终大小与哈希放在仓库外交付记录，提交后仍须 clean 重建。</p>
       </section>
 
       <section id="scope">
@@ -384,6 +384,7 @@ $randomReceipt = Join-Path $env:USERPROFILE 'Documents\serctl-prod-passphrase.tx
           <li>UI 初始即读取本地 catalog；profile 名、host、port、随机 128 位 <code>profile_id</code>、generation 在锁定态可见。只有持有精确 <code>(name, profile_id, generation)</code> grant 的记录才会调度 daemon Status 或网络操作，未授权 refresh 对该 profile 为零 daemon/网络副作用。</li>
           <li>每个 profile 的独立口令验证后授予固定五分钟、非滑动授权。切换主机保留其他 profile grant，但不会把一个口令用于另一个 profile。保存/编辑、重命名、口令轮转、恢复或 admin reset 保留 ID、产生新 package/generation 后立即撤销旧 grant；删除再同名重建会得到新 ID，旧 grant 仍不可用。首次 TOFU pin 只重封同一 identity/package，不推进 generation。</li>
           <li>Windows 超管授权独立固定两分钟，不传入普通 SSH 操作；Linux 同一界面验证有效 UID 0。单项/全部撤销或到期会清零对应口令，关闭该 profile 的 shell/tunnel/transfer 与受保护 workspace；已运行 daemon 故意保留。</li>
+          <li>Windows 新建主机在缺少超管授权时记录一个不含秘密的待保存续接标记，实际 SSH/profile 口令仍只留在编辑器。完成恢复策略初始化并授权后，UI 自动关闭安全窗口并继续原保存动作；轮转恢复介质撤销旧授权后需重新授权，再继续同一待办。手动关闭安全窗口只取消自动续接，编辑器内容仍保留。</li>
           <li>目录、文件传输、命令、Bash 与 tunnel 均通过后台 Tokio runtime 执行。profile refresh 使用一个 32 秒 absolute deadline，先读取 catalog，再只对有效 grant 分波执行最多 8 个 daemon status probe；Status 只读 daemon metadata，不触发 SSH reconnect。</li>
           <li>首次空 v4 vault 在 Windows 必须先输入并确认新超管密码，把新 2-of-2 share 以 create-new 写入指定可移动介质，之后才允许创建 profile。Linux 不设置存储型超管密码。</li>
           <li>“安全操作”分为三类：手动/随机轮转；仅 Windows 可用的超管 + 匹配介质 + 新口令保留式恢复；以及红色破坏性重置（完整替换凭据/口令并输入 profile 名确认，永久丢弃旧凭据、pin 与 package）。三类随机路径都先在 modal 暂存并一次性显示，明确标注“vault 尚未修改”；只有勾选“已安全保存”后提交按钮才启用，点击才调用既有手动 API。生成阶段无后台消息、网络或 vault 副作用；取消/关闭会清零暂存值。</li>
@@ -578,7 +579,7 @@ target\release\serctl.exe --version
           <div class="card"><div class="kpi">15 / 15</div><div class="label">build.rs standalone；fmt/diff/check/strict-clippy PASS</div></div>
           <div class="card"><div class="kpi">exit 0</div><div class="label">cargo-audit 0.22.2 与 cargo-deny 0.20.2；离线新鲜度边界见下文</div></div>
         </div>
-        <div class="callout"><strong>最终本机源码门禁：</strong>Rust 1.97.1；<code>cargo fmt -- --check</code>、<code>git diff --check</code>、locked/offline all-target/all-feature <code>cargo check</code> 与严格 <code>clippy -D warnings</code> 均 PASS。串行完整测试 290/290，测试执行 105.95 秒、命令总耗时约 107.1 秒；<code>build.rs</code> standalone 15/15。较早的 288/288、258/258、IPC v4 234/234 等历史数字不与本轮相加。</div>
+        <div class="callout"><strong>最终本机源码门禁：</strong>Rust 1.97.1；<code>cargo fmt -- --check</code>、<code>git diff --check</code>、locked/offline all-target/all-feature <code>cargo check</code> 与严格 <code>clippy -D warnings</code> 均 PASS。串行完整测试 293/293，测试报告执行 116.68 秒；<code>build.rs</code> standalone 15/15。较早的 290/290、288/288、258/258、IPC v4 234/234 等历史数字不与本轮相加。</div>
         <h3>本轮必须验证的 vault / CLI / UI 覆盖</h3>
         <ul>
           <li>每 profile 独立 salt/KDF/KEK；KeyPackage 与 payload 的双 AEAD 绑定 domain/name/profile_id/host/port/generation；错误口令、跨 profile 口令、identity/generation/package mismatch 与篡改拒绝；</li>

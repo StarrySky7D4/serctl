@@ -12,6 +12,7 @@
 - 锁定状态只显示明文目录元数据（profile 名、host、port、随机 `profile_id`、generation），不会查询 daemon 或连接远端；
 - 每个 profile 独立授权五分钟；切换主机不会混用口令，口令轮转、保存、重命名或恢复推进 generation 后旧授权立即失效；删除再以同名重建会得到新的 `profile_id`，也不能复用旧授权；
 - Windows 超管授权独立为固定两分钟，可初始化/更改超管密码、轮转恢复介质、在介质参与时保留凭据重置 profile 口令，或明确丢弃旧凭据后执行破坏性重置；
+- Windows 新建主机若尚无超管授权，UI 会保留未提交的编辑器内容并进入“安全与恢复”；初始化后提示授权，授权成功即自动续接原保存动作。恢复介质轮转会撤销旧授权，但重新授权后仍续接同一待保存主机；关闭安全窗口只取消自动续接，不清除编辑器；
 - 随机 profile 口令采用两阶段交付：先在安全窗口一次性显示且不改 vault，只有勾选“已安全保存”并提交后才执行轮转/恢复/破坏性重置；取消或关闭会清零暂存值且无网络/vault 副作用；
 - Windows 上的 v2 凭证库通过阻断式向导一次性全量迁移，迁移完成前所有网络功能保持禁用；Linux 按钮禁用且在读取迁移秘密前失败关闭；
 - 启动、检查或停止持久 daemon；
@@ -267,7 +268,7 @@ strip = "symbols"
 当前 vault/record v4 / IPC v5 工作树已完成最终源码门禁；不得把较早 v5 工作树的 **258/258** 与本轮数字相加。验证证据如下：
 
 - **PASS：**Rust 1.97.1 下 `cargo fmt -- --check`、`git diff --check`、locked/offline all-target/all-feature `cargo check` 与严格 `clippy -D warnings`；
-- **PASS：**locked/offline all-target/all-feature 串行测试 **290/290**；测试执行 **105.95 s**，命令总耗时约 **107.1 s**；`build.rs` standalone tests **15/15**；
+- **PASS：**locked/offline all-target/all-feature 串行测试 **293/293**；测试报告执行 **116.68 s**；`build.rs` standalone tests **15/15**；
 - **PASS（带新鲜度边界）：**`cargo-audit 0.22.2 --no-fetch` 扫描 **531 dependencies / 1198 advisories**，exit 0；同时报告 cache/index warning，因此只证明本机离线缓存快照，不证明 advisory 数据库在线最新；
 - **PASS：**`cargo-deny 0.20.2` 的 bans、licenses、sources 检查均 exit 0；
 - v4 定向覆盖包括独立 KDF/key package、随机 128 位 profile identity、identity/generation-bound call key、明文 catalog、Windows admin + USB 2-of-2、介质 create-new/同步/回读、CLI 随机口令“先交付文件、后提交”失败路径、UI 随机口令“先显示确认、后提交”取消路径、profile 手动/随机轮转、保留式恢复、破坏性重置、全量 v2→v4 迁移、未发布中间 v3 fail-closed、Linux `--target-user` NSS 绑定/不可逆降权与 offline recovery fail-closed，以及 UI 的 5 分钟 profile / 2 分钟 admin 授权；

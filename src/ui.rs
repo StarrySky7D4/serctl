@@ -1749,6 +1749,9 @@ struct SerctlApp {
     security_section: SecuritySection,
     admin_dialog: AdminDialog,
     admin_authorization: AdminAuthorization,
+    /// Non-secret continuation: the editor remains the sole owner of the
+    /// unsaved host/profile secrets while Windows admin setup is completed.
+    pending_create_after_admin: bool,
     migration: MigrationWizard,
     migration_state: Option<vault::VaultMigrationState>,
     delete_candidate: Option<String>,
@@ -1811,6 +1814,7 @@ impl SerctlApp {
             security_section: SecuritySection::default(),
             admin_dialog: AdminDialog::default(),
             admin_authorization: AdminAuthorization::default(),
+            pending_create_after_admin: false,
             migration: MigrationWizard::default(),
             migration_state: None,
             delete_candidate: None,
@@ -2477,6 +2481,7 @@ impl SerctlApp {
         #[cfg(windows)]
         let administrator_passphrase = if creating {
             let Some(passphrase) = self.admin_passphrase_for_operation() else {
+                self.pending_create_after_admin = true;
                 self.open_admin_dialog(ctx);
                 return;
             };
@@ -3744,13 +3749,28 @@ impl SerctlApp {
                     self.operations.finish(operation);
                     zeroize_operation_context(operation);
                     if !current {
+                        self.pending_create_after_admin = false;
                         continue;
                     }
                     match std::mem::replace(result, Err(String::new())) {
                         Ok(grant) => {
                             self.admin_authorization
                                 .grant(grant.passphrase, grant.verified_at);
-                            self.set_notice("超管授权已生效，有效期 2 分钟".into(), false);
+                            if self.pending_create_after_admin
+                                && self.editor.visible
+                                && self.editor.original_name.is_none()
+                            {
+                                self.pending_create_after_admin = false;
+                                self.admin_dialog.close();
+                                self.set_notice(
+                                    "超管授权已生效，正在继续保存新主机…".into(),
+                                    false,
+                                );
+                                self.save_profile(ctx);
+                            } else {
+                                self.pending_create_after_admin = false;
+                                self.set_notice("超管授权已生效，有效期 2 分钟".into(), false);
+                            }
                         }
                         Err(mut error) => {
                             let message = format!("超管授权失败：{error}");
@@ -3779,7 +3799,13 @@ impl SerctlApp {
                             self.admin_dialog.clear_secrets();
                             self.admin_authorization.revoke();
                             self.set_notice(
-                                format!("超管与离线恢复已初始化；恢复介质已写入 {path}"),
+                                if self.pending_create_after_admin {
+                                    format!(
+                                        "超管与离线恢复已初始化；恢复介质已写入 {path}。请授权超管密码，随后将自动继续保存主机"
+                                    )
+                                } else {
+                                    format!("超管与离线恢复已初始化；恢复介质已写入 {path}")
+                                },
                                 false,
                             );
                             self.open_admin_dialog(ctx);
@@ -3806,7 +3832,13 @@ impl SerctlApp {
                     self.admin_authorization.revoke();
                     match result {
                         Ok(path) => self.set_notice(
-                            format!("恢复介质已轮转并写入 {path}；旧介质已失效"),
+                            if self.pending_create_after_admin {
+                                format!(
+                                    "恢复介质已轮转并写入 {path}；旧介质已失效。请重新授权，随后将自动继续保存主机"
+                                )
+                            } else {
+                                format!("恢复介质已轮转并写入 {path}；旧介质已失效")
+                            },
                             false,
                         ),
                         Err(error) => self.set_notice(std::mem::take(error), true),
@@ -3993,6 +4025,7 @@ impl SerctlApp {
                     zeroize_operation_context(operation);
                     match result {
                         Ok(name) => {
+                            self.pending_create_after_admin = false;
                             if let Some(original) = original_name.as_deref() {
                                 self.authorizations.revoke_profile(original);
                             }
@@ -4368,6 +4401,7 @@ impl SerctlApp {
     }
 
     fn open_editor(&mut self, profile: Option<ProfileRow>) {
+        self.pending_create_after_admin = false;
         self.editor.clear();
         self.editor.visible = true;
         if let Some(mut profile) = profile {
@@ -4495,6 +4529,7 @@ impl SerctlApp {
         self.editor.zeroize_sensitive_state();
         self.security_dialog.clear();
         self.admin_dialog.close();
+        self.pending_create_after_admin = false;
         zeroize_admin_status(&mut self.admin_dialog.status);
         self.admin_authorization.revoke();
         self.migration.clear_secrets();
@@ -4723,6 +4758,7 @@ impl SerctlApp {
                         .add_enabled(!busy, egui::Button::new("安全与恢复"))
                         .clicked()
                     {
+                        self.pending_create_after_admin = false;
                         self.open_admin_dialog(&ctx);
                     }
                 });
@@ -5502,6 +5538,22 @@ impl SerctlApp {
                     .small()
                     .color(Color32::GRAY),
                 );
+                if self.pending_create_after_admin {
+                    ui.add_space(6.0);
+                    ui.group(|ui| {
+                        ui.label(
+                            RichText::new("正在等待超管授权以继续保存新主机")
+                                .strong()
+                                .color(Color32::from_rgb(120, 190, 255)),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "新主机内容仍保留在编辑器内，尚未写入 vault。完成初始化并授权后会自动继续保存；轮转恢复介质后需要重新授权。",
+                            )
+                            .small(),
+                        );
+                    });
+                }
                 ui.separator();
                 match status.as_ref() {
                     None => {
@@ -5546,7 +5598,14 @@ impl SerctlApp {
                             .color(Color32::GRAY),
                         );
                         initialize = ui
-                            .add_enabled(!busy, egui::Button::new("初始化并写入恢复介质"))
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(if self.pending_create_after_admin {
+                                    "初始化恢复策略（随后授权）"
+                                } else {
+                                    "初始化并写入恢复介质"
+                                }),
+                            )
                             .clicked();
                     }
                     Some(vault::AdminStatus::Uninitialized {
@@ -5595,15 +5654,19 @@ impl SerctlApp {
                                         "输入超管密码",
                                     );
                                 }
+                                let authorize_label = if self.pending_create_after_admin {
+                                    if *platform_requires_password {
+                                        "授权并继续保存新主机"
+                                    } else {
+                                        "验证 root 授权并继续保存新主机"
+                                    }
+                                } else if *platform_requires_password {
+                                    "授权 2 分钟"
+                                } else {
+                                    "验证 root 授权 2 分钟"
+                                };
                                 authorize = ui
-                                    .add_enabled(
-                                        !busy,
-                                        egui::Button::new(if *platform_requires_password {
-                                            "授权 2 分钟"
-                                        } else {
-                                            "验证 root 授权 2 分钟"
-                                        }),
-                                    )
+                                    .add_enabled(!busy, egui::Button::new(authorize_label))
                                     .clicked();
                             }
                         }
@@ -5674,6 +5737,13 @@ impl SerctlApp {
             self.admin_dialog.visible = true;
             self.set_notice("请等待当前安全操作完成后再关闭窗口".into(), true);
         } else if cancel || !visible {
+            if self.pending_create_after_admin {
+                self.pending_create_after_admin = false;
+                self.set_notice(
+                    "已取消授权后的自动保存；新主机内容仍保留在编辑器，可再次点击保存".into(),
+                    false,
+                );
+            }
             self.admin_dialog.close();
         }
     }
@@ -5993,6 +6063,7 @@ impl SerctlApp {
                 self.prepare_random_destructive_profile_reset();
             }
             if open_admin {
+                self.pending_create_after_admin = false;
                 self.open_admin_dialog(ctx);
             }
             if commit_random {
@@ -6110,11 +6181,13 @@ impl SerctlApp {
                         self.save_profile(ctx);
                     }
                     if ui.button("取消").clicked() {
+                        self.pending_create_after_admin = false;
                         self.editor.clear();
                     }
                 });
             });
             if !visible {
+                self.pending_create_after_admin = false;
                 self.editor.clear();
             }
         }
@@ -6844,6 +6917,70 @@ mod tests {
             .is_none());
         authorization.revoke();
         assert!(authorization.passphrase.is_none());
+    }
+
+    #[cfg(windows)]
+    fn fill_new_profile_editor(app: &mut SerctlApp) {
+        app.editor.visible = true;
+        app.editor.name = "new-device".into();
+        app.editor.host = "new-device.example".into();
+        app.editor.port = "22".into();
+        app.editor.user = "alice".into();
+        app.editor.password = "ssh-password".into();
+        app.editor.profile_passphrase = "independent-profile-passphrase".into();
+        app.editor.profile_passphrase_confirmation = "independent-profile-passphrase".into();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_profile_save_waits_for_admin_without_losing_editor_secrets() {
+        let (mut app, _) = test_app();
+        fill_new_profile_editor(&mut app);
+
+        app.save_profile(&egui::Context::default());
+
+        assert!(app.pending_create_after_admin);
+        assert!(app.admin_dialog.visible);
+        assert_eq!(app.editor.password, "ssh-password");
+        assert_eq!(
+            app.editor.profile_passphrase,
+            "independent-profile-passphrase"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn admin_authorization_resumes_pending_new_profile_save() {
+        let (mut app, tx) = test_app();
+        fill_new_profile_editor(&mut app);
+        app.pending_create_after_admin = true;
+        app.admin_dialog.visible = true;
+        let verified_at = Instant::now();
+        let operation = app.operations.begin(None, "authorize administrator".into());
+        tx.send(UiMessage::AdminAuthorization {
+            operation,
+            result: Ok(AdminAuthorizationGrant {
+                passphrase: Some(Zeroizing::new("administrator-passphrase".into())),
+                verified_at,
+            }),
+        })
+        .expect("queue administrator authorization success");
+
+        app.receive_messages(&egui::Context::default());
+
+        assert!(!app.pending_create_after_admin);
+        assert!(!app.admin_dialog.visible);
+        assert!(app.admin_authorization.is_valid_at(verified_at));
+        assert!(
+            app.operations.is_busy(),
+            "save operation should be scheduled"
+        );
+        assert!(app.editor.password.is_empty());
+        assert!(app.editor.profile_passphrase.is_empty());
+        assert!(app
+            .operations
+            .activity()
+            .is_some_and(|activity| activity.contains("正在保存 new-device")));
     }
 
     #[test]
