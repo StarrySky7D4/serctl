@@ -7,30 +7,47 @@ license = "Apache-2.0"
 repository = "https://github.com/StarrySky7D4/serctl"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-russh = "0.50"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+russh = { version = "0.62.5", default-features = false, features = ["ring"] }
 russh-sftp = "2.4"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-argon2 = "0.5"
+argon2 = { version = "0.5", features = ["zeroize"] }
 chacha20poly1305 = "0.10"
+curve25519-dalek = { version = "4", features = ["zeroize"] }
+hkdf = "0.12"
 rand = "0.8"
 base64 = "0.22"
+bytes = "1"
 rpassword = "7"
 anyhow = "1"
 crossterm = "0.28"
-async-trait = "0.1"
 log = "0.4"
 env_logger = "0.11"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 atomic-write-file = "0.3"
 fs2 = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
-eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
-winit = "0.30"
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita-notitle"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Favor a compact distributable without sacrificing unwind-based cleanup.
+# The application relies on Drop during unwinding to restore terminal state,
+# zeroize owned buffers, and roll back partially-created files.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"
