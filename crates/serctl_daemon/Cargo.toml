@@ -1,0 +1,35 @@
+[package]
+name = "serctl-daemon"
+description = "serctl credential and SSH broker daemon: the sole owner of Vault decryption and SSH connectivity."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "serctl_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "serctl_daemon"
+path = "src/main.rs"
+
+[dependencies]
+serctl-core = { version = "0.2.0-test.1", path = "../serctl_core" }
+serctl-protocol = { version = "0.2.0-test.1", path = "../serctl_protocol" }
+tokio.workspace = true
+russh.workspace = true
+russh-sftp.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+hex.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serctl-core = { version = "0.2.0-test.1", path = "../serctl_core", features = ["test-support"] }

@@ -1,30 +1,44 @@
-//! Daemon: loads a profile, holds one long-lived SSH session, serves IPC.
-use crate::vault::{self, now_unix, Creds, LockInfo, ProfileCallKey};
-use anyhow::{bail, Context, Result};
+//! Daemon: the per-user/per-vault credential and SSH broker. The classic
+//! per-profile daemon (v5) and the global v6 daemon share the same
+//! per-operation dispatch; the global mode additionally owns the runtime
+//! descriptor/secret, per-profile credential leases, and the unlock flow.
+use anyhow::{bail, ensure, Context, Result};
 use russh::ChannelMsg;
 use russh_sftp::protocol::OpenFlags;
+use serctl_core::daemon_runtime::{self, DaemonRuntimeDescriptor, DESCRIPTOR_SCHEMA_VERSION};
+use serctl_core::vault::{self, now_unix, Creds, LockInfo, ProfileCallKey};
+use serctl_protocol::v6::{
+    frame_kind, ActivationSecret, InstanceId, V6RequestPrelude, V6ServerIo, IPC_PROTOCOL_VERSION_V6,
+};
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::ipc;
-use crate::ssh::{
+use serctl_core::ssh::{
     commit_remote_upload_no_replace_until, is_explicit_sftp_status, poll_remote_mutation_until,
     protected_upload_file_attributes, temporary_remote_path, validate_remote_command,
     validate_remote_path, validate_shell_dimensions, validate_upload_remote_path,
     ExecSubmissionState, SshSession, MAX_TRANSFER_BYTES,
 };
+use serctl_protocol as ipc;
 
-pub(crate) const CONTROL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound for the complete daemon setup (credential snapshot + runtime
+/// publication) once a start is requested. The CLI launcher mirrors this value
+/// for its own readiness deadline.
+pub const CONTROL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const IPC_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const SHELL_INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDLER_SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
+/// The global broker exits once no live work (connection handler, tunnel,
+/// shell, or operation) remains for this long.
+pub const IDLE_EXIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const RUNTIME_LOCK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_PARTIAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_PARTIAL_CLEANUP_RETRY: Duration = Duration::from_millis(50);
@@ -92,6 +106,9 @@ struct HandlerContext {
     buffered_operation_slots: Arc<Semaphore>,
     tunnel_control_slots: Arc<Semaphore>,
     call_key: Arc<ProfileCallKey>,
+    /// Hard upper bound for this root operation. Global-v6 handlers set it to
+    /// the earliest credential/grant/request deadline; legacy v5 uses `None`.
+    authorization_deadline: Option<Instant>,
 }
 
 fn status_info_frame(info: &ConnInfo) -> ipc::Frame {
@@ -325,7 +342,12 @@ async fn publish_runtime_until(
                 bail!("daemon runtime publication exceeded its setup deadline");
             }
             let token = Arc::new(Zeroizing::new(vault::new_ipc_token()));
-            let listener = ipc::LocalListener::bind(&profile, token.as_str())?;
+            let endpoint = vault::expected_endpoint(&profile, token.as_str())?;
+            let listener = ipc::LocalListener::bind(&endpoint)?;
+            // The Unix socket is created with default permissions; harden it
+            // immediately, before any lock record can name the endpoint.
+            #[cfg(unix)]
+            serctl_core::security::harden_file(std::path::Path::new(&endpoint))?;
             // A blocking bind that crossed the setup deadline must never write
             // a discoverable lock. Dropping the listener also removes its Unix
             // socket (or closes its Windows pipe handle).
@@ -431,7 +453,7 @@ pub async fn run_with_ready(
     .await
 }
 
-pub(crate) async fn run_with_ready_until(
+pub async fn run_with_ready_until(
     profile: &str,
     master: Zeroizing<String>,
     ready: Option<oneshot::Sender<()>>,
@@ -443,7 +465,7 @@ pub(crate) async fn run_with_ready_until(
 /// Start an in-process daemon using a generation-bound UI authorization.
 /// The generation check and credential/call-key unwrap happen in one vault
 /// snapshot while the exclusive profile lease is held.
-pub(crate) async fn run_with_ready_until_at_generation(
+pub async fn run_with_ready_until_at_generation(
     profile: &str,
     master: Zeroizing<String>,
     ready: Option<oneshot::Sender<()>>,
@@ -513,7 +535,10 @@ async fn run_with_ready_until_at_optional_generation(
     .await
 }
 
-#[cfg(test)]
+/// Test entry point: run a daemon over already-decrypted credentials without
+/// touching the vault. Kept unconditional so the CLI's cross-crate e2e suite
+/// can drive the daemon in-process.
+#[doc(hidden)]
 pub async fn run_with_ready_creds_for_test(
     profile: &str,
     creds: Creds,
@@ -816,6 +841,7 @@ async fn run_after_startup_lock_reconciliation(
                     buffered_operation_slots: Arc::clone(&buffered_operation_slots),
                     tunnel_control_slots: Arc::clone(&tunnel_control_slots),
                     call_key: Arc::clone(&call_key),
+                    authorization_deadline: None,
                 };
                 handlers.spawn(async move {
                     let _permit = permit;
@@ -990,7 +1016,7 @@ async fn existing_daemon_is_live(lock: &LockInfo, setup_deadline: Instant) -> Re
         bail!("daemon startup exceeded its setup deadline");
     }
     let probe = async {
-        ipc::validate_endpoint(&lock.profile, &lock.token, &lock.endpoint)?;
+        serctl_core::vault::validate_endpoint(&lock.profile, &lock.token, &lock.endpoint)?;
         let mut stream = ipc::connect(&lock.endpoint).await?;
         ipc::validate_server_identity(&stream, lock.pid)?;
         ipc::authenticate_client(&mut stream, &lock.profile, &lock.token, deadline).await?;
@@ -1063,7 +1089,7 @@ async fn authenticate_incoming_protocol<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    ipc::authenticate_server(stream, profile, token, call_key, deadline).await
+    ipc::authenticate_server(stream, profile, token, call_key.as_bytes(), deadline).await
 }
 
 /// Exec and directory listing retain their complete result until it has been
@@ -1137,6 +1163,7 @@ where
         buffered_operation_slots,
         tunnel_control_slots,
         call_key,
+        authorization_deadline,
     } = context;
     let authentication_deadline = Instant::now() + Duration::from_secs(2);
     let authentication = tokio::select! {
@@ -1161,70 +1188,140 @@ where
             return Ok(());
         }
     };
-    let (mut rd, mut wr) = tokio::io::split(stream);
-    let mut handled_root_request = false;
-    loop {
-        if handled_root_request {
-            break;
-        }
-        let frame =
-            read_authenticated_request(&mut rd, &mut shutdown_rx, POST_AUTH_IDLE_TIMEOUT).await?;
-        let Some(mut frame) = frame else {
-            break;
-        };
-        if let Err(error) = auth_context.verify_request(&call_key, &frame) {
-            frame.zeroize_sensitive();
-            // Authorization failures are deliberately closed without a
-            // structured response. In particular, a mismatched intent must
-            // not reach validation, SSH, or local listener setup.
-            log::warn!(
-                "rejected local IPC request authorization: {}",
-                terminal_safe_error(&error)
-            );
-            return Ok(());
-        }
-        handled_root_request = true;
-        if let Err(error) = validate_request_frame(&frame) {
-            frame.zeroize_sensitive();
-            write_owned_frame_or_shutdown(
-                &mut wr,
-                ipc::Frame::Error {
-                    msg: error.to_string(),
-                },
-                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+    let (mut rd, wr) = tokio::io::split(stream);
+    let frame =
+        read_authenticated_request(&mut rd, &mut shutdown_rx, POST_AUTH_IDLE_TIMEOUT).await?;
+    let Some(mut frame) = frame else {
+        return Ok(());
+    };
+    if let Err(error) = auth_context.verify_request(call_key.as_bytes(), &frame) {
+        frame.zeroize_sensitive();
+        // Authorization failures are deliberately closed without a
+        // structured response. In particular, a mismatched intent must
+        // not reach validation, SSH, or local listener setup.
+        log::warn!(
+            "rejected local IPC request authorization: {}",
+            terminal_safe_error(&error)
+        );
+        return Ok(());
+    }
+    let context = HandlerContext {
+        sessions,
+        info,
+        shutdown,
+        buffered_operation_slots,
+        tunnel_control_slots,
+        call_key,
+        authorization_deadline,
+    };
+    dispatch_root_request(rd, wr, shutdown_rx, context, frame).await
+}
+
+/// Dispatch one authenticated, intent-verified root request. The root frame
+/// is committed in the handshake (v5 intent commitment or v6 prelude hash);
+/// every per-operation branch lives here so both wire generations share the
+/// exact same execution semantics. One connection carries exactly one root
+/// request: after this returns, the connection closes.
+async fn dispatch_root_request<R, W>(
+    rd: R,
+    wr: W,
+    shutdown_rx: watch::Receiver<bool>,
+    context: HandlerContext,
+    frame: ipc::Frame,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let authorization_deadline = context.authorization_deadline;
+    let operation = dispatch_root_request_inner(rd, wr, shutdown_rx, context, frame);
+    match authorization_deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline, operation).await {
+            Ok(result) => result,
+            Err(_) => bail!("profile authorization lease expired"),
+        },
+        None => operation.await,
+    }
+}
+
+async fn dispatch_root_request_inner<R, W>(
+    mut rd: R,
+    mut wr: W,
+    mut shutdown_rx: watch::Receiver<bool>,
+    context: HandlerContext,
+    mut frame: ipc::Frame,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let HandlerContext {
+        sessions,
+        info,
+        shutdown,
+        buffered_operation_slots,
+        tunnel_control_slots,
+        call_key: _call_key,
+        authorization_deadline: _,
+    } = context;
+    if let Err(error) = validate_request_frame(&frame) {
+        frame.zeroize_sensitive();
+        write_owned_frame_or_shutdown(
+            &mut wr,
+            ipc::Frame::Error {
+                msg: error.to_string(),
+            },
+            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+            &mut shutdown_rx,
+        )
+        .await?;
+        return Ok(());
+    }
+    match frame {
+        ipc::Frame::Exec { cmd, timeout_ms } => {
+            let cmd = Zeroizing::new(cmd);
+            let timeout = match validated_exec_timeout(timeout_ms) {
+                Ok(timeout) => timeout,
+                Err(error) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let deadline = Instant::now() + timeout;
+            let _buffered_operation_permit = match acquire_buffered_operation_slot(
+                Arc::clone(&buffered_operation_slots),
+                &mut rd,
                 &mut shutdown_rx,
+                deadline,
             )
-            .await?;
-            continue;
-        }
-        match frame {
-            ipc::Frame::Exec { cmd, timeout_ms } => {
-                let cmd = Zeroizing::new(cmd);
-                let timeout = match validated_exec_timeout(timeout_ms) {
-                    Ok(timeout) => timeout,
-                    Err(error) => {
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                let deadline = Instant::now() + timeout;
-                let _buffered_operation_permit = match acquire_buffered_operation_slot(
-                    Arc::clone(&buffered_operation_slots),
-                    &mut rd,
-                    &mut shutdown_rx,
-                    deadline,
-                )
-                .await
-                {
-                    Ok(Some(permit)) => permit,
+            .await
+            {
+                Ok(Some(permit)) => permit,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let session =
+                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
+                    Ok(Some(session)) => session,
                     Ok(None) => return Ok(()),
                     Err(error) => {
                         write_owned_frame_or_shutdown(
@@ -1232,43 +1329,135 @@ where
                             ipc::Frame::Error {
                                 msg: error.to_string(),
                             },
-                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            deadline,
                             &mut shutdown_rx,
                         )
                         .await?;
-                        continue;
-                    }
-                };
-                let session =
-                    match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline)
-                        .await
-                    {
-                        Ok(Some(session)) => session,
-                        Ok(None) => return Ok(()),
-                        Err(error) => {
-                            write_owned_frame_or_shutdown(
-                                &mut wr,
-                                ipc::Frame::Error {
-                                    msg: error.to_string(),
-                                },
-                                deadline,
-                                &mut shutdown_rx,
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
-                let mut command = match tokio::select! {
-                    result = session.open_exec_until(deadline) => Some(result),
-                    _ = rd.read_u8() => None,
-                    _ = shutdown_rx.changed() => None,
-                } {
-                    Some(Ok(command)) => command,
-                    None => {
-                        session.invalidate().await;
                         return Ok(());
                     }
-                    Some(Err(error)) => {
+                };
+            let mut command = match tokio::select! {
+                result = session.open_exec_until(deadline) => Some(result),
+                _ = rd.read_u8() => None,
+                _ = shutdown_rx.changed() => None,
+            } {
+                Some(Ok(command)) => command,
+                None => {
+                    session.invalidate().await;
+                    return Ok(());
+                }
+                Some(Err(error)) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        deadline,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let requested = tokio::select! {
+                result = command.request_exec_until(cmd.as_str(), deadline) => Some(result),
+                _ = rd.read_u8() => None,
+                _ = shutdown_rx.changed() => None,
+            };
+            match requested {
+                Some(Ok(())) => {}
+                None => {
+                    command.cancel().await;
+                    return Ok(());
+                }
+                Some(Err(error)) => {
+                    command.cancel().await;
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            // A failed/cancelled russh mpsc send never
+                            // transfers ownership of the exec request.
+                            msg: exec_request_rejected_wire_message(error),
+                        },
+                        deadline,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            tokio::select! {
+                result = tokio::time::timeout_at(deadline, command.finish()) => match result {
+                    Ok(Ok(result)) => {
+                        let code = result.code;
+                        let stdout = ZeroizingResponseFrame(ipc::Frame::ExecOut {
+                            data: result.stdout,
+                        });
+                        let stderr = ZeroizingResponseFrame(ipc::Frame::ExecErr {
+                            data: result.stderr,
+                        });
+                        write_frame_or_shutdown(
+                            &mut wr,
+                            &stdout.0,
+                            deadline,
+                            &mut shutdown_rx,
+                        ).await?;
+                        write_frame_or_shutdown(
+                            &mut wr,
+                            &stderr.0,
+                            deadline,
+                            &mut shutdown_rx,
+                        ).await?;
+                        write_frame_or_shutdown(
+                            &mut wr,
+                            &ipc::Frame::ExecExit { code },
+                            deadline,
+                            &mut shutdown_rx,
+                        ).await?;
+                    }
+                    Ok(Err(error)) => {
+                        command.cancel().await;
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: exec_outcome_unknown_wire_message(error),
+                            },
+                            deadline,
+                            &mut shutdown_rx,
+                        ).await?;
+                    }
+                    Err(_) => {
+                        command.cancel().await;
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: exec_outcome_unknown_wire_message(anyhow::anyhow!(
+                                    "remote command exceeded its deadline of {} ms",
+                                    timeout.as_millis()
+                                )),
+                            },
+                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            &mut shutdown_rx,
+                        ).await?;
+                    }
+                },
+                _ = rd.read_u8() => {
+                    command.cancel().await;
+                    return Ok(());
+                }
+                _ = shutdown_rx.changed() => {
+                    command.cancel().await;
+                    return Ok(());
+                }
+            }
+        }
+        ipc::Frame::Shell { cols, rows } => {
+            let deadline = Instant::now() + CONTROL_SETUP_TIMEOUT;
+            let session =
+                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
                         write_owned_frame_or_shutdown(
                             &mut wr,
                             ipc::Frame::Error {
@@ -1278,149 +1467,36 @@ where
                             &mut shutdown_rx,
                         )
                         .await?;
-                        continue;
-                    }
-                };
-                let requested = tokio::select! {
-                    result = command.request_exec_until(cmd.as_str(), deadline) => Some(result),
-                    _ = rd.read_u8() => None,
-                    _ = shutdown_rx.changed() => None,
-                };
-                match requested {
-                    Some(Ok(())) => {}
-                    None => {
-                        command.cancel().await;
                         return Ok(());
                     }
-                    Some(Err(error)) => {
-                        command.cancel().await;
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                // A failed/cancelled russh mpsc send never
-                                // transfers ownership of the exec request.
-                                msg: exec_request_rejected_wire_message(error),
-                            },
-                            deadline,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        continue;
-                    }
+                };
+            let shell = tokio::select! {
+                result = tokio::time::timeout_at(
+                    deadline,
+                    session.pty_shell("xterm-256color", cols, rows),
+                ) => Some(result),
+                _ = rd.read_u8() => None,
+                _ = shutdown_rx.changed() => None,
+            };
+            let shell = match shell {
+                Some(Ok(result)) => result,
+                Some(Err(_)) => {
+                    session.invalidate().await;
+                    Err(anyhow::anyhow!("SSH shell setup exceeded its deadline"))
                 }
-                tokio::select! {
-                    result = tokio::time::timeout_at(deadline, command.finish()) => match result {
-                        Ok(Ok(result)) => {
-                            let code = result.code;
-                            let stdout = ZeroizingResponseFrame(ipc::Frame::ExecOut {
-                                data: result.stdout,
-                            });
-                            let stderr = ZeroizingResponseFrame(ipc::Frame::ExecErr {
-                                data: result.stderr,
-                            });
-                            write_frame_or_shutdown(
-                                &mut wr,
-                                &stdout.0,
-                                deadline,
-                                &mut shutdown_rx,
-                            ).await?;
-                            write_frame_or_shutdown(
-                                &mut wr,
-                                &stderr.0,
-                                deadline,
-                                &mut shutdown_rx,
-                            ).await?;
-                            write_frame_or_shutdown(
-                                &mut wr,
-                                &ipc::Frame::ExecExit { code },
-                                deadline,
-                                &mut shutdown_rx,
-                            ).await?;
-                        }
-                        Ok(Err(error)) => {
-                            command.cancel().await;
-                            write_owned_frame_or_shutdown(
-                                &mut wr,
-                                ipc::Frame::Error {
-                                    msg: exec_outcome_unknown_wire_message(error),
-                                },
-                                deadline,
-                                &mut shutdown_rx,
-                            ).await?;
-                        }
-                        Err(_) => {
-                            command.cancel().await;
-                            write_owned_frame_or_shutdown(
-                                &mut wr,
-                                ipc::Frame::Error {
-                                    msg: exec_outcome_unknown_wire_message(anyhow::anyhow!(
-                                        "remote command exceeded its deadline of {} ms",
-                                        timeout.as_millis()
-                                    )),
-                                },
-                                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                                &mut shutdown_rx,
-                            ).await?;
-                        }
-                    },
-                    _ = rd.read_u8() => {
-                        command.cancel().await;
-                        return Ok(());
-                    }
-                    _ = shutdown_rx.changed() => {
-                        command.cancel().await;
-                        return Ok(());
-                    }
+                None => {
+                    session.invalidate().await;
+                    return Ok(());
                 }
-            }
-            ipc::Frame::Shell { cols, rows } => {
-                let deadline = Instant::now() + CONTROL_SETUP_TIMEOUT;
-                let session =
-                    match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline)
-                        .await
-                    {
-                        Ok(Some(session)) => session,
-                        Ok(None) => return Ok(()),
-                        Err(error) => {
-                            write_owned_frame_or_shutdown(
-                                &mut wr,
-                                ipc::Frame::Error {
-                                    msg: error.to_string(),
-                                },
-                                deadline,
-                                &mut shutdown_rx,
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
-                let shell = tokio::select! {
-                    result = tokio::time::timeout_at(
-                        deadline,
-                        session.pty_shell("xterm-256color", cols, rows),
-                    ) => Some(result),
-                    _ = rd.read_u8() => None,
-                    _ = shutdown_rx.changed() => None,
-                };
-                let shell = match shell {
-                    Some(Ok(result)) => result,
-                    Some(Err(_)) => {
-                        session.invalidate().await;
-                        Err(anyhow::anyhow!("SSH shell setup exceeded its deadline"))
-                    }
-                    None => {
-                        session.invalidate().await;
-                        return Ok(());
-                    }
-                };
-                match shell {
-                    Ok(mut ch) => {
-                        let mut writer = ch.make_writer();
-                        let (shell_frame_tx, mut shell_frame_rx) = mpsc::channel(1);
-                        let shell_frame_pump = read_shell_frame_pump(&mut rd, shell_frame_tx);
-                        tokio::pin!(shell_frame_pump);
-                        let mut shell_frame_pump_running = true;
-                        let shell_result: Result<()> = async {
+            };
+            match shell {
+                Ok(mut ch) => {
+                    let mut writer = ch.make_writer();
+                    let (shell_frame_tx, mut shell_frame_rx) = mpsc::channel(1);
+                    let shell_frame_pump = read_shell_frame_pump(&mut rd, shell_frame_tx);
+                    tokio::pin!(shell_frame_pump);
+                    let mut shell_frame_pump_running = true;
+                    let shell_result: Result<()> = async {
                             write_frame_or_shutdown(
                                 &mut wr,
                                 &ipc::Frame::Ack,
@@ -1502,328 +1578,45 @@ where
                             Ok(())
                         }
                         .await;
-                        zeroize_pending_shell_frames(&mut shell_frame_rx);
-                        drop(writer);
-                        let _ = session.terminate_channel(&mut ch, true).await;
-                        // Shell IPC connections are dedicated sessions. Once
-                        // the remote channel ends (or shutdown/cancellation is
-                        // observed), close the IPC handler instead of returning
-                        // to the top-level frame loop with a consumed watch
-                        // notification.
-                        return shell_result;
-                    }
-                    Err(e) => {
-                        session.invalidate().await;
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error { msg: e.to_string() },
-                            deadline,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                    }
+                    zeroize_pending_shell_frames(&mut shell_frame_rx);
+                    drop(writer);
+                    let _ = session.terminate_channel(&mut ch, true).await;
+                    // Shell IPC connections are dedicated sessions. Once
+                    // the remote channel ends (or shutdown/cancellation is
+                    // observed), close the IPC handler instead of returning
+                    // to the top-level frame loop with a consumed watch
+                    // notification.
+                    return shell_result;
                 }
-            }
-            ipc::Frame::Status => {
-                let deadline = Instant::now() + CONTROL_SETUP_TIMEOUT;
-                // Status is exact-intent call-key authorized before dispatch.
-                // It still reports only daemon lifetime metadata and never
-                // probes SSH health or reconnects with the retained password.
-                write_owned_frame_or_shutdown(
-                    &mut wr,
-                    status_info_frame(&info),
-                    deadline,
-                    &mut shutdown_rx,
-                )
-                .await?;
-            }
-            ipc::Frame::ListDir { path, timeout_ms } => {
-                let timeout = match validated_sftp_timeout(timeout_ms) {
-                    Ok(timeout) => timeout,
-                    Err(error) => {
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                let deadline = Instant::now() + timeout;
-                let _buffered_operation_permit = match acquire_buffered_operation_slot(
-                    Arc::clone(&buffered_operation_slots),
-                    &mut rd,
-                    &mut shutdown_rx,
-                    deadline,
-                )
-                .await
-                {
-                    Ok(Some(permit)) => permit,
-                    Ok(None) => return Ok(()),
-                    Err(error) => {
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                let session =
-                    match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline)
-                        .await
-                    {
-                        Ok(Some(session)) => session,
-                        Ok(None) => return Ok(()),
-                        Err(error) => {
-                            write_owned_frame_or_shutdown(
-                                &mut wr,
-                                ipc::Frame::Error {
-                                    msg: error.to_string(),
-                                },
-                                deadline,
-                                &mut shutdown_rx,
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
-                let result = match tokio::select! {
-                    result = session.list_dir_until(&path, deadline) => Some(result),
-                    _ = rd.read_u8() => None,
-                    _ = shutdown_rx.changed() => None,
-                } {
-                    Some(result) => result,
-                    None => {
-                        session.invalidate().await;
-                        return Ok(());
-                    }
-                };
-                match result {
-                    Ok((path, entries)) => {
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::DirList { path, entries },
-                            deadline,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                    }
-                    Err(error) => {
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            deadline,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                    }
-                }
-            }
-            ipc::Frame::CreateDir { path, timeout_ms } => {
-                let timeout = match validated_sftp_timeout(timeout_ms) {
-                    Ok(timeout) => timeout,
-                    Err(error) => {
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                let deadline = Instant::now() + timeout;
-                let session =
-                    match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline)
-                        .await
-                    {
-                        Ok(Some(session)) => session,
-                        Ok(None) => return Ok(()),
-                        Err(error) => {
-                            write_owned_frame_or_shutdown(
-                                &mut wr,
-                                ipc::Frame::Error {
-                                    msg: error.to_string(),
-                                },
-                                deadline,
-                                &mut shutdown_rx,
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
-                let result = match tokio::select! {
-                    result = session.create_dir_until(&path, deadline) => Some(result),
-                    _ = rd.read_u8() => None,
-                    _ = shutdown_rx.changed() => None,
-                } {
-                    Some(result) => result,
-                    None => {
-                        session.invalidate().await;
-                        return Ok(());
-                    }
-                };
-                match result {
-                    Ok(()) => {
-                        write_frame_or_shutdown(
-                            &mut wr,
-                            &ipc::Frame::Ack,
-                            deadline,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                    }
-                    Err(error) => {
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            deadline,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                    }
-                }
-            }
-            ipc::Frame::Download { path, timeout_ms } => {
-                let timeout = match validated_sftp_timeout(timeout_ms) {
-                    Ok(timeout) => timeout,
-                    Err(error) => {
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                let deadline = Instant::now() + timeout;
-                let session =
-                    match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline)
-                        .await
-                    {
-                        Ok(Some(session)) => session,
-                        Ok(None) => return Ok(()),
-                        Err(error) => {
-                            write_owned_frame_or_shutdown(
-                                &mut wr,
-                                ipc::Frame::Error {
-                                    msg: error.to_string(),
-                                },
-                                deadline,
-                                &mut shutdown_rx,
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
-                let result = match tokio::select! {
-                    result = serve_download(&session, &mut wr, &path, timeout_ms, deadline) => Some(result),
-                    _ = rd.read_u8() => None,
-                    _ = shutdown_rx.changed() => None,
-                } {
-                    Some(result) => result,
-                    None => {
-                        session.invalidate().await;
-                        return Ok(());
-                    }
-                };
-                if let Err(error) = result {
-                    // A timed-out/failed frame may already be partially
-                    // written. Close this IPC connection instead of appending
-                    // an Error frame to a now-ambiguous byte stream.
-                    if error.is::<IpcResponseWriteFailure>() {
-                        return Err(error);
-                    }
+                Err(e) => {
+                    session.invalidate().await;
                     write_owned_frame_or_shutdown(
                         &mut wr,
-                        ipc::Frame::Error {
-                            msg: error.to_string(),
-                        },
-                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                        &mut shutdown_rx,
-                    )
-                    .await?;
-                }
-            }
-            ipc::Frame::UploadBegin {
-                path,
-                size,
-                timeout_ms,
-            } => {
-                let timeout = match validated_sftp_timeout(timeout_ms) {
-                    Ok(timeout) => timeout,
-                    Err(error) => {
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                let deadline = Instant::now() + timeout;
-                let session =
-                    match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline)
-                        .await
-                    {
-                        Ok(Some(session)) => session,
-                        Ok(None) => return Ok(()),
-                        Err(error) => {
-                            write_owned_frame_or_shutdown(
-                                &mut wr,
-                                ipc::Frame::Error {
-                                    msg: error.to_string(),
-                                },
-                                deadline,
-                                &mut shutdown_rx,
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
-                let upload = serve_upload(
-                    &session,
-                    &mut rd,
-                    &mut wr,
-                    UploadRequest {
-                        path: &path,
-                        size,
-                        timeout_ms,
+                        ipc::Frame::Error { msg: e.to_string() },
                         deadline,
-                    },
-                    &mut shutdown_rx,
-                )
-                .await;
-                if let Err(error) = upload {
-                    // See the download path above: never reuse an IPC stream
-                    // after a response write may have stopped mid-frame.
-                    if error.is::<IpcResponseWriteFailure>() {
-                        return Err(error);
-                    }
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                }
+            }
+        }
+        ipc::Frame::Status => {
+            let deadline = Instant::now() + CONTROL_SETUP_TIMEOUT;
+            // Status is exact-intent call-key authorized before dispatch.
+            // It still reports only daemon lifetime metadata and never
+            // probes SSH health or reconnects with the retained password.
+            write_owned_frame_or_shutdown(
+                &mut wr,
+                status_info_frame(&info),
+                deadline,
+                &mut shutdown_rx,
+            )
+            .await?;
+        }
+        ipc::Frame::ListDir { path, timeout_ms } => {
+            let timeout = match validated_sftp_timeout(timeout_ms) {
+                Ok(timeout) => timeout,
+                Err(error) => {
                     write_owned_frame_or_shutdown(
                         &mut wr,
                         ipc::Frame::Error {
@@ -1833,67 +1626,203 @@ where
                         &mut shutdown_rx,
                     )
                     .await?;
+                    return Ok(());
                 }
-                // Upload owns the remainder of this authenticated IPC
-                // connection. Its frame reader can be cancelled after a
-                // partial header/payload by a request deadline, daemon
-                // shutdown, or a competing remote SFTP step. Closing the
-                // connection after the terminal response prevents the outer
-                // request loop from ever treating a partial upload frame as a
-                // new request header.
-                return Ok(());
-            }
-            ipc::Frame::TunnelOpen { spec } => {
-                let deadline = Instant::now() + CONTROL_SETUP_TIMEOUT;
-                let _tunnel_control_permit = match acquire_tunnel_control_slot(
-                    Arc::clone(&tunnel_control_slots),
-                    &mut rd,
-                    &mut shutdown_rx,
-                    deadline,
-                )
-                .await
-                {
-                    Ok(Some(permit)) => permit,
+            };
+            let deadline = Instant::now() + timeout;
+            let _buffered_operation_permit = match acquire_buffered_operation_slot(
+                Arc::clone(&buffered_operation_slots),
+                &mut rd,
+                &mut shutdown_rx,
+                deadline,
+            )
+            .await
+            {
+                Ok(Some(permit)) => permit,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let session =
+                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
+                    Ok(Some(session)) => session,
                     Ok(None) => return Ok(()),
                     Err(error) => {
-                        write_tunnel_terminal(&mut wr, &mut shutdown_rx, Err(error)).await?;
-                        continue;
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                            deadline,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
                     }
                 };
-                let session =
-                    match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline)
-                        .await
-                    {
-                        Ok(Some(session)) => session,
-                        Ok(None) => return Ok(()),
-                        Err(error) => {
-                            write_tunnel_terminal(&mut wr, &mut shutdown_rx, Err(error)).await?;
-                            continue;
-                        }
-                    };
-                // This dedicated IPC connection owns the complete tunnel
-                // lifetime. EOF, TunnelStop, or daemon shutdown all cancel it
-                // and wait for bounded SSH/listener cleanup.
-                return serve_tunnel(session, &mut rd, &mut wr, spec, &mut shutdown_rx, deadline)
-                    .await;
+            let result = match tokio::select! {
+                result = session.list_dir_until(&path, deadline) => Some(result),
+                _ = rd.read_u8() => None,
+                _ = shutdown_rx.changed() => None,
+            } {
+                Some(result) => result,
+                None => {
+                    session.invalidate().await;
+                    return Ok(());
+                }
+            };
+            match result {
+                Ok((path, entries)) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::DirList { path, entries },
+                        deadline,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        deadline,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                }
             }
-            ipc::Frame::Shutdown => {
-                write_frame_or_shutdown(
-                    &mut wr,
-                    &ipc::Frame::Ack,
-                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                    &mut shutdown_rx,
-                )
-                .await?;
-                let _ = shutdown.send(true);
-                break;
+        }
+        ipc::Frame::CreateDir { path, timeout_ms } => {
+            let timeout = match validated_sftp_timeout(timeout_ms) {
+                Ok(timeout) => timeout,
+                Err(error) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let deadline = Instant::now() + timeout;
+            let session =
+                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                            deadline,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            let result = match tokio::select! {
+                result = session.create_dir_until(&path, deadline) => Some(result),
+                _ = rd.read_u8() => None,
+                _ = shutdown_rx.changed() => None,
+            } {
+                Some(result) => result,
+                None => {
+                    session.invalidate().await;
+                    return Ok(());
+                }
+            };
+            match result {
+                Ok(()) => {
+                    write_frame_or_shutdown(&mut wr, &ipc::Frame::Ack, deadline, &mut shutdown_rx)
+                        .await?;
+                }
+                Err(error) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        deadline,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                }
             }
-            mut unexpected => {
-                unexpected.zeroize_sensitive();
+        }
+        ipc::Frame::Download { path, timeout_ms } => {
+            let timeout = match validated_sftp_timeout(timeout_ms) {
+                Ok(timeout) => timeout,
+                Err(error) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let deadline = Instant::now() + timeout;
+            let session =
+                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                            deadline,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            let result = match tokio::select! {
+                result = serve_download(&session, &mut wr, &path, timeout_ms, deadline) => Some(result),
+                _ = rd.read_u8() => None,
+                _ = shutdown_rx.changed() => None,
+            } {
+                Some(result) => result,
+                None => {
+                    session.invalidate().await;
+                    return Ok(());
+                }
+            };
+            if let Err(error) = result {
+                // A timed-out/failed frame may already be partially
+                // written. Close this IPC connection instead of appending
+                // an Error frame to a now-ambiguous byte stream.
+                if error.is::<IpcResponseWriteFailure>() {
+                    return Err(error);
+                }
                 write_owned_frame_or_shutdown(
                     &mut wr,
                     ipc::Frame::Error {
-                        msg: "unexpected frame".into(),
+                        msg: error.to_string(),
                     },
                     Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
                     &mut shutdown_rx,
@@ -1901,8 +1830,1065 @@ where
                 .await?;
             }
         }
+        ipc::Frame::UploadBegin {
+            path,
+            size,
+            timeout_ms,
+        } => {
+            let timeout = match validated_sftp_timeout(timeout_ms) {
+                Ok(timeout) => timeout,
+                Err(error) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let deadline = Instant::now() + timeout;
+            let session =
+                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                            deadline,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            let upload = serve_upload(
+                &session,
+                &mut rd,
+                &mut wr,
+                UploadRequest {
+                    path: &path,
+                    size,
+                    timeout_ms,
+                    deadline,
+                },
+                &mut shutdown_rx,
+            )
+            .await;
+            if let Err(error) = upload {
+                // See the download path above: never reuse an IPC stream
+                // after a response write may have stopped mid-frame.
+                if error.is::<IpcResponseWriteFailure>() {
+                    return Err(error);
+                }
+                write_owned_frame_or_shutdown(
+                    &mut wr,
+                    ipc::Frame::Error {
+                        msg: error.to_string(),
+                    },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await?;
+            }
+            // Upload owns the remainder of this authenticated IPC
+            // connection. Its frame reader can be cancelled after a
+            // partial header/payload by a request deadline, daemon
+            // shutdown, or a competing remote SFTP step. Closing the
+            // connection after the terminal response prevents the outer
+            // request loop from ever treating a partial upload frame as a
+            // new request header.
+            return Ok(());
+        }
+        ipc::Frame::TunnelOpen { spec } => {
+            let deadline = Instant::now() + CONTROL_SETUP_TIMEOUT;
+            let _tunnel_control_permit = match acquire_tunnel_control_slot(
+                Arc::clone(&tunnel_control_slots),
+                &mut rd,
+                &mut shutdown_rx,
+                deadline,
+            )
+            .await
+            {
+                Ok(Some(permit)) => permit,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    write_tunnel_terminal(&mut wr, &mut shutdown_rx, Err(error)).await?;
+                    return Ok(());
+                }
+            };
+            let session =
+                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        write_tunnel_terminal(&mut wr, &mut shutdown_rx, Err(error)).await?;
+                        return Ok(());
+                    }
+                };
+            // This dedicated IPC connection owns the complete tunnel
+            // lifetime. EOF, TunnelStop, or daemon shutdown all cancel it
+            // and wait for bounded SSH/listener cleanup.
+            return serve_tunnel(session, &mut rd, &mut wr, spec, &mut shutdown_rx, deadline).await;
+        }
+        ipc::Frame::Shutdown { mut passphrase } => {
+            passphrase.zeroize();
+            write_frame_or_shutdown(
+                &mut wr,
+                &ipc::Frame::Ack,
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await?;
+            let _ = shutdown.send(true);
+            return Ok(());
+        }
+        mut unexpected => {
+            unexpected.zeroize_sensitive();
+            write_owned_frame_or_shutdown(
+                &mut wr,
+                ipc::Frame::Error {
+                    msg: "unexpected frame".into(),
+                },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await?;
+        }
     }
     Ok(())
+}
+
+// ── Global per-user/per-vault daemon (IPC v6) ──────────────────────────────
+
+/// Bounded credential lease: after this the profile's decrypted credentials
+/// and its vault profile lease are released; a later operation must unlock
+/// again. Mirrors the design's CredentialLease horizon (design §8.4).
+const V6_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const GLOBAL_CONNECTION_LIMIT: usize = 64;
+const GRANT_REGISTRY_LIMIT: usize = 1024;
+const LEASE_REAPER_INTERVAL: Duration = Duration::from_secs(1);
+static GRANT_AUDIT_LOCK: std::sync::LazyLock<StdMutex<()>> =
+    std::sync::LazyLock::new(|| StdMutex::new(()));
+
+struct ProfilePoolEntry {
+    conn_info: ConnInfo,
+    sessions: Arc<SessionManager>,
+    call_key: Arc<ProfileCallKey>,
+    expires_at: Instant,
+    _lease: Arc<vault::ProfileLease>,
+}
+
+#[derive(Default)]
+struct ProfilePool {
+    entries: StdMutex<HashMap<[u8; 16], Arc<ProfilePoolEntry>>>,
+}
+
+impl ProfilePool {
+    /// Resolve a live credential lease for `profile_id`, dropping the stored
+    /// entry (and therefore releasing its vault profile lease) once the
+    /// credential lease expires. In-flight holders are independently wrapped
+    /// by the same hard authorization deadline before dispatch.
+    fn entry_for(&self, profile_id: &[u8; 16]) -> Option<Arc<ProfilePoolEntry>> {
+        let mut entries = self.entries.lock().ok()?;
+        let expired = entries
+            .get(profile_id)
+            .is_some_and(|entry| entry.expires_at <= Instant::now());
+        if expired {
+            entries.remove(profile_id);
+        }
+        entries.get(profile_id).cloned()
+    }
+
+    fn insert(&self, profile_id: [u8; 16], entry: ProfilePoolEntry) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(profile_id, Arc::new(entry));
+        }
+    }
+
+    fn prune_expired(&self, now: Instant) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.retain(|_, entry| entry.expires_at > now);
+        }
+    }
+}
+
+/// Reference-counted live work: every accepted connection handler and every
+/// long-running operation (tunnel, shell, transfer) holds a guard for its
+/// lifetime. The broker exits only after the counter stays at zero for the
+/// whole idle window, so idle exit can never interrupt work in flight.
+#[derive(Default)]
+struct IdleTracker {
+    work: AtomicUsize,
+    changed: Notify,
+}
+
+struct IdleGuard {
+    tracker: Arc<IdleTracker>,
+}
+
+impl IdleTracker {
+    fn acquire(self: &Arc<Self>) -> IdleGuard {
+        self.work.fetch_add(1, Ordering::AcqRel);
+        self.changed.notify_waiters();
+        IdleGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.work.load(Ordering::Acquire) == 0
+    }
+
+    /// Complete once the tracker has observed zero work for `timeout`
+    /// continuously; a spurious wake re-arms the full window.
+    async fn wait_for_idle_exit(self: &Arc<Self>, timeout: Duration) {
+        loop {
+            let notified = self.changed.notified();
+            if self.is_idle() {
+                let deadline = Instant::now() + timeout;
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    return;
+                }
+            } else {
+                notified.await;
+            }
+        }
+    }
+}
+
+impl Drop for IdleGuard {
+    fn drop(&mut self) {
+        self.tracker.work.fetch_sub(1, Ordering::AcqRel);
+        self.tracker.changed.notify_waiters();
+    }
+}
+
+/// Operation kinds a grant may authorize. Interactive shells and control
+/// operations (unlock, shutdown, grant issuance) are never grantable.
+const GRANTABLE_OPERATION_KINDS: &[&str] = &[
+    "ssh.exec",
+    "daemon.status",
+    "sftp.list",
+    "sftp.read",
+    "sftp.write",
+    "forward",
+];
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Live registry of issued grants. Grants die with the daemon instance: a
+/// restart rebinds every capability to a fresh activation secret.
+#[derive(Default)]
+struct GrantRegistry {
+    grants: StdMutex<HashMap<[u8; 16], Arc<GrantRecord>>>,
+}
+
+impl GrantRegistry {
+    fn get(&self, grant_id: &[u8; 16]) -> Option<Arc<GrantRecord>> {
+        let mut grants = self.grants.lock().ok()?;
+        let expired = grants
+            .get(grant_id)
+            .is_some_and(|record| record.expires_at <= Instant::now());
+        if expired {
+            grants.remove(grant_id);
+        }
+        grants.get(grant_id).cloned()
+    }
+
+    fn insert(&self, grant: serctl_protocol::grant::OperationGrant) -> Result<()> {
+        let mut grants = self
+            .grants
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grant registry lock is poisoned"))?;
+        let now = Instant::now();
+        grants.retain(|_, record| record.expires_at > now);
+        ensure!(
+            grants.len() < GRANT_REGISTRY_LIMIT,
+            "grant registry is at its capacity"
+        );
+        ensure!(!grants.contains_key(&grant.grant_id), "grant id collision");
+        grants.insert(grant.grant_id, Arc::new(GrantRecord::new(grant, now)));
+        Ok(())
+    }
+
+    fn prune_expired(&self, now: Instant) {
+        if let Ok(mut grants) = self.grants.lock() {
+            grants.retain(|_, record| record.expires_at > now);
+        }
+    }
+}
+
+/// One grant plus its remaining budget and audit sink.
+struct GrantRecord {
+    grant: serctl_protocol::grant::OperationGrant,
+    remaining: AtomicUsize,
+    expires_at: Instant,
+}
+
+#[derive(serde::Serialize)]
+struct GrantAuditLine {
+    at_unix_ms: u64,
+    grant_id: String,
+    operation_kind: String,
+    profile: String,
+    request_id: String,
+    outcome: String,
+}
+
+impl GrantRecord {
+    fn new(grant: serctl_protocol::grant::OperationGrant, issued_at: Instant) -> Self {
+        Self {
+            remaining: AtomicUsize::new(grant.budget as usize),
+            grant,
+            expires_at: issued_at + serctl_protocol::grant::GRANT_TTL,
+        }
+    }
+
+    /// Validate expiry, requested deadline, scope, and proof of possession,
+    /// then atomically spend one budget unit.
+    fn check_and_spend(&self, prelude: &V6RequestPrelude, now: Instant, now_ms: u64) -> Result<()> {
+        let grant = &self.grant;
+        ensure!(now < self.expires_at, "grant has expired");
+        ensure!(
+            prelude.requested_deadline_unix_ms > now_ms
+                && prelude.requested_deadline_unix_ms <= grant.expires_unix_ms,
+            "requested deadline exceeds the grant expiry"
+        );
+        ensure!(
+            grant.covers(prelude),
+            "grant does not authorize this operation kind"
+        );
+        ensure!(grant.covers_profile(prelude), "grant profile mismatch");
+        let signature = prelude
+            .pop_signature
+            .as_deref()
+            .context("grant prelude must carry a proof-of-possession signature")?;
+        serctl_protocol::grant::verify_prelude_pop(&grant.holder_key, signature, prelude)?;
+        let mut remaining = self.remaining.load(Ordering::Acquire);
+        loop {
+            if remaining == 0 {
+                bail!("grant budget exhausted");
+            }
+            match self.remaining.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(current) => remaining = current,
+            }
+        }
+    }
+
+    /// Append one audit line to the protected grant audit log in the runtime
+    /// directory. Persistence failures are logged, never fatal: audit must not
+    /// become a new failure mode for relayed operations.
+    fn audit(&self, prelude: &V6RequestPrelude, outcome: &str) {
+        let entry = GrantAuditLine {
+            at_unix_ms: now_unix_ms(),
+            grant_id: self.grant.grant_id_hex(),
+            operation_kind: prelude.operation_kind.clone(),
+            profile: prelude
+                .profile_name
+                .clone()
+                .unwrap_or_else(|| self.grant.profile_name.clone()),
+            request_id: hex::encode(prelude.request_id),
+            outcome: outcome.to_owned(),
+        };
+        let result = (|| -> Result<()> {
+            use std::io::{Seek as _, Write as _};
+            let _guard = GRANT_AUDIT_LOCK
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grant audit lock is poisoned"))?;
+            let path = daemon_runtime::grant_audit_path()?;
+            let mut file = serctl_core::security::open_or_create_protected_file(&path)
+                .context("open protected grant audit log")?;
+            file.seek(std::io::SeekFrom::End(0))
+                .context("seek to grant audit end")?;
+            let line =
+                Zeroizing::new(serde_json::to_vec(&entry).context("serialize grant audit entry")?);
+            file.write_all(&line).context("append grant audit entry")?;
+            file.write_all(b"\n")
+                .context("terminate grant audit entry")?;
+            file.sync_data().context("sync grant audit entry")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            log::warn!(
+                "grant audit persistence failed: {}",
+                terminal_safe_error(&error)
+            );
+        }
+    }
+}
+
+/// Issue a grant on behalf of an unlocked issuing profile. The grant's target
+/// profile must be the same unlocked profile; the holder key never leaves the
+/// daemon and the agent's private key never enters it.
+fn issue_grant(
+    prelude: &V6RequestPrelude,
+    pool: &ProfilePool,
+    grants: &GrantRegistry,
+    frame: &ipc::Frame,
+) -> Result<serctl_protocol::grant::OperationGrant> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    use ed25519_dalek::VerifyingKey;
+
+    let ipc::Frame::IssueGrant {
+        profile,
+        operations,
+        budget,
+        holder_key,
+    } = frame
+    else {
+        bail!("issue-grant operation kind without an issue-grant frame");
+    };
+    ensure!(
+        prelude.profile_name.as_deref() == Some(profile.as_str()),
+        "grant issuance must target the unlocked issuing profile"
+    );
+    let profile_id = prelude
+        .profile_id
+        .context("grant issuance requires the issuing profile id")?;
+    let entry = pool
+        .entry_for(&profile_id)
+        .context("profile is locked: unlock it first")?;
+    ensure!(
+        entry.conn_info.profile == *profile,
+        "grant profile name does not match its profile id"
+    );
+    let profile_proof = prelude
+        .profile_proof
+        .as_deref()
+        .context("grant issuance requires a profile call proof")?;
+    serctl_protocol::v6::verify_profile_prelude_proof(
+        entry.call_key.as_bytes(),
+        profile_proof,
+        prelude,
+    )?;
+    let mut unique = operations.clone();
+    unique.sort();
+    unique.dedup();
+    ensure!(
+        !unique.is_empty()
+            && unique
+                .iter()
+                .all(|kind| GRANTABLE_OPERATION_KINDS.contains(&kind.as_str())),
+        "grant contains a non-grantable or empty operation kind"
+    );
+    let decoded = B64
+        .decode(holder_key)
+        .context("decode grant holder public key")?;
+    let key_bytes: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("grant holder key must decode to 32 bytes"))?;
+    let holder =
+        VerifyingKey::from_bytes(&key_bytes).context("grant holder public key is invalid")?;
+    let grant = serctl_protocol::grant::OperationGrant::new(
+        profile.clone(),
+        profile_id,
+        unique,
+        *budget,
+        &holder,
+        now_unix_ms(),
+    )?;
+    grants.insert(grant.clone())?;
+    Ok(grant)
+}
+
+/// Connect an authenticated SSH session for freshly decrypted credentials,
+/// persisting a first-use host-key pin through the still-held profile lease.
+/// Returns the session together with the lease, which remains held by the
+/// pool entry for the whole credential-lease lifetime.
+async fn connect_unlocked_session(
+    name: &str,
+    creds: &mut Creds,
+    passphrase: &Zeroizing<String>,
+    mut lease: vault::ProfileLease,
+    deadline: Instant,
+) -> Result<(SshSession, vault::ProfileLease)> {
+    let expect = creds.host_key.clone();
+    let staged = SshSession::connect_key_exchange_until(creds, expect, deadline).await?;
+    let fp = staged.observed_fingerprint().to_owned();
+    if creds.host_key.is_none() {
+        let profile_owned = name.to_owned();
+        let persisted_fp = fp.clone();
+        let pin_passphrase = Zeroizing::new(passphrase.as_str().to_owned());
+        let mut task = tokio::task::spawn_blocking(move || {
+            let lock_timeout = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .context("daemon host-key pin persistence exceeded its setup deadline")?;
+            vault::set_pinned_fp_with_lock_timeout(
+                &profile_owned,
+                persisted_fp,
+                &pin_passphrase,
+                lock_timeout,
+                &lease,
+            )?;
+            Ok::<_, anyhow::Error>(lease)
+        });
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(result) => {
+                lease = result.context("join daemon host-key pin persistence worker")??;
+            }
+            Err(_) => {
+                task.abort();
+                staged.abort().await;
+                bail!("daemon host-key pin persistence exceeded its setup deadline")
+            }
+        }
+        eprintln!("[serctl] pinned host key {}", terminal_safe_field(&fp));
+        creds.host_key = Some(fp);
+    }
+    let session = staged
+        .authenticate_password_until(&creds.user, &creds.password, deadline)
+        .await?;
+    Ok((session, lease))
+}
+
+/// Unlock one profile: verify the passphrase, decrypt the credentials, derive
+/// the call key, connect SSH (persisting a first-use host-key pin), and
+/// publish a bounded credential lease into the pool.
+async fn unlock_profile(
+    prelude: &V6RequestPrelude,
+    pool: &ProfilePool,
+    frame: &ipc::Frame,
+) -> Result<Zeroizing<String>> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let ipc::Frame::Unlock { passphrase } = frame else {
+        bail!("unlock operation kind without an unlock frame")
+    };
+    let passphrase = Zeroizing::new(passphrase.as_str().to_owned());
+    let name = prelude
+        .profile_name
+        .clone()
+        .context("unlock requires a profile name in the handshake prelude")?;
+    let deadline = Instant::now() + CONTROL_SETUP_TIMEOUT;
+    let profile_owned = name.clone();
+    let key_passphrase = passphrase.clone();
+    let mut snapshot = tokio::task::spawn_blocking(move || {
+        let lease = vault::acquire_profile_use_lease(&profile_owned)?;
+        let lock_timeout = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .context("daemon unlock exceeded its setup deadline")?;
+        let (creds, call_key) = vault::decrypt_with_call_key_with_lock_timeout(
+            &profile_owned,
+            &key_passphrase,
+            None,
+            lock_timeout,
+        )?;
+        let profile_id = vault::list_profile_metadata()?
+            .into_iter()
+            .find(|metadata| metadata.name == profile_owned)
+            .map(|metadata| metadata.profile_id)
+            .context("profile disappeared from the vault catalog")?;
+        Ok::<_, anyhow::Error>((creds, call_key, profile_id, lease))
+    });
+    let (mut creds, call_key, profile_id, lease) =
+        match tokio::time::timeout_at(deadline, &mut snapshot).await {
+            Ok(result) => result.context("join daemon unlock worker")??,
+            Err(_) => {
+                snapshot.abort();
+                bail!("daemon unlock exceeded its setup deadline")
+            }
+        };
+    let (session, lease) =
+        connect_unlocked_session(&name, &mut creds, &passphrase, lease, deadline).await?;
+    drop(passphrase);
+    let encoded_call_key = Zeroizing::new(B64.encode(call_key.as_bytes()));
+    let unlocked_at = Instant::now();
+    let expires_at = unlocked_at + serctl_protocol::v6::CREDENTIAL_LEASE_TTL;
+    let sessions = Arc::new(SessionManager::new(creds.clone(), session));
+    let conn_info = ConnInfo {
+        profile: name.clone(),
+        host: creds.host.clone(),
+        user: creds.user.clone(),
+        started: now_unix(),
+        token: Arc::new(Zeroizing::new(vault::new_ipc_token())),
+    };
+    pool.insert(
+        profile_id,
+        ProfilePoolEntry {
+            conn_info,
+            sessions,
+            call_key: Arc::new(call_key),
+            expires_at,
+            _lease: Arc::new(lease),
+        },
+    );
+    Ok(encoded_call_key)
+}
+
+/// Serve one authenticated v6 connection: the root request is the unlock, the
+/// catalog listing, a grant issuance, or a data-plane operation against a live
+/// credential lease (directly or through a grant).
+async fn handle_global_conn<S>(
+    io: V6ServerIo<S>,
+    prelude: V6RequestPrelude,
+    pool: Arc<ProfilePool>,
+    grants: Arc<GrantRegistry>,
+    shutdown_tx: watch::Sender<bool>,
+    buffered_operation_slots: Arc<Semaphore>,
+    tunnel_control_slots: Arc<Semaphore>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut rd, mut wr) = tokio::io::split(io);
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    let frame =
+        read_authenticated_request(&mut rd, &mut shutdown_rx, POST_AUTH_IDLE_TIMEOUT).await?;
+    let Some(frame) = frame else {
+        return Ok(());
+    };
+
+    match frame_kind(&frame) {
+        "daemon.unlock" => match unlock_profile(&prelude, &pool, &frame).await {
+            Ok(call_key) => {
+                let response = ZeroizingResponseFrame(ipc::Frame::ProfileAuthorized {
+                    call_key: call_key.as_str().to_owned(),
+                });
+                write_frame_or_shutdown(
+                    &mut wr,
+                    &response.0,
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await
+            }
+            Err(error) => {
+                let msg = terminal_safe_error(&error);
+                write_owned_frame_or_shutdown(
+                    &mut wr,
+                    ipc::Frame::Error { msg },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await
+            }
+        },
+        "daemon.list-profiles" => {
+            let listing = tokio::task::spawn_blocking(|| {
+                vault::list_profile_metadata().map(|metadata| {
+                    metadata
+                        .into_iter()
+                        .map(|profile| ipc::WireProfile {
+                            name: profile.name,
+                            host: profile.host,
+                            port: profile.port,
+                            generation: profile.generation,
+                            profile_id: hex::encode(profile.profile_id),
+                        })
+                        .collect()
+                })
+            })
+            .await
+            .context("join profile catalog worker")?;
+            match listing {
+                Ok(profiles) => {
+                    write_frame_or_shutdown(
+                        &mut wr,
+                        &ipc::Frame::ProfileList { profiles },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    let msg = terminal_safe_error(&error);
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error { msg },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await
+                }
+            }
+        }
+        "daemon.issue-grant" => match issue_grant(&prelude, &pool, &grants, &frame) {
+            Ok(grant) => {
+                eprintln!(
+                    "[serctl] grant issued: {} for {} ({} ops, budget {})",
+                    grant.grant_id_hex(),
+                    terminal_safe_field(&grant.profile_name),
+                    grant.operations.len(),
+                    grant.budget
+                );
+                write_frame_or_shutdown(
+                    &mut wr,
+                    &ipc::Frame::GrantIssued {
+                        grant_id: grant.grant_id_hex(),
+                        expires_unix_ms: grant.expires_unix_ms,
+                    },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await
+            }
+            Err(error) => {
+                let msg = terminal_safe_error(&error);
+                write_owned_frame_or_shutdown(
+                    &mut wr,
+                    ipc::Frame::Error { msg },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await
+            }
+        },
+        "daemon.shutdown" => {
+            let ipc::Frame::Shutdown { passphrase } = frame else {
+                bail!("shutdown operation kind without a shutdown frame")
+            };
+            let passphrase = Zeroizing::new(passphrase);
+            let profile = prelude
+                .profile_name
+                .as_deref()
+                .context("shutdown requires a profile name in the handshake prelude")?
+                .to_owned();
+            let verify_deadline = Instant::now() + CONTROL_SETUP_TIMEOUT;
+            let mut verifier = tokio::task::spawn_blocking(move || {
+                vault::derive_profile_call_key_with_lock_timeout(
+                    &profile,
+                    &passphrase,
+                    None,
+                    CONTROL_SETUP_TIMEOUT,
+                )
+            });
+            let verified = match tokio::time::timeout_at(verify_deadline, &mut verifier).await {
+                Ok(result) => result.context("join daemon shutdown verifier")?,
+                Err(_) => {
+                    verifier.abort();
+                    bail!("daemon shutdown authorization exceeded its deadline")
+                }
+            };
+            if let Err(error) = verified {
+                let msg = terminal_safe_error(&error);
+                return write_owned_frame_or_shutdown(
+                    &mut wr,
+                    ipc::Frame::Error { msg },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await;
+            }
+            write_frame_or_shutdown(
+                &mut wr,
+                &ipc::Frame::Ack,
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await?;
+            let _ = shutdown_tx.send(true);
+            Ok(())
+        }
+        _ => {
+            // A grant-bound request names the grant instead of a profile id:
+            // the grant's bound profile and budget authorize the operation.
+            let grant_record: Option<Arc<GrantRecord>> = if let Some(grant_id) = prelude.grant_id {
+                let record = match grants.get(&grant_id) {
+                    Some(record) => record,
+                    None => {
+                        let msg = "grant is unknown or expired".to_owned();
+                        return write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error { msg },
+                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            &mut shutdown_rx,
+                        )
+                        .await;
+                    }
+                };
+                if let Err(error) = record.check_and_spend(&prelude, Instant::now(), now_unix_ms())
+                {
+                    let msg = terminal_safe_error(&error);
+                    record.audit(&prelude, &format!("rejected: {msg}"));
+                    return write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error { msg },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await;
+                }
+                Some(record)
+            } else {
+                None
+            };
+            let profile_id = match (&grant_record, prelude.profile_id) {
+                (Some(record), _) => record.grant.profile_id,
+                (None, Some(profile_id)) => profile_id,
+                (None, None) => {
+                    let msg = "profile id is required for this operation".to_owned();
+                    return write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error { msg },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await;
+                }
+            };
+            let Some(entry) = pool.entry_for(&profile_id) else {
+                let msg = "profile is locked: unlock it first".to_owned();
+                return write_owned_frame_or_shutdown(
+                    &mut wr,
+                    ipc::Frame::Error { msg },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await;
+            };
+            let expected_profile = grant_record
+                .as_ref()
+                .map(|record| record.grant.profile_name.as_str())
+                .or(prelude.profile_name.as_deref())
+                .context("profile name is required for this operation")?;
+            ensure!(
+                entry.conn_info.profile == expected_profile,
+                "profile name does not match its profile id"
+            );
+
+            if grant_record.is_none() {
+                let proof = prelude
+                    .profile_proof
+                    .as_deref()
+                    .context("profile call proof is required")?;
+                serctl_protocol::v6::verify_profile_prelude_proof(
+                    entry.call_key.as_bytes(),
+                    proof,
+                    &prelude,
+                )?;
+            }
+
+            let now = Instant::now();
+            let mut authorization_deadline = entry.expires_at;
+            if let Some(record) = &grant_record {
+                authorization_deadline = authorization_deadline.min(record.expires_at);
+                let wall_now = now_unix_ms();
+                let remaining_ms = prelude
+                    .requested_deadline_unix_ms
+                    .checked_sub(wall_now)
+                    .context("requested deadline has expired")?;
+                let requested_deadline = now
+                    .checked_add(Duration::from_millis(remaining_ms))
+                    .context("requested deadline exceeds the monotonic clock range")?;
+                authorization_deadline = authorization_deadline.min(requested_deadline);
+            }
+            ensure!(
+                authorization_deadline > now,
+                "profile authorization lease expired"
+            );
+            let context = HandlerContext {
+                sessions: entry.sessions.clone(),
+                info: entry.conn_info.clone(),
+                shutdown: shutdown_tx.clone(),
+                buffered_operation_slots,
+                tunnel_control_slots,
+                call_key: entry.call_key.clone(),
+                authorization_deadline: Some(authorization_deadline),
+            };
+            let outcome = dispatch_root_request(rd, wr, shutdown_rx, context, frame).await;
+            if let Some(record) = &grant_record {
+                record.audit(
+                    &prelude,
+                    if outcome.is_ok() {
+                        "accepted"
+                    } else {
+                        "rejected: dispatch failure"
+                    },
+                );
+                if outcome.is_ok() {
+                    eprintln!(
+                        "[serctl] grant relay: {} {} (grant {}, budget left {})",
+                        terminal_safe_field(&prelude.operation_kind),
+                        terminal_safe_field(&record.grant.profile_name),
+                        record.grant.grant_id_hex(),
+                        record.remaining.load(Ordering::Acquire)
+                    );
+                }
+            }
+            outcome
+        }
+    }
+}
+
+/// Global per-user/per-vault daemon: bind the v6 endpoint, publish the runtime
+/// descriptor and activation secret, and serve every profile through
+/// on-demand credential leases.
+pub async fn run_global(
+    instance_id: InstanceId,
+    secret: ActivationSecret,
+    build_commit: String,
+) -> Result<()> {
+    run_global_with_idle_timeout(instance_id, secret, build_commit, IDLE_EXIT_TIMEOUT).await
+}
+
+/// Global broker with a caller-chosen idle-exit window (tests use short
+/// windows; the binary uses `IDLE_EXIT_TIMEOUT`).
+pub async fn run_global_with_idle_timeout(
+    instance_id: InstanceId,
+    secret: ActivationSecret,
+    build_commit: String,
+    idle_exit_timeout: Duration,
+) -> Result<()> {
+    let endpoint = daemon_runtime::v6_endpoint(&instance_id)?;
+    let mut listener = ipc::LocalListener::bind(&endpoint)?;
+    #[cfg(unix)]
+    serctl_core::security::harden_file(std::path::Path::new(&endpoint))?;
+    daemon_runtime::write_descriptor(&DaemonRuntimeDescriptor {
+        version: DESCRIPTOR_SCHEMA_VERSION,
+        instance_id: instance_id.as_hex(),
+        pid: std::process::id(),
+        endpoint,
+        protocol_min: IPC_PROTOCOL_VERSION_V6,
+        protocol_max: IPC_PROTOCOL_VERSION_V6,
+        started_unix: now_unix(),
+        build_commit,
+    })?;
+    daemon_runtime::write_secret(&secret)?;
+
+    let pool = Arc::new(ProfilePool::default());
+    let grants = Arc::new(GrantRegistry::default());
+    let idle = Arc::new(IdleTracker::default());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut daemon_shutdown = shutdown_rx.clone();
+    let connection_slots = Arc::new(Semaphore::new(GLOBAL_CONNECTION_LIMIT));
+    let buffered_operation_slots = Arc::new(Semaphore::new(BUFFERED_HEAVY_OPERATION_LIMIT));
+    let tunnel_control_slots = Arc::new(Semaphore::new(TUNNEL_CONTROL_LIMIT));
+    let mut handlers = JoinSet::new();
+    let reaper_pool = Arc::clone(&pool);
+    let reaper_grants = Arc::clone(&grants);
+    let mut reaper_shutdown = shutdown_rx.clone();
+    let reaper_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(LEASE_REAPER_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let now = Instant::now();
+                    reaper_pool.prune_expired(now);
+                    reaper_grants.prune_expired(now);
+                }
+                changed = reaper_shutdown.changed() => {
+                    if changed.is_err() || *reaper_shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    eprintln!(
+        "[serctl] daemon up: global broker {} (Ctrl-C to stop)",
+        terminal_safe_field(listener.endpoint())
+    );
+
+    let result: Result<()> = loop {
+        tokio::select! {
+            res = listener.accept() => {
+                let stream = match res {
+                    Ok(stream) => stream,
+                    Err(error) => break Err(error.context("accept local IPC connection")),
+                };
+                let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
+                    log::warn!("rejecting IPC connection: connection limit reached");
+                    continue;
+                };
+                let handler_shutdown = shutdown_rx.clone();
+                let _ = handler_shutdown; // the global handler subscribes per connection
+                let pool = Arc::clone(&pool);
+                let grants = Arc::clone(&grants);
+                let secret = secret.clone();
+                let shutdown_tx = shutdown_tx.clone();
+                let buffered_operation_slots = Arc::clone(&buffered_operation_slots);
+                let tunnel_control_slots = Arc::clone(&tunnel_control_slots);
+                let work_guard = idle.acquire();
+                handlers.spawn(async move {
+                    let _permit = permit;
+                    let _work_guard = work_guard;
+                    let deadline = Instant::now() + V6_HANDSHAKE_TIMEOUT;
+                    match serctl_protocol::v6::v6_server_handshake(
+                        stream,
+                        &secret,
+                        instance_id,
+                        deadline,
+                    )
+                    .await
+                    {
+                        Ok((session, prelude)) => {
+                            let io = V6ServerIo::new(session);
+                            handle_global_conn(
+                                io,
+                                prelude,
+                                pool,
+                                grants,
+                                shutdown_tx,
+                                buffered_operation_slots,
+                                tunnel_control_slots,
+                            )
+                            .await
+                        }
+                        Err(error) => {
+                            log::warn!("rejected IPC v6 handshake: {}", terminal_safe_error(&error));
+                            Ok(())
+                        }
+                    }
+                });
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("[serctl] shutting down");
+                break Ok(());
+            }
+            changed = daemon_shutdown.changed() => {
+                if changed.is_ok() && *daemon_shutdown.borrow() {
+                    eprintln!("[serctl] shutdown requested");
+                    break Ok(());
+                }
+            }
+            _ = idle.wait_for_idle_exit(idle_exit_timeout) => {
+                // Re-check under the wake race: work may have arrived exactly
+                // as the idle window expired.
+                if idle.is_idle() {
+                    eprintln!("[serctl] idle for {idle_exit_timeout:?}; exiting");
+                    break Ok(());
+                }
+            }
+            joined = handlers.join_next(), if !handlers.is_empty() => {
+                log_handler_result(joined);
+            }
+        }
+    };
+
+    let _ = shutdown_tx.send(true);
+    let _ = reaper_task.await;
+    let drained = tokio::time::timeout(HANDLER_SHUTDOWN_GRACE, async {
+        while let Some(joined) = handlers.join_next().await {
+            log_handler_result(Some(joined));
+        }
+    })
+    .await;
+    if drained.is_err() {
+        handlers.abort_all();
+        while handlers.join_next().await.is_some() {}
+    }
+    daemon_runtime::clear_runtime_state()?;
+    result
 }
 
 async fn write_tunnel_terminal<W>(
@@ -1988,7 +2974,7 @@ async fn serve_tunnel<R, W>(
     session: Arc<SshSession>,
     reader: &mut R,
     writer: &mut W,
-    spec: crate::ssh::TunnelSpec,
+    spec: serctl_core::ssh::TunnelSpec,
     shutdown: &mut watch::Receiver<bool>,
     setup_deadline: Instant,
 ) -> Result<()>
@@ -2647,11 +3633,11 @@ mod tests {
         acquire_buffered_operation_slot, acquire_tunnel_control_slot,
         authenticate_incoming_protocol, await_owned_blocking_until, daemon_up_line,
         exec_outcome_unknown_wire_message, exec_request_rejected_wire_message, handoff_readiness,
-        read_authenticated_request, read_shell_frame_pump, read_shell_frame_pump_inner,
+        ipc, read_authenticated_request, read_shell_frame_pump, read_shell_frame_pump_inner,
         recover_invalid_startup_lock_read, status_info_frame, stop_tunnel_and_report,
         terminal_safe_error, validate_request_frame, validated_exec_timeout,
         validated_sftp_timeout, wait_for_tunnel_control_or_completion, write_all_until_or_shutdown,
-        write_frame_or_shutdown, ConnInfo, TunnelControlWait, MAX_UPLOAD_CHUNK_BYTES,
+        write_frame_or_shutdown, ConnInfo, Creds, TunnelControlWait, MAX_UPLOAD_CHUNK_BYTES,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2659,6 +3645,356 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::time::Instant;
     use zeroize::Zeroize;
+
+    /// `vault::set_test_home` is process-global; the three global-daemon tests
+    /// serialize on it for their whole lifetime.
+    static TEST_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn global_daemon_serves_catalog_rejects_bad_unlock_and_shuts_down() {
+        use serctl_core::{daemon_runtime, vault};
+        use serctl_protocol::v6::{
+            v6_client_handshake, ActivationSecret, InstanceId, V6ClientIo, V6RequestPrelude,
+            IPC_PROTOCOL_VERSION_V6,
+        };
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let _home_guard = TEST_HOME_LOCK.lock().await;
+
+        let base = std::env::temp_dir().join(format!(
+            "serctl-global-daemon-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        vault::set_test_home(Some(base.clone()));
+
+        // Windows profile creation requires an initialized administrator
+        // policy with a persisted 2-of-2 recovery share.
+        #[cfg(windows)]
+        vault::initialize_admin_password("test-administrator-password", |media| {
+            std::fs::write(base.join("recovery.bin"), media).map_err(anyhow::Error::from)
+        })
+        .unwrap();
+
+        vault::create_profile(
+            "v6test",
+            &Creds {
+                host: "127.0.0.1".into(),
+                port: 22,
+                user: "tester".into(),
+                password: "remote-password".into(),
+                host_key: None,
+            },
+            "correct-passphrase",
+            Some("test-administrator-password"),
+        )
+        .unwrap();
+
+        let instance = InstanceId::random();
+        let secret = ActivationSecret::random();
+        let daemon_task = tokio::spawn(super::run_global(
+            instance,
+            secret.clone(),
+            "testbuild".into(),
+        ));
+
+        // Wait for the runtime descriptor: the daemon writes it only after the
+        // listener is bound.
+        let endpoint = loop {
+            if let Some(descriptor) = daemon_runtime::read_descriptor().unwrap() {
+                break descriptor.endpoint;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        // Catalog listing needs no unlock and no SSH.
+        let stream = loop {
+            match ipc::connect(&endpoint).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        let list_frame = ipc::Frame::ListProfiles;
+        let list_hash = serctl_protocol::v6::root_request_hash(&list_frame).unwrap();
+        let list_prelude = V6RequestPrelude {
+            protocol_version: IPC_PROTOCOL_VERSION_V6,
+            client_session_id: [1_u8; 16],
+            request_id: [2_u8; 16],
+            operation_kind: "daemon.list-profiles".into(),
+            profile_id: None,
+            profile_name: None,
+            grant_id: None,
+            pop_signature: None,
+            profile_proof: None,
+            requested_deadline_unix_ms: 0,
+            root_request_hash: list_hash,
+        };
+        let session = v6_client_handshake(stream, &secret, instance, list_prelude, deadline)
+            .await
+            .unwrap();
+        let mut io = V6ClientIo::new(session);
+        ipc::write_frame_limited(&mut io, &list_frame, ipc::MAX_REQUEST_FRAME)
+            .await
+            .unwrap();
+        let reply = ipc::read_frame_limited(&mut io, ipc::MAX_RESPONSE_FRAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let ipc::Frame::ProfileList { profiles } = reply else {
+            panic!("expected ProfileList, got {reply:?}");
+        };
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "v6test");
+
+        // A wrong passphrase fails the unlock before any SSH connection.
+        let stream = ipc::connect(&endpoint).await.unwrap();
+        let unlock_frame = ipc::Frame::Unlock {
+            passphrase: "wrong-passphrase".into(),
+        };
+        let unlock_hash = serctl_protocol::v6::root_request_hash(&unlock_frame).unwrap();
+        let unlock_prelude = V6RequestPrelude {
+            protocol_version: IPC_PROTOCOL_VERSION_V6,
+            client_session_id: [3_u8; 16],
+            request_id: [4_u8; 16],
+            operation_kind: "daemon.unlock".into(),
+            profile_id: None,
+            profile_name: Some("v6test".into()),
+            grant_id: None,
+            pop_signature: None,
+            profile_proof: None,
+            requested_deadline_unix_ms: 0,
+            root_request_hash: unlock_hash,
+        };
+        let session = v6_client_handshake(stream, &secret, instance, unlock_prelude, deadline)
+            .await
+            .unwrap();
+        let mut io = V6ClientIo::new(session);
+        ipc::write_frame_limited(&mut io, &unlock_frame, ipc::MAX_REQUEST_FRAME)
+            .await
+            .unwrap();
+        let reply = ipc::read_frame_limited(&mut io, ipc::MAX_RESPONSE_FRAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(reply, ipc::Frame::Error { .. }));
+
+        // Possession of the activation secret alone cannot stop the broker.
+        let stream = ipc::connect(&endpoint).await.unwrap();
+        let rejected_shutdown = ipc::Frame::Shutdown {
+            passphrase: "wrong-passphrase".into(),
+        };
+        let rejected_hash = serctl_protocol::v6::root_request_hash(&rejected_shutdown).unwrap();
+        let rejected_prelude = V6RequestPrelude {
+            protocol_version: IPC_PROTOCOL_VERSION_V6,
+            client_session_id: [5_u8; 16],
+            request_id: [6_u8; 16],
+            operation_kind: "daemon.shutdown".into(),
+            profile_id: None,
+            profile_name: Some("v6test".into()),
+            grant_id: None,
+            pop_signature: None,
+            profile_proof: None,
+            requested_deadline_unix_ms: 0,
+            root_request_hash: rejected_hash,
+        };
+        let session = v6_client_handshake(stream, &secret, instance, rejected_prelude, deadline)
+            .await
+            .unwrap();
+        let mut io = V6ClientIo::new(session);
+        ipc::write_frame_limited(&mut io, &rejected_shutdown, ipc::MAX_REQUEST_FRAME)
+            .await
+            .unwrap();
+        let reply = ipc::read_frame_limited(&mut io, ipc::MAX_RESPONSE_FRAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(reply, ipc::Frame::Error { .. }));
+        assert!(daemon_runtime::read_descriptor().unwrap().is_some());
+
+        // A verified profile passphrase closes the daemon and clears runtime state.
+        let stream = ipc::connect(&endpoint).await.unwrap();
+        let shutdown_frame = ipc::Frame::Shutdown {
+            passphrase: "correct-passphrase".into(),
+        };
+        let shutdown_hash = serctl_protocol::v6::root_request_hash(&shutdown_frame).unwrap();
+        let shutdown_prelude = V6RequestPrelude {
+            protocol_version: IPC_PROTOCOL_VERSION_V6,
+            client_session_id: [7_u8; 16],
+            request_id: [8_u8; 16],
+            operation_kind: "daemon.shutdown".into(),
+            profile_id: None,
+            profile_name: Some("v6test".into()),
+            grant_id: None,
+            pop_signature: None,
+            profile_proof: None,
+            requested_deadline_unix_ms: 0,
+            root_request_hash: shutdown_hash,
+        };
+        let session = v6_client_handshake(stream, &secret, instance, shutdown_prelude, deadline)
+            .await
+            .unwrap();
+        let mut io = V6ClientIo::new(session);
+        ipc::write_frame_limited(&mut io, &shutdown_frame, ipc::MAX_REQUEST_FRAME)
+            .await
+            .unwrap();
+        let reply = ipc::read_frame_limited(&mut io, ipc::MAX_RESPONSE_FRAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(reply, ipc::Frame::Ack));
+
+        tokio::time::timeout(Duration::from_secs(5), daemon_task)
+            .await
+            .expect("global daemon did not exit after shutdown")
+            .unwrap()
+            .unwrap();
+        assert!(daemon_runtime::read_descriptor().unwrap().is_none());
+        assert!(daemon_runtime::read_secret().unwrap().is_none());
+
+        vault::set_test_home(None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    async fn v6_io_for(
+        endpoint: &str,
+        secret: &serctl_protocol::v6::ActivationSecret,
+        instance: serctl_protocol::v6::InstanceId,
+        prelude: serctl_protocol::v6::V6RequestPrelude,
+        deadline: Instant,
+    ) -> serctl_protocol::v6::V6ClientIo<ipc::ClientStream> {
+        use serctl_protocol::v6::{v6_client_handshake, V6ClientIo};
+        let stream = ipc::connect(endpoint).await.unwrap();
+        let session = v6_client_handshake(stream, secret, instance, prelude, deadline)
+            .await
+            .unwrap();
+        V6ClientIo::new(session)
+    }
+
+    async fn global_test_base() -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let base = std::env::temp_dir().join(format!(
+            "serctl-global-daemon-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        serctl_core::vault::set_test_home(Some(base.clone()));
+        base
+    }
+
+    #[tokio::test]
+    async fn global_daemon_exits_after_its_idle_window_with_no_work() {
+        use serctl_core::{daemon_runtime, vault};
+        use serctl_protocol::v6::{ActivationSecret, InstanceId};
+
+        let _home_guard = TEST_HOME_LOCK.lock().await;
+        let base = global_test_base().await;
+        let instance = InstanceId::random();
+        let secret = ActivationSecret::random();
+        let daemon_task = tokio::spawn(super::run_global_with_idle_timeout(
+            instance,
+            secret,
+            "testbuild".into(),
+            Duration::from_millis(300),
+        ));
+
+        // Wait for publication, then let the idle window expire.
+        let publish_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if daemon_runtime::read_descriptor().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= publish_deadline {
+                panic!("global daemon did not publish its runtime descriptor");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), daemon_task)
+            .await
+            .expect("global daemon did not idle-exit")
+            .unwrap()
+            .unwrap();
+        assert!(daemon_runtime::read_descriptor().unwrap().is_none());
+        assert!(daemon_runtime::read_secret().unwrap().is_none());
+
+        vault::set_test_home(None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn global_daemon_keeps_serving_while_live_work_holds_the_idle_counter() {
+        use serctl_core::{daemon_runtime, vault};
+        use serctl_protocol::v6::{
+            frame_kind, ActivationSecret, InstanceId, V6RequestPrelude, IPC_PROTOCOL_VERSION_V6,
+        };
+
+        let _home_guard = TEST_HOME_LOCK.lock().await;
+        let base = global_test_base().await;
+        let instance = InstanceId::random();
+        let secret = ActivationSecret::random();
+        let daemon_task = tokio::spawn(super::run_global_with_idle_timeout(
+            instance,
+            secret.clone(),
+            "testbuild".into(),
+            Duration::from_secs(2),
+        ));
+
+        let publish_deadline = Instant::now() + Duration::from_secs(5);
+        let endpoint = loop {
+            if let Some(descriptor) = daemon_runtime::read_descriptor().unwrap() {
+                break descriptor.endpoint;
+            }
+            if Instant::now() >= publish_deadline {
+                panic!("global daemon did not publish its runtime descriptor");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        // One open, authenticated connection is live work: it must postpone
+        // idle exit well beyond the idle window.
+        let list_frame = ipc::Frame::ListProfiles;
+        let list_hash = serctl_protocol::v6::root_request_hash(&list_frame).unwrap();
+        let prelude = V6RequestPrelude {
+            protocol_version: IPC_PROTOCOL_VERSION_V6,
+            client_session_id: [1_u8; 16],
+            request_id: [2_u8; 16],
+            operation_kind: frame_kind(&list_frame).into(),
+            profile_id: None,
+            profile_name: None,
+            grant_id: None,
+            pop_signature: None,
+            profile_proof: None,
+            requested_deadline_unix_ms: 0,
+            root_request_hash: list_hash,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let held = v6_io_for(&endpoint, &secret, instance, prelude, deadline).await;
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !daemon_task.is_finished(),
+            "broker exited its idle window while a live connection held work"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), daemon_task)
+            .await
+            .expect("global daemon did not idle-exit after the last connection closed")
+            .unwrap()
+            .unwrap();
+        assert!(daemon_runtime::read_descriptor().unwrap().is_none());
+
+        vault::set_test_home(None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn dropped_readiness_receiver_rejects_handoff_and_cleans_publication_owner() {
@@ -2709,7 +4045,7 @@ mod tests {
             token: Arc::new(zeroize::Zeroizing::new("unused-token".into())),
         };
         match status_info_frame(&info) {
-            crate::ipc::Frame::StatusInfo {
+            serctl_protocol::Frame::StatusInfo {
                 profile,
                 host,
                 user,
@@ -2734,10 +4070,10 @@ mod tests {
         let expected = vec![0x41; 32 * 1024];
         let sent = expected.clone();
         let writer_task = tokio::spawn(async move {
-            crate::ipc::write_frame_limited(
+            serctl_protocol::write_frame_limited(
                 &mut writer,
-                &crate::ipc::Frame::ShellInput { data: sent },
-                crate::ipc::MAX_SHELL_FRAME,
+                &serctl_protocol::Frame::ShellInput { data: sent },
+                serctl_protocol::MAX_SHELL_FRAME,
             )
             .await
             .unwrap();
@@ -2760,7 +4096,7 @@ mod tests {
         };
         writer_task.await.unwrap();
         match &mut received {
-            crate::ipc::Frame::ShellInput { data } => {
+            serctl_protocol::Frame::ShellInput { data } => {
                 assert_eq!(data, &expected);
                 data.zeroize();
             }
@@ -2868,12 +4204,12 @@ mod tests {
         });
 
         for byte in [0x41, 0x42] {
-            crate::ipc::write_frame_limited(
+            serctl_protocol::write_frame_limited(
                 &mut writer,
-                &crate::ipc::Frame::ShellInput {
+                &serctl_protocol::Frame::ShellInput {
                     data: vec![byte; 1024],
                 },
-                crate::ipc::MAX_SHELL_FRAME,
+                serctl_protocol::MAX_SHELL_FRAME,
             )
             .await
             .unwrap();
@@ -2899,11 +4235,11 @@ mod tests {
     #[tokio::test]
     async fn daemon_protocol_helper_verifies_v5_client_proof() {
         let (mut client, mut server) = tokio::io::duplex(8 * 1024);
-        let token = crate::vault::new_ipc_token();
-        let call_key = crate::vault::ProfileCallKey::from_bytes_for_test([0x5a; 32]);
+        let token = serctl_core::vault::new_ipc_token();
+        let call_key = serctl_core::vault::ProfileCallKey::from_bytes_for_test([0x5a; 32]);
         let deadline = Instant::now() + Duration::from_secs(1);
         let (client_result, server_result) = tokio::join!(
-            crate::ipc::authenticate_client(&mut client, "prod", &token, deadline),
+            serctl_protocol::authenticate_client(&mut client, "prod", &token, deadline),
             authenticate_incoming_protocol(&mut server, "prod", &token, &call_key, deadline),
         );
         client_result.unwrap();
@@ -2913,23 +4249,27 @@ mod tests {
     #[tokio::test]
     async fn token_only_daemon_auth_rejects_all_business_requests() {
         for request in [
-            crate::ipc::Frame::Status,
-            crate::ipc::Frame::Shutdown,
-            crate::ipc::Frame::TunnelOpen {
-                spec: crate::ssh::TunnelSpec::local(0, 22),
+            serctl_protocol::Frame::Status,
+            serctl_protocol::Frame::Shutdown {
+                passphrase: "profile-passphrase".into(),
+            },
+            serctl_protocol::Frame::TunnelOpen {
+                spec: serctl_core::ssh::TunnelSpec::local(0, 22),
             },
         ] {
             let (mut client, mut server) = tokio::io::duplex(8 * 1024);
-            let token = crate::vault::new_ipc_token();
-            let call_key = crate::vault::ProfileCallKey::from_bytes_for_test([0x3c; 32]);
+            let token = serctl_core::vault::new_ipc_token();
+            let call_key = serctl_core::vault::ProfileCallKey::from_bytes_for_test([0x3c; 32]);
             let deadline = Instant::now() + Duration::from_secs(1);
             let (client_result, server_result) = tokio::join!(
-                crate::ipc::authenticate_client(&mut client, "prod", &token, deadline),
+                serctl_protocol::authenticate_client(&mut client, "prod", &token, deadline),
                 authenticate_incoming_protocol(&mut server, "prod", &token, &call_key, deadline),
             );
             client_result.unwrap();
             let mut context = server_result.unwrap();
-            let error = context.verify_request(&call_key, &request).unwrap_err();
+            let error = context
+                .verify_request(call_key.as_bytes(), &request)
+                .unwrap_err();
             assert!(error
                 .to_string()
                 .contains("requires master-passphrase authorization"));
@@ -2962,7 +4302,7 @@ mod tests {
     async fn fragmented_tunnel_stop_survives_poll_ticks_and_reports_closed() {
         let (mut client, mut server) = tokio::io::duplex(64);
         let client_task = tokio::spawn(async move {
-            let payload = serde_json::to_vec(&crate::ipc::Frame::TunnelStop).unwrap();
+            let payload = serde_json::to_vec(&serctl_protocol::Frame::TunnelStop).unwrap();
             let mut wire = (payload.len() as u32).to_be_bytes().to_vec();
             wire.extend_from_slice(&payload);
 
@@ -2977,7 +4317,7 @@ mod tests {
             client.write_all(&wire[5..]).await.unwrap();
             client.flush().await.unwrap();
 
-            crate::ipc::read_frame_limited(&mut client, crate::ipc::MAX_CONTROL_FRAME)
+            serctl_protocol::read_frame_limited(&mut client, serctl_protocol::MAX_CONTROL_FRAME)
                 .await
                 .unwrap()
         });
@@ -2992,7 +4332,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             control,
-            TunnelControlWait::Frame(Some(crate::ipc::Frame::TunnelStop))
+            TunnelControlWait::Frame(Some(serctl_protocol::Frame::TunnelStop))
         ));
 
         let cleaned = Arc::new(AtomicBool::new(false));
@@ -3007,15 +4347,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(response, Some(crate::ipc::Frame::TunnelClosed)));
+        assert!(matches!(
+            response,
+            Some(serctl_protocol::Frame::TunnelClosed)
+        ));
         assert!(cleaned.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
     async fn invalid_client_proof_is_closed_without_a_structured_error() {
         let (mut client, mut server) = tokio::io::duplex(8 * 1024);
-        let token = crate::vault::new_ipc_token();
-        let call_key = crate::vault::ProfileCallKey::from_bytes_for_test([0x5a; 32]);
+        let token = serctl_core::vault::new_ipc_token();
+        let call_key = serctl_core::vault::ProfileCallKey::from_bytes_for_test([0x5a; 32]);
         let deadline = Instant::now() + Duration::from_secs(1);
 
         let server_task = async move {
@@ -3030,37 +4373,37 @@ mod tests {
             drop(server);
         };
         let client_task = async move {
-            crate::ipc::write_frame_limited(
+            serctl_protocol::write_frame_limited(
                 &mut client,
-                &crate::ipc::Frame::AuthHello {
-                    version: crate::ipc::IPC_PROTOCOL_VERSION,
-                    client_nonce: crate::vault::new_ipc_token(),
+                &serctl_protocol::Frame::AuthHello {
+                    version: serctl_protocol::IPC_PROTOCOL_VERSION,
+                    client_nonce: serctl_core::vault::new_ipc_token(),
                     intent_commitment: None,
                 },
-                crate::ipc::MAX_AUTH_FRAME,
+                serctl_protocol::MAX_AUTH_FRAME,
             )
             .await
             .unwrap();
             assert!(matches!(
-                crate::ipc::read_frame_limited(&mut client, crate::ipc::MAX_AUTH_FRAME)
+                serctl_protocol::read_frame_limited(&mut client, serctl_protocol::MAX_AUTH_FRAME)
                     .await
                     .unwrap(),
-                Some(crate::ipc::Frame::AuthChallenge { .. })
+                Some(serctl_protocol::Frame::AuthChallenge { .. })
             ));
-            crate::ipc::write_frame_limited(
+            serctl_protocol::write_frame_limited(
                 &mut client,
-                &crate::ipc::Frame::AuthResponse {
-                    client_proof: crate::vault::new_ipc_token(),
+                &serctl_protocol::Frame::AuthResponse {
+                    client_proof: serctl_core::vault::new_ipc_token(),
                     client_call_proof: None,
                 },
-                crate::ipc::MAX_AUTH_FRAME,
+                serctl_protocol::MAX_AUTH_FRAME,
             )
             .await
             .unwrap();
 
             match tokio::time::timeout(
                 Duration::from_millis(250),
-                crate::ipc::read_frame_limited(&mut client, crate::ipc::MAX_AUTH_FRAME),
+                serctl_protocol::read_frame_limited(&mut client, serctl_protocol::MAX_AUTH_FRAME),
             )
             .await
             {
@@ -3079,14 +4422,14 @@ mod tests {
     fn exec_timeout_is_bounded() {
         assert!(validated_exec_timeout(0).is_err());
         assert!(validated_exec_timeout(1).is_ok());
-        assert!(validated_exec_timeout(crate::ipc::MAX_EXEC_TIMEOUT_MS + 1).is_err());
+        assert!(validated_exec_timeout(serctl_protocol::MAX_EXEC_TIMEOUT_MS + 1).is_err());
     }
 
     #[test]
     fn sftp_timeout_is_bounded() {
         assert!(validated_sftp_timeout(0).is_err());
         assert!(validated_sftp_timeout(1).is_ok());
-        assert!(validated_sftp_timeout(crate::ipc::MAX_SFTP_TIMEOUT_MS + 1).is_err());
+        assert!(validated_sftp_timeout(serctl_protocol::MAX_SFTP_TIMEOUT_MS + 1).is_err());
     }
 
     #[test]
@@ -3110,54 +4453,60 @@ mod tests {
 
     #[test]
     fn authenticated_request_semantic_limits_are_enforced() {
-        assert!(validate_request_frame(&crate::ipc::Frame::Exec {
-            cmd: "x".repeat(crate::ssh::MAX_REMOTE_COMMAND_BYTES + 1),
+        assert!(validate_request_frame(&serctl_protocol::Frame::Exec {
+            cmd: "x".repeat(serctl_core::ssh::MAX_REMOTE_COMMAND_BYTES + 1),
             timeout_ms: 1,
         })
         .is_err());
-        assert!(validate_request_frame(&crate::ipc::Frame::UploadChunk {
-            data: vec![0; MAX_UPLOAD_CHUNK_BYTES + 1],
-        })
-        .is_err());
-        assert!(validate_request_frame(&crate::ipc::Frame::UploadBegin {
-            path: "/tmp/x".into(),
-            size: crate::ssh::MAX_TRANSFER_BYTES + 1,
-            timeout_ms: 1,
-        })
-        .is_err());
+        assert!(
+            validate_request_frame(&serctl_protocol::Frame::UploadChunk {
+                data: vec![0; MAX_UPLOAD_CHUNK_BYTES + 1],
+            })
+            .is_err()
+        );
+        assert!(
+            validate_request_frame(&serctl_protocol::Frame::UploadBegin {
+                path: "/tmp/x".into(),
+                size: serctl_core::ssh::MAX_TRANSFER_BYTES + 1,
+                timeout_ms: 1,
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn daemon_and_direct_routes_share_command_and_path_rejections() {
-        let oversized_command = "x".repeat(crate::ssh::MAX_REMOTE_COMMAND_BYTES + 1);
-        assert!(crate::ssh::validate_remote_command(&oversized_command).is_err());
-        assert!(validate_request_frame(&crate::ipc::Frame::Exec {
+        let oversized_command = "x".repeat(serctl_core::ssh::MAX_REMOTE_COMMAND_BYTES + 1);
+        assert!(serctl_core::ssh::validate_remote_command(&oversized_command).is_err());
+        assert!(validate_request_frame(&serctl_protocol::Frame::Exec {
             cmd: oversized_command,
             timeout_ms: 1,
         })
         .is_err());
-        assert!(crate::ssh::validate_remote_command("echo\0hidden").is_err());
-        assert!(validate_request_frame(&crate::ipc::Frame::Exec {
+        assert!(serctl_core::ssh::validate_remote_command("echo\0hidden").is_err());
+        assert!(validate_request_frame(&serctl_protocol::Frame::Exec {
             cmd: "echo\0hidden".to_owned(),
             timeout_ms: 1,
         })
         .is_err());
 
         for invalid_path in [String::new(), "nul\0path".to_owned()] {
-            assert!(crate::ssh::validate_remote_path(&invalid_path, false).is_err());
-            assert!(validate_request_frame(&crate::ipc::Frame::Download {
+            assert!(serctl_core::ssh::validate_remote_path(&invalid_path, false).is_err());
+            assert!(validate_request_frame(&serctl_protocol::Frame::Download {
                 path: invalid_path,
                 timeout_ms: 1,
             })
             .is_err());
         }
 
-        for (cols, rows) in [(0, 24), (80, crate::ssh::MAX_SHELL_DIMENSION + 1)] {
-            assert!(crate::ssh::validate_shell_dimensions(cols, rows).is_err());
-            assert!(validate_request_frame(&crate::ipc::Frame::Shell { cols, rows }).is_err());
+        for (cols, rows) in [(0, 24), (80, serctl_core::ssh::MAX_SHELL_DIMENSION + 1)] {
+            assert!(serctl_core::ssh::validate_shell_dimensions(cols, rows).is_err());
+            assert!(validate_request_frame(&serctl_protocol::Frame::Shell { cols, rows }).is_err());
         }
-        assert!(crate::ssh::validate_shell_dimensions(80, 24).is_ok());
-        assert!(validate_request_frame(&crate::ipc::Frame::Shell { cols: 80, rows: 24 }).is_ok());
+        assert!(serctl_core::ssh::validate_shell_dimensions(80, 24).is_ok());
+        assert!(
+            validate_request_frame(&serctl_protocol::Frame::Shell { cols: 80, rows: 24 }).is_ok()
+        );
     }
 
     #[test]
@@ -3183,28 +4532,29 @@ mod tests {
             "injected russh exec queue send failure"
         ));
         let (mut writer, mut reader) = tokio::io::duplex(1024);
-        crate::ipc::write_frame(
+        serctl_protocol::write_frame(
             &mut writer,
-            &crate::ipc::Frame::Error {
+            &serctl_protocol::Frame::Error {
                 msg: rejected.clone(),
             },
         )
         .await
         .unwrap();
-        let frame = crate::ipc::read_frame_limited(&mut reader, crate::ipc::MAX_RESPONSE_FRAME)
-            .await
-            .unwrap()
-            .unwrap();
-        let crate::ipc::Frame::Error { msg } = frame else {
+        let frame =
+            serctl_protocol::read_frame_limited(&mut reader, serctl_protocol::MAX_RESPONSE_FRAME)
+                .await
+                .unwrap()
+                .unwrap();
+        let serctl_protocol::Frame::Error { msg } = frame else {
             panic!("daemon exec rejection was not encoded as an error frame");
         };
         assert_eq!(msg, rejected);
-        assert!(crate::ssh::ExecOutcomeUnknown::from_wire_message(&msg).is_none());
+        assert!(serctl_core::ssh::ExecOutcomeUnknown::from_wire_message(&msg).is_none());
 
         let uncertain = exec_outcome_unknown_wire_message(anyhow::anyhow!(
             "remote command finish response was lost"
         ));
-        assert!(crate::ssh::ExecOutcomeUnknown::from_wire_message(&uncertain).is_some());
+        assert!(serctl_core::ssh::ExecOutcomeUnknown::from_wire_message(&uncertain).is_some());
     }
 
     #[tokio::test]
@@ -3255,7 +4605,7 @@ mod tests {
         let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let error = write_frame_or_shutdown(
             &mut writer,
-            &crate::ipc::Frame::ExecOut {
+            &serctl_protocol::Frame::ExecOut {
                 data: vec![0; 1024],
             },
             Instant::now() + Duration::from_millis(20),
@@ -3280,7 +4630,7 @@ mod tests {
 
         let error = write_frame_or_shutdown(
             &mut writer,
-            &crate::ipc::Frame::ExecOut {
+            &serctl_protocol::Frame::ExecOut {
                 data: vec![0; 1024],
             },
             Instant::now() + Duration::from_secs(5),

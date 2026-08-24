@@ -52,8 +52,10 @@ jobs:
 
       - name: Run standalone build-script tests
         run: |
-          rustc --edition=2021 --test build.rs -o target/build-script-tests
-          ./target/build-script-tests
+          rustc --edition=2021 --test crates/serctl_cli/build.rs -o target/cli-build-script-tests
+          ./target/cli-build-script-tests
+          rustc --edition=2021 --test crates/serctl_daemon/build.rs -o target/daemon-build-script-tests
+          ./target/daemon-build-script-tests
 
       - name: Generate dependency evidence
         run: |
@@ -148,20 +150,22 @@ jobs:
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build optimized release from the checked-out commit
-        run: cargo build --locked --release --all-targets --all-features
+        # Production artifacts must never enable serctl-core/test-support.
+        # Build only the shipped binaries with their normal feature sets.
+        run: cargo build --locked --release --workspace --bins
 
       - name: Verify embedded clean commit and record release evidence
         shell: pwsh
         run: |
           $expected = "${{ github.sha }}".Substring(0, 12)
-          $version = & .\target\release\serctl.exe --version
+          $version = & .\target\release\serctl_cli.exe --version
           if ($version -notmatch "git $expected\)") {
             throw "release version does not identify the checked-out commit: $version"
           }
           if ($version -match "-dirty") {
             throw "release version unexpectedly reports a dirty worktree: $version"
           }
-          Get-FileHash .\target\release\serctl.exe, .\target\release\serctl.pdb -Algorithm SHA256 |
+          Get-FileHash .\target\release\serctl_cli.exe, .\target\release\serctl_cli.pdb, .\target\release\serctl_daemon.exe, .\target\release\serctl_daemon.pdb -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash)  $([IO.Path]::GetFileName($_.Path))" } |
             Set-Content -Path release-sha256.txt -Encoding utf8
           @(
@@ -179,8 +183,10 @@ jobs:
         with:
           name: windows-release-${{ github.sha }}
           path: |
-            target/release/serctl.exe
-            target/release/serctl.pdb
+            target/release/serctl_cli.exe
+            target/release/serctl_cli.pdb
+            target/release/serctl_daemon.exe
+            target/release/serctl_daemon.pdb
             release-sha256.txt
             release-environment.txt
           if-no-files-found: error

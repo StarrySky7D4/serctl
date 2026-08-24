@@ -1,6 +1,15 @@
 //! Authenticated local IPC with one framing protocol over Windows named pipes
 //! or Unix domain sockets.
-use anyhow::{bail, Context, Result};
+//!
+//! Two wire generations exist side by side during the Phase 2 migration:
+//! - v5 (this crate's historical per-profile protocol) remains the default
+//!   until the daemon/CLI cut over;
+//! - [`v6`] is the per-user/per-vault global-daemon protocol: per-boot
+//!   activation-secret mutual authentication, HKDF direction keys, and
+//!   ChaCha20-Poly1305 AEAD frames with strict sequence counters.
+pub mod grant;
+pub mod v6;
+use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
@@ -11,11 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::ssh::{RemoteEntry, TunnelMode, TunnelReady, TunnelSpec};
-use crate::vault::ProfileCallKey;
-
 pub const IPC_PROTOCOL_VERSION: u16 = 5;
-#[cfg(test)]
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 pub const MAX_AUTH_FRAME: usize = 4 * 1024;
 pub const MAX_CONTROL_FRAME: usize = 16 * 1024;
@@ -35,6 +40,202 @@ fn default_exec_timeout_ms() -> u64 {
 
 fn default_sftp_timeout_ms() -> u64 {
     DEFAULT_SFTP_TIMEOUT_MS
+}
+
+/// Validate a profile name that can appear in a local IPC endpoint or lock
+/// record. This rule is shared by the CLI, the daemon, and the vault, so it
+/// lives in the wire crate rather than in any one owner.
+pub fn validate_profile_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 128 {
+        bail!("profile name must contain 1 to 128 bytes");
+    }
+    if name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+    {
+        bail!("profile name contains unsafe path characters");
+    }
+    Ok(())
+}
+
+/// Aggregate cap shared by every tunnel on one SSH transport.
+pub const DEFAULT_TUNNEL_CONNECTIONS: usize = 32;
+pub const MAX_TUNNEL_CONNECTIONS: usize = 128;
+/// Longest host name the wire format accepts in a tunnel request.
+pub const MAX_TUNNEL_HOST_BYTES: usize = 255;
+
+fn default_tunnel_connections_u16() -> u16 {
+    DEFAULT_TUNNEL_CONNECTIONS as u16
+}
+
+/// The SSH forwarding primitive used by a tunnel.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelMode {
+    Local,
+    Remote,
+    Dynamic,
+}
+
+/// A validated-at-startup SSH tunnel request.
+///
+/// Addresses are deliberately absent from this public type: local and dynamic
+/// listeners bind only to IPv4 loopback, remote listeners ask the SSH server
+/// to bind only to IPv4 loopback, and fixed L/R targets are IPv4 loopback on
+/// the opposite side of the SSH connection. This makes external exposure
+/// impossible to request through the CLI, UI, or IPC wire format.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelSpec {
+    pub mode: TunnelMode,
+    pub bind_port: u16,
+    #[serde(default)]
+    pub target_port: u16,
+    #[serde(default = "default_tunnel_connections_u16")]
+    pub max_connections: u16,
+}
+
+impl TunnelSpec {
+    /// Test constructor; the real CLI/UI builds the struct directly.
+    #[doc(hidden)]
+    pub fn local(bind_port: u16, target_port: u16) -> Self {
+        Self {
+            mode: TunnelMode::Local,
+            bind_port,
+            target_port,
+            max_connections: DEFAULT_TUNNEL_CONNECTIONS as u16,
+        }
+    }
+
+    /// Test constructor; the real CLI/UI builds the struct directly.
+    #[doc(hidden)]
+    pub fn remote(bind_port: u16, target_port: u16) -> Self {
+        Self {
+            mode: TunnelMode::Remote,
+            bind_port,
+            target_port,
+            max_connections: DEFAULT_TUNNEL_CONNECTIONS as u16,
+        }
+    }
+
+    /// Test constructor; the real CLI/UI builds the struct directly.
+    #[doc(hidden)]
+    pub fn dynamic(bind_port: u16) -> Self {
+        Self {
+            mode: TunnelMode::Dynamic,
+            bind_port,
+            target_port: 0,
+            max_connections: DEFAULT_TUNNEL_CONNECTIONS as u16,
+        }
+    }
+
+    pub fn mode(&self) -> TunnelMode {
+        self.mode
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ValidatedTunnelSpec::try_from(self.clone()).map(drop)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TunnelReady {
+    pub mode: TunnelMode,
+    pub bind_host: String,
+    pub bind_port: u16,
+}
+
+/// One directory listing entry transferred over the IPC wire.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: u64,
+    pub modified_unix: Option<u32>,
+}
+
+/// The loopback-only validated form of a [`TunnelSpec`].
+#[derive(Clone, Debug)]
+pub enum ValidatedTunnelSpec {
+    Local {
+        bind: std::net::SocketAddr,
+        target_port: u16,
+        max_connections: usize,
+    },
+    Remote {
+        bind_port: u16,
+        target_port: u16,
+        max_connections: usize,
+    },
+    Dynamic {
+        bind: std::net::SocketAddr,
+        max_connections: usize,
+    },
+}
+
+fn validate_tunnel_connections(max_connections: usize) -> Result<()> {
+    ensure!(
+        (1..=MAX_TUNNEL_CONNECTIONS).contains(&max_connections),
+        "tunnel connection limit must be between 1 and {MAX_TUNNEL_CONNECTIONS}"
+    );
+    Ok(())
+}
+
+fn tunnel_loopback_addr(port: u16) -> std::net::SocketAddr {
+    std::net::SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+impl TryFrom<TunnelSpec> for ValidatedTunnelSpec {
+    type Error = anyhow::Error;
+
+    fn try_from(spec: TunnelSpec) -> Result<Self> {
+        let TunnelSpec {
+            mode,
+            bind_port,
+            target_port,
+            max_connections,
+        } = spec;
+        let max_connections = usize::from(max_connections);
+        validate_tunnel_connections(max_connections)?;
+        match mode {
+            TunnelMode::Local => {
+                ensure!(
+                    target_port != 0,
+                    "local-forward target port must not be zero"
+                );
+                Ok(Self::Local {
+                    bind: tunnel_loopback_addr(bind_port),
+                    target_port,
+                    max_connections,
+                })
+            }
+            TunnelMode::Remote => {
+                ensure!(
+                    target_port != 0,
+                    "remote-forward target port must not be zero"
+                );
+                Ok(Self::Remote {
+                    bind_port,
+                    target_port,
+                    max_connections,
+                })
+            }
+            TunnelMode::Dynamic => {
+                ensure!(
+                    target_port == 0,
+                    "dynamic forwarding target port must be zero"
+                );
+                Ok(Self::Dynamic {
+                    bind: tunnel_loopback_addr(bind_port),
+                    max_connections,
+                })
+            }
+        }
+    }
 }
 
 const ENDPOINT_DOMAIN: &[u8] = b"serctl/ipc/endpoint/v5\0";
@@ -80,7 +281,7 @@ mod base64_bytes {
 }
 
 fn endpoint_id(profile: &str, token: &str) -> Result<String> {
-    crate::vault::validate_profile_name(profile)?;
+    validate_profile_name(profile)?;
     let token = decode_base64_32("IPC token", token)?;
     Ok(endpoint_id_with_token(profile, &token))
 }
@@ -98,24 +299,13 @@ fn endpoint_id_with_token(profile: &str, token: &[u8; 32]) -> String {
     hex::encode(digest.finalize())[..32].to_owned()
 }
 
-#[cfg(windows)]
-pub fn expected_endpoint(profile: &str, token: &str) -> Result<String> {
-    let id = endpoint_id(profile, token)?;
-    Ok(format!(r"\\.\pipe\serctl-v5-{id}"))
-}
-
-#[cfg(unix)]
-pub fn expected_endpoint(profile: &str, token: &str) -> Result<String> {
-    let runtime_dir = crate::vault::run_dir()?;
-    expected_endpoint_in_runtime_dir(profile, token, &runtime_dir)
-}
-
 /// Derive an endpoint without touching directory metadata. Callers must pass a
 /// runtime directory they already validated through `vault::run_dir`; this is
 /// used by stale-lock cleanup to keep filesystem-security failures distinct
-/// from malformed v5 lock contents.
+/// from malformed v5 lock contents. On Windows the runtime directory is unused
+/// because the endpoint is a named-pipe path.
 #[cfg(unix)]
-pub(crate) fn expected_endpoint_in_runtime_dir(
+pub fn expected_endpoint_in_runtime_dir(
     profile: &str,
     token: &str,
     runtime_dir: &std::path::Path,
@@ -128,16 +318,17 @@ pub(crate) fn expected_endpoint_in_runtime_dir(
 }
 
 #[cfg(windows)]
-pub(crate) fn expected_endpoint_in_runtime_dir(
+pub fn expected_endpoint_in_runtime_dir(
     profile: &str,
     token: &str,
     _runtime_dir: &std::path::Path,
 ) -> Result<String> {
-    expected_endpoint(profile, token)
+    let id = endpoint_id(profile, token)?;
+    Ok(format!(r"\\.\pipe\serctl-v5-{id}"))
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn expected_endpoint_in_runtime_dir(
+pub fn expected_endpoint_in_runtime_dir(
     _profile: &str,
     _token: &str,
     _runtime_dir: &std::path::Path,
@@ -145,17 +336,19 @@ pub(crate) fn expected_endpoint_in_runtime_dir(
     bail!("local IPC endpoints are unsupported on this platform")
 }
 
-#[cfg(not(any(unix, windows)))]
-pub fn expected_endpoint(_profile: &str, _token: &str) -> Result<String> {
-    bail!("local IPC endpoints are unsupported on this platform")
-}
-
-pub fn validate_endpoint(profile: &str, token: &str, endpoint: &str) -> Result<()> {
-    let expected = expected_endpoint(profile, token)?;
+/// Verify that a recorded endpoint equals the endpoint derived for the given
+/// profile/token pair under the given (already validated) runtime directory.
+pub fn validate_endpoint_in_runtime_dir(
+    profile: &str,
+    token: &str,
+    runtime_dir: &std::path::Path,
+    endpoint: &str,
+) -> Result<()> {
+    let expected = expected_endpoint_in_runtime_dir(profile, token, runtime_dir)?;
     validate_endpoint_bytes(&expected, endpoint)
 }
 
-fn validate_endpoint_bytes(expected: &str, endpoint: &str) -> Result<()> {
+pub fn validate_endpoint_bytes(expected: &str, endpoint: &str) -> Result<()> {
     if endpoint.as_bytes() != expected.as_bytes() {
         bail!("runtime lock contains an unexpected local IPC endpoint");
     }
@@ -181,8 +374,8 @@ pub struct LocalListener {
 
 #[cfg(windows)]
 impl LocalListener {
-    pub fn bind(profile: &str, token: &str) -> Result<Self> {
-        let endpoint = expected_endpoint(profile, token)?;
+    pub fn bind(endpoint: &str) -> Result<Self> {
+        let endpoint = endpoint.to_owned();
         let pending = create_named_pipe_instance(&endpoint, true)?;
         Ok(Self { endpoint, pending })
     }
@@ -273,8 +466,11 @@ fn create_named_pipe_instance(
 
 #[cfg(unix)]
 impl LocalListener {
-    pub fn bind(profile: &str, token: &str) -> Result<Self> {
-        let endpoint = expected_endpoint(profile, token)?;
+    /// Bind a Unix-domain socket at `endpoint`. The caller owns the runtime
+    /// directory and applies the platform permission hardening through
+    /// `serctl_core::security::harden_file` after the bind succeeds.
+    pub fn bind(endpoint: &str) -> Result<Self> {
+        let endpoint = endpoint.to_owned();
         let path = std::path::Path::new(&endpoint);
         match std::fs::remove_file(path) {
             Ok(()) => {}
@@ -283,7 +479,6 @@ impl LocalListener {
         }
         let listener = tokio::net::UnixListener::bind(path)
             .with_context(|| format!("bind Unix socket {endpoint}"))?;
-        crate::security::harden_file(path)?;
         Ok(Self { endpoint, listener })
     }
 
@@ -399,6 +594,18 @@ pub fn endpoint_kind() -> &'static str {
     "unsupported"
 }
 
+/// Sanitized profile catalog row transferred over the v6 wire: identity and
+/// connection metadata only, never secrets.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WireProfile {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub generation: u64,
+    /// Lowercase hex of the 16-byte profile id.
+    pub profile_id: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "t", content = "d")]
 pub enum Frame {
@@ -428,7 +635,38 @@ pub enum Frame {
         data: Vec<u8>,
     },
     Status,
-    Shutdown,
+    /// v6 global-control operation. The passphrase is carried only inside the
+    /// authenticated AEAD stream and is verified locally without opening SSH.
+    Shutdown {
+        passphrase: String,
+    },
+    /// v6 root operation: verify a profile passphrase and open a bounded
+    /// credential lease for the profile named in the handshake prelude.
+    Unlock {
+        passphrase: String,
+    },
+    /// v6 response: an opaque, profile-bound authorization key returned only
+    /// after a successful passphrase verification. It authorizes ordinary
+    /// requests from this frontend without disclosing vault or SSH keys.
+    ProfileAuthorized {
+        call_key: String,
+    },
+    /// v6 root operation: return the daemon's sanitized profile catalog.
+    ListProfiles,
+    /// v6 root operation: issue a bounded OperationGrant for an agent
+    /// frontend. Requires the issuing connection to hold an unlocked profile.
+    IssueGrant {
+        profile: String,
+        operations: Vec<String>,
+        budget: u32,
+        /// Base64 Ed25519 public key of the grant holder.
+        holder_key: String,
+    },
+    /// v6 response: the issued grant id and its absolute expiry.
+    GrantIssued {
+        grant_id: String,
+        expires_unix_ms: u64,
+    },
     ListDir {
         path: String,
         #[serde(default = "default_sftp_timeout_ms")]
@@ -484,6 +722,10 @@ pub enum Frame {
         data: Vec<u8>,
     },
     ShellClosed,
+    /// v6 response: sanitized profile catalog (no secrets).
+    ProfileList {
+        profiles: Vec<WireProfile>,
+    },
     StatusInfo {
         profile: String,
         host: String,
@@ -540,6 +782,7 @@ impl Zeroize for Frame {
                 client_call_proof.zeroize();
             }
             Frame::Exec { cmd, .. } => cmd.zeroize(),
+            Frame::ProfileAuthorized { call_key } => call_key.zeroize(),
             Frame::ShellInput { data }
             | Frame::UploadChunk { data }
             | Frame::ExecOut { data }
@@ -580,11 +823,31 @@ impl Zeroize for Frame {
                 entries.clear();
             }
             Frame::Error { msg } => msg.zeroize(),
+            Frame::Unlock { passphrase } | Frame::Shutdown { passphrase } => passphrase.zeroize(),
+            Frame::IssueGrant {
+                profile,
+                operations,
+                holder_key,
+                ..
+            } => {
+                profile.zeroize();
+                operations.zeroize();
+                holder_key.zeroize();
+            }
+            Frame::GrantIssued { grant_id, .. } => grant_id.zeroize(),
+            Frame::ProfileList { profiles } => {
+                for entry in profiles.iter_mut() {
+                    entry.name.zeroize();
+                    entry.host.zeroize();
+                    entry.profile_id.zeroize();
+                }
+                profiles.clear();
+            }
             Frame::Shell { .. }
             | Frame::TunnelOpen { .. }
             | Frame::AuthAccepted
             | Frame::Status
-            | Frame::Shutdown
+            | Frame::ListProfiles
             | Frame::UploadEnd
             | Frame::TunnelStop
             | Frame::TunnelClosed
@@ -669,7 +932,15 @@ fn canonical_request_digest(frame: &Frame) -> Result<Zeroizing<[u8; 32]>> {
             digest.update(rows.to_be_bytes());
         }
         Frame::Status => digest.update([3]),
-        Frame::Shutdown => digest.update([4]),
+        Frame::Shutdown { passphrase } => {
+            digest.update([4]);
+            update_length_prefixed(&mut digest, passphrase.as_bytes())?;
+        }
+        Frame::Unlock { passphrase } => {
+            digest.update([10]);
+            update_length_prefixed(&mut digest, passphrase.as_bytes())?;
+        }
+        Frame::ListProfiles => digest.update([11]),
         Frame::ListDir { path, timeout_ms } => {
             digest.update([5]);
             update_length_prefixed(&mut digest, path.as_bytes())?;
@@ -716,12 +987,9 @@ fn canonical_request_digest(frame: &Frame) -> Result<Zeroizing<[u8; 32]>> {
     Ok(value)
 }
 
-fn request_intent_commitment(
-    call_key: &ProfileCallKey,
-    frame: &Frame,
-) -> Result<Zeroizing<[u8; 32]>> {
+fn request_intent_commitment(call_key: &[u8; 32], frame: &Frame) -> Result<Zeroizing<[u8; 32]>> {
     let request_digest = canonical_request_digest(frame)?;
-    let mut mac = HmacSha256::new_from_slice(call_key.as_bytes())
+    let mut mac = HmacSha256::new_from_slice(call_key)
         .map_err(|_| anyhow::anyhow!("invalid IPC call authorization key"))?;
     mac.update(INTENT_COMMITMENT_DOMAIN);
     mac.update(&IPC_PROTOCOL_VERSION.to_be_bytes());
@@ -825,17 +1093,13 @@ fn verify_proof(
 /// A server-side authorization transcript. Sensitive transcript material is
 /// held only in zeroizing buffers. Verification consumes the context so one
 /// successful handshake cannot authorize a second root request.
-pub(crate) struct AuthContext {
+pub struct AuthContext {
     intent_commitment: Option<Zeroizing<[u8; 32]>>,
     request_verified: bool,
 }
 
 impl AuthContext {
-    pub(crate) fn verify_request(
-        &mut self,
-        call_key: &ProfileCallKey,
-        request: &Frame,
-    ) -> Result<()> {
+    pub fn verify_request(&mut self, call_key: &[u8; 32], request: &Frame) -> Result<()> {
         if std::mem::replace(&mut self.request_verified, true) {
             bail!("IPC authorization context was already consumed");
         }
@@ -890,11 +1154,11 @@ where
 /// client only returns after it has verified the daemon's call-key proof and
 /// received `AuthAccepted`, so a wrong master or fake daemon sees zero business
 /// request bytes.
-pub(crate) async fn authenticate_client_for_request<S>(
+pub async fn authenticate_client_for_request<S>(
     stream: &mut S,
     profile: &str,
     token: &str,
-    call_key: &ProfileCallKey,
+    call_key: &[u8; 32],
     request: &Frame,
     deadline: Instant,
 ) -> Result<()>
@@ -916,14 +1180,14 @@ async fn authenticate_client_inner<S>(
     stream: &mut S,
     profile: &str,
     token: &str,
-    call_key: Option<&ProfileCallKey>,
+    call_key: Option<&[u8; 32]>,
     request: Option<&Frame>,
     deadline: Instant,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    crate::vault::validate_profile_name(profile)?;
+    validate_profile_name(profile)?;
     let intent_commitment = match (call_key, request) {
         (Some(call_key), Some(request)) => Some(request_intent_commitment(call_key, request)?),
         (None, None) => None,
@@ -977,7 +1241,7 @@ where
     let client_call_proof = match (call_key, intent_commitment.as_ref(), server_call_proof) {
         (Some(call_key), Some(commitment), Some(server_call_proof)) => {
             verify_proof(
-                call_key.as_bytes(),
+                call_key,
                 SERVER_CALL_PROOF_DOMAIN,
                 IPC_PROTOCOL_VERSION,
                 profile,
@@ -988,7 +1252,7 @@ where
                 &server_call_proof,
             )?;
             Some(encoded_proof(
-                call_key.as_bytes(),
+                call_key,
                 CLIENT_CALL_PROOF_DOMAIN,
                 IPC_PROTOCOL_VERSION,
                 profile,
@@ -1025,17 +1289,17 @@ where
 
 /// Authenticate a local IPC client using a nonce challenge. No business frame
 /// is returned to the caller until the client proof has been verified.
-pub(crate) async fn authenticate_server<S>(
+pub async fn authenticate_server<S>(
     stream: &mut S,
     profile: &str,
     token: &str,
-    call_key: &ProfileCallKey,
+    call_key: &[u8; 32],
     deadline: Instant,
 ) -> Result<AuthContext>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    crate::vault::validate_profile_name(profile)?;
+    validate_profile_name(profile)?;
     let token = decode_base64_32("IPC token", token)?;
     let endpoint_id = endpoint_id_with_token(profile, &token);
     let mut hello = ZeroizingAuthFrame(read_auth_frame(stream, deadline).await?);
@@ -1076,7 +1340,7 @@ where
         .as_ref()
         .map(|commitment| {
             encoded_proof(
-                call_key.as_bytes(),
+                call_key,
                 SERVER_CALL_PROOF_DOMAIN,
                 IPC_PROTOCOL_VERSION,
                 profile,
@@ -1119,7 +1383,7 @@ where
     )?;
     match (intent_commitment.as_ref(), client_call_proof) {
         (Some(commitment), Some(client_call_proof)) => verify_proof(
-            call_key.as_bytes(),
+            call_key,
             CLIENT_CALL_PROOF_DOMAIN,
             IPC_PROTOCOL_VERSION,
             profile,
@@ -1139,11 +1403,12 @@ where
     })
 }
 
-#[cfg(test)]
+/// Write one frame with the default wire cap. Kept public (and unconditional)
+/// because cross-crate tests exercise typed framing through it.
+#[doc(hidden)]
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> Result<()> {
     write_frame_limited(w, f, MAX_FRAME).await
 }
-
 pub async fn write_frame_limited<W: AsyncWrite + Unpin>(
     w: &mut W,
     f: &Frame,
@@ -1156,7 +1421,7 @@ pub async fn write_frame_limited<W: AsyncWrite + Unpin>(
 /// length prefix and payload have both been accepted by `AsyncWrite`, but
 /// before flushing. Cancellation or an error during serialization or either
 /// write never invokes the callback; a later flush failure does.
-pub(crate) async fn write_frame_limited_with_written_callback<W, F>(
+pub async fn write_frame_limited_with_written_callback<W, F>(
     w: &mut W,
     f: &Frame,
     max_frame: usize,
@@ -1258,7 +1523,7 @@ impl std::io::Write for PreallocatedFrameBuffer {
     }
 }
 
-pub(crate) fn encoded_frame_len_limited(frame: &Frame, maximum: usize) -> Result<usize> {
+pub fn encoded_frame_len_limited(frame: &Frame, maximum: usize) -> Result<usize> {
     let mut counter = BoundedFrameCounter::new(maximum);
     if let Err(error) = serde_json::to_writer(&mut counter, frame) {
         if counter.exceeded {
@@ -1279,7 +1544,9 @@ fn serialize_frame_bounded(frame: &Frame, maximum: usize) -> Result<Zeroizing<Ve
     Ok(sink.bytes)
 }
 
-#[cfg(test)]
+/// Read one frame with the default wire cap. Kept public (and unconditional)
+/// because cross-crate tests exercise typed framing through it.
+#[doc(hidden)]
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>> {
     read_frame_limited(r, MAX_FRAME).await
 }
@@ -1320,8 +1587,8 @@ mod tests {
         B64.encode([0x5a_u8; 32])
     }
 
-    fn test_call_key() -> ProfileCallKey {
-        ProfileCallKey::from_bytes_for_test([0xa5_u8; 32])
+    fn test_call_key() -> [u8; 32] {
+        [0xa5_u8; 32]
     }
 
     #[tokio::test]
@@ -1370,7 +1637,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8 * 1024);
         let token = test_token();
         let correct_key = test_call_key();
-        let wrong_key = ProfileCallKey::from_bytes_for_test([0x11_u8; 32]);
+        let wrong_key = [0x11_u8; 32];
         let request = Frame::Exec {
             cmd: "must-not-be-sent".into(),
             timeout_ms: 1_000,
@@ -1433,7 +1700,9 @@ mod tests {
     fn token_only_context_rejects_every_root_request() {
         for request in [
             Frame::Status,
-            Frame::Shutdown,
+            Frame::Shutdown {
+                passphrase: "profile-passphrase".into(),
+            },
             Frame::Exec {
                 cmd: "unauthorized".into(),
                 timeout_ms: 1,
@@ -1454,7 +1723,12 @@ mod tests {
 
     #[tokio::test]
     async fn status_and_shutdown_require_exact_call_key_intents() {
-        for request in [Frame::Status, Frame::Shutdown] {
+        for request in [
+            Frame::Status,
+            Frame::Shutdown {
+                passphrase: "profile-passphrase".into(),
+            },
+        ] {
             let (mut client, mut server) = tokio::io::duplex(8 * 1024);
             let token = test_token();
             let call_key = test_call_key();
@@ -1483,9 +1757,14 @@ mod tests {
             request_intent_commitment(&key, &Frame::Status)
                 .unwrap()
                 .as_ref(),
-            request_intent_commitment(&key, &Frame::Shutdown)
-                .unwrap()
-                .as_ref(),
+            request_intent_commitment(
+                &key,
+                &Frame::Shutdown {
+                    passphrase: "profile-passphrase".into(),
+                },
+            )
+            .unwrap()
+            .as_ref(),
         );
         let first = Frame::UploadBegin {
             path: "/tmp/file".into(),
@@ -1745,7 +2024,7 @@ mod tests {
         let token = decode_base64_32("test token", &test_token()).unwrap();
         let endpoint = endpoint_id_with_token("prod", &token);
         let proof = encoded_proof(
-            key.as_bytes(),
+            &key,
             CLIENT_CALL_PROOF_DOMAIN,
             IPC_PROTOCOL_VERSION,
             "prod",
@@ -1757,7 +2036,7 @@ mod tests {
         .unwrap();
 
         verify_proof(
-            key.as_bytes(),
+            &key,
             CLIENT_CALL_PROOF_DOMAIN,
             IPC_PROTOCOL_VERSION,
             "prod",
@@ -1769,7 +2048,7 @@ mod tests {
         )
         .unwrap();
         assert!(verify_proof(
-            key.as_bytes(),
+            &key,
             CLIENT_CALL_PROOF_DOMAIN,
             IPC_PROTOCOL_VERSION,
             "prod",
@@ -1781,7 +2060,7 @@ mod tests {
         )
         .is_err());
         assert!(verify_proof(
-            key.as_bytes(),
+            &key,
             CLIENT_CALL_PROOF_DOMAIN,
             IPC_PROTOCOL_VERSION,
             "prod",
@@ -1793,7 +2072,7 @@ mod tests {
         )
         .is_err());
         assert!(verify_proof(
-            key.as_bytes(),
+            &key,
             CLIENT_CALL_PROOF_DOMAIN,
             IPC_PROTOCOL_VERSION - 1,
             "prod",
@@ -1963,9 +2242,9 @@ mod tests {
         assert!(prod
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
-        assert!(expected_endpoint("prod", &token)
-            .unwrap()
-            .contains("serctl-v5-"));
+        let endpoint =
+            expected_endpoint_in_runtime_dir("prod", &token, std::path::Path::new("")).unwrap();
+        assert!(endpoint.contains("serctl-v5-"));
         validate_endpoint_bytes("expected", "expected").unwrap();
         assert!(validate_endpoint_bytes("expected", "EXPECTED").is_err());
         assert!(validate_endpoint_bytes("expected", "expected ").is_err());
@@ -2179,13 +2458,13 @@ mod tests {
                 mode: TunnelMode::Remote,
                 bind_port: u16::MAX,
                 target_port: u16::MAX,
-                max_connections: crate::ssh::MAX_TUNNEL_CONNECTIONS as u16,
+                max_connections: MAX_TUNNEL_CONNECTIONS as u16,
             },
         };
         let ready = Frame::TunnelReady {
             ready: TunnelReady {
                 mode: TunnelMode::Remote,
-                bind_host: "b".repeat(crate::ssh::MAX_TUNNEL_HOST_BYTES),
+                bind_host: "b".repeat(MAX_TUNNEL_HOST_BYTES),
                 bind_port: u16::MAX,
             },
         };
@@ -2203,7 +2482,9 @@ mod tests {
 
         let profile = format!("pipe-test-{}", std::process::id());
         let token = test_token();
-        let mut listener = LocalListener::bind(&profile, &token).unwrap();
+        let endpoint =
+            expected_endpoint_in_runtime_dir(&profile, &token, std::path::Path::new("")).unwrap();
+        let mut listener = LocalListener::bind(&endpoint).unwrap();
         let endpoint = listener.endpoint().to_owned();
         let client = tokio::time::timeout(Duration::from_secs(1), connect(&endpoint))
             .await

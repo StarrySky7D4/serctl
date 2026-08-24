@@ -8,7 +8,6 @@ use russh_sftp::protocol::{
     Close, File, FileAttributes, Handle, Init, Name, OpenDir, Packet, ReadDir, RealPath, Status,
     StatusCode, VERSION,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -27,7 +26,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::vault::Creds;
 
-const MAX_COMMAND_OUTPUT: usize = crate::ipc::MAX_COMMAND_OUTPUT;
+const MAX_COMMAND_OUTPUT: usize = serctl_protocol::MAX_COMMAND_OUTPUT;
 pub const MAX_REMOTE_COMMAND_BYTES: usize = 64 * 1024;
 pub const MAX_REMOTE_PATH_BYTES: usize = 4096;
 pub const MAX_SFTP_PACKET_BYTES: usize = 1024 * 1024;
@@ -38,9 +37,13 @@ const SSH_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
 const TRANSPORT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const CHANNEL_OPERATION_TIMEOUT: Duration = Duration::from_millis(350);
 const CHANNEL_SIGNAL_GRACE: Duration = Duration::from_millis(100);
-pub const DEFAULT_TUNNEL_CONNECTIONS: usize = 32;
-pub const MAX_TUNNEL_CONNECTIONS: usize = 128;
-pub const MAX_TUNNEL_HOST_BYTES: usize = 255;
+// Tunnel wire types and their loopback-only validation live in the protocol
+// crate; the SSH engine re-exports them so existing callers keep resolving
+// `ssh::TunnelSpec` and friends.
+pub use serctl_protocol::{
+    RemoteEntry, TunnelMode, TunnelReady, TunnelSpec, ValidatedTunnelSpec,
+    DEFAULT_TUNNEL_CONNECTIONS, MAX_TUNNEL_CONNECTIONS, MAX_TUNNEL_HOST_BYTES,
+};
 /// Aggregate cap shared by every tunnel on one SSH transport. Per-tunnel
 /// limits preserve fairness without multiplying the daemon-wide live-flow
 /// bound across its long-lived tunnel control connections.
@@ -89,84 +92,6 @@ async fn connect_ssh_tcp_until(
         Ok(result) => result.context("connect SSH TCP socket"),
         Err(_) => bail!("SSH connection exceeded its deadline"),
     }
-}
-
-fn default_tunnel_connections_u16() -> u16 {
-    DEFAULT_TUNNEL_CONNECTIONS as u16
-}
-
-/// The SSH forwarding primitive used by a tunnel.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TunnelMode {
-    Local,
-    Remote,
-    Dynamic,
-}
-
-/// A validated-at-startup SSH tunnel request.
-///
-/// Addresses are deliberately absent from this public type: local and dynamic
-/// listeners bind only to IPv4 loopback, remote listeners ask the SSH server
-/// to bind only to IPv4 loopback, and fixed L/R targets are IPv4 loopback on
-/// the opposite side of the SSH connection. This makes external exposure
-/// impossible to request through the CLI, UI, or IPC wire format.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TunnelSpec {
-    pub mode: TunnelMode,
-    pub bind_port: u16,
-    #[serde(default)]
-    pub target_port: u16,
-    #[serde(default = "default_tunnel_connections_u16")]
-    pub max_connections: u16,
-}
-
-impl TunnelSpec {
-    #[cfg(test)]
-    pub fn local(bind_port: u16, target_port: u16) -> Self {
-        Self {
-            mode: TunnelMode::Local,
-            bind_port,
-            target_port,
-            max_connections: DEFAULT_TUNNEL_CONNECTIONS as u16,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn remote(bind_port: u16, target_port: u16) -> Self {
-        Self {
-            mode: TunnelMode::Remote,
-            bind_port,
-            target_port,
-            max_connections: DEFAULT_TUNNEL_CONNECTIONS as u16,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn dynamic(bind_port: u16) -> Self {
-        Self {
-            mode: TunnelMode::Dynamic,
-            bind_port,
-            target_port: 0,
-            max_connections: DEFAULT_TUNNEL_CONNECTIONS as u16,
-        }
-    }
-
-    pub fn mode(&self) -> TunnelMode {
-        self.mode
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        ValidatedTunnelSpec::try_from(self.clone()).map(drop)
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TunnelReady {
-    pub mode: TunnelMode,
-    pub bind_host: String,
-    pub bind_port: u16,
 }
 
 /// Owns the cancellation lease for one running tunnel. Dropping the handle
@@ -225,24 +150,6 @@ impl Drop for RunningTunnel {
     }
 }
 
-#[derive(Clone, Debug)]
-enum ValidatedTunnelSpec {
-    Local {
-        bind: SocketAddr,
-        target_port: u16,
-        max_connections: usize,
-    },
-    Remote {
-        bind_port: u16,
-        target_port: u16,
-        max_connections: usize,
-    },
-    Dynamic {
-        bind: SocketAddr,
-        max_connections: usize,
-    },
-}
-
 fn validate_tunnel_host(label: &str, host: &str) -> Result<()> {
     ensure!(
         !host.is_empty() && host.len() <= MAX_TUNNEL_HOST_BYTES,
@@ -258,18 +165,6 @@ fn validate_tunnel_host(label: &str, host: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_tunnel_connections(max_connections: usize) -> Result<()> {
-    ensure!(
-        (1..=MAX_TUNNEL_CONNECTIONS).contains(&max_connections),
-        "tunnel connection limit must be between 1 and {MAX_TUNNEL_CONNECTIONS}"
-    );
-    Ok(())
-}
-
-fn tunnel_loopback_addr(port: u16) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], port))
-}
-
 fn remote_forward_channel_is_loopback_only(
     connected_address: &str,
     originator_address: &str,
@@ -281,55 +176,6 @@ fn remote_forward_channel_is_loopback_only(
         )
     };
     is_ipv4_localhost(connected_address) && is_ipv4_localhost(originator_address)
-}
-
-impl TryFrom<TunnelSpec> for ValidatedTunnelSpec {
-    type Error = anyhow::Error;
-
-    fn try_from(spec: TunnelSpec) -> Result<Self> {
-        let TunnelSpec {
-            mode,
-            bind_port,
-            target_port,
-            max_connections,
-        } = spec;
-        let max_connections = usize::from(max_connections);
-        validate_tunnel_connections(max_connections)?;
-        match mode {
-            TunnelMode::Local => {
-                ensure!(
-                    target_port != 0,
-                    "local-forward target port must not be zero"
-                );
-                Ok(Self::Local {
-                    bind: tunnel_loopback_addr(bind_port),
-                    target_port,
-                    max_connections,
-                })
-            }
-            TunnelMode::Remote => {
-                ensure!(
-                    target_port != 0,
-                    "remote-forward target port must not be zero"
-                );
-                Ok(Self::Remote {
-                    bind_port,
-                    target_port,
-                    max_connections,
-                })
-            }
-            TunnelMode::Dynamic => {
-                ensure!(
-                    target_port == 0,
-                    "dynamic forwarding target port must be zero"
-                );
-                Ok(Self::Dynamic {
-                    bind: tunnel_loopback_addr(bind_port),
-                    max_connections,
-                })
-            }
-        }
-    }
 }
 
 // Directory listings are returned as one or more SSH_FXP_NAME packets. The
@@ -383,7 +229,7 @@ impl fmt::Display for ExecOutcomeUnknown {
 impl std::error::Error for ExecOutcomeUnknown {}
 
 impl ExecOutcomeUnknown {
-    pub(crate) fn from_wire_message(message: &str) -> Option<Self> {
+    pub fn from_wire_message(message: &str) -> Option<Self> {
         (message.starts_with(EXEC_OUTCOME_UNKNOWN_PREFIX)
             && message.contains(EXEC_OUTCOME_UNKNOWN_GUIDANCE))
         .then(|| Self(message.to_owned()))
@@ -391,18 +237,18 @@ impl ExecOutcomeUnknown {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum ExecSubmissionState {
+pub enum ExecSubmissionState {
     #[default]
     BeforeRequest,
     RequestMayHaveReachedRemote,
 }
 
 impl ExecSubmissionState {
-    pub(crate) fn request_started(&mut self) {
+    pub fn request_started(&mut self) {
         *self = Self::RequestMayHaveReachedRemote;
     }
 
-    pub(crate) fn classify(self, error: anyhow::Error) -> anyhow::Error {
+    pub fn classify(self, error: anyhow::Error) -> anyhow::Error {
         if self == Self::BeforeRequest || error.is::<ExecOutcomeUnknown>() {
             return error;
         }
@@ -435,7 +281,7 @@ impl fmt::Display for CreateDirOutcomeUnknown {
 impl std::error::Error for CreateDirOutcomeUnknown {}
 
 impl CreateDirOutcomeUnknown {
-    pub(crate) fn from_wire_message(message: &str) -> Option<Self> {
+    pub fn from_wire_message(message: &str) -> Option<Self> {
         (message.starts_with(CREATE_DIR_OUTCOME_UNKNOWN_PREFIX)
             && message.contains(CREATE_DIR_OUTCOME_UNKNOWN_GUIDANCE))
         .then(|| Self(message.to_owned()))
@@ -443,18 +289,18 @@ impl CreateDirOutcomeUnknown {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum CreateDirSubmissionState {
+pub enum CreateDirSubmissionState {
     #[default]
     BeforeRequest,
     RequestMayHaveReachedRemote,
 }
 
 impl CreateDirSubmissionState {
-    pub(crate) fn request_started(&mut self) {
+    pub fn request_started(&mut self) {
         *self = Self::RequestMayHaveReachedRemote;
     }
 
-    pub(crate) fn classify(self, error: anyhow::Error) -> anyhow::Error {
+    pub fn classify(self, error: anyhow::Error) -> anyhow::Error {
         if self == Self::BeforeRequest || error.is::<CreateDirOutcomeUnknown>() {
             return error;
         }
@@ -473,7 +319,7 @@ impl CreateDirSubmissionState {
 /// still live. Tokio timeouts poll their inner future before checking the timer,
 /// so the explicit check must happen on every poll; the timeout is retained only
 /// to arrange a wakeup at the deadline.
-pub(crate) async fn poll_remote_mutation_until<F, T, E, S, D>(
+pub async fn poll_remote_mutation_until<F, T, E, S, D>(
     deadline: tokio::time::Instant,
     operation: F,
     on_first_poll: S,
@@ -519,7 +365,7 @@ where
     }
 }
 
-pub(crate) fn is_explicit_sftp_status(error: &anyhow::Error) -> bool {
+pub fn is_explicit_sftp_status(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<russh_sftp::client::error::Error>(),
         Some(russh_sftp::client::error::Error::Status(_))
@@ -1094,16 +940,6 @@ impl Drop for TransportControl {
     fn drop(&mut self) {
         self.trip.trip();
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RemoteEntry {
-    pub name: String,
-    pub path: String,
-    pub is_dir: bool,
-    pub is_symlink: bool,
-    pub size: u64,
-    pub modified_unix: Option<u32>,
 }
 
 async fn run_transport_proxy(
@@ -2829,18 +2665,18 @@ where
     // Apply the exact IPC JSON wire budget even on the direct route. JSON can
     // expand control characters sixfold, so a retained-string budget alone
     // cannot guarantee that daemon serialization will fit its response cap.
-    let mut frame = crate::ipc::Frame::DirList {
+    let mut frame = serctl_protocol::Frame::DirList {
         path: canonical,
         entries,
     };
     if let Err(error) =
-        crate::ipc::encoded_frame_len_limited(&frame, crate::ipc::MAX_RESPONSE_FRAME)
+        serctl_protocol::encoded_frame_len_limited(&frame, serctl_protocol::MAX_RESPONSE_FRAME)
     {
         frame.zeroize_sensitive();
         return Err(error).context("SFTP directory listing exceeds the IPC wire-size limit");
     }
     match frame {
-        crate::ipc::Frame::DirList { path, entries } => Ok((path, entries)),
+        serctl_protocol::Frame::DirList { path, entries } => Ok((path, entries)),
         _ => unreachable!(),
     }
 }
@@ -4016,7 +3852,10 @@ mod tests {
             assert!(result.is_err());
         }
         for _ in 0..ATTEMPTS {
-            tokio::time::timeout(Duration::from_secs(2), closed_rx.recv())
+            // The close drain asserts prompt closure, not latency: the 25 ms
+            // KEX deadline above is the property under test. The generous cap
+            // absorbs scheduling jitter when the whole suite runs in parallel.
+            tokio::time::timeout(Duration::from_secs(10), closed_rx.recv())
                 .await
                 .expect("proxy connection was not closed")
                 .expect("server close channel ended early");
@@ -4087,13 +3926,14 @@ mod tests {
             .unwrap();
         }
         assert!(budget.string_bytes <= MAX_DIRECTORY_STRING_BYTES);
-        let frame = crate::ipc::Frame::DirList {
+        let frame = serctl_protocol::Frame::DirList {
             path: "/".into(),
             entries,
         };
         let encoded =
-            crate::ipc::encoded_frame_len_limited(&frame, crate::ipc::MAX_RESPONSE_FRAME).unwrap();
-        assert!(encoded <= crate::ipc::MAX_RESPONSE_FRAME);
+            serctl_protocol::encoded_frame_len_limited(&frame, serctl_protocol::MAX_RESPONSE_FRAME)
+                .unwrap();
+        assert!(encoded <= serctl_protocol::MAX_RESPONSE_FRAME);
     }
 
     #[test]

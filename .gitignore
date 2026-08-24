@@ -1,4 +1,5 @@
-/target/
+target/
+**/target/
 *.serctl-part
 *.log
 .serctl/

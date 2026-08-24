@@ -16,7 +16,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{client, daemon, security, ssh::RemoteEntry, vault};
+use crate::client;
+use crate::launcher::DAEMON_STARTUP_TIMEOUT;
+use serctl_core::{security, ssh::RemoteEntry, vault};
 
 const MAX_CONCURRENT_STATUS_PROBES: usize = 8;
 const TRANSFER_EXIT_GRACE: Duration = Duration::from_secs(6);
@@ -536,7 +538,7 @@ async fn load_profile_rows(
         // network for a profile whose independent passphrase is not cached.
         let daemon = match passphrase {
             Some(passphrase) => {
-                client::daemon_status_at_generation(&row.name, &passphrase, row.identity())
+                client::daemon_status_probe_at_generation(&row.name, &passphrase, row.identity())
                     .await
                     .unwrap_or(None)
             }
@@ -668,6 +670,9 @@ enum UiMessage {
         instance: Option<u64>,
         result: Result<(), String>,
     },
+    /// Reserved for broker-exit notifications (e.g. idle exit). The global
+    /// daemon outlives the UI, so nothing sends it yet.
+    #[allow(dead_code)]
     DaemonEnded {
         operation: OperationContext,
         profile: String,
@@ -1613,6 +1618,7 @@ fn tunnel_end_matches_pending(pending: Option<&TunnelContext>, incoming: &Tunnel
     pending == Some(incoming)
 }
 
+#[cfg(test)]
 enum DaemonReadiness<T> {
     Ready,
     Ended(std::result::Result<T, tokio::task::JoinError>),
@@ -1620,6 +1626,7 @@ enum DaemonReadiness<T> {
     TimedOut,
 }
 
+#[cfg(test)]
 async fn wait_for_daemon_readiness<T>(
     ready: tokio::sync::oneshot::Receiver<()>,
     daemon_task: &mut tokio::task::JoinHandle<T>,
@@ -3173,7 +3180,7 @@ impl SerctlApp {
                 &profile,
                 &local,
                 &remote,
-                Duration::from_millis(crate::ipc::DEFAULT_SFTP_TIMEOUT_MS),
+                Duration::from_millis(serctl_protocol::DEFAULT_SFTP_TIMEOUT_MS),
                 master,
                 expected_generation,
                 worker_cancellation,
@@ -3230,7 +3237,7 @@ impl SerctlApp {
                 &profile,
                 &remote,
                 &local,
-                Duration::from_millis(crate::ipc::DEFAULT_SFTP_TIMEOUT_MS),
+                Duration::from_millis(serctl_protocol::DEFAULT_SFTP_TIMEOUT_MS),
                 master,
                 expected_generation,
                 worker_cancellation,
@@ -3539,7 +3546,7 @@ impl SerctlApp {
     }
 
     fn start_daemon(&mut self, ctx: &egui::Context, profile: String) {
-        let startup_deadline = tokio::time::Instant::now() + daemon::CONTROL_SETUP_TIMEOUT;
+        let startup_deadline = tokio::time::Instant::now() + DAEMON_STARTUP_TIMEOUT;
         let Some((expected_generation, master)) = self.required_authorized_profile_grant(&profile)
         else {
             return;
@@ -3552,137 +3559,29 @@ impl SerctlApp {
         let tx = self.tx.clone();
         let repaint = ctx.clone();
         self.runtime().spawn(async move {
-            let status = match tokio::time::timeout_at(
+            // The broker is per-user/per-vault global and outlives this UI:
+            // "connecting" a profile only requires the broker to be published
+            // (launching it on demand) and the profile to unlock against it.
+            // The authorized Status probe doubles as the readiness signal.
+            let result = match tokio::time::timeout_at(
                 startup_deadline,
                 client::daemon_status_at_generation(&profile, &master, expected_generation),
             )
             .await
             {
-                Ok(status) => status,
-                Err(_) => {
-                    let _ = tx.send(UiMessage::DaemonStarted {
-                        operation,
-                        profile,
-                        instance,
-                        result: Err("连接未能在 30 秒内就绪".into()),
-                    });
-                    repaint.request_repaint();
-                    return;
-                }
+                Ok(Ok(Some(_))) => Ok(true),
+                Ok(Ok(None)) => Err("连接未能启动：daemon 未发布运行时描述符".into()),
+                Ok(Err(error)) => Err(format!("连接未能启动：{error}")),
+                Err(_) => Err("连接未能在 30 秒内就绪".into()),
             };
-            match status {
-                Ok(Some(_)) => {
-                    // daemon_status already performed the exact Status
-                    // call-key authorization for this profile and master.
-                    drop(master);
-                    let _ = tx.send(UiMessage::DaemonStarted {
-                        operation,
-                        profile,
-                        instance,
-                        result: Ok(false),
-                    });
-                    repaint.request_repaint();
-                    return;
-                }
-                Err(e) => {
-                    let _ = tx.send(UiMessage::DaemonStarted {
-                        operation,
-                        profile,
-                        instance,
-                        result: Err(e.to_string()),
-                    });
-                    repaint.request_repaint();
-                    return;
-                }
-                Ok(None) => {}
-            }
-
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let daemon_profile = profile.clone();
-            let mut daemon_task = tokio::spawn(async move {
-                daemon::run_with_ready_until_at_generation(
-                    &daemon_profile,
-                    master,
-                    Some(ready_tx),
-                    expected_generation,
-                    startup_deadline,
-                )
-                .await
+            drop(master);
+            let _ = tx.send(UiMessage::DaemonStarted {
+                operation,
+                profile,
+                instance,
+                result,
             });
-            let ready =
-                wait_for_daemon_readiness(ready_rx, &mut daemon_task, startup_deadline).await;
-            match ready {
-                DaemonReadiness::Ended(ended) => {
-                    let error = match ended {
-                        Ok(Ok(())) => "连接已结束".to_owned(),
-                        Ok(Err(e)) => e.to_string(),
-                        Err(e) => e.to_string(),
-                    };
-                    let _ = tx.send(UiMessage::DaemonStarted {
-                        operation: operation.clone(),
-                        profile: profile.clone(),
-                        instance,
-                        result: Err(format!("连接未能启动：{error}")),
-                    });
-                    repaint.request_repaint();
-                }
-                DaemonReadiness::Ready => {
-                    // Queue readiness before observing termination so a short-lived
-                    // daemon can never produce Ended before Started.
-                    let queued = tx.send(UiMessage::DaemonStarted {
-                        operation: operation.clone(),
-                        profile: profile.clone(),
-                        instance,
-                        result: Ok(true),
-                    });
-                    repaint.request_repaint();
-                    if queued.is_err() {
-                        if !abort_and_wait(&mut daemon_task).await {
-                            eprintln!(
-                                "[serctl] abandoned daemon startup cleanup exceeded its join grace"
-                            );
-                        }
-                        return;
-                    }
-
-                    let error = match daemon_task.await {
-                        Ok(Ok(())) => "连接已结束".to_owned(),
-                        Ok(Err(e)) => e.to_string(),
-                        Err(e) => e.to_string(),
-                    };
-                    let _ = tx.send(UiMessage::DaemonEnded {
-                        operation,
-                        profile,
-                        instance,
-                        error,
-                    });
-                    repaint.request_repaint();
-                }
-                DaemonReadiness::Closed(error) => {
-                    if !abort_and_wait(&mut daemon_task).await {
-                        eprintln!("[serctl] daemon startup task cleanup exceeded its join grace");
-                    }
-                    let _ = tx.send(UiMessage::DaemonStarted {
-                        operation,
-                        profile,
-                        instance,
-                        result: Err(format!("连接就绪信号提前关闭：{error}")),
-                    });
-                    repaint.request_repaint();
-                }
-                DaemonReadiness::TimedOut => {
-                    if !abort_and_wait(&mut daemon_task).await {
-                        eprintln!("[serctl] daemon startup task cleanup exceeded its join grace");
-                    }
-                    let _ = tx.send(UiMessage::DaemonStarted {
-                        operation,
-                        profile,
-                        instance,
-                        result: Err("连接未能在 30 秒内就绪".into()),
-                    });
-                    repaint.request_repaint();
-                }
-            }
+            repaint.request_repaint();
         });
     }
 
@@ -6528,6 +6427,7 @@ async fn wait_for_task_until<T>(
     tokio::time::timeout_at(deadline, task).await.is_ok()
 }
 
+#[cfg(test)]
 async fn abort_and_wait<T>(task: &mut tokio::task::JoinHandle<T>) -> bool {
     task.abort();
     wait_for_task_until(task, tokio::time::Instant::now() + ABORT_JOIN_GRACE).await

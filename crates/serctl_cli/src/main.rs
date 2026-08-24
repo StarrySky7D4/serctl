@@ -4,13 +4,10 @@
 //! every `exec`/`shell` reuses one authenticated SSH session without re-exposing
 //! the password on the command line.
 mod client;
-mod daemon;
-mod ipc;
-mod recovery;
-mod security;
-mod ssh;
+mod launcher;
 mod ui;
-mod vault;
+use serctl_core::security;
+use serctl_core::vault;
 
 #[cfg(test)]
 mod e2e_tests;
@@ -36,7 +33,7 @@ const BUILD_VERSION: &str = concat!(
 
 #[derive(Parser)]
 #[command(
-    name = "serctl",
+    name = "serctl_cli",
     version = BUILD_VERSION,
     long_version = BUILD_VERSION,
     about = "Persistent SSH control suite: encrypted creds + long-lived daemon + IPC"
@@ -86,9 +83,9 @@ enum Cmd {
         #[command(subcommand)]
         command: RecoveryCommand,
     },
-    /// Start the connection daemon for a profile (foreground; Ctrl-C to stop).
+    /// Start the global broker and unlock one profile (foreground; Ctrl-C to stop).
     Up { name: Option<String> },
-    /// Run a remote command (reuses the daemon if up, otherwise direct connect).
+    /// Run a remote command through the on-demand global broker.
     Exec {
         name: String,
         /// Hard deadline for the remote command.
@@ -115,7 +112,7 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
     },
-    /// Open an interactive PTY shell (reuses the daemon if up).
+    /// Open an interactive PTY shell through the on-demand global broker.
     Shell { name: Option<String> },
     /// Run a loopback-only SSH TCP tunnel in the foreground until Ctrl+C.
     Tunnel {
@@ -125,8 +122,28 @@ enum Cmd {
     },
     /// Show daemon status.
     Status { name: Option<String> },
-    /// Stop a running daemon.
+    /// Stop a running daemon after verifying one profile passphrase.
     Down { name: Option<String> },
+    /// Issue a bounded 30-minute OperationGrant for an agent frontend.
+    GrantIssue {
+        name: String,
+        /// Comma-separated operation kinds (exec, status, list, read, write, forward).
+        #[arg(long, value_delimiter = ',')]
+        operations: Vec<String>,
+        /// Maximum number of relayed operations (1..=1000).
+        #[arg(long, default_value_t = 32)]
+        budget: u32,
+        /// File to write the grant plus its agent private key to.
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Run the agent stdio gateway: JSONL requests on stdin, JSONL relay
+    /// results on stdout, authenticated by an issued OperationGrant.
+    Agent {
+        /// Grant file previously written by `grant-issue`.
+        #[arg(long, value_name = "FILE")]
+        grant: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -596,10 +613,12 @@ impl StartupSecrets {
             | Cmd::Tunnel { .. }
             | Cmd::Remove { .. }
             | Cmd::Status { .. }
-            | Cmd::Down { .. } => Self {
+            | Cmd::Down { .. }
+            | Cmd::GrantIssue { .. } => Self {
                 profile_passphrase,
                 ..Self::default()
             },
+            Cmd::Agent { .. } | Cmd::Ui => Self::default(),
             Cmd::Admin { command } => match command {
                 AdminCommand::Status => Self::default(),
                 AdminCommand::Init { .. } | AdminCommand::Verify | AdminCommand::ChangePassword => {
@@ -634,7 +653,6 @@ impl StartupSecrets {
                     ..Self::default()
                 },
             },
-            Cmd::Ui => Self::default(),
         }
     }
 }
@@ -942,6 +960,20 @@ fn missing_profile_message(name: &str) -> String {
 
 fn upload_success_message(bytes: u64, remote: &str) -> String {
     format!("uploaded {bytes} bytes to {}", terminal_safe_field(remote))
+}
+
+fn grant_issued_message(grant_id: &str, expires_unix_ms: u64, output: &Path) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let remaining_minutes = expires_unix_ms.saturating_sub(now_ms) / 60_000;
+    format!(
+        "grant {} issued for {} minutes; agent credentials written to {}",
+        terminal_safe_field(grant_id),
+        remaining_minutes,
+        terminal_safe_field(&output.display().to_string())
+    )
 }
 
 fn download_success_message(bytes: u64, local: &Path) -> String {
@@ -1468,9 +1500,17 @@ async fn run_cli(cmd: Cmd, mut secrets: StartupSecrets) -> Result<()> {
         }
         Cmd::Recovery { command } => run_recovery_command(command, &mut secrets)?,
         Cmd::Up { name } => {
-            let name = nm(name);
-            let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
-            daemon::run(&name, master).await?;
+            // The broker is per-user/per-vault global; the legacy per-profile
+            // argument is accepted for compatibility but no longer scopes the
+            // daemon, and no passphrase is needed (profiles unlock per request).
+            let _ = name;
+            if client::daemon_is_published()? {
+                bail!("the daemon is already running");
+            }
+            // The daemon is a sibling binary; this CLI process supervises it
+            // in the foreground and mirrors its exit status.
+            let code = launcher::run_global_daemon_foreground().await?;
+            std::process::exit(code);
         }
         Cmd::Exec {
             name,
@@ -1548,6 +1588,23 @@ async fn run_cli(cmd: Cmd, mut secrets: StartupSecrets) -> Result<()> {
             let name = nm(name);
             let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
             client::down(&name, &master).await?;
+        }
+        Cmd::GrantIssue {
+            name,
+            operations,
+            budget,
+            output,
+        } => {
+            let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
+            let grant =
+                client::issue_grant_until(&name, &master, operations, budget, &output).await?;
+            println!(
+                "{}",
+                grant_issued_message(&grant.grant_id_hex(), grant.expires_unix_ms, &output)
+            );
+        }
+        Cmd::Agent { grant } => {
+            client::agent_stdio_loop(&grant).await?;
         }
     }
     Ok(())

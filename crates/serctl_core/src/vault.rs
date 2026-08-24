@@ -28,7 +28,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::security;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_HOME: std::sync::LazyLock<std::sync::RwLock<Option<PathBuf>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
 
@@ -78,15 +78,17 @@ pub struct Creds {
 /// never be written to the vault or a runtime lock. The daemon retains only
 /// this domain-separated key, never the profile passphrase, DEK, or AuthSeed.
 #[derive(Zeroize, ZeroizeOnDrop)]
-pub(crate) struct ProfileCallKey(Zeroizing<[u8; 32]>);
+pub struct ProfileCallKey(Zeroizing<[u8; 32]>);
 
 impl ProfileCallKey {
-    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+    pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_bytes_for_test(bytes: [u8; 32]) -> Self {
+    /// Test-only constructor, kept unconditional so cross-crate test modules
+    /// can build fixed keys without enabling this crate's own test cfg.
+    #[doc(hidden)]
+    pub fn from_bytes_for_test(bytes: [u8; 32]) -> Self {
         Self(Zeroizing::new(bytes))
     }
 }
@@ -105,7 +107,7 @@ pub(crate) struct AuthorizedProfileMetadata {
 /// A profile-specific runtime/use lock coupled to the vault-wide rekey
 /// barrier. Both handles stay live for the complete daemon/direct/mutation
 /// lifetime, so an exclusive master rotation cannot overlap credential use.
-pub(crate) struct ProfileLease {
+pub struct ProfileLease {
     name: String,
     exclusive: bool,
     profile: File,
@@ -115,7 +117,7 @@ pub(crate) struct ProfileLease {
 impl ProfileLease {
     /// Explicit release is used by daemon teardown so lock cleanup errors are
     /// observable. Drop remains the crash/cancellation-safe fallback.
-    pub(crate) fn unlock(self) -> Result<()> {
+    pub fn unlock(self) -> Result<()> {
         let profile = FileExt::unlock(&self.profile).context("release profile runtime lease");
         let barrier = FileExt::unlock(&self.barrier).context("release vault runtime barrier");
         profile?;
@@ -378,7 +380,7 @@ pub fn now_unix() -> i64 {
 }
 
 pub fn home_dir() -> Result<PathBuf> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(path) = TEST_HOME.read().expect("test home lock poisoned").clone() {
         return Ok(path);
     }
@@ -399,7 +401,7 @@ pub fn home_dir() -> Result<PathBuf> {
 /// Return the directory identity used for containment checks without
 /// re-resolving a delegated Linux target through its original NSS pathname.
 /// Normal callers retain the non-creating historical behavior.
-pub(crate) fn vault_dir_for_external_path_validation() -> Result<PathBuf> {
+pub fn vault_dir_for_external_path_validation() -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     if let Some(directory) = LINUX_ADMIN_TARGET_VAULT_DIR.get() {
         use std::os::fd::AsRawFd;
@@ -412,8 +414,9 @@ pub(crate) fn vault_dir_for_external_path_validation() -> Result<PathBuf> {
     Ok(home_dir()?.join(".serctl"))
 }
 
-#[cfg(test)]
-pub(crate) fn set_test_home(path: Option<PathBuf>) {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_test_home(path: Option<PathBuf>) {
     *TEST_HOME.write().expect("test home lock poisoned") = path;
 }
 
@@ -455,7 +458,7 @@ pub fn run_dir() -> Result<PathBuf> {
 /// Resolve the runtime directory without creating it or rewriting its ACL.
 /// Read-only lock polling and daemon teardown must not contend over directory
 /// security metadata on Windows.
-fn run_dir_path() -> Result<PathBuf> {
+pub(crate) fn run_dir_path() -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     if LINUX_ADMIN_TARGET_VAULT_DIR.get().is_some() {
         return Ok(dir()?.join("run"));
@@ -581,7 +584,7 @@ where
 
 /// Acquire the lifetime lease for one profile daemon. The OS releases this
 /// automatically if the daemon exits or crashes.
-pub(crate) fn acquire_runtime_lease(profile: &str) -> Result<ProfileLease> {
+pub fn acquire_runtime_lease(profile: &str) -> Result<ProfileLease> {
     validate_profile_name(profile)?;
     // Global-before-profile is the single lock order used by every current
     // operation. Rekey takes only the exclusive global side before the vault
@@ -606,7 +609,7 @@ pub(crate) fn acquire_runtime_lease(profile: &str) -> Result<ProfileLease> {
 /// Hold a shared lease while a direct (non-daemon) operation is using a
 /// profile snapshot. Multiple direct operations may coexist, but daemon
 /// startup and credential mutation require the exclusive form above.
-pub(crate) fn acquire_profile_use_lease(profile: &str) -> Result<ProfileLease> {
+pub fn acquire_profile_use_lease(profile: &str) -> Result<ProfileLease> {
     validate_profile_name(profile)?;
     let barrier = acquire_runtime_barrier_shared()?;
     let file = open_runtime_lease_file(profile)?;
@@ -673,24 +676,26 @@ fn acquire_rename_leases(old_name: &str, new_name: &str) -> Result<(ProfileLease
 }
 
 pub fn validate_profile_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > 128 {
-        bail!("profile name must contain 1 to 128 bytes");
-    }
-    if name == "."
-        || name == ".."
-        || name
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
-    {
-        bail!("profile name contains unsafe path characters");
-    }
-    Ok(())
+    serctl_protocol::validate_profile_name(name)
 }
 
 pub fn new_ipc_token() -> String {
     let mut token = Zeroizing::new([0_u8; 32]);
     OsRng.fill_bytes(&mut *token);
     B64.encode(token.as_ref())
+}
+
+/// Derive the local IPC endpoint for a profile/token pair under the current
+/// runtime directory. The daemon binds this; CLI callers derive the same value
+/// to connect and to validate recorded lock state.
+pub fn expected_endpoint(profile: &str, token: &str) -> Result<String> {
+    serctl_protocol::expected_endpoint_in_runtime_dir(profile, token, &run_dir()?)
+}
+
+/// Verify that a recorded endpoint matches the derived endpoint for this
+/// profile/token pair under the current runtime directory.
+pub fn validate_endpoint(profile: &str, token: &str, endpoint: &str) -> Result<()> {
+    serctl_protocol::validate_endpoint_in_runtime_dir(profile, token, &run_dir()?, endpoint)
 }
 
 pub fn load_vault() -> Result<VaultFile> {
@@ -1094,19 +1099,22 @@ fn validate_kdf(config: &KdfConfig) -> Result<()> {
 }
 
 fn new_profile_kdf() -> KdfConfig {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
-        KdfConfig {
-            memory_kib: 8 * 1024,
-            iterations: 1,
-            parallelism: 1,
-            output_bytes: 32,
+        // `test-support` is also visible to workspace-wide tooling. Never let
+        // merely enabling that feature weaken a real vault: the fast KDF is
+        // available only while a test has explicitly redirected the vault
+        // into its isolated test home.
+        if TEST_HOME.read().expect("test home lock poisoned").is_some() {
+            return KdfConfig {
+                memory_kib: 8 * 1024,
+                iterations: 1,
+                parallelism: 1,
+                output_bytes: 32,
+            };
         }
     }
-    #[cfg(not(test))]
-    {
-        KdfConfig::default()
-    }
+    KdfConfig::default()
 }
 
 fn derive_key(master: &[u8], salt: &[u8], config: &KdfConfig) -> Result<Zeroizing<[u8; 32]>> {
@@ -2567,7 +2575,7 @@ pub fn verify_profile_identity(name: &str, passphrase: &str) -> Result<ProfileId
     profile_identity(encrypted)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn verify_profile_passphrase(name: &str, passphrase: &str) -> Result<u64> {
     Ok(verify_profile_identity(name, passphrase)?.generation)
 }
@@ -3052,7 +3060,7 @@ fn rename_profile_in_vault(
     Ok(previous_pin)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn decrypt(name: &str, master: &str) -> Result<Creds> {
     decrypt_with_lock_timeout(name, master, None, VAULT_LOCK_WAIT_TIMEOUT)
 }
@@ -3061,7 +3069,7 @@ pub fn decrypt(name: &str, master: &str) -> Result<Creds> {
 /// lock. Callers that invoke this from async code should run it on a blocking
 /// worker and retain their own end-to-end deadline; local filesystem I/O and
 /// Argon2 itself are synchronous and cannot be preempted by this timeout.
-pub(crate) fn decrypt_with_lock_timeout(
+pub fn decrypt_with_lock_timeout(
     name: &str,
     profile_passphrase: &str,
     expected_identity: Option<ProfileIdentity>,
@@ -3085,7 +3093,7 @@ pub(crate) fn decrypt_with_lock_timeout(
 /// call-authorization key from the same Argon2 result. The returned key is
 /// domain-separated from the vault encryption key; neither the master
 /// passphrase nor the vault key needs to survive daemon setup.
-pub(crate) fn decrypt_with_call_key_with_lock_timeout(
+pub fn decrypt_with_call_key_with_lock_timeout(
     name: &str,
     master: &str,
     expected_identity: Option<ProfileIdentity>,
@@ -3124,7 +3132,7 @@ fn decrypt_with_call_key_from_vault(
 /// return only its domain-separated IPC call key. Although authenticating the
 /// target ciphertext necessarily decrypts it transiently, the credential
 /// value remains under `ZeroizeOnDrop` and is never returned to the caller.
-pub(crate) fn derive_profile_call_key_with_lock_timeout(
+pub fn derive_profile_call_key_with_lock_timeout(
     name: &str,
     master: &str,
     expected_identity: Option<ProfileIdentity>,
@@ -3159,7 +3167,7 @@ fn derive_profile_call_key_from_vault(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_pinned_fp(name: &str, fingerprint: String, master: &str) -> Result<()> {
     let lease = acquire_profile_mutation_lease(name)?;
     set_pinned_fp_with_lock_timeout(name, fingerprint, master, VAULT_LOCK_WAIT_TIMEOUT, &lease)
@@ -3168,7 +3176,7 @@ pub fn set_pinned_fp(name: &str, fingerprint: String, master: &str) -> Result<()
 /// Persist a TOFU pin while bounding only acquisition of the exclusive
 /// vault-file lock. See `decrypt_with_lock_timeout` for the synchronous-I/O and
 /// KDF caveat; the mutation itself remains atomic once the lock is acquired.
-pub(crate) fn set_pinned_fp_with_lock_timeout(
+pub fn set_pinned_fp_with_lock_timeout(
     name: &str,
     fingerprint: String,
     master: &str,
@@ -3524,17 +3532,17 @@ fn validate_runtime_lock_info(expected_profile: &str, info: &LockInfo) -> Result
         bail!("runtime lock profile mismatch");
     }
     match info.protocol {
-        crate::ipc::IPC_PROTOCOL_VERSION => {}
+        serctl_protocol::IPC_PROTOCOL_VERSION => {}
         0 => bail!(
             "legacy runtime lock uses bearer-token IPC; stop it and restart with protocol {}",
-            crate::ipc::IPC_PROTOCOL_VERSION
+            serctl_protocol::IPC_PROTOCOL_VERSION
         ),
         version => bail!("unsupported runtime lock IPC protocol {version}"),
     }
     if info.pid == 0 {
         bail!("runtime lock contains an invalid daemon PID");
     }
-    crate::ipc::validate_endpoint(expected_profile, &info.token, &info.endpoint)
+    validate_endpoint(expected_profile, &info.token, &info.endpoint)
         .context("validate runtime lock endpoint and capability")?;
     if info.port != 0 || !info.host.is_empty() || !info.user.is_empty() {
         bail!("protocol-v5 runtime lock contains forbidden remote metadata");
@@ -3695,7 +3703,7 @@ pub fn remove_invalid_hashed_v5_lock(profile: &str) -> Result<bool> {
 /// Variant for daemon startup, whose caller already owns the profile's
 /// exclusive runtime lease. This mirrors `remove_lock_if_token_while_leased`;
 /// callers must keep that lease handle alive for the full call.
-pub(crate) fn remove_invalid_hashed_v5_lock_while_leased(profile: &str) -> Result<bool> {
+pub fn remove_invalid_hashed_v5_lock_while_leased(profile: &str) -> Result<bool> {
     validate_profile_name(profile)?;
     // Validate/harden the directory before classifying contents. Any owner,
     // ACL, reparse, or directory I/O error exits before deletion is possible.
@@ -3723,7 +3731,7 @@ fn hashed_v5_lock_is_invalid(
         Ok(info) => info,
         Err(_) => return Ok(true),
     };
-    if info.protocol != crate::ipc::IPC_PROTOCOL_VERSION {
+    if info.protocol != serctl_protocol::IPC_PROTOCOL_VERSION {
         bail!(
             "runtime lock protocol {} is not eligible for protocol-v5 malformed-lock cleanup",
             info.protocol
@@ -3749,7 +3757,7 @@ fn hashed_v5_lock_is_invalid(
     if canonical_token.as_bytes() != info.token.as_bytes() {
         return Ok(true);
     }
-    let expected_endpoint = crate::ipc::expected_endpoint_in_runtime_dir(
+    let expected_endpoint = serctl_protocol::expected_endpoint_in_runtime_dir(
         expected_profile,
         &info.token,
         verified_runtime_dir,
@@ -3816,10 +3824,7 @@ fn with_exclusive_runtime_cleanup(
 /// Remove the caller's runtime lock while it still owns the exclusive lease.
 /// Keeping removal before lease release closes the handoff window in which a
 /// replacement daemon could observe the retiring daemon's lock record.
-pub(crate) fn remove_lock_if_token_while_leased(
-    profile: &str,
-    expected_token: &str,
-) -> Result<bool> {
+pub fn remove_lock_if_token_while_leased(profile: &str, expected_token: &str) -> Result<bool> {
     Ok(matches!(
         reconcile_lock_if_token_while_leased(profile, expected_token)?,
         LockReconcileOutcome::Removed
@@ -4855,12 +4860,12 @@ mod tests {
             .contains("unsupported runtime lock IPC protocol 3"));
         assert!(!old_v3.to_string().contains(secret_token));
 
-        lock.protocol = crate::ipc::IPC_PROTOCOL_VERSION + 1;
+        lock.protocol = serctl_protocol::IPC_PROTOCOL_VERSION + 1;
         let unknown = validate_runtime_lock_info("prod", &lock).unwrap_err();
         assert!(unknown.to_string().contains("unsupported runtime lock"));
         assert!(!unknown.to_string().contains(secret_token));
 
-        lock.protocol = crate::ipc::IPC_PROTOCOL_VERSION;
+        lock.protocol = serctl_protocol::IPC_PROTOCOL_VERSION;
         lock.endpoint = "not-the-derived-endpoint".into();
         lock.token = "not-base64".into();
         let invalid = validate_runtime_lock_info("prod", &lock).unwrap_err();
@@ -4872,10 +4877,11 @@ mod tests {
         let runtime_dir = std::env::temp_dir();
         let token = new_ipc_token();
         let endpoint =
-            crate::ipc::expected_endpoint_in_runtime_dir("prod", &token, &runtime_dir).unwrap();
+            serctl_protocol::expected_endpoint_in_runtime_dir("prod", &token, &runtime_dir)
+                .unwrap();
         let mut lock = LockInfo {
             profile: "prod".into(),
-            protocol: crate::ipc::IPC_PROTOCOL_VERSION,
+            protocol: serctl_protocol::IPC_PROTOCOL_VERSION,
             pid: 7,
             port: 0,
             endpoint,
@@ -4896,7 +4902,7 @@ mod tests {
         let old_v4 = serde_json::to_vec(&lock).unwrap();
         assert!(hashed_v5_lock_is_invalid("prod", &old_v4, &runtime_dir).is_err());
 
-        lock.protocol = crate::ipc::IPC_PROTOCOL_VERSION + 1;
+        lock.protocol = serctl_protocol::IPC_PROTOCOL_VERSION + 1;
         let future = serde_json::to_vec(&lock).unwrap();
         assert!(hashed_v5_lock_is_invalid("prod", &future, &runtime_dir).is_err());
     }

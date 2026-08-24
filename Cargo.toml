@@ -1,12 +1,19 @@
-[package]
-name = "serctl"
-version = "0.1.0"
+[workspace]
+resolver = "2"
+members = [
+    "crates/serctl_protocol",
+    "crates/serctl_core",
+    "crates/serctl_daemon",
+    "crates/serctl_cli",
+]
+
+[workspace.package]
+version = "0.2.0-test.1"
 edition = "2021"
-description = "Persistent SSH control suite: encrypted credentials, long-lived connection daemon, IPC command execution."
 license = "Apache-2.0"
 repository = "https://github.com/StarrySky7D4/serctl"
 
-[dependencies]
+[workspace.dependencies]
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
 russh = { version = "0.62.5", default-features = false, features = ["ring"] }
@@ -17,6 +24,7 @@ serde_json = "1"
 argon2 = { version = "0.5", features = ["zeroize"] }
 chacha20poly1305 = "0.10"
 curve25519-dalek = { version = "4", features = ["zeroize"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 hkdf = "0.12"
 rand = "0.8"
 base64 = "0.22"
@@ -35,11 +43,7 @@ zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita-notitle"] }
-
-[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading"] }
-
-[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # Favor a compact distributable without sacrificing unwind-based cleanup.

@@ -2,6 +2,8 @@
 
 `serctl` 是一个纯 Rust 的持久 SSH 控制工具，提供 Winit/Egui 桌面 UI 与完整 CLI。它复用 SSH 连接执行远端命令、浏览目录、通过 SFTP 上传/下载文件、运行 Bash PTY，并支持本地（`-L`）、远程（`-R`）和动态 SOCKS5（`-D`）TCP 隧道。
 
+当前重写版标记为预发布测试版本 **v0.2.0-test.1**；原 main 基线保存在远端 `V1` 分支。测试版本不应替代正式签名发行物。
+
 当前工作树使用 vault/record v4：每个 profile 有彼此独立的口令、Argon2id KDF、随机 DEK、IPC `AuthSeed` 与随机 128 位 `profile_id`，不存在可解锁全部主机的共享主口令。Windows 另设超管密码并配合离线介质形成 2-of-2 恢复；超管密码本身不能查看现有 profile 口令，也不能单独恢复 SSH 凭据。CLI 的每次远程调用都重新验证目标 profile 口令，桌面 UI 则按 `(name, profile_id, generation)` 保存固定五分钟、非滑动授权。SSH 隧道的所有 listener，以及 L/R 的固定目标地址，都强制为 `127.0.0.1`。实现级说明、威胁边界和验证证据见 [架构、安全与运维说明](docs/serctl-architecture-security.html)。
 
 ## 功能
@@ -28,14 +30,14 @@
 开发时启动 debug UI：
 
 ```powershell
-cargo run
-# 等价于 cargo run -- ui
+cargo run -p serctl-cli --bin serctl_cli -- ui
+# 省略最后的 ui 也会打开桌面工作台
 ```
 
 ## CLI
 
 ```powershell
-$exe = ".\target\debug\serctl.exe"
+$exe = ".\target\debug\serctl_cli.exe"
 
 # Windows 首次使用：新介质路径必须不存在，超管密码交互输入
 $media = 'E:\serctl-recovery-v1.json'
@@ -116,11 +118,11 @@ CLI 将远端非零退出状态映射为本地非零退出码，缺失退出状�
 
 ```text
 Winit / Egui UI ─┐
-                 ├─ client ── IPC v5 ── daemon ── russh 0.62.5 ── SSH
+                 ├─ client ── IPC v6 AEAD ── 全局 broker ── russh 0.62.5 ── SSH
 CLI ─────────────┘       │       │              └─ russh-sftp / SFTP v3
-                         │       ├─ persistent session + bounded handlers
+                         │       ├─ per-profile session pool + bounded handlers
                          │       └─ L/R/D tunnel control（TCP data 不经 IPC）
-                         └─ direct fallback + profile lease
+                         └─ 无 direct-connect 回退
 
 vault/record v4: profile passphrase ─ Argon2id ─ KEK ─┐
                                                        ├─ wrap {DEK, AuthSeed, profile_id, generation}
@@ -131,7 +133,7 @@ AuthSeed ─ HMAC domain separation → name + profile_id + generation scoped ca
 IPC: Windows Named Pipe / Unix Domain Socket，共用长度前缀 JSON 帧抽象
 ```
 
-每个 `exec` / `list-dir` / `create-dir` / `upload` / `download` / shell / tunnel 请求只探测 daemon 一次，然后固定走该 IPC stream 或直连路径，避免二次探测的路由竞态。daemon 路径先用调用者提供的目标 profile 口令认证解包 `{DEK, AuthSeed, generation}`，再由 `AuthSeed` 派生 call key，并用 IPC v5 把授权绑定到完整、规范化的根请求；真正的业务帧只在 daemon 身份、token 证明、call-key 证明和 `AuthAccepted` 全部通过后发送。无 daemon 的直连路径持有 profile 共享租约；首次 TOFU pin 需要只写一次时升级为排他租约，`exec`、SFTP、shell 与 tunnel 使用同一规则。
+每个远程请求都只走 per-user/per-vault 全局 broker，不再存在 direct-connect 回退。客户端先通过激活密钥完成 IPC v6 双向认证并建立 ChaCha20-Poly1305 通道；首次使用某 profile 时，口令仅在该 AEAD 通道内发送。daemon 验证并解包该 profile 后返回域分离的短期 call key，后续每个普通请求以 HMAC 把完整 v6 prelude（操作、profile 名/ID、请求 ID、deadline 与根请求哈希）绑定到该 profile。daemon 同时校验根帧哈希、profile 名/ID 和 call proof，未通过前不会触发 SSH、SFTP 或 listener 副作用。
 
 daemon 最多接受 64 个并发本机连接；会完整缓冲结果的 `Exec` 与 `ListDir` 共用额外 8 槽上限，长驻 tunnel control 另有 8 槽上限。每个已认证 IPC 连接只接受一个根请求；上传块、shell 输入和 tunnel stop 是该根请求生命周期内的后续帧。认证后 10 秒仍未发送根请求的连接被关闭。响应写通常受请求剩余 deadline 与 2 秒局部上限的较早者约束，并可被 shutdown 抢占；远端上传已明确提交而原预算刚过时的 `TransferDone` 例外使用新的最多 2 秒确认窗口。关闭时广播取消，使用 `JoinSet` 等待 handler 最多 4 秒，再中止并回收剩余任务。
 
@@ -151,35 +153,35 @@ UI 启动 daemon 的 status 探测、bind、lock publication 与 readiness 全�
 - vault 与运行锁共用的受保护原子提交在 Unix 上执行同目录临时文件 `sync_all`、原子 `rename` 和父目录 `fsync`；Windows 从创建临时文件起即应用 protected DACL，`sync_all` 后以稳定的受保护父目录句柄配合 `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` 替换。注入提交失败时旧目标保持不变且临时文件被清理。这里验证的是 OS 提供的持久化/写穿原语与失败路径，不是断电模拟，也不承诺硬件或文件系统超出其语义的行为。
 - 敏感 JSON 使用“计数遍 + 精确预分配写入遍”，直接落入 `Zeroizing<Vec<u8>>`；vault、运行锁与 IPC 帧不再先产生普通敏感序列化缓冲区。完成和错误分支均尽早清零可控副本。
 - Windows 凭证目录/文件使用禁止继承的 owner、SYSTEM、Administrators DACL；Unix 目录为 `0700`、文件为 `0600`。路径通过稳定句柄检查 owner、类型、ACL/mode 与 reparse/symlink 边界，失败关闭。Windows owner 校验接受对象 owner 等于当前进程令牌的 `TokenUser` 或该令牌的 `TokenOwner`：这兼容提升令牌以 `BUILTIN\Administrators` 作为默认 owner 的正常创建结果，同时仍拒绝与本令牌无关的 SID，并且不扩大既有 DACL 已明确包含的管理员边界。
-- 运行锁采用 profile SHA-256 文件名、受保护权限和 profile 生命周期租约。读取器在首次 I/O 前就建立 `Zeroizing` 64 KiB + 1 固定缓冲，避免增长重分配留下 token 前缀。profile mutation 只有在排他锁实际返回 contention 时才报告“正在被 direct operation 或 daemon 使用”；打开 lease、owner/ACL 与其他 I/O 错误保留原始原因，不再被误包装为占用。畸形的当前 protocol-v5 hashed 锁只能在同一排他租约下重验后清理；对账只有 `Removed` / `Absent` 允许直连 fallback，`Changed` / `Contended` 均 fail closed。旧 v4、v3、protocol 0/2 和未知协议锁在连接前拒绝并保留。Unix raw legacy 锁仍会被读出并拒绝。
+- v6 全局 broker 的 descriptor 与 activation secret 分离保存，并使用受保护权限和稳定句柄校验。profile pool 持有排他使用租约；profile mutation 只有在实际 contention 时才报告“正在被 daemon 使用”。credential lease 由独立 reaper 主动清理，handler/tunnel 还受同一 monotonic hard deadline 约束。旧 protocol-v5 profile 运行锁仅作为 legacy daemon 兼容代码保留；v6 client 不读取它、不清理它，也不回退直连。
 - daemon 启动时用目标 profile 的 Argon2 KDF 解包 key package，解密 SSH 凭据并从 `AuthSeed + name + profile_id + generation` 派生 32 字节 `ProfileCallKey`；SSH 建连和首次 TOFU pin 完成后清除 profile 口令，只保留 SSH 会话与 call key。call key 不序列化、不写入 vault/运行锁，最后一个引用释放时清零。
 
 UI 的 profile/admin/editor SSH secret 使用 `MaskedSecretTextBuffer`：egui 只能看到与 Unicode 字符数相同的 `*`，每次显示前后都把 undo 容量设为 0，Unicode 编辑替换的旧 app-side 字符串会清零。eframe persistence 已移除，window/egui memory persistence 都关闭。启动和锁定期间允许刷新本地明文目录元数据，但只有持有目标 `(name, profile_id, generation)` 固定五分钟授权的记录才会发 status probe 或执行网络操作；超管授权独立固定两分钟且不能用于普通 SSH 操作。到期或显式撤销会清零相应授权和受保护上下文，取消该 profile 的传输、关闭 shell 并停止 tunnel；daemon 故意保留。Shell/Tunnel/Command/Directory/Transfer 的任务都捕获不可变 identity，reducer 在呈现完成结果前再次核对 identity 与授权；TTL 撤销后的迟到结果会被取消或丢弃。随机轮转、Windows 保留式恢复和随机破坏性重置共用两阶段 modal：生成阶段只在 UI 内暂存并一次性显示，明确标注 vault 尚未修改；勾选已安全保存后提交按钮才启用，取消/关闭则清零且不产生后台消息。`SensitiveUiMessage` 的 RAII envelope 从排队、send 失败、receiver drop 一直存活到 reducer match 完成，unwind 也会清零 payload并取消 shell/tunnel。profile refresh 使用单一 32 秒 deadline；未授权 profile 的 refresh 只有本地 metadata，已授权 profile 的 Status 也不触发 SSH reconnect。Linux v2 迁移 UI 禁用；面向其他本机账号的 root 破坏性 reset 采用上述 CLI `--target-user` 降权入口，而不是任意 vault 路径选择器。
 
-## IPC v5、CLI 逐调用验证与 UI 限时授权
+## IPC v6、CLI 逐调用验证与 UI 限时授权
 
 daemon 不监听本机 TCP。Windows 使用拒绝远程客户端的 Named Pipe；每个 pipe instance 在创建时即带禁止继承、仅 owner/SYSTEM/Administrators 可访问的 DACL。Unix 使用 `0700` runtime 目录中的 `0600` Unix Socket。
 
-运行锁中的 256 位 token 继续负责 daemon instance、endpoint 和 OS peer 的互认证；它不再单独授权远程操作。`exec`、目录列出/创建、上传、下载、shell 和 tunnel 的 daemon 路径必须先用本次独立口令认证目标 profile key package，并从其 `AuthSeed` 按 name + 128-bit `profile_id` + generation 派生 32 字节 call key。错误口令在连接 daemon 之前失败，因此不会发送 IPC 字节、业务帧，也不会触发 SSH 重连或远端副作用。
+受保护的 `daemon.secret` 只负责建立 IPC v6 的双向认证 AEAD 通道，不能单独授权 profile 操作或停机。`exec`、目录列出/创建、上传、下载、shell、tunnel、status 与 grant 签发均要求目标 profile 的短期 call key 证明；`down` 则在同一 AEAD 通道内重新验证所选 profile 口令，但不会为停机建立新的 SSH 连接。错误口令不会产生远端副作用。
 
-客户端连接后先核对 OS 对端身份：Windows Named Pipe server PID 必须等于受保护运行锁中的 PID；Unix peer UID 必须等于当前 euid，且 peer PID 必须存在并匹配运行锁。无法提供 peer PID 的 Unix 目标失败关闭，不降级为仅验证 UID。随后执行四帧 nonce-HMAC-SHA256 交换：
+客户端连接后先核对 OS 对端身份：Windows Named Pipe server PID 必须等于受保护 descriptor 中的 PID；Unix peer UID 必须等于当前 euid，且 peer PID 必须存在并匹配 descriptor。无法提供 peer PID 的 Unix 目标失败关闭，不降级为仅验证 UID。随后进行 transcript-bound HMAC 双向认证，以 HKDF-SHA256 派生双向独立密钥，并用严格递增计数器 nonce 的 ChaCha20-Poly1305 加密所有业务帧：
 
 ```text
-client → AuthHello(version=5, client_nonce, intent_commitment?)
-daemon → AuthChallenge(version=5, server_nonce, server_proof, server_call_proof?)
-client → AuthResponse(client_proof, client_call_proof?)
-daemon → AuthAccepted
+client → V6Hello(instance, client_nonce, 完整 request prelude)
+daemon → V6Challenge(server_nonce, transcript MAC)
+client → V6Finish(transcript MAC)
+daemon → AEAD response / stream
 ```
 
-token HMAC 与 call-key HMAC 使用不同 role/domain，均绑定协议版本、profile、派生 endpoint id、双方 nonce 和可选 intent commitment。commitment 是 call key 对“规范化完整根请求摘要”的 HMAC，覆盖操作类型和每个安全相关字段：命令/路径、deadline、上传大小、PTY 尺寸，以及 tunnel 模式、监听端口、L/R 目标端口和连接上限；地址不在 `TunnelSpec` 中，双方固定使用 `127.0.0.1`。client 在验证 daemon 的 token/call-key 证明并收到 `AuthAccepted` 前不发送根请求；daemon 收到根请求后再次计算并常量时间核对 commitment，任何替换、跨 profile/endpoint/version 重放或第二个根请求都在 SSH、本地 listener 或其他业务副作用之前关闭。上传块、shell 输入和 tunnel stop 只继承已经授权的单个根请求，不能单独作为授权根请求。
+profile proof 与激活密钥使用不同 domain。proof 覆盖规范化完整 prelude，prelude 又提交根请求 SHA-256；地址不在 `TunnelSpec` 中，双方固定使用 `127.0.0.1`。任何字段替换、跨 profile/daemon instance 重放、AEAD 计数器乱序或第二个根请求都会在 SSH、本地 listener 或其他业务副作用之前关闭。上传块、shell 输入和 tunnel stop 只继承已经授权的单个根请求，不能单独作为授权根请求。
 
-`Status` 与 `Shutdown` 和其他根请求一样要求目标 profile 的 call-key 与精确 intent；token-only 四帧握手不能消费任何业务根帧。CLI API 会先验证本次独立口令；UI 只为仍持有匹配 `(name, profile_id, generation)` grant 的记录派生 call key，其他记录只显示本地目录元数据且产生零 daemon/network 副作用。UI 没有有效授权时，退出不会绕过协议去停止持久 daemon。`Status` 仍只是 daemon 生命周期元数据查询，绝不检查 SSH health、调用 retained password 或触发 reconnect。
+`Status` 使用 profile call proof；`Shutdown` 在 AEAD 内携带并验证本次 profile 口令。只有激活密钥的进程不能消费 profile 业务根帧或停机。CLI 每个调用进程都重新取得本次独立口令；UI 只使用仍匹配 `(name, profile_id, generation)` 的固定五分钟授权。其他记录只显示本地目录元数据且不产生网络副作用。`Status` 仍只是 daemon 生命周期元数据查询，绝不检查 SSH health 或触发 reconnect。
 
 认证帧最多 4 KiB，控制帧最多 16 KiB，业务响应最多 16 MiB；二进制字段使用规范 Base64。长度前缀读取只有在第一个 header 字节之前读到 0 字节才是正常 EOF；1–3 字节的部分长度前缀必定报错。命令输出总计最多 8 MiB，上传 chunk 与 shell input 各最多 64 KiB。
 
 认证有 2 秒上限；`status` / `down` 控制交换为 3 秒。Shutdown 的 4 字节长度头与完整 payload 被 writer 接收后、flush 前即置为 sent；从这个线性化点起，即使 flush、Ack 读取或连接随后失败，也会再以运行锁 token + 租约对账最多 10 秒。同 token 表示预期 generation 仍活跃，不同的有效 token 证明替换 generation 已在旧 daemon 释放排他租约后启动；锁消失本身不足以报成功，还必须探测到预期 daemon 的运行租约已释放。运行锁轮询均在同一 absolute deadline 下交给 blocking worker。
 
-v5 不与 v4 或更早实现 dual-stack。v5 的 endpoint/domain 和运行锁 protocol 均已升级；v5 client 在读取锁时就拒绝旧 v4、v3、protocol 0/2 与未知版本，保留证据且不回退直连。升级前必须先用与活动旧 daemon 匹配的旧 executable 正常 `down`，再整体切换 client/daemon。旧 v4 锁会 fail closed；不要在 daemon 活动或租约仍持有时强删锁。
+v6 全局 broker 不与旧 per-profile v5/v4 daemon dual-stack。v6 client 对旧 runtime 状态失败关闭且不回退直连。升级前必须先用与活动旧 daemon 匹配的旧 executable 正常 `down`，再整体切换 client/daemon；不要在 daemon 活动或租约仍持有时强删运行状态。
 
 ## SSH、命令、SFTP 与隧道
 
@@ -217,7 +219,7 @@ daemon download 把下游断开/背压识别为 `IpcResponseWriteFailure`：一�
 
 ## 构建与验证
 
-体积优化已经提交并推送为 clean 基线 `94fb37118f4b31ab997f40cdba09d105081bde18`。当前 IPC v5、CLI/UI 授权语义与 loopback-only tunnel 工作树建立在该基线上。下面严格区分本轮源码门禁、较早 dirty 构建、历史体积测量和未来正式 clean artifact：
+体积优化已经提交并推送为 clean 基线 `94fb37118f4b31ab997f40cdba09d105081bde18`。当前 IPC v6 全局 broker、CLI/UI 授权语义与 loopback-only tunnel 工作树建立在后续重构上。下面严格区分本轮源码门禁、较早 dirty 构建、历史体积测量和未来正式 clean artifact：
 
 ```powershell
 cargo fmt -- --check
@@ -226,10 +228,11 @@ cargo check --locked --offline --all-targets --all-features
 cargo clippy --locked --offline --all-targets --all-features -- -D warnings
 cargo test --locked --offline --all-targets --all-features -- --test-threads=1
 cargo audit --no-fetch
-cargo build --locked --offline --all-targets --all-features
-cargo build --release --locked --offline --all-targets --all-features
-target\debug\serctl.exe --version
-target\release\serctl.exe --version
+cargo build --locked --offline --workspace --bins
+# 正式 Release 禁止 --all-features，避免启用 serctl-core/test-support
+cargo build --release --locked --offline --workspace --bins
+target\debug\serctl_cli.exe --version
+target\release\serctl_cli.exe --version
 ```
 
 测试套件除单元测试外，还会在随机本地端口启动临时 SSH/SFTP 服务和真实 daemon；daemon IPC 使用当前平台的 Named Pipe/Unix Socket，覆盖认证、错误令牌拒绝、exec 正常退出、deadline、客户端断连取消，以及上传/下载内容往返。所有状态写入 `target` 下的隔离临时目录，不读取或修改真实凭证库；外部服务器兼容性验证仍需要可访问的测试服务器。
@@ -253,7 +256,7 @@ strip = "symbols"
 
 依赖侧把 Tokio 的 `full` feature 收窄为实际使用的 `fs`、`io-std`、`io-util`、`macros`、`net`、`rt-multi-thread`、`signal`、`sync`、`time`，并移除已不再需要的 `async-trait` 直接依赖及锁定包，避免为未使用能力保留依赖和编译输入。
 
-提交 `94fb371` 前的同一优化轮次 A/B 数据如下；它们用于选择并提交 release profile，不是当前 IPC v5/授权/隧道工作树的二进制测量：
+提交 `94fb371` 前的同一优化轮次 A/B 数据如下；它们用于选择并提交 release profile，不是当前 IPC v6/授权/隧道工作树的二进制测量：
 
 | Release 候选 | 文件大小 | 相对原基线 |
 | --- | ---: | ---: |
@@ -265,9 +268,9 @@ strip = "symbols"
 
 历史标准路径测量曾得到 `target\release\serctl.exe` **10,723,840 B**、SHA-256 `68F571F7FDAD09986C8E5E6E23F8AE229B8E0043654298F3C349A0B99490F601`，以及单独留存、不计入分发体积的 **2,748,416 B** PDB。该摘要产生于优化提交前，随后源码才以 clean commit `94fb371` 推送；这里只把它保留为 profile/体积选择证据。
 
-上一轮 IPC v4 dirty 功能树的标准 Release 曾为 **11,273,216 B**，SHA-256 `A464F57EE7D60ACB583C0300D399E183F1BCB328C60B88CE6498D4C46592DE53`；单独 PDB 为 **2,797,568 B**。对应 debug EXE 为 **49,509,376 B**，SHA-256 `E2BEA438B1DFE10CF5996D69C829F009F383112424667332D4FC0DA67EE87FF8`；两者版本均为 `serctl 0.1.0 (git 94fb37118f4b-dirty)`。源码现已进入 v5，本地同名路径可能已被覆盖，因此这些只作为上一轮记录，不描述当前文件，也不是正式 clean artifact。
+上一轮 IPC v4 dirty 功能树的标准 Release 曾为 **11,273,216 B**，SHA-256 `A464F57EE7D60ACB583C0300D399E183F1BCB328C60B88CE6498D4C46592DE53`；单独 PDB 为 **2,797,568 B**。对应 debug EXE 为 **49,509,376 B**，SHA-256 `E2BEA438B1DFE10CF5996D69C829F009F383112424667332D4FC0DA67EE87FF8`；两者版本均为 `serctl 0.1.0 (git 94fb37118f4b-dirty)`。源码现已进入 v6，本地同名路径可能已被覆盖，因此这些只作为上一轮记录，不描述当前文件，也不是正式 clean artifact。
 
-当前 vault/record v4 / IPC v5 工作树已完成最终源码门禁；不得把较早 v5 工作树的 **258/258** 与本轮数字相加。验证证据如下：
+当前 vault/record v4 / IPC v6 工作树须以本次验收报告中的最新门禁为准；不得把较早 v5 工作树的 **258/258** 与本轮数字相加。验证证据如下：
 
 - **PASS：**Rust 1.97.1 下 `cargo fmt -- --check`、`git diff --check`、locked/offline all-target/all-feature `cargo check` 与严格 `clippy -D warnings`；
 - **PASS：**locked/offline all-target/all-feature 串行测试 **293/293**；测试报告执行 **116.68 s**；`build.rs` standalone tests **15/15**；

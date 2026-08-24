@@ -1,36 +1,36 @@
-//! IPC client + direct-connect fallback for exec / shell / status / down.
+//! IPC client for exec / shell / status / down against the global daemon,
+//! plus the OperationGrant issuance and agent stdio gateway.
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use crossterm::{
     event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use ed25519_dalek::SigningKey;
 use rand::{rngs::OsRng, RngCore};
-use russh::ChannelMsg;
-use russh_sftp::protocol::OpenFlags;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::ipc;
-use crate::security;
-use crate::ssh::{
-    commit_remote_upload_no_replace_until, is_explicit_sftp_status, poll_remote_mutation_until,
-    protected_upload_file_attributes, temporary_remote_path, validate_remote_command,
-    validate_remote_path, validate_shell_dimensions, validate_upload_remote_path,
-    CreateDirOutcomeUnknown, CreateDirSubmissionState, ExecOutcomeUnknown, ExecSubmissionState,
-    RemoteEntry, RunningTunnel, SshSession, MAX_TRANSFER_BYTES,
+use serctl_core::security;
+use serctl_core::ssh::{
+    validate_remote_command, validate_remote_path, validate_shell_dimensions,
+    validate_upload_remote_path, CreateDirOutcomeUnknown, CreateDirSubmissionState,
+    ExecOutcomeUnknown, ExecSubmissionState, RemoteEntry, MAX_TRANSFER_BYTES,
 };
-use crate::vault::{self, now_unix, Creds, LockInfo};
+use serctl_core::vault::{self, now_unix};
+use serctl_protocol as ipc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 
-pub use crate::ssh::{TunnelMode, TunnelReady, TunnelSpec};
+pub use serctl_core::ssh::{TunnelMode, TunnelReady, TunnelSpec};
 
-const DIRECT_SHELL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const IPC_SHELL_SETUP_TIMEOUT: Duration = Duration::from_secs(32);
 const SHELL_INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const SHELL_OUTPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -42,8 +42,6 @@ const CONTROL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(3);
 // two seconds each on transport and runtime-lock cleanup. Keep two seconds of
 // scheduling margin so an acknowledged, healthy shutdown is not misreported.
 const DAEMON_LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
-const IPC_CONNECT_AUTH_TIMEOUT: Duration = Duration::from_secs(2);
-const DIRECT_TUNNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const IPC_TUNNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(32);
 const TUNNEL_CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 // Daemon-routed cancellation can spend up to 2 seconds writing TunnelStop
@@ -58,6 +56,19 @@ const LOCAL_PARTIAL_CLEANUP_JOIN_MARGIN: Duration = Duration::from_millis(100);
 const LOCAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCAL_COMMIT_RECONCILE_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_COMMIT_RECONCILE_TIMEOUT: Duration = Duration::from_millis(2250);
+const MAX_AGENT_GRANT_BYTES: usize = 64 * 1024;
+const MAX_AGENT_REQUEST_LINE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct ShutdownRejected(String);
+
+impl std::fmt::Display for ShutdownRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ShutdownRejected {}
 
 fn terminal_safe_field(value: &str) -> String {
     value.escape_debug().to_string()
@@ -296,9 +307,796 @@ impl Drop for GuiTunnel {
 }
 
 struct DaemonConnection {
-    stream: ipc::ClientStream,
+    stream: serctl_protocol::v6::V6ClientIo<ipc::ClientStream>,
     endpoint: String,
-    expected_token: Zeroizing<String>,
+}
+
+/// One mirrored credential lease, keyed by daemon instance and profile id.
+type UnlockedProfileKey = (String, [u8; 16]);
+
+struct CachedProfileAuthorization {
+    call_key: Arc<Zeroizing<[u8; 32]>>,
+    expires_at: tokio::time::Instant,
+}
+
+/// Process-local mirror of the daemon's credential lease: profiles already
+/// unlocked against one daemon instance skip the unlock round trip. A daemon
+/// restart changes the instance id, so a stale mirror can never suppress a
+/// required unlock.
+static UNLOCKED_PROFILES: std::sync::LazyLock<
+    StdMutex<HashMap<UnlockedProfileKey, CachedProfileAuthorization>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// One reachable global daemon instance, identified by its runtime descriptor.
+#[derive(Clone)]
+struct DaemonAccess {
+    instance_id: serctl_protocol::v6::InstanceId,
+    secret: serctl_protocol::v6::ActivationSecret,
+    endpoint: String,
+    pid: u32,
+}
+
+/// Whether a live daemon is currently published in the runtime descriptor.
+pub fn daemon_is_published() -> Result<bool> {
+    let Some(descriptor) = serctl_core::daemon_runtime::read_descriptor()? else {
+        return Ok(false);
+    };
+    Ok(serctl_core::daemon_runtime::pid_is_alive(descriptor.pid))
+}
+
+/// Resolve the current daemon from the protected runtime descriptor/secret,
+/// cleaning up stale state (dead PID) under the startup singleton. Returns
+/// `None` when no live daemon is published.
+async fn resolve_daemon_until(deadline: tokio::time::Instant) -> Result<Option<DaemonAccess>> {
+    let read = || -> Result<Option<DaemonAccess>> {
+        let Some(descriptor) = serctl_core::daemon_runtime::read_descriptor()? else {
+            return Ok(None);
+        };
+        if !serctl_core::daemon_runtime::pid_is_alive(descriptor.pid) {
+            if let serctl_core::daemon_runtime::StartupLockAcquire::Acquired(lock) =
+                serctl_core::daemon_runtime::acquire_startup_lock()?
+            {
+                let _ = serctl_core::daemon_runtime::cleanup_stale_runtime_if_dead(&lock);
+            }
+            return Ok(None);
+        }
+        let Some(secret) = serctl_core::daemon_runtime::read_secret()? else {
+            return Ok(None);
+        };
+        Ok(Some(DaemonAccess {
+            instance_id: serctl_protocol::v6::InstanceId::from_hex(&descriptor.instance_id)?,
+            secret,
+            endpoint: descriptor.endpoint,
+            pid: descriptor.pid,
+        }))
+    };
+    join_blocking_until(
+        tokio::task::spawn_blocking(read),
+        deadline,
+        "daemon runtime descriptor read",
+    )
+    .await
+}
+
+/// Resolve a live daemon, launching the global broker through the singleton
+/// startup protocol when none is published.
+async fn ensure_daemon_until(deadline: tokio::time::Instant) -> Result<DaemonAccess> {
+    loop {
+        if let Some(access) = resolve_daemon_until(deadline).await? {
+            return Ok(access);
+        }
+        match serctl_core::daemon_runtime::acquire_startup_lock()? {
+            serctl_core::daemon_runtime::StartupLockAcquire::Acquired(lock) => {
+                // Recheck under the lock to avoid a TOCTOU double spawn, then
+                // hold the lock across spawn + publication so only one CLI
+                // launches the broker.
+                if let Some(access) = resolve_daemon_until(deadline).await? {
+                    return Ok(access);
+                }
+                let (instance, _secret) = crate::launcher::spawn_global_daemon()?;
+                drop(lock);
+                // Wait for the descriptor naming exactly this instance.
+                let instance_hex = instance.as_hex();
+                loop {
+                    if let Some(access) = resolve_daemon_until(deadline).await? {
+                        if access.instance_id.as_hex() == instance_hex {
+                            return Ok(access);
+                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        bail!("daemon did not publish its runtime descriptor in time");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }
+            serctl_core::daemon_runtime::StartupLockAcquire::Contended => {
+                if tokio::time::Instant::now() >= deadline {
+                    bail!("another daemon startup is in progress and exceeded its deadline");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+    }
+}
+
+/// Fetch the sanitized profile catalog and resolve one profile id.
+async fn catalog_profile_id_until(
+    access: &DaemonAccess,
+    profile: &str,
+    deadline: tokio::time::Instant,
+) -> Result<[u8; 16]> {
+    let prelude = v6_prelude(&ipc::Frame::ListProfiles, None, None, deadline)?;
+    let connection = connect_v6_until(access, prelude, deadline).await?;
+    let mut stream = connection.stream;
+    ipc::write_frame_limited(
+        &mut stream,
+        &ipc::Frame::ListProfiles,
+        ipc::MAX_REQUEST_FRAME,
+    )
+    .await?;
+    let reply = ipc::read_frame_limited(&mut stream, ipc::MAX_RESPONSE_FRAME)
+        .await?
+        .context("daemon closed before returning the profile catalog")?;
+    let ipc::Frame::ProfileList { profiles } = reply else {
+        bail!("daemon returned an unexpected catalog response")
+    };
+    let found = profiles
+        .into_iter()
+        .find(|entry| entry.name == profile)
+        .with_context(|| format!("profile '{profile}' does not exist"))?;
+    let bytes = hex::decode(&found.profile_id).context("catalog carries an invalid profile id")?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("catalog profile id must decode to 16 bytes"))
+}
+
+/// Unlock one profile against the daemon, unless this process already holds a
+/// mirror of the credential lease for this exact daemon instance.
+async fn ensure_profile_unlocked(
+    access: &DaemonAccess,
+    profile: &str,
+    master: &str,
+    profile_id: [u8; 16],
+    deadline: tokio::time::Instant,
+) -> Result<Arc<Zeroizing<[u8; 32]>>> {
+    let key = (access.instance_id.as_hex(), profile_id);
+    if let Ok(mut unlocked) = UNLOCKED_PROFILES.lock() {
+        let now = tokio::time::Instant::now();
+        unlocked.retain(|_, cached| cached.expires_at > now);
+        if unlocked.get(&key).is_some() {
+            return Ok(Arc::clone(&unlocked[&key].call_key));
+        }
+    }
+    // Start the frontend's mirror TTL before the daemon verifies the unlock,
+    // making it conservatively no later than the daemon-held lease.
+    let unlocked_at = tokio::time::Instant::now();
+    let request = ipc::Frame::Unlock {
+        passphrase: master.to_owned(),
+    };
+    let prelude = v6_prelude(&request, None, Some(profile.to_owned()), deadline)?;
+    let connection = connect_v6_until(access, prelude, deadline).await?;
+    let mut stream = connection.stream;
+    ipc::write_frame_limited(&mut stream, &request, ipc::MAX_REQUEST_FRAME).await?;
+    let reply = ipc::read_frame_limited(&mut stream, ipc::MAX_RESPONSE_FRAME)
+        .await?
+        .context("daemon closed before answering the unlock request")?;
+    let mut encoded_call_key = match reply {
+        ipc::Frame::ProfileAuthorized { call_key } => call_key,
+        ipc::Frame::Error { msg } => bail!("{msg}"),
+        mut other => {
+            other.zeroize_sensitive();
+            bail!("daemon returned an unexpected unlock response")
+        }
+    };
+    let decoded = Zeroizing::new(
+        B64.decode(&encoded_call_key)
+            .context("decode daemon profile authorization key")?,
+    );
+    encoded_call_key.zeroize();
+    let call_key: [u8; 32] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("daemon profile authorization key must decode to 32 bytes"))?;
+    let call_key = Arc::new(Zeroizing::new(call_key));
+    if let Ok(mut unlocked) = UNLOCKED_PROFILES.lock() {
+        unlocked.insert(
+            key,
+            CachedProfileAuthorization {
+                call_key: Arc::clone(&call_key),
+                expires_at: unlocked_at + serctl_protocol::v6::CREDENTIAL_LEASE_TTL,
+            },
+        );
+    }
+    Ok(call_key)
+}
+
+/// Build a v6 request prelude for one root request.
+fn v6_prelude(
+    request: &ipc::Frame,
+    profile_id: Option<[u8; 16]>,
+    profile_name: Option<String>,
+    deadline: tokio::time::Instant,
+) -> Result<serctl_protocol::v6::V6RequestPrelude> {
+    let _ = deadline; // deadline guards the caller's connect path, not the prelude
+    let operation_kind = serctl_protocol::v6::frame_kind(request).to_owned();
+    let root_request_hash = serctl_protocol::v6::root_request_hash(request)?;
+    let mut client_session_id = [0_u8; 16];
+    let mut request_id = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut client_session_id);
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
+    Ok(serctl_protocol::v6::V6RequestPrelude {
+        protocol_version: serctl_protocol::v6::IPC_PROTOCOL_VERSION_V6,
+        client_session_id,
+        request_id,
+        operation_kind,
+        profile_id,
+        profile_name,
+        grant_id: None,
+        pop_signature: None,
+        profile_proof: None,
+        requested_deadline_unix_ms: 0,
+        root_request_hash,
+    })
+}
+
+/// Connect to the published endpoint, cross-check the peer PID against the
+/// descriptor, and complete the v6 handshake for one root request.
+async fn connect_v6_until(
+    access: &DaemonAccess,
+    prelude: serctl_protocol::v6::V6RequestPrelude,
+    deadline: tokio::time::Instant,
+) -> Result<DaemonConnection> {
+    let stream = ipc::connect(&access.endpoint).await?;
+    ipc::validate_server_identity(&stream, access.pid)?;
+    let session = serctl_protocol::v6::v6_client_handshake(
+        stream,
+        &access.secret,
+        access.instance_id,
+        prelude,
+        deadline,
+    )
+    .await?;
+    Ok(DaemonConnection {
+        stream: serctl_protocol::v6::V6ClientIo::new(session),
+        endpoint: access.endpoint.clone(),
+    })
+}
+
+/// Connect to the global daemon (launching it on demand) and authorize exactly
+/// `request` through a v6 handshake with a prelude-bound root request. The
+/// profile passphrase reaches the daemon only inside the AEAD channel during
+/// the unlock step; a wrong passphrase therefore never reaches SSH.
+async fn connect_daemon_for_request_until(
+    profile: &str,
+    master: &str,
+    expected_generation: Option<vault::ProfileIdentity>,
+    request: &ipc::Frame,
+    request_deadline: tokio::time::Instant,
+) -> Result<DaemonConnection> {
+    // The generation-bound UI grant verifies the current record before this
+    // call. The v6 authorization proof below additionally binds the daemon's
+    // per-profile call key to the complete request prelude.
+    let _ = expected_generation;
+    let access = ensure_daemon_until(request_deadline).await?;
+    connect_authorized_request_until(&access, profile, master, request, request_deadline).await
+}
+
+/// Authorize exactly `request` against one already-resolved daemon instance:
+/// catalog lookup, cached unlock, prelude, and handshake.
+async fn connect_authorized_request_until(
+    access: &DaemonAccess,
+    profile: &str,
+    master: &str,
+    request: &ipc::Frame,
+    request_deadline: tokio::time::Instant,
+) -> Result<DaemonConnection> {
+    let profile_id = catalog_profile_id_until(access, profile, request_deadline).await?;
+    let call_key =
+        ensure_profile_unlocked(access, profile, master, profile_id, request_deadline).await?;
+    let mut prelude = v6_prelude(
+        request,
+        Some(profile_id),
+        Some(profile.to_owned()),
+        request_deadline,
+    )?;
+    prelude.profile_proof = Some(serctl_protocol::v6::profile_prelude_proof(
+        call_key.as_ref(),
+        &prelude,
+    )?);
+    connect_v6_until(access, prelude, request_deadline).await
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Agent-side grant file: the issued grant plus the agent's Ed25519 signing
+/// seed. The seed never reaches the daemon; only the public key is bound into
+/// the grant.
+#[derive(Serialize, Deserialize)]
+pub struct AgentGrantFile {
+    pub grant: serctl_protocol::grant::OperationGrant,
+    /// Base64 32-byte Ed25519 signing-key seed.
+    pub agent_key: String,
+}
+
+/// Load and decode an agent grant file into the grant plus its signing key.
+pub fn load_agent_grant(
+    path: &Path,
+) -> Result<(serctl_protocol::grant::OperationGrant, SigningKey)> {
+    use std::io::Read as _;
+    let mut handle =
+        security::open_existing_protected_file(path)?.context("agent grant file does not exist")?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    handle
+        .by_ref()
+        .take((MAX_AGENT_GRANT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .context("read agent grant file")?;
+    ensure!(
+        bytes.len() <= MAX_AGENT_GRANT_BYTES,
+        "agent grant file exceeds its 64 KiB safety limit"
+    );
+    let mut file: AgentGrantFile =
+        serde_json::from_slice(&bytes).context("parse agent grant file")?;
+    let agent_key = Zeroizing::new(std::mem::take(&mut file.agent_key));
+    let decoded = Zeroizing::new(
+        B64.decode(agent_key.as_bytes())
+            .context("decode agent key seed")?,
+    );
+    let seed: [u8; 32] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("agent key seed must decode to 32 bytes"))?;
+    let seed = Zeroizing::new(seed);
+    let key = SigningKey::from_bytes(&seed);
+    Ok((file.grant, key))
+}
+
+/// Issue a bounded 30-minute grant for an agent frontend. The profile must be
+/// unlocked first (the same unlock authorizes the issuance), and the grant
+/// plus the agent's private key are written atomically to `output`.
+pub async fn issue_grant_until(
+    profile: &str,
+    master: &str,
+    operations: Vec<String>,
+    budget: u32,
+    output: &Path,
+) -> Result<serctl_protocol::grant::OperationGrant> {
+    let signing = SigningKey::generate(&mut OsRng);
+    let holder_key = B64.encode(signing.verifying_key().to_bytes());
+    let request = ipc::Frame::IssueGrant {
+        profile: profile.to_owned(),
+        operations: operations.clone(),
+        budget,
+        holder_key,
+    };
+    let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
+    let access = ensure_daemon_until(deadline).await?;
+    let profile_id = catalog_profile_id_until(&access, profile, deadline).await?;
+    let call_key = ensure_profile_unlocked(&access, profile, master, profile_id, deadline).await?;
+    let mut prelude = v6_prelude(
+        &request,
+        Some(profile_id),
+        Some(profile.to_owned()),
+        deadline,
+    )?;
+    prelude.profile_proof = Some(serctl_protocol::v6::profile_prelude_proof(
+        call_key.as_ref(),
+        &prelude,
+    )?);
+    let connection = connect_v6_until(&access, prelude, deadline).await?;
+    let mut stream = connection.stream;
+    let reply = tokio::time::timeout_at(deadline, async {
+        ipc::write_frame_limited(&mut stream, &request, ipc::MAX_REQUEST_FRAME).await?;
+        ipc::read_frame_limited(&mut stream, ipc::MAX_RESPONSE_FRAME)
+            .await?
+            .context("daemon closed before answering the grant request")
+    })
+    .await
+    .map_err(|_| anyhow!("grant issuance exceeded its deadline"))??;
+    let (grant_id, expires_unix_ms) = match reply {
+        ipc::Frame::GrantIssued {
+            grant_id,
+            expires_unix_ms,
+        } => (grant_id, expires_unix_ms),
+        ipc::Frame::Error { msg } => bail!("{msg}"),
+        mut other => {
+            other.zeroize_sensitive();
+            bail!("daemon returned an unexpected grant response")
+        }
+    };
+    let grant_id_bytes: [u8; 16] = hex::decode(&grant_id)
+        .context("daemon returned an invalid grant id")?
+        .try_into()
+        .map_err(|_| anyhow!("daemon grant id must decode to 16 bytes"))?;
+    let grant = serctl_protocol::grant::OperationGrant {
+        grant_id: grant_id_bytes,
+        profile_name: profile.to_owned(),
+        profile_id,
+        operations,
+        budget,
+        issued_unix_ms: now_unix_ms(),
+        expires_unix_ms,
+        holder_key: signing.verifying_key().to_bytes(),
+    };
+    let mut file = AgentGrantFile {
+        grant: grant.clone(),
+        agent_key: B64.encode(signing.to_bytes()),
+    };
+    let encoded = Zeroizing::new(serde_json::to_vec(&file).context("serialize agent grant file")?);
+    file.agent_key.zeroize();
+    write_agent_grant_file(output, &encoded)
+        .with_context(|| format!("write agent grant file {}", output.display()))?;
+    Ok(grant)
+}
+
+/// Write the agent grant file through a create-new handle protected at
+/// creation time (0600 on Unix, explicit protected DACL on Windows). It never
+/// overwrites an existing grant.
+fn write_agent_grant_file(path: &Path, encoded: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let mut file = security::create_new_protected_file(path)
+        .with_context(|| format!("create agent grant file {}", path.display()))?;
+    file.write_all(encoded).context("write agent grant file")?;
+    file.sync_all().context("sync agent grant file")?;
+    Ok(())
+}
+
+/// Connect one grant-authorized root request: the prelude carries the grant
+/// id, an absolute operation deadline bounded by the grant expiry, and the
+/// agent's proof-of-possession signature.
+async fn connect_grant_request_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    request: &ipc::Frame,
+    op_timeout: Duration,
+) -> Result<DaemonConnection> {
+    let deadline_ms = now_unix_ms()
+        .checked_add(
+            u64::try_from(op_timeout.as_millis())
+                .context("operation timeout exceeds u64 millis")?,
+        )
+        .context("operation deadline overflow")?;
+    ensure!(
+        deadline_ms < grant.expires_unix_ms,
+        "operation would exceed the grant expiry"
+    );
+    let handshake_deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
+    let access = ensure_daemon_until(handshake_deadline).await?;
+    let mut prelude = v6_prelude(
+        request,
+        None,
+        Some(grant.profile_name.clone()),
+        handshake_deadline,
+    )?;
+    prelude.grant_id = Some(grant.grant_id);
+    prelude.requested_deadline_unix_ms = deadline_ms;
+    prelude.pop_signature = Some(serctl_protocol::grant::sign_prelude_pop(signing, &prelude)?);
+    connect_v6_until(&access, prelude, handshake_deadline).await
+}
+
+/// One request line of the agent stdio protocol.
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+enum AgentRequest {
+    Exec {
+        request_id: u64,
+        cmd: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+    ListDir {
+        request_id: u64,
+        path: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+    CreateDir {
+        request_id: u64,
+        path: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+    Status {
+        request_id: u64,
+    },
+}
+
+/// One result line of the agent stdio protocol: the visible relay record.
+#[derive(Serialize)]
+struct AgentResultLine {
+    request_id: u64,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
+}
+
+/// The agent stdio gateway: JSONL requests on stdin, JSONL relay results on
+/// stdout. Every relayed operation is authorized by the grant's budget and
+/// scope and proven by its proof-of-possession signature.
+pub async fn agent_stdio_loop(grant_path: &Path) -> Result<()> {
+    agent_stdio_loop_with(tokio::io::stdin(), tokio::io::stdout(), grant_path).await
+}
+
+async fn agent_stdio_loop_with<R, W>(reader: R, writer: W, grant_path: &Path) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (grant, signing) = load_agent_grant(grant_path)?;
+    let mut lines = tokio::io::BufReader::new(reader);
+    let mut stdout = writer;
+    while let Some(line) = read_bounded_agent_line(&mut lines).await? {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let result = match serde_json::from_slice::<AgentRequest>(&line) {
+            Err(error) => AgentResultLine {
+                request_id: 0,
+                ok: false,
+                error: Some(format!("invalid request: {error}")),
+                data: None,
+            },
+            Ok(request) => dispatch_agent_request(&grant, &signing, request).await,
+        };
+        let mut encoded = serde_json::to_vec(&result).context("serialize agent result line")?;
+        encoded.push(b'\n');
+        stdout
+            .write_all(&encoded)
+            .await
+            .context("write agent result line")?;
+        stdout.flush().await.context("flush agent result line")?;
+    }
+    Ok(())
+}
+
+async fn read_bounded_agent_line<R>(reader: &mut R) -> Result<Option<Zeroizing<Vec<u8>>>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut line = Zeroizing::new(Vec::new());
+    loop {
+        let available = reader.fill_buf().await.context("read agent request line")?;
+        if available.is_empty() {
+            return Ok((!line.is_empty()).then_some(line));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        ensure!(
+            line.len().saturating_add(consumed) <= MAX_AGENT_REQUEST_LINE_BYTES + 1,
+            "agent request line exceeds its 1 MiB safety limit"
+        );
+        line.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(line));
+        }
+    }
+}
+
+async fn dispatch_agent_request(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    request: AgentRequest,
+) -> AgentResultLine {
+    let (request_id, outcome) = match request {
+        AgentRequest::Exec {
+            request_id,
+            cmd,
+            timeout_ms,
+        } => (
+            request_id,
+            agent_exec_until(
+                grant,
+                signing,
+                &cmd,
+                timeout_ms.unwrap_or(ipc::DEFAULT_EXEC_TIMEOUT_MS),
+            )
+            .await,
+        ),
+        AgentRequest::ListDir {
+            request_id,
+            path,
+            timeout_ms,
+        } => (
+            request_id,
+            agent_list_until(
+                grant,
+                signing,
+                &path,
+                timeout_ms.unwrap_or(ipc::DEFAULT_SFTP_TIMEOUT_MS),
+            )
+            .await,
+        ),
+        AgentRequest::CreateDir {
+            request_id,
+            path,
+            timeout_ms,
+        } => (
+            request_id,
+            agent_create_dir_until(
+                grant,
+                signing,
+                &path,
+                timeout_ms.unwrap_or(ipc::DEFAULT_SFTP_TIMEOUT_MS),
+            )
+            .await,
+        ),
+        AgentRequest::Status { request_id } => {
+            (request_id, agent_status_until(grant, signing).await)
+        }
+    };
+    match outcome {
+        Ok(data) => AgentResultLine {
+            request_id,
+            ok: true,
+            error: None,
+            data: Some(data),
+        },
+        Err(error) => AgentResultLine {
+            request_id,
+            ok: false,
+            error: Some(format!("{error:#}")),
+            data: None,
+        },
+    }
+}
+
+pub(crate) async fn agent_exec_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    cmd: &str,
+    timeout_ms: u64,
+) -> Result<serde_json::Value> {
+    validate_remote_command(cmd)?;
+    ensure!(
+        (1..=ipc::MAX_EXEC_TIMEOUT_MS).contains(&timeout_ms),
+        "exec timeout is outside the supported range"
+    );
+    let request = ipc::Frame::Exec {
+        cmd: cmd.to_owned(),
+        timeout_ms,
+    };
+    let timeout = Duration::from_millis(timeout_ms);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let daemon = connect_grant_request_until(grant, signing, &request, timeout).await?;
+    let mut stream = daemon.stream;
+    let mut submission = ExecSubmissionState::BeforeRequest;
+    write_daemon_exec_frame_until(&mut stream, &request, timeout_ms, deadline, &mut submission)
+        .await?;
+    let output = match tokio::time::timeout_at(deadline, read_exec_response(&mut stream)).await {
+        Ok(result) => result,
+        Err(_) => bail!("remote command exceeded its deadline of {timeout_ms} ms"),
+    }
+    .map_err(|error| classify_daemon_exec_read_error(submission, error))?;
+    Ok(serde_json::json!({
+        "stdout": B64.encode(&output.stdout),
+        "stderr": B64.encode(&output.stderr),
+        "code": output.code,
+    }))
+}
+
+pub(crate) async fn agent_list_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    path: &str,
+    timeout_ms: u64,
+) -> Result<serde_json::Value> {
+    validate_remote_path(path, false)?;
+    ensure!(
+        (1..=ipc::MAX_SFTP_TIMEOUT_MS).contains(&timeout_ms),
+        "SFTP timeout is outside the supported range"
+    );
+    let request = ipc::Frame::ListDir {
+        path: path.to_owned(),
+        timeout_ms,
+    };
+    let timeout = Duration::from_millis(timeout_ms);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let daemon = connect_grant_request_until(grant, signing, &request, timeout).await?;
+    let mut stream = daemon.stream;
+    let reply = tokio::time::timeout_at(deadline, async {
+        ipc::write_frame_limited(&mut stream, &request, ipc::MAX_REQUEST_FRAME).await?;
+        ipc::read_frame_limited(&mut stream, ipc::MAX_RESPONSE_FRAME)
+            .await?
+            .context("daemon disconnected during directory listing")
+    })
+    .await
+    .map_err(|_| anyhow!("SFTP directory listing exceeded its deadline of {timeout_ms} ms"))??;
+    match reply {
+        ipc::Frame::DirList { path, entries } => {
+            Ok(serde_json::json!({ "path": path, "entries": entries }))
+        }
+        ipc::Frame::Error { msg } => bail!("{msg}"),
+        mut other => {
+            other.zeroize_sensitive();
+            bail!("daemon returned an unexpected directory response")
+        }
+    }
+}
+
+async fn agent_create_dir_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    path: &str,
+    timeout_ms: u64,
+) -> Result<serde_json::Value> {
+    validate_remote_path(path, false)?;
+    ensure!(
+        (1..=ipc::MAX_SFTP_TIMEOUT_MS).contains(&timeout_ms),
+        "SFTP timeout is outside the supported range"
+    );
+    let request = ipc::Frame::CreateDir {
+        path: path.to_owned(),
+        timeout_ms,
+    };
+    let timeout = Duration::from_millis(timeout_ms);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let daemon = connect_grant_request_until(grant, signing, &request, timeout).await?;
+    let mut stream = daemon.stream;
+    let reply = tokio::time::timeout_at(deadline, async {
+        ipc::write_frame_limited(&mut stream, &request, ipc::MAX_REQUEST_FRAME).await?;
+        ipc::read_frame_limited(&mut stream, ipc::MAX_RESPONSE_FRAME)
+            .await?
+            .context("daemon disconnected during create-directory")
+    })
+    .await
+    .map_err(|_| anyhow!("SFTP create-directory exceeded its deadline of {timeout_ms} ms"))??;
+    match reply {
+        ipc::Frame::Ack => Ok(serde_json::json!({ "created": path })),
+        ipc::Frame::Error { msg } => bail!("{msg}"),
+        mut other => {
+            other.zeroize_sensitive();
+            bail!("daemon returned an unexpected create-directory response")
+        }
+    }
+}
+
+pub(crate) async fn agent_status_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+) -> Result<serde_json::Value> {
+    let request = ipc::Frame::Status;
+    let timeout = CONTROL_EXCHANGE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let daemon = connect_grant_request_until(grant, signing, &request, timeout).await?;
+    let mut stream = daemon.stream;
+    let reply = tokio::time::timeout_at(deadline, async {
+        ipc::write_frame_limited(&mut stream, &request, ipc::MAX_CONTROL_FRAME).await?;
+        ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME)
+            .await?
+            .context("daemon disconnected during status exchange")
+    })
+    .await
+    .map_err(|_| anyhow!("daemon status exchange exceeded its deadline"))??;
+    match reply {
+        ipc::Frame::StatusInfo {
+            profile,
+            host,
+            user,
+            started_unix,
+        } => Ok(serde_json::json!({
+            "profile": profile,
+            "host": host,
+            "user": user,
+            "started_unix": started_unix,
+        })),
+        ipc::Frame::Error { msg } => bail!("{msg}"),
+        mut other => {
+            other.zeroize_sensitive();
+            bail!("daemon returned an unexpected status response")
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -311,39 +1109,6 @@ impl std::fmt::Display for UploadCommitOutcomeUnknown {
 }
 
 impl std::error::Error for UploadCommitOutcomeUnknown {}
-
-fn recover_invalid_daemon_lock_read<T, C, R>(
-    read: Result<Option<T>>,
-    cleanup: C,
-    reread: R,
-) -> Result<Option<T>>
-where
-    C: FnOnce() -> Result<bool>,
-    R: FnOnce() -> Result<Option<T>>,
-{
-    match read {
-        Ok(lock) => Ok(lock),
-        Err(read_error) => match cleanup() {
-            // Removing the hashed current-v5 record can expose a raw legacy
-            // Unix lock that was previously shadowed. Re-read the complete
-            // namespace before deciding that no daemon exists.
-            Ok(true) => reread(),
-            Ok(false) => Err(read_error
-                .context("invalid runtime lock was not eligible for safe protocol-v5 recovery")),
-            Err(cleanup_error) => Err(anyhow!(
-                "{read_error:#}; malformed runtime-lock recovery failed: {cleanup_error:#}"
-            )),
-        },
-    }
-}
-
-fn read_daemon_lock_with_recovery(profile: &str) -> Result<Option<LockInfo>> {
-    recover_invalid_daemon_lock_read(
-        vault::read_lock(profile),
-        || vault::remove_invalid_hashed_v5_lock(profile),
-        || vault::read_lock(profile),
-    )
-}
 
 async fn join_blocking_until<T>(
     mut task: tokio::task::JoinHandle<Result<T>>,
@@ -366,314 +1131,6 @@ where
     }
 }
 
-fn remaining_deadline_budget(
-    deadline: tokio::time::Instant,
-    operation: &'static str,
-) -> Result<Duration> {
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    ensure!(!remaining.is_zero(), "{operation} exceeded its deadline");
-    Ok(remaining)
-}
-
-async fn read_daemon_lock_with_recovery_until(
-    profile: &str,
-    deadline: tokio::time::Instant,
-) -> Result<Option<LockInfo>> {
-    let profile = profile.to_owned();
-    join_blocking_until(
-        tokio::task::spawn_blocking(move || read_daemon_lock_with_recovery(&profile)),
-        deadline,
-        "runtime-lock read/recovery",
-    )
-    .await
-}
-
-async fn read_daemon_lock_without_recovery_until(
-    profile: &str,
-    deadline: tokio::time::Instant,
-) -> Result<Option<LockInfo>> {
-    let profile = profile.to_owned();
-    join_blocking_until(
-        tokio::task::spawn_blocking(move || vault::read_lock(&profile)),
-        deadline,
-        "runtime-lock read",
-    )
-    .await
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ShutdownLockObservation {
-    ExpectedGeneration,
-    ReplacementGeneration,
-    Absent,
-}
-
-fn classify_shutdown_lock_generation(
-    lock: Option<LockInfo>,
-    expected_token: &str,
-) -> ShutdownLockObservation {
-    use subtle::ConstantTimeEq;
-
-    let Some(mut lock) = lock else {
-        return ShutdownLockObservation::Absent;
-    };
-    let actual_token = Zeroizing::new(std::mem::take(&mut lock.token));
-    if bool::from(actual_token.as_bytes().ct_eq(expected_token.as_bytes())) {
-        ShutdownLockObservation::ExpectedGeneration
-    } else {
-        // A valid different lock can only be published while its daemon owns
-        // the same exclusive lifetime lease. That proves the expected daemon
-        // released the lease before this replacement generation started.
-        ShutdownLockObservation::ReplacementGeneration
-    }
-}
-
-async fn observe_shutdown_lock_until(
-    profile: String,
-    expected_token: Zeroizing<String>,
-    deadline: tokio::time::Instant,
-) -> Result<ShutdownLockObservation> {
-    join_blocking_until(
-        tokio::task::spawn_blocking(move || {
-            Ok(classify_shutdown_lock_generation(
-                vault::read_lock(&profile)?,
-                expected_token.as_str(),
-            ))
-        }),
-        deadline,
-        "runtime-lock shutdown poll",
-    )
-    .await
-}
-
-async fn probe_runtime_lease_until(
-    profile: String,
-    deadline: tokio::time::Instant,
-) -> Result<vault::RuntimeLeaseLiveness> {
-    join_blocking_until(
-        tokio::task::spawn_blocking(move || vault::probe_runtime_lease_liveness(&profile)),
-        deadline,
-        "runtime-lease shutdown probe",
-    )
-    .await
-}
-
-async fn derive_profile_call_key_until(
-    profile: &str,
-    master: &str,
-    expected_generation: Option<vault::ProfileIdentity>,
-    deadline: tokio::time::Instant,
-) -> Result<vault::ProfileCallKey> {
-    let profile = profile.to_owned();
-    let master = Zeroizing::new(master.to_owned());
-    let task = tokio::task::spawn_blocking(move || {
-        let lock_timeout = remaining_deadline_budget(deadline, "master-passphrase verification")?;
-        vault::derive_profile_call_key_with_lock_timeout(
-            &profile,
-            &master,
-            expected_generation,
-            lock_timeout,
-        )
-    });
-    join_blocking_until(task, deadline, "master-passphrase verification").await
-}
-
-/// Connect to a published daemon and authorize exactly `request`. The vault
-/// verification happens before connecting, so a wrong master passphrase
-/// causes zero IPC bytes. Once a valid daemon identity has been reached, an
-/// authentication failure is returned directly and can never become a direct
-/// SSH fallback.
-async fn connect_daemon_for_request_until(
-    profile: &str,
-    master: &str,
-    expected_generation: Option<vault::ProfileIdentity>,
-    request: &ipc::Frame,
-    request_deadline: tokio::time::Instant,
-) -> Result<Option<DaemonConnection>> {
-    // A cleanly absent lock has no recovery or IPC side effect; let the direct
-    // route authenticate while decrypting its single credential snapshot.
-    // Every present or erroneous lock state must authenticate first. In
-    // particular, a wrong master may neither delete a malformed current-v5
-    // lock nor use old-version/ACL/parse errors as an unauthenticated oracle.
-    let initial_lock = read_daemon_lock_without_recovery_until(profile, request_deadline).await;
-    if matches!(initial_lock, Ok(None)) {
-        return Ok(None);
-    }
-    let call_key =
-        derive_profile_call_key_until(profile, master, expected_generation, request_deadline)
-            .await?;
-    connect_daemon_for_request_with_key_and_lock_until(
-        profile,
-        &call_key,
-        request,
-        request_deadline,
-        initial_lock,
-    )
-    .await
-}
-
-/// Authorize a daemon-only control request. Unlike remote-operation routing,
-/// control calls have no direct fallback, so verify the profile master even
-/// when no daemon lock exists. This preserves the "every invocation"
-/// contract while still deriving the expensive key only once.
-async fn connect_daemon_for_control_request_until(
-    profile: &str,
-    master: &str,
-    expected_generation: Option<vault::ProfileIdentity>,
-    request: &ipc::Frame,
-    request_deadline: tokio::time::Instant,
-) -> Result<Option<DaemonConnection>> {
-    let call_key =
-        derive_profile_call_key_until(profile, master, expected_generation, request_deadline)
-            .await?;
-    let initial_lock = read_daemon_lock_without_recovery_until(profile, request_deadline).await;
-    connect_daemon_for_request_with_key_and_lock_until(
-        profile,
-        &call_key,
-        request,
-        request_deadline,
-        initial_lock,
-    )
-    .await
-}
-
-async fn connect_daemon_for_request_with_key_and_lock_until(
-    profile: &str,
-    call_key: &vault::ProfileCallKey,
-    request: &ipc::Frame,
-    request_deadline: tokio::time::Instant,
-    initial_lock: Result<Option<LockInfo>>,
-) -> Result<Option<DaemonConnection>> {
-    let recovered_lock = match initial_lock {
-        Ok(lock) => lock,
-        Err(_) => read_daemon_lock_with_recovery_until(profile, request_deadline).await?,
-    };
-    let Some(mut lock) = recovered_lock else {
-        return Ok(None);
-    };
-    ipc::validate_endpoint(profile, &lock.token, &lock.endpoint)?;
-    let deadline = request_deadline.min(tokio::time::Instant::now() + IPC_CONNECT_AUTH_TIMEOUT);
-    ensure!(
-        deadline > tokio::time::Instant::now(),
-        "daemon IPC connect/authentication deadline expired"
-    );
-    let mut stream = match tokio::time::timeout_at(deadline, ipc::connect(&lock.endpoint)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            handle_unreachable_daemon_lock_until(
-                profile,
-                lock,
-                error.context("connect daemon IPC endpoint"),
-                request_deadline,
-            )
-            .await?;
-            return Ok(None);
-        }
-        Err(_) => {
-            handle_unreachable_daemon_lock_until(
-                profile,
-                lock,
-                anyhow!("daemon IPC connect/authentication deadline expired"),
-                request_deadline,
-            )
-            .await?;
-            return Ok(None);
-        }
-    };
-
-    authenticate_connected_daemon_for_request(
-        &mut stream,
-        profile,
-        &lock.token,
-        call_key,
-        request,
-        deadline,
-        |stream| ipc::validate_server_identity(stream, lock.pid),
-    )
-    .await?;
-
-    Ok(Some(DaemonConnection {
-        stream,
-        endpoint: lock.endpoint.clone(),
-        expected_token: Zeroizing::new(std::mem::take(&mut lock.token)),
-    }))
-}
-
-#[cfg(test)]
-async fn authenticate_connected_daemon<S, F>(
-    stream: &mut S,
-    profile: &str,
-    token: &str,
-    deadline: tokio::time::Instant,
-    validate_identity: F,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-    F: FnOnce(&S) -> Result<()>,
-{
-    // PID/UID verification is deliberately before AuthHello: a connection to
-    // the wrong local process receives neither authentication bytes nor a
-    // business request.
-    validate_identity(stream)?;
-    ipc::authenticate_client(stream, profile, token, deadline).await
-}
-
-async fn authenticate_connected_daemon_for_request<S, F>(
-    stream: &mut S,
-    profile: &str,
-    token: &str,
-    call_key: &vault::ProfileCallKey,
-    request: &ipc::Frame,
-    deadline: tokio::time::Instant,
-    validate_identity: F,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-    F: FnOnce(&S) -> Result<()>,
-{
-    // Do not disclose even AuthHello to a process whose PID/UID does not
-    // match the protected runtime record.
-    validate_identity(stream)?;
-    ipc::authenticate_client_for_request(stream, profile, token, call_key, request, deadline).await
-}
-
-fn handle_unreachable_daemon_lock(
-    profile: &str,
-    lock: &LockInfo,
-    failure: anyhow::Error,
-) -> Result<()> {
-    match vault::reconcile_lock_if_token(profile, &lock.token) {
-        Ok(vault::LockReconcileOutcome::Removed | vault::LockReconcileOutcome::Absent) => Ok(()),
-        Ok(vault::LockReconcileOutcome::Changed) => {
-            Err(failure.context("daemon runtime lock changed; refusing unsafe direct fallback"))
-        }
-        Ok(vault::LockReconcileOutcome::Contended) => {
-            Err(failure
-                .context("daemon runtime lock is still leased; refusing unsafe direct fallback"))
-        }
-        Err(cleanup) => Err(anyhow!(
-            "{failure:#}; validating stale daemon lock cleanup failed: {cleanup:#}"
-        )),
-    }
-}
-
-async fn handle_unreachable_daemon_lock_until(
-    profile: &str,
-    lock: LockInfo,
-    failure: anyhow::Error,
-    deadline: tokio::time::Instant,
-) -> Result<()> {
-    let profile = profile.to_owned();
-    join_blocking_until(
-        tokio::task::spawn_blocking(move || {
-            handle_unreachable_daemon_lock(&profile, &lock, failure)
-        }),
-        deadline,
-        "stale daemon-lock reconciliation",
-    )
-    .await
-}
-
 fn ask_master() -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(rpassword::prompt_password(
         "master passphrase: ",
@@ -691,144 +1148,6 @@ struct OwnedPendingProfileAuthorization {
     passphrase: Option<Zeroizing<String>>,
     prompt_if_missing: bool,
     expected_generation: Option<vault::ProfileIdentity>,
-}
-
-#[derive(Clone, Copy)]
-struct ProfileAuthorizationRef<'a> {
-    passphrase: &'a str,
-    expected_generation: Option<vault::ProfileIdentity>,
-}
-
-async fn direct_connect_until(
-    profile: &str,
-    creds: &Creds,
-    master: &str,
-    deadline: tokio::time::Instant,
-    profile_lease: vault::ProfileLease,
-) -> Result<(SshSession, vault::ProfileLease)> {
-    let expect = creds.host_key.clone();
-    let staged = SshSession::connect_key_exchange_until(creds, expect, deadline).await?;
-    let fp = staged.observed_fingerprint().to_owned();
-    let profile_lease = if creds.host_key.is_none() {
-        let profile = profile.to_owned();
-        let persisted_fp = fp.clone();
-        let master = Zeroizing::new(master.to_owned());
-        let task = tokio::task::spawn_blocking(move || {
-            let lock_timeout = remaining_deadline_budget(deadline, "host-key pin persistence")?;
-            vault::set_pinned_fp_with_lock_timeout(
-                &profile,
-                persisted_fp,
-                &master,
-                lock_timeout,
-                &profile_lease,
-            )?;
-            // The exclusive TOFU lease stays in this blocking worker even if
-            // the async caller reaches its deadline. A late atomic pin can
-            // therefore never race profile replacement or another unpinned
-            // connection, and successful completion returns the same lease to
-            // the DirectSession.
-            Ok(profile_lease)
-        });
-        let lease = match join_blocking_until(task, deadline, "host-key pin persistence").await {
-            Ok(lease) => lease,
-            Err(error) => {
-                // The staged transport has completed KEX but has not sent the
-                // password. Close it deterministically if the pin could not
-                // be persisted, preserving that ordering invariant even on a
-                // vault-lock deadline or disk error.
-                staged.abort().await;
-                return Err(error);
-            }
-        };
-        eprintln!("[serctl] pinned host key {}", terminal_safe_field(&fp));
-        lease
-    } else {
-        profile_lease
-    };
-    let session = staged
-        .authenticate_password_until(&creds.user, &creds.password, deadline)
-        .await?;
-    Ok((session, profile_lease))
-}
-
-struct DirectSession {
-    session: SshSession,
-    _profile_lease: vault::ProfileLease,
-}
-
-fn acquire_direct_profile_snapshot_with<L, S, E, D>(
-    acquire_shared: S,
-    acquire_exclusive: E,
-    mut decrypt: D,
-) -> Result<(Creds, L)>
-where
-    S: FnOnce() -> Result<L>,
-    E: FnOnce() -> Result<L>,
-    D: FnMut() -> Result<Creds>,
-{
-    let shared = acquire_shared()?;
-    let creds = decrypt()?;
-    if creds.host_key.is_some() {
-        return Ok((creds, shared));
-    }
-
-    // TOFU must be serialized before any password authentication. Releasing
-    // the shared snapshot and taking the exclusive runtime lease prevents a
-    // second direct caller (or daemon startup) from also connecting with no
-    // expected host key. Always decrypt again after the lease transition: a
-    // competing winner may have persisted the pin in between.
-    drop(shared);
-    let exclusive = acquire_exclusive()?;
-    let current = decrypt()?;
-    Ok((current, exclusive))
-}
-
-async fn acquire_direct_profile_snapshot_until(
-    profile: &str,
-    master: &str,
-    expected_generation: Option<vault::ProfileIdentity>,
-    deadline: tokio::time::Instant,
-) -> Result<(Creds, vault::ProfileLease)> {
-    let profile = profile.to_owned();
-    let master = Zeroizing::new(master.to_owned());
-    let task = tokio::task::spawn_blocking(move || {
-        acquire_direct_profile_snapshot_with(
-            || vault::acquire_profile_use_lease(&profile),
-            || {
-                vault::acquire_runtime_lease(&profile).with_context(|| {
-                    format!("serialize first-use host-key pin for profile '{profile}'")
-                })
-            },
-            || {
-                let lock_timeout =
-                    remaining_deadline_budget(deadline, "direct credential snapshot")?;
-                vault::decrypt_with_lock_timeout(
-                    &profile,
-                    &master,
-                    expected_generation,
-                    lock_timeout,
-                )
-            },
-        )
-    });
-    join_blocking_until(task, deadline, "direct credential snapshot").await
-}
-
-async fn connect_direct_profile_until(
-    profile: &str,
-    master: &str,
-    expected_generation: Option<vault::ProfileIdentity>,
-    deadline: tokio::time::Instant,
-) -> Result<DirectSession> {
-    let (creds, profile_lease) =
-        acquire_direct_profile_snapshot_until(profile, master, expected_generation, deadline)
-            .await?;
-    let (session, profile_lease) =
-        direct_connect_until(profile, &creds, master, deadline, profile_lease).await?;
-    Ok(DirectSession {
-        session,
-        _profile_lease: profile_lease,
-    })
 }
 
 pub async fn exec_with_timeout_and_master(
@@ -905,10 +1224,9 @@ pub async fn exec_capture_with_timeout(
     exec_capture_with_timeout_inner(profile, cmd, master, false, None, timeout).await
 }
 
-/// Execute on behalf of a generation-bound UI grant. Both daemon
-/// authorization and direct fallback derive credentials from exactly that
-/// profile generation, so a stale cached passphrase cannot authorize a newly
-/// replaced same-name profile.
+/// Execute on behalf of a generation-bound UI grant. The daemon derives
+/// credentials from exactly that profile generation, so a stale cached
+/// passphrase cannot authorize a newly replaced same-name profile.
 pub(crate) async fn exec_capture_at_generation(
     profile: &str,
     cmd: &str,
@@ -930,7 +1248,7 @@ async fn exec_capture_with_timeout_inner(
     profile: &str,
     cmd: &str,
     master: Option<&str>,
-    prompt_if_direct: bool,
+    prompt_if_missing: bool,
     expected_generation: Option<vault::ProfileIdentity>,
     timeout: Duration,
 ) -> Result<CommandOutput> {
@@ -939,7 +1257,7 @@ async fn exec_capture_with_timeout_inner(
         .ok()
         .filter(|value| (1..=ipc::MAX_EXEC_TIMEOUT_MS).contains(value))
         .ok_or_else(|| anyhow!("exec timeout is outside the supported range"))?;
-    let prompted_master = if master.is_none() && prompt_if_direct {
+    let prompted_master = if master.is_none() && prompt_if_missing {
         Some(ask_master()?)
     } else {
         None
@@ -968,38 +1286,17 @@ async fn exec_capture_with_timeout_inner(
         Ok(result) => result?,
         Err(_) => bail!("remote command exceeded its deadline of {timeout_ms} ms"),
     };
-    if let Some(daemon) = daemon {
-        let mut s = daemon.stream;
-        let mut submission = ExecSubmissionState::BeforeRequest;
-        write_daemon_exec_frame_until(&mut s, &request.0, timeout_ms, deadline, &mut submission)
-            .await?;
-        let result = match tokio::time::timeout_at(deadline, read_exec_response(&mut s)).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!(
-                "remote command exceeded its deadline of {timeout_ms} ms"
-            )),
-        };
-        result.map_err(|error| classify_daemon_exec_read_error(submission, error))
-    } else {
-        let direct =
-            connect_direct_profile_until(profile, master, expected_generation, deadline).await?;
-        let r = direct
-            .session
-            .exec_until(cmd, deadline)
-            .await
-            .map_err(|error| {
-                if error.to_string() == "remote command exceeded its deadline" {
-                    anyhow!("remote command exceeded its deadline of {timeout_ms} ms")
-                } else {
-                    error
-                }
-            })?;
-        Ok(CommandOutput {
-            stdout: r.stdout,
-            stderr: r.stderr,
-            code: r.code,
-        })
-    }
+    let mut s = daemon.stream;
+    let mut submission = ExecSubmissionState::BeforeRequest;
+    write_daemon_exec_frame_until(&mut s, &request.0, timeout_ms, deadline, &mut submission)
+        .await?;
+    let result = match tokio::time::timeout_at(deadline, read_exec_response(&mut s)).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!(
+            "remote command exceeded its deadline of {timeout_ms} ms"
+        )),
+    };
+    result.map_err(|error| classify_daemon_exec_read_error(submission, error))
 }
 
 async fn poll_request_write_before_deadline<F>(
@@ -1199,72 +1496,68 @@ fn elapsed_nonnegative_seconds(now: i64, started: i64) -> i64 {
 }
 
 pub async fn daemon_status(profile: &str, master: &str) -> Result<Option<DaemonStatus>> {
-    daemon_status_at_optional_generation(profile, master, None).await
+    daemon_status_at_optional_generation(profile, master, None, true).await
 }
 
+/// Status for one profile, launching the broker on demand (CLI `status`).
 pub(crate) async fn daemon_status_at_generation(
     profile: &str,
     master: &str,
     expected_generation: vault::ProfileIdentity,
 ) -> Result<Option<DaemonStatus>> {
-    daemon_status_at_optional_generation(profile, master, Some(expected_generation)).await
+    daemon_status_at_optional_generation(profile, master, Some(expected_generation), true).await
+}
+
+/// Status probe for one profile that never launches the broker: UI refresh
+/// must not start a background daemon merely by opening the window.
+pub(crate) async fn daemon_status_probe_at_generation(
+    profile: &str,
+    master: &str,
+    expected_generation: vault::ProfileIdentity,
+) -> Result<Option<DaemonStatus>> {
+    daemon_status_at_optional_generation(profile, master, Some(expected_generation), false).await
 }
 
 async fn daemon_status_at_optional_generation(
     profile: &str,
     master: &str,
-    expected_generation: Option<vault::ProfileIdentity>,
+    _expected_generation: Option<vault::ProfileIdentity>,
+    launch_on_demand: bool,
 ) -> Result<Option<DaemonStatus>> {
     let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
-    let call_key =
-        derive_profile_call_key_until(profile, master, expected_generation, deadline).await?;
-    daemon_status_with_call_key_until(profile, &call_key, deadline).await
-}
-
-/// Query daemon metadata with a call key obtained from an already-authorized
-/// vault snapshot. UI refresh can derive all profile keys in one blocking
-/// snapshot instead of running one memory-hard KDF per status row.
-pub(crate) async fn daemon_status_with_call_key_until(
-    profile: &str,
-    call_key: &vault::ProfileCallKey,
-    deadline: tokio::time::Instant,
-) -> Result<Option<DaemonStatus>> {
+    let access = if launch_on_demand {
+        Some(ensure_daemon_until(deadline).await?)
+    } else {
+        resolve_daemon_until(deadline).await?
+    };
+    let Some(access) = access else {
+        return Ok(None);
+    };
     let request = ipc::Frame::Status;
     let operation = async {
-        let initial_lock = read_daemon_lock_without_recovery_until(profile, deadline).await;
-        if let Some(daemon) = connect_daemon_for_request_with_key_and_lock_until(
-            profile,
-            call_key,
-            &request,
-            deadline,
-            initial_lock,
-        )
-        .await?
-        {
-            let endpoint = daemon.endpoint;
-            let mut s = daemon.stream;
-            ipc::write_frame_limited(&mut s, &request, ipc::MAX_CONTROL_FRAME).await?;
-            match ipc::read_frame_limited(&mut s, ipc::MAX_CONTROL_FRAME).await? {
-                Some(ipc::Frame::StatusInfo {
-                    profile,
-                    host,
-                    user,
-                    started_unix,
-                }) => Ok(Some(DaemonStatus {
-                    profile,
-                    host,
-                    user,
-                    started_unix,
-                    endpoint,
-                })),
-                Some(mut frame) => {
-                    frame.zeroize_sensitive();
-                    bail!("daemon responded with an unexpected frame")
-                }
-                None => bail!("daemon disconnected during status exchange"),
+        let daemon =
+            connect_authorized_request_until(&access, profile, master, &request, deadline).await?;
+        let endpoint = daemon.endpoint;
+        let mut s = daemon.stream;
+        ipc::write_frame_limited(&mut s, &request, ipc::MAX_CONTROL_FRAME).await?;
+        match ipc::read_frame_limited(&mut s, ipc::MAX_CONTROL_FRAME).await? {
+            Some(ipc::Frame::StatusInfo {
+                profile,
+                host,
+                user,
+                started_unix,
+            }) => Ok(Some(DaemonStatus {
+                profile,
+                host,
+                user,
+                started_unix,
+                endpoint,
+            })),
+            Some(mut frame) => {
+                frame.zeroize_sensitive();
+                bail!("daemon responded with an unexpected frame")
             }
-        } else {
-            Ok(None)
+            None => bail!("daemon disconnected during status exchange"),
         }
     };
     match tokio::time::timeout_at(deadline, operation).await {
@@ -1279,8 +1572,9 @@ pub async fn down(profile: &str, master: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stop a daemon without writing to stdout. Returns whether a live daemon was
-/// contacted, which makes it suitable for both CLI and GUI frontends.
+/// Stop the global daemon without writing to stdout after verifying the named
+/// profile passphrase. Returns whether a live daemon was contacted, which
+/// makes it suitable for both CLI and GUI frontends.
 pub async fn down_quiet(profile: &str, master: &str) -> Result<bool> {
     down_quiet_at_optional_generation(profile, master, None).await
 }
@@ -1299,45 +1593,57 @@ async fn down_quiet_at_optional_generation(
     expected_generation: Option<vault::ProfileIdentity>,
 ) -> Result<bool> {
     let mut shutdown_sent = false;
-    let mut expected_token = Zeroizing::new(String::new());
     let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
-    let request = ipc::Frame::Shutdown;
+    let mut request = ipc::Frame::Shutdown {
+        passphrase: master.to_owned(),
+    };
     let exchange = async {
-        if let Some(daemon) = connect_daemon_for_control_request_until(
-            profile,
-            master,
-            expected_generation,
-            &request,
-            deadline,
-        )
-        .await?
-        {
-            expected_token = daemon.expected_token;
-            let mut s = daemon.stream;
-            shutdown_daemon_exchange(&mut s, &mut shutdown_sent, deadline).await?;
-            Ok(true)
-        } else {
-            Ok(false)
+        // Shutdown never launches the broker: it only contacts a daemon that
+        // is already published. The passphrase is then verified inside the
+        // authenticated v6 AEAD channel without opening an SSH connection.
+        let Some(access) = resolve_daemon_until(deadline).await? else {
+            return Ok(false);
+        };
+        if let Some(expected) = expected_generation {
+            let observed = vault::list_profile_metadata()?
+                .into_iter()
+                .find(|entry| entry.name == profile)
+                .with_context(|| format!("profile '{profile}' does not exist"))?
+                .identity();
+            ensure!(
+                observed == expected,
+                "profile authorization no longer matches the current record"
+            );
         }
+        let prelude = v6_prelude(&request, None, Some(profile.to_owned()), deadline)?;
+        let connection = connect_v6_until(&access, prelude, deadline).await?;
+        let mut s = connection.stream;
+        shutdown_daemon_exchange(&mut s, &request, &mut shutdown_sent, deadline).await?;
+        Ok(true)
     };
     let exchange_result = match tokio::time::timeout_at(deadline, exchange).await {
         Ok(result) => result,
         Err(_) => Err(anyhow!("daemon shutdown exchange exceeded its deadline")),
     };
+    request.zeroize_sensitive();
+    if exchange_result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.is::<ShutdownRejected>())
+    {
+        return exchange_result;
+    }
     reconcile_shutdown_exchange(
         exchange_result,
         shutdown_sent,
-        wait_for_daemon_lock_release(
-            profile,
-            expected_token.as_str(),
-            DAEMON_LOCK_RELEASE_TIMEOUT,
-        ),
+        wait_for_daemon_exit(DAEMON_LOCK_RELEASE_TIMEOUT),
     )
     .await
 }
 
 async fn write_shutdown_request_until<W>(
     writer: &mut W,
+    request: &ipc::Frame,
     shutdown_sent: &mut bool,
     deadline: tokio::time::Instant,
 ) -> Result<()>
@@ -1352,7 +1658,7 @@ where
     };
     let write = ipc::write_frame_limited_with_written_callback(
         &mut deadline_writer,
-        &ipc::Frame::Shutdown,
+        request,
         ipc::MAX_CONTROL_FRAME,
         || *shutdown_sent = true,
     );
@@ -1369,6 +1675,7 @@ where
 
 async fn shutdown_daemon_exchange<S>(
     stream: &mut S,
+    request: &ipc::Frame,
     shutdown_sent: &mut bool,
     deadline: tokio::time::Instant,
 ) -> Result<()>
@@ -1378,7 +1685,7 @@ where
     // A complete framed write is the linearization point. If the Ack is lost,
     // the daemon may still have consumed the request and stopped, so callers
     // must reconcile against the runtime lock before reporting failure.
-    write_shutdown_request_until(stream, shutdown_sent, deadline).await?;
+    write_shutdown_request_until(stream, request, shutdown_sent, deadline).await?;
     let response = match tokio::time::timeout_at(
         deadline,
         ipc::read_frame_limited(stream, ipc::MAX_CONTROL_FRAME),
@@ -1390,6 +1697,7 @@ where
     };
     match response {
         Some(ipc::Frame::Ack) => Ok(()),
+        Some(ipc::Frame::Error { msg }) => Err(ShutdownRejected(msg).into()),
         Some(mut frame) => {
             frame.zeroize_sensitive();
             bail!("daemon returned an unexpected response")
@@ -1422,81 +1730,48 @@ where
     }
 }
 
-async fn wait_for_daemon_lock_release(
-    profile: &str,
-    expected_token: &str,
-    timeout: Duration,
-) -> Result<()> {
-    let observe_profile = profile.to_owned();
-    let observe_token = Zeroizing::new(expected_token.to_owned());
-    let probe_profile = profile.to_owned();
-    wait_for_daemon_lock_release_with(
-        profile,
-        timeout,
-        move |deadline| {
-            let profile = observe_profile.clone();
-            let expected_token = Zeroizing::new(observe_token.as_str().to_owned());
-            async move { observe_shutdown_lock_until(profile, expected_token, deadline).await }
-        },
-        move |deadline| {
-            let profile = probe_profile.clone();
-            async move { probe_runtime_lease_until(profile, deadline).await }
-        },
-    )
+/// Poll the daemon exit signal until it disappears: the daemon clears its
+/// runtime descriptor and activation secret as the final step of shutdown, so
+/// descriptor absence (or an unreadable/dead descriptor) is the authoritative
+/// release signal for the singleton.
+async fn wait_for_daemon_exit(timeout: Duration) -> Result<()> {
+    wait_for_daemon_absent_until(timeout, |deadline| {
+        join_blocking_until(
+            tokio::task::spawn_blocking(|| daemon_is_published().map(|published| !published)),
+            deadline,
+            "daemon runtime descriptor probe",
+        )
+    })
     .await
 }
 
-async fn wait_for_daemon_lock_release_with<O, OFut, P, PFut>(
-    profile: &str,
-    timeout: Duration,
-    mut observe_lock: O,
-    mut probe_lease: P,
-) -> Result<()>
+async fn wait_for_daemon_absent_until<O, OFut>(timeout: Duration, mut observe: O) -> Result<()>
 where
     O: FnMut(tokio::time::Instant) -> OFut,
-    OFut: Future<Output = Result<ShutdownLockObservation>>,
-    P: FnMut(tokio::time::Instant) -> PFut,
-    PFut: Future<Output = Result<vault::RuntimeLeaseLiveness>>,
+    OFut: Future<Output = Result<bool>>,
 {
     // Shutdown now drains live IPC handlers and closes their remote channels.
-    // Do not report success merely because cleanup removed the lock record:
-    // the expected daemon must also release its exclusive lifetime lease.
+    // Do not report success merely because the request exchange completed: the
+    // daemon must also clear its runtime state before another CLI may take the
+    // singleton.
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if tokio::time::Instant::now() >= deadline {
             bail!(
-                "daemon did not release its runtime lock and lease within {} ms",
+                "daemon did not release its runtime state within {} ms",
                 timeout.as_millis()
             );
         }
-        match observe_lock(deadline).await {
-            Ok(ShutdownLockObservation::ReplacementGeneration) => return Ok(()),
-            Ok(ShutdownLockObservation::ExpectedGeneration) => {}
-            Ok(ShutdownLockObservation::Absent) => match probe_lease(deadline).await {
-                Ok(vault::RuntimeLeaseLiveness::Released) => return Ok(()),
-                Ok(vault::RuntimeLeaseLiveness::Held) => {}
-                Err(error) if tokio::time::Instant::now() >= deadline => {
-                    return Err(error).context(format!(
-                        "daemon did not release its runtime lease within {} ms",
-                        timeout.as_millis()
-                    ));
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("probe runtime lease for '{profile}' after shutdown")
-                    });
-                }
-            },
+        match observe(deadline).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
             Err(error) if tokio::time::Instant::now() >= deadline => {
                 return Err(error).context(format!(
-                    "daemon did not release its runtime lock within {} ms",
+                    "daemon did not release its runtime state within {} ms",
                     timeout.as_millis()
                 ));
             }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("poll runtime lock for '{profile}' after shutdown"));
-            }
+            Err(error) => return Err(error).context("probe daemon exit"),
         }
         tokio::time::sleep_until(
             (tokio::time::Instant::now() + Duration::from_millis(20)).min(deadline),
@@ -1601,29 +1876,23 @@ async fn list_dir_inner(
         Ok(result) => result?,
         Err(_) => bail!("SFTP directory listing exceeded its deadline of {timeout_ms} ms"),
     };
-    if let Some(daemon) = daemon {
-        let mut stream = daemon.stream;
-        let operation = async {
-            ipc::write_frame_limited(&mut stream, &request.0, ipc::MAX_REQUEST_FRAME).await?;
-            match ipc::read_frame_limited(&mut stream, ipc::MAX_RESPONSE_FRAME).await? {
-                Some(ipc::Frame::DirList { path, entries }) => Ok((path, entries)),
-                Some(ipc::Frame::Error { msg }) => bail!(msg),
-                Some(mut frame) => {
-                    frame.zeroize_sensitive();
-                    bail!("daemon returned an unexpected directory response")
-                }
-                None => bail!("daemon disconnected during directory listing"),
+    let mut stream = daemon.stream;
+    let operation = async {
+        ipc::write_frame_limited(&mut stream, &request.0, ipc::MAX_REQUEST_FRAME).await?;
+        match ipc::read_frame_limited(&mut stream, ipc::MAX_RESPONSE_FRAME).await? {
+            Some(ipc::Frame::DirList { path, entries }) => Ok((path, entries)),
+            Some(ipc::Frame::Error { msg }) => bail!(msg),
+            Some(mut frame) => {
+                frame.zeroize_sensitive();
+                bail!("daemon returned an unexpected directory response")
             }
-        };
-        return match tokio::time::timeout_at(deadline, operation).await {
-            Ok(result) => result,
-            Err(_) => bail!("SFTP directory listing exceeded its deadline of {timeout_ms} ms"),
-        };
+            None => bail!("daemon disconnected during directory listing"),
+        }
+    };
+    match tokio::time::timeout_at(deadline, operation).await {
+        Ok(result) => result,
+        Err(_) => bail!("SFTP directory listing exceeded its deadline of {timeout_ms} ms"),
     }
-
-    let direct =
-        connect_direct_profile_until(profile, master, expected_generation, deadline).await?;
-    direct.session.list_dir_until(path, deadline).await
 }
 
 #[allow(dead_code)] // compatibility entry; the UI uses the generation-bound variant
@@ -1803,29 +2072,17 @@ async fn create_dir_inner(
         Ok(result) => result?,
         Err(_) => bail!("SFTP create-directory exceeded its deadline of {timeout_ms} ms"),
     };
-    if let Some(daemon) = daemon {
-        let mut stream = daemon.stream;
-        let mut submission = CreateDirSubmissionState::BeforeRequest;
-        write_daemon_create_dir_frame_until(
-            &mut stream,
-            &request.0,
-            timeout_ms,
-            deadline,
-            &mut submission,
-        )
-        .await?;
-        return read_daemon_create_dir_response_until(
-            &mut stream,
-            timeout_ms,
-            deadline,
-            submission,
-        )
-        .await;
-    }
-
-    let direct =
-        connect_direct_profile_until(profile, master, expected_generation, deadline).await?;
-    direct.session.create_dir_until(path, deadline).await
+    let mut stream = daemon.stream;
+    let mut submission = CreateDirSubmissionState::BeforeRequest;
+    write_daemon_create_dir_frame_until(
+        &mut stream,
+        &request.0,
+        timeout_ms,
+        deadline,
+        &mut submission,
+    )
+    .await?;
+    read_daemon_create_dir_response_until(&mut stream, timeout_ms, deadline, submission).await
 }
 
 /// High-level upload entry for callers that consume secrets before starting an
@@ -1942,43 +2199,20 @@ async fn upload_file_with_timeout_inner(
         Err(_) => bail!("SFTP upload exceeded its deadline of {timeout_ms} ms"),
     };
 
-    if let Some(daemon) = daemon {
-        let worker_cancel = cancellation.clone();
-        let worker = tokio::spawn(async move {
-            upload_file_via_daemon(
-                daemon,
-                source,
-                size,
-                timeout_ms,
-                request,
-                deadline,
-                worker_cancel,
-            )
-            .await
-        });
-        return await_owned_upload_worker(worker, cancellation).await;
-    }
-
-    let direct =
-        connect_direct_profile_until(profile, master, authorization.expected_generation, deadline)
-            .await
-            .map_err(|error| {
-                if error.to_string() == "SSH connection exceeded its deadline" {
-                    anyhow!("SFTP upload exceeded its deadline of {timeout_ms} ms")
-                } else {
-                    error
-                }
-            })?;
-    upload_file_direct_until(
-        direct,
-        source,
-        size,
-        remote,
-        deadline,
-        timeout_ms,
-        cancellation,
-    )
-    .await
+    let worker_cancel = cancellation.clone();
+    let worker = tokio::spawn(async move {
+        upload_file_via_daemon(
+            daemon,
+            source,
+            size,
+            timeout_ms,
+            request,
+            deadline,
+            worker_cancel,
+        )
+        .await
+    });
+    await_owned_upload_worker(worker, cancellation).await
 }
 
 async fn open_local_upload_source(
@@ -2082,45 +2316,6 @@ async fn await_owned_upload_worker(
     let result = worker.await.context("join owned upload worker")?;
     guard.disarm();
     result
-}
-
-async fn cleanup_remote_partial(
-    session: &SshSession,
-    partial: &str,
-    retry_after_cancel: bool,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + REMOTE_PARTIAL_CLEANUP_TIMEOUT;
-    loop {
-        // Use a fresh subsystem channel: the transfer channel itself may be
-        // the operation that hung and triggered cancellation.
-        let attempt = match session.sftp_until(deadline).await {
-            Ok(sftp) => {
-                poll_remote_mutation_until(
-                    deadline,
-                    sftp.remove_file(partial),
-                    || {},
-                    || {},
-                    "remote partial cleanup exceeded its deadline",
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
-        match attempt {
-            Ok(()) => return true,
-            Err(_) if retry_after_cancel => {
-                // Cancellation may race a CREATE request already in flight.
-                // Retry briefly so a late-created partial is still removed.
-                if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(50)))
-                    .await
-                    .is_err()
-                {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
 }
 
 struct ZeroizingUploadChunk(ipc::Frame);
@@ -2360,277 +2555,6 @@ async fn upload_file_via_daemon(
     result
 }
 
-async fn upload_file_direct_until(
-    direct: DirectSession,
-    source: tokio::fs::File,
-    size: u64,
-    remote: &str,
-    deadline: tokio::time::Instant,
-    timeout_ms: u64,
-    cancellation: CancellationToken,
-) -> Result<u64> {
-    let remote = remote.to_owned();
-    let worker_cancel = cancellation.clone();
-    let worker = tokio::spawn(async move {
-        upload_file_direct_worker(
-            direct,
-            source,
-            size,
-            &remote,
-            deadline,
-            timeout_ms,
-            worker_cancel,
-        )
-        .await
-    });
-    await_owned_upload_worker(worker, cancellation).await
-}
-
-fn classify_direct_upload_finished_error(
-    error: anyhow::Error,
-    commit_started: bool,
-    remote: &str,
-) -> Result<u64> {
-    if commit_started {
-        Err(UploadCommitOutcomeUnknown(format!(
-            "SFTP upload commit outcome unknown after a transport/protocol failure: {error:#}; \
-             inspect {remote} before retry"
-        ))
-        .into())
-    } else {
-        Err(error)
-    }
-}
-
-fn direct_upload_outcome_unknown(remote: &str, reason: &str) -> anyhow::Error {
-    UploadCommitOutcomeUnknown(format!(
-        "SFTP upload commit outcome unknown {reason}; inspect {remote} before retry"
-    ))
-    .into()
-}
-
-async fn upload_file_direct_worker(
-    direct: DirectSession,
-    mut source: tokio::fs::File,
-    size: u64,
-    remote: &str,
-    deadline: tokio::time::Instant,
-    timeout_ms: u64,
-    cancellation: CancellationToken,
-) -> Result<u64> {
-    let DirectSession {
-        session,
-        _profile_lease,
-    } = direct;
-    if remote.is_empty() || remote.len() > 4096 || remote.contains('\0') {
-        bail!("remote destination is empty, invalid, or exceeds 4096 bytes");
-    }
-    let sftp = tokio::select! {
-        result = session.sftp_until(deadline) => result?,
-        _ = cancellation.cancelled() => {
-            session.invalidate().await;
-            bail!("SFTP upload cancelled")
-        }
-    };
-    let exists = tokio::select! {
-        result = tokio::time::timeout_at(deadline, sftp.try_exists(remote)) => match result {
-            Ok(result) => result?,
-            Err(_) => {
-                session.invalidate().await;
-                bail!("SFTP upload exceeded its deadline of {timeout_ms} ms")
-            }
-        },
-        _ = cancellation.cancelled() => {
-            session.invalidate().await;
-            bail!("SFTP upload cancelled")
-        },
-    };
-    if exists {
-        bail!("remote destination already exists: {remote}");
-    }
-
-    let partial = temporary_remote_path(remote)?;
-    let partial_may_exist = std::sync::atomic::AtomicBool::new(false);
-    let commit_started = std::sync::atomic::AtomicBool::new(false);
-    let remote_committed = std::sync::atomic::AtomicBool::new(false);
-    let deadline_message = format!("SFTP upload exceeded its deadline of {timeout_ms} ms");
-    let operation = async {
-        let opened = poll_remote_mutation_until(
-            deadline,
-            sftp.open_with_flags_and_attributes(
-                &partial,
-                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
-                protected_upload_file_attributes(),
-            ),
-            || partial_may_exist.store(true, std::sync::atomic::Ordering::Release),
-            || {},
-            deadline_message.as_str(),
-        )
-        .await;
-        let mut destination = match opened {
-            Ok(file) => file,
-            Err(error) => {
-                // A completed EXCLUDE failure proves this request did not
-                // create the random partial only when it is an explicit server
-                // STATUS. Transport/protocol failures remain uncertain.
-                if is_explicit_sftp_status(&error) {
-                    partial_may_exist.store(false, std::sync::atomic::Ordering::Release);
-                }
-                return Err(error);
-            }
-        };
-        let mut transferred = 0_u64;
-        let mut buffer = Zeroizing::new(vec![0_u8; 32 * 1024]);
-        loop {
-            let read = source.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            poll_remote_mutation_until(
-                deadline,
-                destination.write_all(&buffer[..read]),
-                || {},
-                || {},
-                deadline_message.as_str(),
-            )
-            .await?;
-            transferred = transferred
-                .checked_add(read as u64)
-                .context("upload size overflow")?;
-            ensure!(
-                transferred <= size && transferred <= MAX_TRANSFER_BYTES,
-                "upload exceeded its declared or configured size"
-            );
-        }
-        poll_remote_mutation_until(
-            deadline,
-            destination.flush(),
-            || {},
-            || {},
-            deadline_message.as_str(),
-        )
-        .await?;
-        poll_remote_mutation_until(
-            deadline,
-            destination.shutdown(),
-            || {},
-            || {},
-            deadline_message.as_str(),
-        )
-        .await?;
-        drop(destination);
-        if transferred != size {
-            bail!("upload size changed while reading: expected {size}, read {transferred}");
-        }
-        if sftp.try_exists(remote).await? {
-            bail!("remote destination was created during upload: {remote}");
-        }
-        ensure!(!cancellation.is_cancelled(), "SFTP upload cancelled");
-        ensure!(
-            tokio::time::Instant::now() < deadline,
-            "SFTP upload exceeded its deadline of {timeout_ms} ms"
-        );
-        commit_started.store(true, std::sync::atomic::Ordering::Release);
-        let commit = commit_remote_upload_no_replace_until(
-            &sftp,
-            &partial,
-            remote,
-            &remote_committed,
-            deadline,
-            deadline_message.as_str(),
-        )
-        .await?;
-        if commit.partial_removed || cleanup_remote_partial(&session, &partial, false).await {
-            partial_may_exist.store(false, std::sync::atomic::Ordering::Release);
-        } else {
-            log::warn!(
-                "upload committed to {}, but remote temporary name {} could not be removed",
-                terminal_safe_field(remote),
-                terminal_safe_field(&partial),
-            );
-        }
-        Ok::<u64, anyhow::Error>(transferred)
-    };
-    enum End {
-        Finished(Result<u64>),
-        Cancelled,
-        TimedOut,
-    }
-    let end = tokio::select! {
-        result = tokio::time::timeout_at(deadline, operation) => match result {
-            Ok(result) => End::Finished(result),
-            Err(_) => End::TimedOut,
-        },
-        _ = cancellation.cancelled() => End::Cancelled,
-    };
-    drop(sftp);
-
-    match end {
-        End::Finished(Ok(bytes)) => Ok(bytes),
-        End::Finished(Err(error))
-            if remote_committed.load(std::sync::atomic::Ordering::Acquire) =>
-        {
-            if partial_may_exist.load(std::sync::atomic::Ordering::Acquire)
-                && cleanup_remote_partial(&session, &partial, false).await
-            {
-                partial_may_exist.store(false, std::sync::atomic::Ordering::Release);
-            }
-            log::warn!(
-                "upload to {} committed before post-commit cleanup failed: {}",
-                terminal_safe_field(remote),
-                terminal_safe_error(&error),
-            );
-            session.invalidate().await;
-            Ok(size)
-        }
-        End::Finished(Err(error)) => {
-            if partial_may_exist.load(std::sync::atomic::Ordering::Acquire) {
-                cleanup_remote_partial(&session, &partial, false).await;
-                session.invalidate().await;
-            }
-            classify_direct_upload_finished_error(
-                error,
-                commit_started.load(std::sync::atomic::Ordering::Acquire),
-                remote,
-            )
-        }
-        End::TimedOut => {
-            if partial_may_exist.load(std::sync::atomic::Ordering::Acquire) {
-                cleanup_remote_partial(&session, &partial, true).await;
-            }
-            session.invalidate().await;
-            if remote_committed.load(std::sync::atomic::Ordering::Acquire) {
-                log::warn!(
-                    "upload to {} committed before its post-commit cleanup deadline elapsed",
-                    terminal_safe_field(remote),
-                );
-                Ok(size)
-            } else if commit_started.load(std::sync::atomic::Ordering::Acquire) {
-                Err(direct_upload_outcome_unknown(remote, "after its deadline"))
-            } else {
-                bail!("SFTP upload exceeded its deadline of {timeout_ms} ms")
-            }
-        }
-        End::Cancelled => {
-            if partial_may_exist.load(std::sync::atomic::Ordering::Acquire) {
-                cleanup_remote_partial(&session, &partial, true).await;
-            }
-            session.invalidate().await;
-            if remote_committed.load(std::sync::atomic::Ordering::Acquire) {
-                log::warn!(
-                    "upload to {} committed before cancellation was observed",
-                    terminal_safe_field(remote),
-                );
-                Ok(size)
-            } else if commit_started.load(std::sync::atomic::Ordering::Acquire) {
-                Err(direct_upload_outcome_unknown(remote, "after cancellation"))
-            } else {
-                bail!("SFTP upload cancelled")
-            }
-        }
-    }
-}
-
 pub async fn download_with_timeout_and_master(
     profile: &str,
     remote: &str,
@@ -2789,13 +2713,9 @@ async fn download_file_worker(
         bail!("SFTP download cancelled");
     }
     download_file_inner(DownloadRequest {
-        profile,
-        remote,
         local,
         daemon,
         root_request,
-        master: Some(master),
-        expected_generation: authorization.expected_generation,
         timeout_ms,
         deadline,
         cancellation,
@@ -2866,85 +2786,10 @@ async fn download_via_daemon_until(
     }
 }
 
-async fn download_direct_until(
-    profile: &str,
-    remote: &str,
-    authorization: ProfileAuthorizationRef<'_>,
-    destination: &mut tokio::fs::File,
-    timeout_ms: u64,
-    deadline: tokio::time::Instant,
-    cancellation: &CancellationToken,
-) -> Result<u64> {
-    let direct = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => bail!("SFTP download cancelled"),
-        result = connect_direct_profile_until(
-            profile,
-            authorization.passphrase,
-            authorization.expected_generation,
-            deadline,
-        ) => result.map_err(|error| {
-            if error.to_string() == "SSH connection exceeded its deadline" {
-                anyhow!("SFTP download exceeded its deadline of {timeout_ms} ms")
-            } else {
-                error
-            }
-        })?,
-    };
-    let session = &direct.session;
-    let operation = async {
-        let sftp = session.sftp_until(deadline).await?;
-        let mut received = 0_u64;
-        let mut source = sftp.open(remote).await?;
-        let mut buffer = Zeroizing::new(vec![0_u8; 32 * 1024]);
-        loop {
-            let read = source.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            destination.write_all(&buffer[..read]).await?;
-            received = received
-                .checked_add(read as u64)
-                .ok_or_else(|| anyhow!("download size overflow"))?;
-            ensure!(
-                received <= MAX_TRANSFER_BYTES,
-                "download exceeds the {} byte safety limit",
-                MAX_TRANSFER_BYTES
-            );
-        }
-        source.shutdown().await?;
-        Ok::<u64, anyhow::Error>(received)
-    };
-    let result = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => None,
-        result = tokio::time::timeout_at(deadline, operation) => Some(result),
-    };
-    match result {
-        Some(Ok(Ok(bytes))) => Ok(bytes),
-        Some(Ok(Err(error))) => {
-            session.invalidate().await;
-            Err(error)
-        }
-        Some(Err(_)) => {
-            session.invalidate().await;
-            bail!("SFTP download exceeded its deadline of {timeout_ms} ms")
-        }
-        None => {
-            session.invalidate().await;
-            bail!("SFTP download cancelled")
-        }
-    }
-}
-
 struct DownloadRequest<'a> {
-    profile: &'a str,
-    remote: &'a str,
     local: &'a Path,
-    daemon: Option<DaemonConnection>,
+    daemon: DaemonConnection,
     root_request: ZeroizingRequestFrame,
-    master: Option<&'a str>,
-    expected_generation: Option<vault::ProfileIdentity>,
     timeout_ms: u64,
     deadline: tokio::time::Instant,
     cancellation: CancellationToken,
@@ -2952,13 +2797,9 @@ struct DownloadRequest<'a> {
 
 async fn download_file_inner(request: DownloadRequest<'_>) -> Result<u64> {
     let DownloadRequest {
-        profile,
-        remote,
         local,
         daemon,
         root_request,
-        master,
-        expected_generation,
         timeout_ms,
         deadline,
         cancellation,
@@ -2997,36 +2838,15 @@ async fn download_file_inner(request: DownloadRequest<'_>) -> Result<u64> {
         bail!("SFTP download exceeded its deadline of {timeout_ms} ms");
     }
 
-    let transfer: Result<u64> = if let Some(daemon) = daemon {
-        download_via_daemon_until(
-            daemon,
-            root_request,
-            &mut destination,
-            timeout_ms,
-            deadline,
-            &cancellation,
-        )
-        .await
-    } else {
-        match master {
-            Some(master) => {
-                download_direct_until(
-                    profile,
-                    remote,
-                    ProfileAuthorizationRef {
-                        passphrase: master,
-                        expected_generation,
-                    },
-                    &mut destination,
-                    timeout_ms,
-                    deadline,
-                    &cancellation,
-                )
-                .await
-            }
-            None => Err(anyhow!("master passphrase is required")),
-        }
-    };
+    let transfer: Result<u64> = download_via_daemon_until(
+        daemon,
+        root_request,
+        &mut destination,
+        timeout_ms,
+        deadline,
+        &cancellation,
+    )
+    .await;
 
     match transfer {
         Ok(bytes) => {
@@ -3861,30 +3681,9 @@ where
     }
 }
 
-async fn open_direct_shell_until(
-    session: &SshSession,
-    term: &str,
-    cols: u32,
-    rows: u32,
-    deadline: tokio::time::Instant,
-) -> Result<russh::Channel<russh::client::Msg>> {
-    validate_shell_dimensions(cols, rows)?;
-    match tokio::time::timeout_at(deadline, session.pty_shell(term, cols, rows)).await {
-        Ok(Ok(channel)) => Ok(channel),
-        Ok(Err(error)) => {
-            session.invalidate().await;
-            Err(error).context("open remote shell")
-        }
-        Err(_) => {
-            session.invalidate().await;
-            bail!("direct shell setup exceeded its 30-second deadline")
-        }
-    }
-}
-
-#[allow(dead_code)] // compatibility entry; the UI uses the generation-bound variant
-pub async fn open_gui_shell(profile: &str, master: Option<&str>) -> Result<GuiShell> {
-    open_gui_shell_at_optional_generation(profile, master, None).await
+#[allow(dead_code)] // compatibility entry; retained for external callers
+pub async fn open_gui_shell(profile: &str, master: Zeroizing<String>) -> Result<GuiShell> {
+    open_gui_shell_at_optional_generation(profile, Some(master.as_str()), None).await
 }
 
 pub(crate) async fn open_gui_shell_at_generation(
@@ -3902,7 +3701,7 @@ async fn open_gui_shell_at_optional_generation(
 ) -> Result<GuiShell> {
     validate_shell_dimensions(120, 36)?;
     let master = master.ok_or_else(|| anyhow!("master passphrase is required"))?;
-    let (input_tx, mut input_rx) = mpsc::channel::<Zeroizing<Vec<u8>>>(64);
+    let (input_tx, input_rx) = mpsc::channel::<Zeroizing<Vec<u8>>>(64);
     let (event_tx, event_rx) = mpsc::channel::<ShellEvent>(128);
     let cancellation = CancellationToken::new();
 
@@ -3911,119 +3710,98 @@ async fn open_gui_shell_at_optional_generation(
         cols: 120,
         rows: 36,
     });
-    if let Some(daemon) = connect_daemon_for_request_until(
+    let daemon = connect_daemon_for_request_until(
         profile,
         master,
         expected_generation,
         &request.0,
         ipc_setup_deadline,
     )
-    .await?
-    {
-        let stream = daemon.stream;
-        let (mut rd, mut wr) = tokio::io::split(stream);
-        start_ipc_shell_frame_until(&mut rd, &mut wr, &request.0, ipc_setup_deadline).await?;
-        let worker_cancellation = cancellation.clone();
-        tokio::spawn(run_gui_ipc_shell(
-            rd,
-            wr,
-            input_rx,
-            event_tx,
-            worker_cancellation,
-        ));
-    } else {
-        let setup_deadline = tokio::time::Instant::now() + DIRECT_SHELL_SETUP_TIMEOUT;
-        let direct =
-            connect_direct_profile_until(profile, master, expected_generation, setup_deadline)
-                .await?;
-        let mut channel =
-            open_direct_shell_until(&direct.session, "dumb", 120, 36, setup_deadline).await?;
-        let mut writer = channel.make_writer();
-        let worker_cancellation = cancellation.clone();
-        tokio::spawn(async move {
-            let mut terminal_error = None;
-            'shell: loop {
-                tokio::select! {
-                    biased;
-                    _ = worker_cancellation.cancelled() => break,
-                    input = input_rx.recv() => match input {
-                        Some(mut data) => {
-                            if let Err(error) = validate_shell_input(&mut data) {
-                                terminal_error = Some(error.to_string());
-                                break;
-                            }
-                            let write = tokio::select! {
-                                biased;
-                                _ = worker_cancellation.cancelled() => break 'shell,
-                                result = complete_shell_input_write_until(
-                                    writer.write_all(&data),
-                                    tokio::time::Instant::now() + SHELL_INPUT_WRITE_TIMEOUT,
-                                ) => result,
-                            };
-                            data.zeroize();
-                            if let Err(error) = write {
-                                terminal_error = Some(error.to_string());
-                                break;
-                            }
-                        }
-                        None => break,
-                    },
-                    message = channel.wait() => match message {
-                        Some(ChannelMsg::Data { data }) => {
-                            let data = Zeroizing::new(data.to_vec());
-                            match send_gui_shell_output_or_cancel(
-                                &event_tx,
-                                data,
-                                &worker_cancellation,
-                            ).await {
-                                Ok(true) => {}
-                                Ok(false) => break 'shell,
-                                Err(error) => {
-                                    terminal_error = Some(error.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                        Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
-                            let data = Zeroizing::new(data.to_vec());
-                            match send_gui_shell_output_or_cancel(
-                                &event_tx,
-                                data,
-                                &worker_cancellation,
-                            ).await {
-                                Ok(true) => {}
-                                Ok(false) => break 'shell,
-                                Err(error) => {
-                                    terminal_error = Some(error.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                        Some(ChannelMsg::ExtendedData { ext, .. }) => {
-                            terminal_error = Some(format!(
-                                "remote shell returned unsupported extended-data type {ext}"
-                            ));
-                            break;
-                        }
-                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                        _ => {}
-                    }
-                }
-            }
-            zeroize_pending_shell_input(&mut input_rx);
-            drop(writer);
-            let _ = direct.session.terminate_channel(&mut channel, true).await;
-            if let Some(error) = terminal_error {
-                try_send_shell_event(&event_tx, ShellEvent::Error(error));
-            }
-            try_send_shell_event(&event_tx, ShellEvent::Closed);
-        });
-    }
+    .await?;
+    let stream = daemon.stream;
+    let (mut rd, mut wr) = tokio::io::split(stream);
+    start_ipc_shell_frame_until(&mut rd, &mut wr, &request.0, ipc_setup_deadline).await?;
+    let worker_cancellation = cancellation.clone();
+    tokio::spawn(run_gui_ipc_shell(
+        rd,
+        wr,
+        input_rx,
+        event_tx,
+        worker_cancellation,
+    ));
 
     Ok(GuiShell {
         input: input_tx,
         events: event_rx,
         cancellation,
+    })
+}
+
+/// Start an SSH tunnel for the GUI and return only after its listener or
+/// remote forward is ready. The master passphrase authorizes this one tunnel
+/// start even when the SSH transport is owned by the daemon.
+pub async fn open_gui_tunnel(
+    profile: &str,
+    spec: TunnelSpec,
+    master: Zeroizing<String>,
+) -> Result<GuiTunnel> {
+    open_gui_tunnel_at_optional_generation(profile, spec, master, None).await
+}
+
+pub(crate) async fn open_gui_tunnel_at_generation(
+    profile: &str,
+    spec: TunnelSpec,
+    master: Zeroizing<String>,
+    expected_generation: vault::ProfileIdentity,
+) -> Result<GuiTunnel> {
+    open_gui_tunnel_at_optional_generation(profile, spec, master, Some(expected_generation)).await
+}
+
+async fn open_gui_tunnel_at_optional_generation(
+    profile: &str,
+    spec: TunnelSpec,
+    master: Zeroizing<String>,
+    expected_generation: Option<vault::ProfileIdentity>,
+) -> Result<GuiTunnel> {
+    spec.validate()?;
+    let requested_mode = spec.mode();
+    let request = ZeroizingRequestFrame(ipc::Frame::TunnelOpen { spec: spec.clone() });
+    let ipc_deadline = tokio::time::Instant::now() + IPC_TUNNEL_SETUP_TIMEOUT;
+    let mut daemon = connect_daemon_for_request_until(
+        profile,
+        &master,
+        expected_generation,
+        &request.0,
+        ipc_deadline,
+    )
+    .await?;
+    let ready = read_daemon_tunnel_ready_until(
+        &mut daemon.stream,
+        &request.0,
+        requested_mode,
+        ipc_deadline,
+    )
+    .await?;
+    let cancellation = CancellationToken::new();
+    let (event_tx, event_rx) = mpsc::channel(128);
+    try_send_tunnel_event(
+        &event_tx,
+        TunnelEvent::Ready {
+            bind_host: ready.bind_host.clone(),
+            bind_port: ready.bind_port,
+        },
+    );
+    let worker_cancellation = cancellation.clone();
+    let worker = tokio::spawn(run_gui_ipc_tunnel(
+        daemon.stream,
+        event_tx,
+        worker_cancellation,
+    ));
+    Ok(GuiTunnel {
+        ready,
+        events: event_rx,
+        cancellation,
+        worker: Some(worker),
     })
 }
 
@@ -4123,115 +3901,6 @@ where
     result
 }
 
-fn gui_tunnel_from_direct(running: RunningTunnel, profile_lease: vault::ProfileLease) -> GuiTunnel {
-    let ready = running.ready().clone();
-    let cancellation = running.cancellation_token();
-    let (event_tx, event_rx) = mpsc::channel(128);
-    try_send_tunnel_event(
-        &event_tx,
-        TunnelEvent::Ready {
-            bind_host: ready.bind_host.clone(),
-            bind_port: ready.bind_port,
-        },
-    );
-    let worker = tokio::spawn(async move {
-        let result = running.wait().await;
-        if let Err(error) = &result {
-            try_send_tunnel_event(&event_tx, TunnelEvent::Error(error.to_string()));
-        }
-        try_send_tunnel_event(&event_tx, TunnelEvent::Closed);
-        drop(profile_lease);
-        result
-    });
-    GuiTunnel {
-        ready,
-        events: event_rx,
-        cancellation,
-        worker: Some(worker),
-    }
-}
-
-/// Start an SSH tunnel for the GUI and return only after its listener or
-/// remote forward is ready. The master passphrase authorizes this one tunnel
-/// start even when the SSH transport is owned by the daemon.
-pub async fn open_gui_tunnel(
-    profile: &str,
-    spec: TunnelSpec,
-    master: Zeroizing<String>,
-) -> Result<GuiTunnel> {
-    open_gui_tunnel_at_optional_generation(profile, spec, master, None).await
-}
-
-pub(crate) async fn open_gui_tunnel_at_generation(
-    profile: &str,
-    spec: TunnelSpec,
-    master: Zeroizing<String>,
-    expected_generation: vault::ProfileIdentity,
-) -> Result<GuiTunnel> {
-    open_gui_tunnel_at_optional_generation(profile, spec, master, Some(expected_generation)).await
-}
-
-async fn open_gui_tunnel_at_optional_generation(
-    profile: &str,
-    spec: TunnelSpec,
-    master: Zeroizing<String>,
-    expected_generation: Option<vault::ProfileIdentity>,
-) -> Result<GuiTunnel> {
-    spec.validate()?;
-    let requested_mode = spec.mode();
-    let request = ZeroizingRequestFrame(ipc::Frame::TunnelOpen { spec: spec.clone() });
-    let ipc_deadline = tokio::time::Instant::now() + IPC_TUNNEL_SETUP_TIMEOUT;
-    if let Some(mut daemon) = connect_daemon_for_request_until(
-        profile,
-        &master,
-        expected_generation,
-        &request.0,
-        ipc_deadline,
-    )
-    .await?
-    {
-        let ready = read_daemon_tunnel_ready_until(
-            &mut daemon.stream,
-            &request.0,
-            requested_mode,
-            ipc_deadline,
-        )
-        .await?;
-        let cancellation = CancellationToken::new();
-        let (event_tx, event_rx) = mpsc::channel(128);
-        try_send_tunnel_event(
-            &event_tx,
-            TunnelEvent::Ready {
-                bind_host: ready.bind_host.clone(),
-                bind_port: ready.bind_port,
-            },
-        );
-        let worker_cancellation = cancellation.clone();
-        let worker = tokio::spawn(run_gui_ipc_tunnel(
-            daemon.stream,
-            event_tx,
-            worker_cancellation,
-        ));
-        return Ok(GuiTunnel {
-            ready,
-            events: event_rx,
-            cancellation,
-            worker: Some(worker),
-        });
-    }
-
-    let direct_deadline = tokio::time::Instant::now() + DIRECT_TUNNEL_SETUP_TIMEOUT;
-    let DirectSession {
-        session,
-        _profile_lease: profile_lease,
-    } = connect_direct_profile_until(profile, &master, expected_generation, direct_deadline)
-        .await?;
-    let session = Arc::new(session);
-    let running = session.start_tunnel(spec, direct_deadline).await?;
-    Ok(gui_tunnel_from_direct(running, profile_lease))
-}
-
-/// Run a tunnel in the foreground until Ctrl+C or remote closure.
 pub async fn tunnel_with_master(
     profile: &str,
     spec: TunnelSpec,
@@ -4361,23 +4030,20 @@ pub async fn shell_with_master(profile: &str, master: Option<Zeroizing<String>>)
         .ok_or_else(|| anyhow!("master passphrase is required"))?;
     let ipc_setup_deadline = tokio::time::Instant::now() + IPC_SHELL_SETUP_TIMEOUT;
     let request = ZeroizingRequestFrame(ipc::Frame::Shell { cols, rows });
-    if let Some(daemon) =
+    let daemon =
         connect_daemon_for_request_until(profile, master, None, &request.0, ipc_setup_deadline)
-            .await?
-    {
-        shell_via_ipc(daemon.stream, &request.0, ipc_setup_deadline).await
-    } else {
-        let setup_deadline = tokio::time::Instant::now() + DIRECT_SHELL_SETUP_TIMEOUT;
-        let direct = connect_direct_profile_until(profile, master, None, setup_deadline).await?;
-        shell_direct(&direct.session, cols, rows, setup_deadline).await
-    }
+            .await?;
+    shell_via_ipc(daemon.stream, &request.0, ipc_setup_deadline).await
 }
 
-async fn shell_via_ipc(
-    stream: ipc::ClientStream,
+async fn shell_via_ipc<S>(
+    stream: S,
     request: &ipc::Frame,
     setup_deadline: tokio::time::Instant,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (mut rd, mut wr) = tokio::io::split(stream);
     start_ipc_shell_frame_until(&mut rd, &mut wr, request, setup_deadline).await?;
 
@@ -4428,64 +4094,6 @@ where
     }
     .await;
     zeroize_pending_shell_frames(&mut frame_rx);
-    result
-}
-
-async fn shell_direct(
-    session: &SshSession,
-    cols: u32,
-    rows: u32,
-    setup_deadline: tokio::time::Instant,
-) -> Result<()> {
-    validate_shell_dimensions(cols, rows)?;
-    let mut ch =
-        open_direct_shell_until(session, "xterm-256color", cols, rows, setup_deadline).await?;
-    let mut writer = ch.make_writer();
-    let raw_mode = enter_raw_mode()?;
-    let mut kbrx = spawn_stdin_pump();
-    let mut out = tokio::io::stdout();
-    let result: Result<()> = async {
-        loop {
-            tokio::select! {
-                key = kbrx.recv() => match key {
-                    Some(mut b) => {
-                        validate_shell_input(&mut b)?;
-                        let write = complete_shell_input_write_until(
-                            writer.write_all(&b),
-                            tokio::time::Instant::now() + SHELL_INPUT_WRITE_TIMEOUT,
-                        ).await;
-                        b.zeroize();
-                        write?;
-                    }
-                    None => break,
-                },
-                msg = ch.wait() => match msg {
-                    Some(ChannelMsg::Data { data }) => {
-                        let mut output = Zeroizing::new(data.to_vec());
-                        let write = write_shell_output(&mut out, &output).await;
-                        output.zeroize();
-                        write?;
-                    }
-                    Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
-                        let mut output = Zeroizing::new(data.to_vec());
-                        let write = write_shell_output(&mut out, &output).await;
-                        output.zeroize();
-                        write?;
-                    }
-                    Some(ChannelMsg::ExtendedData { ext, .. }) => {
-                        bail!("remote shell returned unsupported extended-data type {ext}");
-                    }
-                    Some(ChannelMsg::Eof) | None => break,
-                    _ => {}
-                },
-            }
-        }
-        Ok(())
-    }
-    .await;
-    drop(raw_mode);
-    drop(writer);
-    let _ = session.terminate_channel(&mut ch, true).await;
     result
 }
 
@@ -4540,36 +4148,34 @@ fn key_to_bytes(ev: &Event) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_direct_profile_snapshot_with, authenticate_connected_daemon,
-        await_daemon_upload_commit_response_with_grace, await_owned_upload_worker,
-        classify_daemon_exec_read_error, classify_direct_upload_finished_error,
-        classify_shutdown_lock_generation, commit_local_no_replace_with_hook,
-        commit_local_no_replace_with_hook_and_link, complete_shell_input_write_until,
-        create_dir_inner, create_local_download_partial, create_local_download_partial_with,
-        daemon_absent_line, daemon_down_line, daemon_status_line, download_file_with_timeout_owned,
-        elapsed_nonnegative_seconds, enter_raw_mode_with, exec_capture_with_timeout_inner,
-        finalize_local_download, join_blocking_until, key_to_bytes, list_dir_inner,
-        open_local_upload_source, open_local_upload_source_with,
-        read_daemon_create_dir_response_until, read_daemon_tunnel_ready_until, read_exec_response,
-        read_shell_frame_pump, read_shell_frame_pump_inner, reconcile_shutdown_exchange,
-        recover_invalid_daemon_lock_read, run_gui_ipc_shell, run_gui_ipc_tunnel,
-        run_local_partial_cleanup_with, send_gui_shell_output_or_cancel, shutdown_daemon_exchange,
-        spawn_stdin_pump_with, start_ipc_shell_until, terminal_safe_error, terminal_safe_field,
-        upload_file_with_timeout_inner, validate_shell_input, validated_sftp_timeout_ms,
-        verify_owned_file_identities_until_with, wait_for_daemon_lock_release_with,
-        write_command_output_to, write_daemon_create_dir_request_until,
-        write_daemon_exec_request_until, write_shutdown_request_until, CommandOutput, DaemonStatus,
-        OwnedPendingProfileAuthorization, PendingProfileAuthorization, ShellEvent,
-        ShutdownLockObservation, TunnelEvent, UnclaimedLocalPartial, UploadCommitOutcomeUnknown,
-        DAEMON_LOCK_RELEASE_TIMEOUT, MAX_SHELL_INPUT_BYTES,
+        agent_stdio_loop_with, await_daemon_upload_commit_response_with_grace,
+        await_owned_upload_worker, classify_daemon_exec_read_error,
+        commit_local_no_replace_with_hook, commit_local_no_replace_with_hook_and_link,
+        complete_shell_input_write_until, create_dir_inner, create_local_download_partial,
+        create_local_download_partial_with, daemon_absent_line, daemon_down_line,
+        daemon_status_line, download_file_with_timeout_owned, elapsed_nonnegative_seconds,
+        enter_raw_mode_with, exec_capture_with_timeout_inner, finalize_local_download,
+        join_blocking_until, key_to_bytes, list_dir_inner, open_local_upload_source,
+        open_local_upload_source_with, read_daemon_create_dir_response_until,
+        read_daemon_tunnel_ready_until, read_exec_response, read_shell_frame_pump,
+        read_shell_frame_pump_inner, reconcile_shutdown_exchange, run_gui_ipc_shell,
+        run_gui_ipc_tunnel, run_local_partial_cleanup_with, send_gui_shell_output_or_cancel,
+        shutdown_daemon_exchange, spawn_stdin_pump_with, start_ipc_shell_until,
+        terminal_safe_error, terminal_safe_field, upload_file_with_timeout_inner,
+        validate_shell_input, validated_sftp_timeout_ms, verify_owned_file_identities_until_with,
+        wait_for_daemon_absent_until, write_command_output_to,
+        write_daemon_create_dir_request_until, write_daemon_exec_request_until,
+        write_shutdown_request_until, AgentGrantFile, CommandOutput, DaemonStatus,
+        OwnedPendingProfileAuthorization, PendingProfileAuthorization, ShellEvent, TunnelEvent,
+        UnclaimedLocalPartial, UploadCommitOutcomeUnknown, DAEMON_LOCK_RELEASE_TIMEOUT,
+        MAX_SHELL_INPUT_BYTES,
     };
-    use crate::ipc::{self, Frame};
-    use crate::ssh::{
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use serctl_core::ssh::{
         CreateDirOutcomeUnknown, CreateDirSubmissionState, ExecOutcomeUnknown, ExecSubmissionState,
         TunnelMode, TunnelReady, TunnelSpec,
     };
-    use crate::vault::{LockInfo, RuntimeLeaseLiveness};
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use serctl_protocol::{self as ipc, Frame};
     use std::future::Future;
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -4874,128 +4480,6 @@ mod tests {
     }
 
     #[test]
-    fn competing_tofu_pin_is_reloaded_before_the_second_connection() {
-        struct TrackedLease {
-            label: &'static str,
-            events: Arc<StdMutex<Vec<&'static str>>>,
-        }
-
-        impl Drop for TrackedLease {
-            fn drop(&mut self) {
-                self.events.lock().unwrap().push(if self.label == "shared" {
-                    "shared-drop"
-                } else {
-                    "exclusive-drop"
-                });
-            }
-        }
-
-        let events = Arc::new(StdMutex::new(Vec::new()));
-        let shared_events = Arc::clone(&events);
-        let exclusive_events = Arc::clone(&events);
-        let decrypt_events = Arc::clone(&events);
-        let decrypt_count = std::cell::Cell::new(0_u8);
-        let (creds, lease) = acquire_direct_profile_snapshot_with(
-            move || {
-                shared_events.lock().unwrap().push("shared-acquire");
-                Ok(TrackedLease {
-                    label: "shared",
-                    events: Arc::clone(&shared_events),
-                })
-            },
-            move || {
-                // Model another contender winning TOFU and persisting
-                // fingerprint A after our shared snapshot was released.
-                assert_eq!(
-                    exclusive_events.lock().unwrap().last(),
-                    Some(&"shared-drop")
-                );
-                exclusive_events.lock().unwrap().push("exclusive-acquire");
-                Ok(TrackedLease {
-                    label: "exclusive",
-                    events: Arc::clone(&exclusive_events),
-                })
-            },
-            move || {
-                let attempt = decrypt_count.get();
-                decrypt_count.set(attempt + 1);
-                decrypt_events.lock().unwrap().push(if attempt == 0 {
-                    "decrypt-unpinned"
-                } else {
-                    "decrypt-pinned"
-                });
-                Ok(crate::vault::Creds {
-                    host: "127.0.0.1".into(),
-                    port: 22,
-                    user: "tester".into(),
-                    password: "secret".into(),
-                    host_key: (attempt != 0).then(|| "SHA256:fingerprint-a".into()),
-                })
-            },
-        )
-        .unwrap();
-
-        // A server presenting competing fingerprint B is therefore connected
-        // with A as `expect`, never with a second `None` TOFU expectation.
-        assert_eq!(creds.host_key.as_deref(), Some("SHA256:fingerprint-a"));
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            [
-                "shared-acquire",
-                "decrypt-unpinned",
-                "shared-drop",
-                "exclusive-acquire",
-                "decrypt-pinned",
-            ]
-        );
-        drop(lease);
-        assert_eq!(events.lock().unwrap().last(), Some(&"exclusive-drop"));
-    }
-
-    #[test]
-    fn malformed_v3_lock_recovery_is_fail_closed_unless_deletion_succeeds() {
-        let recovered = recover_invalid_daemon_lock_read::<u8, _, _>(
-            Err(anyhow::anyhow!("malformed lock")),
-            || Ok(true),
-            || Ok(None),
-        )
-        .unwrap();
-        assert!(recovered.is_none());
-
-        let shadowed_legacy = recover_invalid_daemon_lock_read::<u8, _, _>(
-            Err(anyhow::anyhow!("malformed hashed lock")),
-            || Ok(true),
-            || Ok(Some(7)),
-        )
-        .unwrap();
-        assert_eq!(shadowed_legacy, Some(7));
-
-        let reread_error = recover_invalid_daemon_lock_read::<u8, _, _>(
-            Err(anyhow::anyhow!("malformed hashed lock")),
-            || Ok(true),
-            || Err(anyhow::anyhow!("legacy bearer-token lock remains")),
-        )
-        .unwrap_err();
-        assert!(reread_error.to_string().contains("legacy bearer-token"));
-
-        let leased = recover_invalid_daemon_lock_read::<u8, _, _>(
-            Err(anyhow::anyhow!("malformed lock")),
-            || Ok(false),
-            || panic!("ineligible cleanup must not reread"),
-        )
-        .unwrap_err();
-        assert!(leased.to_string().contains("not eligible"));
-
-        let unsafe_cleanup = recover_invalid_daemon_lock_read::<u8, _, _>(
-            Err(anyhow::anyhow!("malformed lock")),
-            || Err(anyhow::anyhow!("active lease")),
-            || panic!("failed cleanup must not reread"),
-        )
-        .unwrap_err();
-        assert!(unsafe_cleanup.to_string().contains("active lease"));
-    }
-
-    #[test]
     fn daemon_uptime_arithmetic_is_saturating_and_nonnegative() {
         assert_eq!(elapsed_nonnegative_seconds(10, 3), 7);
         assert_eq!(elapsed_nonnegative_seconds(3, 10), 0);
@@ -5030,20 +4514,6 @@ mod tests {
         }
         assert_eq!(terminal_safe_field("普通 Unicode"), "普通 Unicode");
         assert_eq!(daemon_down_line(hostile, true), "daemon stopped");
-    }
-
-    #[tokio::test]
-    async fn client_daemon_protocol_helper_uses_v5_mutual_authentication() {
-        let (mut client, mut server) = tokio::io::duplex(8 * 1024);
-        let token = crate::vault::new_ipc_token();
-        let call_key = crate::vault::ProfileCallKey::from_bytes_for_test([0x5a; 32]);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-        let (client_result, server_result) = tokio::join!(
-            authenticate_connected_daemon(&mut client, "prod", &token, deadline, |_| Ok(())),
-            ipc::authenticate_server(&mut server, "prod", &token, &call_key, deadline),
-        );
-        client_result.unwrap();
-        server_result.unwrap();
     }
 
     #[tokio::test]
@@ -5143,28 +4613,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identity_mismatch_sends_no_authentication_or_business_bytes() {
-        let (mut client, mut observer) = tokio::io::duplex(1024);
-        let token = crate::vault::new_ipc_token();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-
-        let error = authenticate_connected_daemon(&mut client, "prod", &token, deadline, |_| {
-            Err(anyhow::anyhow!("simulated daemon PID mismatch"))
-        })
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("PID mismatch"));
-
-        let mut byte = [0_u8; 1];
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            observer.read(&mut byte),
-        )
-        .await
-        .is_err());
-    }
-
-    #[tokio::test]
     async fn command_output_is_flushed_before_the_cli_exits() {
         let output = CommandOutput {
             stdout: b"short stdout".to_vec(),
@@ -5260,32 +4708,6 @@ mod tests {
             .contains("inspect the target before retry"));
     }
 
-    #[test]
-    fn direct_upload_finished_error_becomes_unknown_only_after_commit_started() {
-        let precommit = classify_direct_upload_finished_error(
-            anyhow::anyhow!("definite precommit failure"),
-            false,
-            "/evidence.bin",
-        )
-        .unwrap_err();
-        assert!(!precommit.is::<UploadCommitOutcomeUnknown>());
-        assert!(precommit.to_string().contains("definite precommit failure"));
-
-        let commit_phase = classify_direct_upload_finished_error(
-            anyhow::anyhow!("server closed before commit response"),
-            true,
-            "/evidence.bin",
-        )
-        .unwrap_err();
-        assert!(commit_phase.is::<UploadCommitOutcomeUnknown>());
-        assert!(commit_phase
-            .to_string()
-            .contains("server closed before commit response"));
-        assert!(commit_phase
-            .to_string()
-            .contains("inspect /evidence.bin before retry"));
-    }
-
     #[tokio::test]
     async fn lost_shutdown_ack_reconciles_when_the_runtime_lock_disappears() {
         let (mut client, mut daemon) = tokio::io::duplex(1024);
@@ -5294,14 +4716,18 @@ mod tests {
                 ipc::read_frame_limited(&mut daemon, ipc::MAX_CONTROL_FRAME)
                     .await
                     .unwrap(),
-                Some(Frame::Shutdown)
+                Some(Frame::Shutdown { .. })
             ));
             // Dropping without Ack models a daemon that consumed Shutdown and
             // released its runtime lock before the response reached us.
         });
         let mut shutdown_sent = false;
+        let request = Frame::Shutdown {
+            passphrase: "profile-passphrase".into(),
+        };
         let exchange = shutdown_daemon_exchange(
             &mut client,
+            &request,
             &mut shutdown_sent,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
@@ -5319,16 +4745,23 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_submission_tracks_only_a_complete_request_frame() {
+        let request = Frame::Shutdown {
+            passphrase: "profile-passphrase".into(),
+        };
         let expired_deadline = tokio::time::Instant::now() - Duration::from_millis(1);
         let mut expired_writer = FailAfterBytesWriter {
             fail_after: usize::MAX,
             ..FailAfterBytesWriter::default()
         };
         let mut expired_sent = false;
-        let expired =
-            write_shutdown_request_until(&mut expired_writer, &mut expired_sent, expired_deadline)
-                .await
-                .unwrap_err();
+        let expired = write_shutdown_request_until(
+            &mut expired_writer,
+            &request,
+            &mut expired_sent,
+            expired_deadline,
+        )
+        .await
+        .unwrap_err();
         assert!(!expired_sent);
         assert_eq!(expired_writer.poll_writes, 0);
         assert!(format!("{expired:#}").contains("deadline"));
@@ -5340,6 +4773,7 @@ mod tests {
         let mut partial_sent = false;
         let partial = write_shutdown_request_until(
             &mut partial_writer,
+            &request,
             &mut partial_sent,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
@@ -5357,6 +4791,7 @@ mod tests {
         let mut complete_sent = false;
         let flush = write_shutdown_request_until(
             &mut flush_writer,
+            &request,
             &mut complete_sent,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
@@ -5372,74 +4807,33 @@ mod tests {
         );
     }
 
-    fn shutdown_test_lock(token: &str) -> LockInfo {
-        LockInfo {
-            profile: "shutdown-test".into(),
-            protocol: crate::ipc::IPC_PROTOCOL_VERSION,
-            pid: 42,
-            port: 0,
-            endpoint: "test-endpoint".into(),
-            host: String::new(),
-            user: String::new(),
-            started_unix: 1,
-            token: token.into(),
-        }
-    }
-
-    #[test]
-    fn shutdown_lock_generation_is_bound_to_the_authenticated_token() {
-        assert_eq!(
-            classify_shutdown_lock_generation(
-                Some(shutdown_test_lock("generation-a")),
-                "generation-a"
-            ),
-            ShutdownLockObservation::ExpectedGeneration
-        );
-        assert_eq!(
-            classify_shutdown_lock_generation(
-                Some(shutdown_test_lock("generation-b")),
-                "generation-a"
-            ),
-            ShutdownLockObservation::ReplacementGeneration
-        );
-        assert_eq!(
-            classify_shutdown_lock_generation(None, "generation-a"),
-            ShutdownLockObservation::Absent
-        );
-    }
-
     #[tokio::test(flavor = "current_thread")]
-    async fn absent_lock_waits_for_the_expected_daemon_lease_to_release() {
-        let released = Arc::new(AtomicBool::new(false));
+    async fn absent_daemon_waits_for_the_runtime_state_to_clear() {
+        let exited = Arc::new(AtomicBool::new(false));
         let probe_started = Arc::new(Notify::new());
-        let release_flag = Arc::clone(&released);
-        let release_started = Arc::clone(&probe_started);
+        let exit_flag = Arc::clone(&exited);
+        let exit_started = Arc::clone(&probe_started);
         let releaser = tokio::spawn(async move {
-            release_started.notified().await;
+            exit_started.notified().await;
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-            release_flag.store(true, Ordering::Release);
+            exit_flag.store(true, Ordering::Release);
         });
-        let probe_flag = Arc::clone(&released);
+        let probe_flag = Arc::clone(&exited);
         let probe_notice = Arc::clone(&probe_started);
         let started = tokio::time::Instant::now();
 
-        wait_for_daemon_lock_release_with(
-            "shutdown-test",
-            std::time::Duration::from_secs(1),
-            |_| async { Ok(ShutdownLockObservation::Absent) },
-            move |_| {
-                let released = Arc::clone(&probe_flag);
-                let probe_started = Arc::clone(&probe_notice);
-                async move {
-                    if released.load(Ordering::Acquire) {
-                        Ok(RuntimeLeaseLiveness::Released)
-                    } else {
-                        probe_started.notify_one();
-                        Ok(RuntimeLeaseLiveness::Held)
-                    }
+        wait_for_daemon_absent_until(std::time::Duration::from_secs(1), move |_| {
+            let exited = Arc::clone(&probe_flag);
+            let probe_started = Arc::clone(&probe_notice);
+            async move {
+                if exited.load(Ordering::Acquire) {
+                    Ok(true)
+                } else {
+                    probe_started.notify_one();
+                    Ok(false)
                 }
-            },
-        )
+            }
+        })
         .await
         .unwrap();
 
@@ -5448,29 +4842,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn replacement_daemon_generation_completes_old_shutdown_reconciliation() {
+    async fn runtime_state_clearing_ends_the_shutdown_wait() {
         let observations = Arc::new(AtomicUsize::new(0));
         let observation_count = Arc::clone(&observations);
         let started = tokio::time::Instant::now();
-        wait_for_daemon_lock_release_with(
-            "shutdown-test",
-            std::time::Duration::from_secs(1),
-            move |_| {
-                let observation = observation_count.fetch_add(1, Ordering::Relaxed);
-                async move {
-                    Ok(if observation == 0 {
-                        ShutdownLockObservation::ExpectedGeneration
-                    } else {
-                        ShutdownLockObservation::ReplacementGeneration
-                    })
-                }
-            },
-            |_| async {
-                Err(anyhow::anyhow!(
-                    "replacement must not require a lease probe"
-                ))
-            },
-        )
+        wait_for_daemon_absent_until(std::time::Duration::from_secs(1), move |_| {
+            let observation = observation_count.fetch_add(1, Ordering::Relaxed);
+            async move { Ok(observation > 0) }
+        })
         .await
         .unwrap();
 
@@ -5479,25 +4858,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn lease_probe_io_error_never_counts_as_shutdown_success() {
-        let error = wait_for_daemon_lock_release_with(
-            "shutdown-test",
-            std::time::Duration::from_secs(1),
-            |_| async { Ok(ShutdownLockObservation::Absent) },
-            |_| async { Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()) },
-        )
+    async fn exit_probe_io_error_never_counts_as_shutdown_success() {
+        let error = wait_for_daemon_absent_until(std::time::Duration::from_secs(1), |_| async {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        })
         .await
         .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("probe runtime lease for 'shutdown-test'"));
+        assert!(error.to_string().contains("probe daemon exit"));
     }
 
     #[test]
     fn daemon_lock_release_wait_covers_bounded_shutdown_cleanup() {
         assert!(DAEMON_LOCK_RELEASE_TIMEOUT >= std::time::Duration::from_secs(10));
         assert!(DAEMON_LOCK_RELEASE_TIMEOUT <= std::time::Duration::from_secs(12));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_stdio_gateway_reports_invalid_request_lines_without_a_daemon() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "serctl-agent-gateway-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let grant = serctl_protocol::grant::OperationGrant {
+            grant_id: [1_u8; 16],
+            profile_name: "prod".into(),
+            profile_id: [2_u8; 16],
+            operations: vec!["ssh.exec".into()],
+            budget: 1,
+            issued_unix_ms: 0,
+            expires_unix_ms: u64::MAX / 2,
+            holder_key: [0_u8; 32],
+        };
+        let file = AgentGrantFile {
+            grant,
+            agent_key: B64.encode([7_u8; 32]),
+        };
+        let path = base.join("agent-grant.json");
+        super::write_agent_grant_file(&path, &serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let (mut input, output) = tokio::io::duplex(1024);
+        input.write_all(b"not-json\n").await.unwrap();
+        input.write_all(b"\n").await.unwrap();
+        drop(input);
+        let mut captured = Vec::new();
+        agent_stdio_loop_with(output, &mut captured, &path)
+            .await
+            .unwrap();
+        let line: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+        assert_eq!(line["request_id"], 0);
+        assert_eq!(line["ok"], false);
+        assert!(line["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("invalid request")));
+        // Empty lines are skipped, so exactly one result line was emitted.
+        assert_eq!(captured.iter().filter(|byte| **byte == b'\n').count(), 1);
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5936,7 +5360,7 @@ mod tests {
     async fn every_route_rejects_invalid_commands_and_paths_before_io() {
         let timeout = std::time::Duration::from_secs(1);
         let deadline = tokio::time::Instant::now() + timeout;
-        let oversized_command = "x".repeat(crate::ssh::MAX_REMOTE_COMMAND_BYTES + 1);
+        let oversized_command = "x".repeat(serctl_core::ssh::MAX_REMOTE_COMMAND_BYTES + 1);
         assert!(exec_capture_with_timeout_inner(
             "profile-that-must-not-be-read",
             &oversized_command,
@@ -6183,7 +5607,7 @@ mod tests {
             80,
             move |path| {
                 worker_gate.block();
-                let file = crate::security::open_regular_file_for_read(&path)?;
+                let file = serctl_core::security::open_regular_file_for_read(&path)?;
                 let size = file.metadata()?.len();
                 worker_finished.store(true, Ordering::Release);
                 Ok((file, size))
@@ -6709,7 +6133,7 @@ mod tests {
         assert!(validated_sftp_timeout_ms(std::time::Duration::ZERO).is_err());
         assert!(validated_sftp_timeout_ms(std::time::Duration::from_millis(1)).is_ok());
         assert!(validated_sftp_timeout_ms(std::time::Duration::from_millis(
-            crate::ipc::MAX_SFTP_TIMEOUT_MS + 1
+            serctl_protocol::MAX_SFTP_TIMEOUT_MS + 1
         ))
         .is_err());
     }

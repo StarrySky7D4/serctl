@@ -1,4 +1,6 @@
-use crate::{client, daemon, ipc, security, vault};
+use crate::client;
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use ed25519_dalek::SigningKey;
 use rand::{rngs::OsRng, RngCore as Rand08RngCore};
 use russh::keys::{
     ssh_key::{self, rand_core},
@@ -9,6 +11,9 @@ use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect};
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version,
 };
+use serctl_core::vault;
+use serctl_daemon::daemon;
+use serctl_protocol as ipc;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,9 +25,7 @@ use zeroize::Zeroizing;
 
 const E2E_PROFILE_PASSPHRASE: &str = "daemon-profile-passphrase";
 const TOFU_PROFILE_PASSPHRASE: &str = "tofu-profile-passphrase";
-const LEGACY_LOCK_PROFILE_PASSPHRASE: &str = "legacy-lock-profile-passphrase";
 const DIRECT_PROFILE_PASSPHRASE: &str = "direct-profile-passphrase";
-const PID_MISMATCH_PROFILE_PASSPHRASE: &str = "pid-mismatch-profile-passphrase";
 const E2E_ADMINISTRATOR_PASSPHRASE: &str = "e2e-administrator-passphrase";
 
 struct CompatibleOsRng(OsRng);
@@ -198,16 +201,6 @@ impl TestState {
         })
         .await;
         assert!(observed.is_err(), "unexpected remote exec during {context}");
-    }
-
-    async fn exec_start_count_after(&self, after: u64, command: &[u8]) -> usize {
-        self.exec_events
-            .lock()
-            .await
-            .started
-            .iter()
-            .filter(|event| event.generation > after && event.command == command)
-            .count()
     }
 
     async fn wait_for_cancel(&self, channel: ExecChannel, context: &str) {
@@ -956,45 +949,6 @@ impl russh_sftp::server::Handler for MemorySftp {
     }
 }
 
-async fn authenticated_stream(endpoint: &str, token: &str) -> anyhow::Result<ipc::ClientStream> {
-    let mut stream = ipc::connect(endpoint).await?;
-    ipc::authenticate_client(
-        &mut stream,
-        "e2e",
-        token,
-        tokio::time::Instant::now() + Duration::from_secs(2),
-    )
-    .await?;
-    Ok(stream)
-}
-
-async fn authorized_stream(
-    endpoint: &str,
-    token: &str,
-    request: &ipc::Frame,
-) -> anyhow::Result<ipc::ClientStream> {
-    let call_key = tokio::task::spawn_blocking(|| {
-        vault::derive_profile_call_key_with_lock_timeout(
-            "e2e",
-            E2E_PROFILE_PASSPHRASE,
-            None,
-            Duration::from_secs(5),
-        )
-    })
-    .await??;
-    let mut stream = ipc::connect(endpoint).await?;
-    ipc::authenticate_client_for_request(
-        &mut stream,
-        "e2e",
-        token,
-        &call_key,
-        request,
-        tokio::time::Instant::now() + Duration::from_secs(2),
-    )
-    .await?;
-    Ok(stream)
-}
-
 async fn assert_tcp_echo(bind_host: &str, bind_port: u16, evidence: &[u8]) {
     let mut stream = tokio::time::timeout(
         Duration::from_secs(2),
@@ -1192,7 +1146,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     let tofu_lease = vault::acquire_runtime_lease(tofu_profile).unwrap();
     let tofu_creds = vault::decrypt(tofu_profile, tofu_passphrase).unwrap();
     let auth_before_failed_pin = state.password_auth_attempts.load(Ordering::SeqCst);
-    let staged = crate::ssh::SshSession::connect_key_exchange_until(
+    let staged = serctl_core::ssh::SshSession::connect_key_exchange_until(
         &tofu_creds,
         None,
         tokio::time::Instant::now() + Duration::from_secs(3),
@@ -1236,21 +1190,71 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     )
     .unwrap();
 
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let daemon_task = tokio::spawn(daemon::run_with_ready_creds_for_test(
-        "e2e",
-        daemon_creds,
-        Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned()),
-        Some(ready_tx),
+    let daemon_instance = ipc::v6::InstanceId::random();
+    let daemon_secret = ipc::v6::ActivationSecret::random();
+    let daemon_task = tokio::spawn(daemon::run_global(
+        daemon_instance,
+        daemon_secret,
+        "e2e-test-commit".to_owned(),
     ));
-    tokio::time::timeout(Duration::from_secs(5), ready_rx)
-        .await
+    let publish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if serctl_core::daemon_runtime::read_descriptor()
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= publish_deadline {
+            panic!("global daemon did not publish its runtime descriptor");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let descriptor = serctl_core::daemon_runtime::read_descriptor()
         .unwrap()
         .unwrap();
-    let lock = vault::read_lock("e2e").unwrap().unwrap();
-    assert_eq!(lock.protocol, ipc::IPC_PROTOCOL_VERSION);
-    assert_eq!(lock.port, 0);
-    assert!(!lock.endpoint.is_empty());
+    assert_eq!(descriptor.pid, std::process::id());
+    assert!(!descriptor.endpoint.is_empty());
+    assert_eq!(descriptor.protocol_min, ipc::v6::IPC_PROTOCOL_VERSION_V6);
+
+    // A wrong profile passphrase is rejected by the broker during the unlock
+    // step, before it can reach SSH. Probe this first: once a profile is
+    // unlocked the process-local mirror skips the unlock round trip.
+    let wrong_status = client::daemon_status("e2e", "definitely-wrong-master")
+        .await
+        .unwrap_err();
+    assert!(wrong_status
+        .to_string()
+        .contains("wrong profile passphrase"));
+    let wrong_passphrase_after = state.latest_exec_generation().await;
+    let wrong_passphrase = client::exec_capture_with_timeout(
+        "e2e",
+        "wrong-master-probe",
+        Some("definitely-wrong-master"),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap_err();
+    assert!(wrong_passphrase
+        .to_string()
+        .contains("wrong profile passphrase"));
+    state
+        .assert_no_exec_start(
+            wrong_passphrase_after,
+            b"wrong-master-probe",
+            "wrong-profile-passphrase broker unlock",
+        )
+        .await;
+
+    // Unlock through the broker: the pool's credential lease is what blocks
+    // vault mutations while a profile is live and unlocked.
+    assert!(matches!(
+        client::daemon_status("e2e", E2E_PROFILE_PASSPHRASE)
+            .await
+            .unwrap(),
+        Some(client::DaemonStatus { profile, .. }) if profile == "e2e"
+    ));
+
     let mutation_error = vault::update_profile(
         "e2e",
         &vault::Creds {
@@ -1283,167 +1287,6 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         vault_before_daemon_rekey,
         "a contended daemon lease allowed profile rekeying to modify the vault"
     );
-    #[cfg(windows)]
-    assert!(lock.endpoint.starts_with(r"\\.\pipe\serctl-v5-"));
-    #[cfg(unix)]
-    assert!(std::path::Path::new(&lock.endpoint)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("serctl-v5-") && name.ends_with(".sock")));
-
-    let mut rejected = ipc::connect(&lock.endpoint).await.unwrap();
-    let rejected_auth = ipc::authenticate_client(
-        &mut rejected,
-        "e2e",
-        &vault::new_ipc_token(),
-        tokio::time::Instant::now() + Duration::from_secs(2),
-    )
-    .await;
-    assert!(rejected_auth.is_err());
-    // A client that cannot verify the server proof sends no AuthResponse. If
-    // it nevertheless attempts a business frame, the daemon must close the
-    // connection without returning a structured authentication oracle.
-    ipc::write_frame_limited(&mut rejected, &ipc::Frame::Status, ipc::MAX_REQUEST_FRAME)
-        .await
-        .unwrap();
-    match tokio::time::timeout(
-        Duration::from_secs(3),
-        ipc::read_frame_limited(&mut rejected, ipc::MAX_RESPONSE_FRAME),
-    )
-    .await
-    {
-        Ok(Ok(None)) | Ok(Err(_)) => {}
-        Ok(Ok(Some(frame))) => panic!("failed authentication returned a frame: {frame:?}"),
-        Err(_) => panic!("daemon did not close failed authentication promptly"),
-    }
-
-    // Token mutual authentication alone is not a business capability. Even
-    // Status must carry an exact call-key intent, otherwise a same-user
-    // process that copied the protected runtime token could query metadata or
-    // stop the daemon without this profile's passphrase.
-    let mut status_stream = authenticated_stream(&lock.endpoint, &lock.token)
-        .await
-        .unwrap();
-    ipc::write_frame_limited(
-        &mut status_stream,
-        &ipc::Frame::Status,
-        ipc::MAX_CONTROL_FRAME,
-    )
-    .await
-    .unwrap();
-    match tokio::time::timeout(
-        Duration::from_secs(2),
-        ipc::read_frame_limited(&mut status_stream, ipc::MAX_CONTROL_FRAME),
-    )
-    .await
-    {
-        Ok(Ok(None)) | Ok(Err(_)) => {}
-        Ok(Ok(Some(frame))) => panic!("token-only Status returned a business frame: {frame:?}"),
-        Err(_) => panic!("daemon did not close token-only Status promptly"),
-    }
-    assert!(matches!(
-        client::daemon_status("e2e", E2E_PROFILE_PASSPHRASE)
-            .await
-            .unwrap(),
-        Some(client::DaemonStatus { profile, .. }) if profile == "e2e"
-    ));
-    let wrong_status = client::daemon_status("e2e", "definitely-wrong-master")
-        .await
-        .unwrap_err();
-    assert!(wrong_status
-        .to_string()
-        .contains("wrong profile passphrase"));
-
-    // A wrong profile passphrase is rejected by client-side verification before
-    // it connects to IPC. Observe the SSH server rather than trusting only the
-    // returned error: no remote exec request may appear afterward.
-    let wrong_passphrase_after = state.latest_exec_generation().await;
-    let wrong_passphrase = client::exec_capture_with_timeout(
-        "e2e",
-        "wrong-master-probe",
-        Some("definitely-wrong-master"),
-        Duration::from_secs(2),
-    )
-    .await
-    .unwrap_err();
-    assert!(wrong_passphrase
-        .to_string()
-        .contains("wrong profile passphrase"));
-    state
-        .assert_no_exec_start(
-            wrong_passphrase_after,
-            b"wrong-master-probe",
-            "wrong-profile-passphrase daemon authorization",
-        )
-        .await;
-
-    // The authorization commitment covers the complete root frame. Authenticate
-    // for one command and send another; the daemon must close without allowing
-    // the mismatched command to reach SSH.
-    let authorized_intent = ipc::Frame::Exec {
-        cmd: "authorized-intent".into(),
-        timeout_ms: 2_000,
-    };
-    let mut intent_stream = authorized_stream(&lock.endpoint, &lock.token, &authorized_intent)
-        .await
-        .unwrap();
-    let intent_after = state.latest_exec_generation().await;
-    ipc::write_frame(
-        &mut intent_stream,
-        &ipc::Frame::Exec {
-            cmd: "intent-mismatch-probe".into(),
-            timeout_ms: 2_000,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), ipc::read_frame(&mut intent_stream)).await,
-        Ok(Ok(None)) | Ok(Err(_))
-    ));
-    state
-        .assert_no_exec_start(
-            intent_after,
-            b"intent-mismatch-probe",
-            "mismatched IPC request intent",
-        )
-        .await;
-
-    // One authorization context is consumable exactly once. Buffering the
-    // same root frame twice on one authenticated connection must yield one and
-    // only one SSH exec request.
-    let replay_request = ipc::Frame::Exec {
-        cmd: "replay-probe".into(),
-        timeout_ms: 2_000,
-    };
-    let mut replay_stream = authorized_stream(&lock.endpoint, &lock.token, &replay_request)
-        .await
-        .unwrap();
-    let replay_after = state.latest_exec_generation().await;
-    ipc::write_frame(&mut replay_stream, &replay_request)
-        .await
-        .unwrap();
-    let replay_channel = state
-        .wait_for_exec_start(replay_after, b"replay-probe")
-        .await;
-    let _ = ipc::write_frame(&mut replay_stream, &replay_request).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while let Ok(Some(mut frame)) = ipc::read_frame(&mut replay_stream).await {
-            frame.zeroize_sensitive();
-        }
-    })
-    .await
-    .expect("replayed IPC root did not close promptly");
-    assert_eq!(
-        state
-            .exec_start_count_after(replay_after, b"replay-probe")
-            .await,
-        1,
-        "one call authorization executed a replayed root request"
-    );
-    state
-        .wait_for_cancel(replay_channel, "replayed IPC root")
-        .await;
 
     // Daemon-routed local forwarding carries data directly over SSH rather
     // than through IPC. Port zero also proves readiness reports the effective
@@ -1546,7 +1389,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     });
     let overflow_channel = state.wait_for_exec_start(overflow_after, b"overflow").await;
     let overflow = overflow_task.await.unwrap().unwrap_err();
-    assert!(overflow.is::<crate::ssh::ExecOutcomeUnknown>());
+    assert!(overflow.is::<serctl_core::ssh::ExecOutcomeUnknown>());
     assert!(
         overflow.to_string().contains("8 MiB safety limit")
             && overflow.to_string().contains("outcome unknown"),
@@ -1564,7 +1407,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     )
     .await
     .unwrap_err();
-    assert!(disconnected.is::<crate::ssh::ExecOutcomeUnknown>());
+    assert!(disconnected.is::<serctl_core::ssh::ExecOutcomeUnknown>());
     assert!(
         disconnected.to_string().contains("outcome unknown")
             && disconnected
@@ -1603,7 +1446,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     });
     let timeout_channel = state.wait_for_exec_start(timeout_after, b"hang").await;
     let timeout = timeout_task.await.unwrap().unwrap_err();
-    assert!(timeout.is::<crate::ssh::ExecOutcomeUnknown>());
+    assert!(timeout.is::<serctl_core::ssh::ExecOutcomeUnknown>());
     assert!(timeout.to_string().contains("deadline"));
     assert!(timeout
         .to_string()
@@ -1611,85 +1454,6 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     state
         .wait_for_cancel(timeout_channel, "command deadline")
         .await;
-
-    let disconnected_request = ipc::Frame::Exec {
-        cmd: "hang".into(),
-        timeout_ms: 10_000,
-    };
-    let mut disconnected = authorized_stream(&lock.endpoint, &lock.token, &disconnected_request)
-        .await
-        .unwrap();
-    let disconnect_after = state.latest_exec_generation().await;
-    ipc::write_frame(&mut disconnected, &disconnected_request)
-        .await
-        .unwrap();
-    let disconnected_channel = state.wait_for_exec_start(disconnect_after, b"hang").await;
-    disconnected.shutdown().await.unwrap();
-    drop(disconnected);
-    state
-        .wait_for_cancel(disconnected_channel, "IPC client disconnect")
-        .await;
-
-    let daemon_upload_after = state.latest_upload_partial_generation().await;
-    state.sftp_write_hang.store(true, Ordering::SeqCst);
-    state
-        .upload_partial_remove_delay
-        .store(true, Ordering::SeqCst);
-    let timed_upload_request = ipc::Frame::UploadBegin {
-        path: "/daemon-timeout.txt".into(),
-        size: 15,
-        timeout_ms: 100,
-    };
-    let mut timed_upload = authorized_stream(&lock.endpoint, &lock.token, &timed_upload_request)
-        .await
-        .unwrap();
-    ipc::write_frame(&mut timed_upload, &timed_upload_request)
-        .await
-        .unwrap();
-    assert!(matches!(
-        ipc::read_frame(&mut timed_upload).await.unwrap(),
-        Some(ipc::Frame::Ack)
-    ));
-    let daemon_partial = state
-        .wait_for_upload_partial(daemon_upload_after, "/daemon-timeout.txt")
-        .await;
-    assert!(daemon_partial.starts_with("/daemon-timeout.txt.serctl-part-"));
-    ipc::write_frame(
-        &mut timed_upload,
-        &ipc::Frame::UploadChunk {
-            data: b"server evidence".to_vec(),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        ipc::read_frame(&mut timed_upload).await.unwrap(),
-        Some(ipc::Frame::Ack)
-    ));
-    ipc::write_frame(&mut timed_upload, &ipc::Frame::UploadEnd)
-        .await
-        .unwrap();
-    let response = tokio::time::timeout(Duration::from_secs(3), ipc::read_frame(&mut timed_upload))
-        .await
-        .expect("daemon upload cleanup exceeded its bounded grace")
-        .unwrap();
-    assert!(
-        matches!(
-            response,
-            Some(ipc::Frame::Error { ref msg }) if msg.contains("deadline")
-        ),
-        "unexpected timed upload response: {response:?}"
-    );
-    assert!(!state
-        .files
-        .lock()
-        .await
-        .keys()
-        .any(|path| path.starts_with("/daemon-timeout.txt.serctl-part-")));
-    state.sftp_write_hang.store(false, Ordering::SeqCst);
-    state
-        .upload_partial_remove_delay
-        .store(false, Ordering::SeqCst);
 
     let upload_source = test_home.join("evidence.txt");
     std::fs::write(&upload_source, b"server evidence").unwrap();
@@ -1804,45 +1568,6 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     .unwrap();
     assert_eq!(after_large_directory.code, Some(0));
 
-    // A download client that authenticates and then stops reading must lose
-    // only its IPC connection. In particular, filling the local socket/pipe
-    // buffer must not turn the daemon's bounded response-write failure into a
-    // daemon-wide SSH invalidation that disrupts unrelated requests.
-    state
-        .files
-        .lock()
-        .await
-        .insert("/ipc-backpressure.bin".into(), vec![b'b'; 12 * 1024 * 1024]);
-    let ssh_connections_before_backpressure = state.next_connection.load(Ordering::SeqCst);
-    let stalled_download_request = ipc::Frame::Download {
-        path: "/ipc-backpressure.bin".into(),
-        timeout_ms: 10_000,
-    };
-    let mut stalled_download =
-        authorized_stream(&lock.endpoint, &lock.token, &stalled_download_request)
-            .await
-            .unwrap();
-    ipc::write_frame(&mut stalled_download, &stalled_download_request)
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(2_750)).await;
-    drop(stalled_download);
-    let after_backpressure = client::exec_capture_with_timeout(
-        "e2e",
-        "ok",
-        Some(E2E_PROFILE_PASSPHRASE),
-        Duration::from_secs(1),
-    )
-    .await
-    .unwrap();
-    assert_eq!(after_backpressure.code, Some(0));
-    assert_eq!(
-        state.next_connection.load(Ordering::SeqCst),
-        ssh_connections_before_backpressure,
-        "an IPC-only download failure invalidated the shared SSH transport"
-    );
-    state.files.lock().await.remove("/ipc-backpressure.bin");
-
     let download_target = test_home.join("downloaded-evidence.txt");
     assert_eq!(
         client::download_with_timeout_and_master(
@@ -1900,29 +1625,19 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     .unwrap();
     assert_eq!(after_timeout.code, Some(0));
 
-    let shutdown_request = ipc::Frame::Exec {
-        cmd: "hang".into(),
-        timeout_ms: 10_000,
-    };
-    let mut shutdown_exec = authorized_stream(&lock.endpoint, &lock.token, &shutdown_request)
-        .await
-        .unwrap();
     let shutdown_after = state.latest_exec_generation().await;
-    ipc::write_frame(&mut shutdown_exec, &shutdown_request)
-        .await
-        .unwrap();
+    let shutdown_exec_task = tokio::spawn(client::exec_capture_with_timeout(
+        "e2e",
+        "hang",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(10),
+    ));
     let shutdown_channel = state.wait_for_exec_start(shutdown_after, b"hang").await;
 
-    let wrong_shutdown = client::down_quiet("e2e", "definitely-wrong-master")
-        .await
-        .unwrap_err();
-    assert!(wrong_shutdown
-        .to_string()
-        .contains("wrong profile passphrase"));
-    assert!(client::daemon_status("e2e", E2E_PROFILE_PASSPHRASE)
-        .await
-        .unwrap()
-        .is_some());
+    // Shutdown verifies the selected profile passphrase inside the v6 AEAD
+    // channel without opening another SSH connection. The broker drains the
+    // in-flight hang, closes its SSH channel, clears its runtime state, and
+    // exits.
     assert!(client::down_quiet("e2e", E2E_PROFILE_PASSPHRASE)
         .await
         .unwrap());
@@ -1931,328 +1646,40 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .expect("daemon did not drain active handlers during shutdown")
         .unwrap()
         .unwrap();
+    assert!(!client::daemon_is_published().unwrap());
     // The daemon awaits the local channel close, but delivery to the test
     // server's callback crosses the SSH transport task and may be observed a
     // scheduler turn after the daemon future completes.
     state
         .wait_for_cancel(shutdown_channel, "daemon shutdown")
         .await;
-
-    // A malformed current-v5 lock must not become an oracle or a side effect
-    // for an unauthenticated caller. Keep a real local endpoint listening so
-    // the test can prove that a wrong profile passphrase reaches neither IPC nor SSH,
-    // while the protected lock remains byte-for-byte unchanged. Once the
-    // existing profile is authenticated, the same lock is eligible for safe
-    // recovery and the request may proceed over direct SSH.
-    let malformed_token = Zeroizing::new(vault::new_ipc_token());
-    let mut malformed_listener = ipc::LocalListener::bind("e2e", &malformed_token).unwrap();
-    let malformed_lock = vault::LockInfo {
-        profile: "e2e".into(),
-        protocol: ipc::IPC_PROTOCOL_VERSION,
-        pid: std::process::id(),
-        port: 0,
-        endpoint: malformed_listener.endpoint().to_owned(),
-        host: "forbidden-current-v5-metadata".into(),
-        user: String::new(),
-        started_unix: vault::now_unix(),
-        token: malformed_token.as_str().to_owned(),
-    };
-    let malformed_json = Zeroizing::new(serde_json::to_vec(&malformed_lock).unwrap());
-    let malformed_path = vault::lock_path("e2e").unwrap();
-    assert!(
-        !malformed_path.exists(),
-        "daemon shutdown left the e2e runtime lock behind"
-    );
-    security::write_protected_atomic(&malformed_path, &malformed_json).unwrap();
-    let malformed_before = std::fs::read(&malformed_path).unwrap();
-    assert_eq!(malformed_before.as_slice(), malformed_json.as_slice());
-
-    let malformed_exec_after = state.latest_exec_generation().await;
-    let malformed_ssh_connections = state.next_connection.load(Ordering::SeqCst);
-    let malformed_password_attempts = state.password_auth_attempts.load(Ordering::SeqCst);
-    let malformed_wrong_passphrase = client::exec_capture_with_timeout(
-        "e2e",
-        "malformed-lock-wrong-master-probe",
-        Some("definitely-wrong-master"),
-        Duration::from_secs(2),
-    )
-    .await
-    .unwrap_err();
-    let malformed_wrong_passphrase = malformed_wrong_passphrase.to_string();
-    assert!(malformed_wrong_passphrase.contains("wrong profile passphrase"));
-    assert!(!malformed_wrong_passphrase.contains("forbidden remote metadata"));
-    assert!(malformed_path.exists());
-    assert_eq!(std::fs::read(&malformed_path).unwrap(), malformed_before);
-    assert_eq!(
-        state.next_connection.load(Ordering::SeqCst),
-        malformed_ssh_connections,
-        "wrong profile passphrase opened SSH while recovering a malformed lock"
-    );
-    assert_eq!(
-        state.password_auth_attempts.load(Ordering::SeqCst),
-        malformed_password_attempts,
-        "wrong profile passphrase attempted SSH authentication during lock recovery"
-    );
-    state
-        .assert_no_exec_start(
-            malformed_exec_after,
-            b"malformed-lock-wrong-master-probe",
-            "wrong-profile-passphrase malformed-lock recovery",
-        )
-        .await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(75), malformed_listener.accept())
-            .await
-            .is_err(),
-        "wrong profile passphrase connected to the malformed lock's IPC endpoint"
-    );
-    drop(malformed_listener);
-
-    let recovered_direct = client::exec_capture_with_timeout(
-        "e2e",
-        "ok",
-        Some(E2E_PROFILE_PASSPHRASE),
-        Duration::from_secs(3),
-    )
-    .await
-    .unwrap();
-    assert_eq!(recovered_direct.code, Some(0));
-    assert_eq!(recovered_direct.stdout, b"evidence\n");
-    assert!(
-        !malformed_path.exists(),
-        "authenticated recovery left the malformed current-v5 lock behind"
-    );
-
-    // Missing protocol means the legacy bearer-token handshake. It must fail
-    // before even connecting to an endpoint, and diagnostics must not echo the
-    // reusable token.
-    let legacy_profile = "legacy-lock-e2e";
-    vault::create_profile(
-        legacy_profile,
-        &vault::Creds {
-            host: "127.0.0.1".into(),
-            port: ssh_port,
-            user: "tester".into(),
-            password: "password".into(),
-            host_key: Some(fingerprint.clone()),
-        },
-        LEGACY_LOCK_PROFILE_PASSPHRASE,
-        administrator_passphrase,
-    )
-    .unwrap();
-    let legacy_token = Zeroizing::new(vault::new_ipc_token());
-    let mut legacy_listener = ipc::LocalListener::bind(legacy_profile, &legacy_token).unwrap();
-    let legacy_endpoint = legacy_listener.endpoint().to_owned();
-    #[derive(serde::Serialize)]
-    struct LegacyLock<'a> {
-        profile: &'a str,
-        pid: u32,
-        port: u16,
-        endpoint: &'a str,
-        host: &'a str,
-        user: &'a str,
-        started_unix: i64,
-        token: &'a str,
-    }
-    let legacy_json = Zeroizing::new(
-        serde_json::to_vec(&LegacyLock {
-            profile: legacy_profile,
-            pid: std::process::id(),
-            port: 0,
-            endpoint: &legacy_endpoint,
-            host: "",
-            user: "",
-            started_unix: vault::now_unix(),
-            token: &legacy_token,
-        })
-        .unwrap(),
-    );
-    let legacy_path = vault::lock_path(legacy_profile).unwrap();
-    std::fs::write(&legacy_path, &legacy_json).unwrap();
-    let legacy_error = client::daemon_status(legacy_profile, LEGACY_LOCK_PROFILE_PASSPHRASE)
+    // The pending client exec observes the broker exit as a disconnect error.
+    let _ = tokio::time::timeout(Duration::from_secs(5), shutdown_exec_task)
         .await
-        .unwrap_err();
-    assert!(legacy_error.to_string().contains("bearer-token IPC"));
-    assert!(!legacy_error.to_string().contains(legacy_token.as_str()));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(75), legacy_listener.accept())
-            .await
-            .is_err()
-    );
+        .expect("hang exec did not settle after daemon shutdown");
 
-    // Protocol v2 used an untagged Error frame for both definite rejection
-    // and post-submit uncertainty. A v5 client must reject its lock before
-    // connecting, disclose no authentication bytes, and retain the evidence
-    // instead of treating it as a malformed current-version lock.
-    let old_v2_lock = vault::LockInfo {
-        profile: legacy_profile.into(),
-        protocol: 2,
-        pid: std::process::id(),
-        port: 0,
-        endpoint: legacy_endpoint.clone(),
-        host: String::new(),
-        user: String::new(),
-        started_unix: vault::now_unix(),
-        token: legacy_token.as_str().to_owned(),
-    };
-    let old_v2_json = Zeroizing::new(serde_json::to_vec(&old_v2_lock).unwrap());
-    std::fs::write(&legacy_path, &old_v2_json).unwrap();
-    let old_v2_error = client::daemon_status(legacy_profile, LEGACY_LOCK_PROFILE_PASSPHRASE)
-        .await
-        .unwrap_err();
-    assert!(old_v2_error
-        .to_string()
-        .contains("unsupported runtime lock IPC protocol 2"));
-    assert!(!old_v2_error.to_string().contains(legacy_token.as_str()));
-    assert!(legacy_path.exists());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(75), legacy_listener.accept())
-            .await
-            .is_err()
-    );
-
-    // Protocol v4 predates the address-free, loopback-only tunnel intent. A
-    // v5 client must reject the old lock before connecting, sending an auth
-    // hello, or silently falling back to direct SSH.
-    let old_v4_lock = vault::LockInfo {
-        profile: legacy_profile.into(),
-        protocol: 4,
-        pid: std::process::id(),
-        port: 0,
-        endpoint: legacy_endpoint.clone(),
-        host: String::new(),
-        user: String::new(),
-        started_unix: vault::now_unix(),
-        token: legacy_token.as_str().to_owned(),
-    };
-    let old_v4_json = Zeroizing::new(serde_json::to_vec(&old_v4_lock).unwrap());
-    std::fs::write(&legacy_path, &old_v4_json).unwrap();
-    let old_v4_error = client::daemon_status(legacy_profile, LEGACY_LOCK_PROFILE_PASSPHRASE)
-        .await
-        .unwrap_err();
-    assert!(old_v4_error
-        .to_string()
-        .contains("unsupported runtime lock IPC protocol 4"));
-    assert!(!old_v4_error.to_string().contains(legacy_token.as_str()));
-    assert!(legacy_path.exists());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(75), legacy_listener.accept())
-            .await
-            .is_err()
-    );
-
-    // A malformed current-v5 lock in the hashed namespace is recoverable only
-    // after the client obtains the exclusive runtime lease. Endpoint mismatch
-    // is then deleted without connecting or sending authentication bytes.
-    let tampered_lock = vault::LockInfo {
-        profile: legacy_profile.into(),
-        protocol: ipc::IPC_PROTOCOL_VERSION,
-        pid: std::process::id(),
-        port: 0,
-        endpoint: format!("{legacy_endpoint}x"),
-        host: String::new(),
-        user: String::new(),
-        started_unix: vault::now_unix(),
-        token: legacy_token.as_str().to_owned(),
-    };
-    let tampered_json = Zeroizing::new(serde_json::to_vec(&tampered_lock).unwrap());
-    std::fs::write(&legacy_path, &tampered_json).unwrap();
-    assert!(
-        client::daemon_status(legacy_profile, LEGACY_LOCK_PROFILE_PASSPHRASE)
-            .await
+    // The broker identity is per-boot: a fresh instance id and activation
+    // secret accompany every startup, so reconnecting after shutdown derives
+    // the whole v6 handshake again instead of reusing any session state.
+    let daemon_instance = ipc::v6::InstanceId::random();
+    let daemon_secret = ipc::v6::ActivationSecret::random();
+    let daemon_task = tokio::spawn(daemon::run_global(
+        daemon_instance,
+        daemon_secret,
+        "e2e-test-commit".to_owned(),
+    ));
+    let publish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if serctl_core::daemon_runtime::read_descriptor()
             .unwrap()
-            .is_none()
-    );
-    assert!(!legacy_path.exists());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(75), legacy_listener.accept())
-            .await
-            .is_err()
-    );
-
-    #[cfg(unix)]
-    {
-        // The raw v1 name is consulted only after the hashed namespace has no
-        // record. A malformed hashed-v5 lock must therefore be removed and
-        // followed by a second read, which exposes (and rejects) this legacy
-        // bearer-token lock instead of silently falling back to direct SSH.
-        let raw_legacy_path = vault::run_dir()
-            .unwrap()
-            .join(format!("{legacy_profile}.lock"));
-        std::fs::write(&raw_legacy_path, &legacy_json).unwrap();
-        std::fs::write(&legacy_path, &tampered_json).unwrap();
-        let shadowed_legacy = client::daemon_status(legacy_profile, LEGACY_LOCK_PROFILE_PASSPHRASE)
-            .await
-            .unwrap_err();
-        assert!(shadowed_legacy.to_string().contains("bearer-token IPC"));
-        assert!(!shadowed_legacy.to_string().contains(legacy_token.as_str()));
-        assert!(!legacy_path.exists());
-        assert!(raw_legacy_path.exists());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(75), legacy_listener.accept())
-                .await
-                .is_err()
-        );
-        std::fs::remove_file(raw_legacy_path).unwrap();
-    }
-
-    #[cfg(windows)]
-    {
-        // Windows exposes the named-pipe server PID reliably. A mismatched
-        // protected-lock PID must stop before AuthHello, and a held daemon
-        // lease must prevent the client from deleting that lock as stale.
-        let profile = "pid-mismatch-e2e";
-        vault::create_profile(
-            profile,
-            &vault::Creds {
-                host: "127.0.0.1".into(),
-                port: ssh_port,
-                user: "tester".into(),
-                password: "password".into(),
-                host_key: Some(fingerprint.clone()),
-            },
-            PID_MISMATCH_PROFILE_PASSPHRASE,
-            administrator_passphrase,
-        )
-        .unwrap();
-        let token = Zeroizing::new(vault::new_ipc_token());
-        let mut fake_listener = ipc::LocalListener::bind(profile, &token).unwrap();
-        let endpoint = fake_listener.endpoint().to_owned();
-        let lease = vault::acquire_runtime_lease(profile).unwrap();
-        let current_pid = std::process::id();
-        let wrong_pid = if current_pid == u32::MAX {
-            current_pid - 1
-        } else {
-            current_pid + 1
-        };
-        vault::write_lock(&vault::LockInfo {
-            profile: profile.into(),
-            protocol: ipc::IPC_PROTOCOL_VERSION,
-            pid: wrong_pid,
-            port: 0,
-            endpoint,
-            host: String::new(),
-            user: String::new(),
-            started_unix: vault::now_unix(),
-            token: token.as_str().to_owned(),
-        })
-        .unwrap();
-
-        let pid_error = client::daemon_status(profile, PID_MISMATCH_PROFILE_PASSPHRASE)
-            .await
-            .unwrap_err();
-        assert!(pid_error.to_string().contains("PID does not match"));
-        let mut fake_server = fake_listener.accept().await.unwrap();
-        assert!(matches!(
-            ipc::read_frame_limited(&mut fake_server, ipc::MAX_AUTH_FRAME).await,
-            Ok(None)
-        ));
-        assert!(vault::read_lock(profile).unwrap().is_some());
-        drop(lease);
-        assert_eq!(
-            vault::reconcile_lock_if_token(profile, &token).unwrap(),
-            vault::LockReconcileOutcome::Removed
-        );
+            .is_some()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= publish_deadline {
+            panic!("second global daemon did not publish its runtime descriptor");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
     let direct_passphrase = DIRECT_PROFILE_PASSPHRASE;
@@ -2347,7 +1774,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     });
     let direct_hang_channel = state.wait_for_exec_start(direct_hang_after, b"hang").await;
     let direct_hang = direct_hang_task.await.unwrap().unwrap_err();
-    assert!(direct_hang.is::<crate::ssh::ExecOutcomeUnknown>());
+    assert!(direct_hang.is::<serctl_core::ssh::ExecOutcomeUnknown>());
     assert!(direct_hang
         .to_string()
         .contains("inspect remote side effects before retry"));
@@ -2369,7 +1796,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .wait_for_exec_start(direct_disconnect_after, b"disconnect")
         .await;
     let direct_disconnect = direct_disconnect_task.await.unwrap().unwrap_err();
-    assert!(direct_disconnect.is::<crate::ssh::ExecOutcomeUnknown>());
+    assert!(direct_disconnect.is::<serctl_core::ssh::ExecOutcomeUnknown>());
     assert!(direct_disconnect
         .to_string()
         .contains("inspect remote side effects before retry"));
@@ -2442,6 +1869,110 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .any(|path| path.starts_with("/direct-timeout.txt.serctl-part-")));
     assert!(!state.files.lock().await.contains_key("/direct-timeout.txt"));
 
+    // ── OperationGrant: issuance, relay, scope, budget, PoP, audit ───────
+    let grant_path = test_home.join("agent-grant.json");
+    let grant = client::issue_grant_until(
+        "direct-e2e",
+        direct_passphrase,
+        vec!["ssh.exec".into(), "sftp.list".into()],
+        3,
+        &grant_path,
+    )
+    .await
+    .unwrap();
+    let (loaded_grant, signing) = client::load_agent_grant(&grant_path).unwrap();
+    assert_eq!(loaded_grant.grant_id, grant.grant_id);
+    assert_eq!(loaded_grant.operations, vec!["ssh.exec", "sftp.list"]);
+
+    // A grant relay executes against the daemon's pooled session.
+    let exec_value = client::agent_exec_until(&loaded_grant, &signing, "ok", 3_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        B64.decode(exec_value["stdout"].as_str().unwrap()).unwrap(),
+        b"evidence\n"
+    );
+    assert_eq!(exec_value["code"], 0);
+
+    // The budget is enforced by the broker: 3 units issued; the second and
+    // third relays are accepted, the fourth is rejected without reaching SSH.
+    assert!(
+        client::agent_exec_until(&loaded_grant, &signing, "ok", 3_000)
+            .await
+            .is_ok()
+    );
+    assert!(
+        client::agent_exec_until(&loaded_grant, &signing, "ok", 3_000)
+            .await
+            .is_ok()
+    );
+    let exec_events_before_budget = state.latest_exec_generation().await;
+    let exhausted = client::agent_exec_until(&loaded_grant, &signing, "ok", 3_000)
+        .await
+        .unwrap_err();
+    assert!(exhausted.to_string().contains("grant budget exhausted"));
+    state
+        .assert_no_exec_start(
+            exec_events_before_budget,
+            b"ok",
+            "budget-exhausted grant relay",
+        )
+        .await;
+
+    // Scope is enforced: a list-only grant cannot relay an exec.
+    let list_grant_path = test_home.join("list-grant.json");
+    client::issue_grant_until(
+        "direct-e2e",
+        direct_passphrase,
+        vec!["sftp.list".into()],
+        1,
+        &list_grant_path,
+    )
+    .await
+    .unwrap();
+    let (list_grant, list_signing) = client::load_agent_grant(&list_grant_path).unwrap();
+    let scope_error = client::agent_exec_until(&list_grant, &list_signing, "ok", 3_000)
+        .await
+        .unwrap_err();
+    assert!(scope_error
+        .to_string()
+        .contains("does not authorize this operation kind"));
+    let listing = client::agent_list_until(&list_grant, &list_signing, "/", 3_000)
+        .await
+        .unwrap();
+    assert!(listing["entries"]
+        .as_array()
+        .is_some_and(|entries| entries.iter().any(|entry| entry["name"] == "evidence.txt")));
+
+    // Proof of possession: a different key cannot relay with this grant.
+    let other_key = SigningKey::generate(&mut OsRng);
+    let pop_error = client::agent_exec_until(&loaded_grant, &other_key, "ok", 3_000)
+        .await
+        .unwrap_err();
+    assert!(pop_error
+        .to_string()
+        .contains("proof-of-possession verification failed"));
+
+    // The audit trail persists accepted relays and rejections.
+    let audit_path = serctl_core::daemon_runtime::grant_audit_path().unwrap();
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(
+        audit.contains("\"accepted\""),
+        "grant audit log is missing accepted relays: {audit}"
+    );
+    assert!(
+        audit.contains("rejected: grant budget exhausted"),
+        "grant audit log is missing budget rejections: {audit}"
+    );
+    assert!(
+        audit.contains("rejected: grant does not authorize this operation kind"),
+        "grant audit log is missing scope rejections: {audit}"
+    );
+    assert!(
+        audit.contains("proof-of-possession verification failed"),
+        "grant audit log is missing proof-of-possession rejections: {audit}"
+    );
+
     // Profile passphrase rotation is isolated: a use lease blocks rekeying
     // only that profile and leaves the vault byte-identical, while another
     // profile can still rotate independently.
@@ -2477,6 +2008,19 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         rotated_tofu_generation
     );
     drop(rekey_use_lease);
+
+    // Rotation of a broker-unlocked profile needs the credential lease
+    // released: stop the broker (it clears its pool on exit) and observe the
+    // descriptor disappear before mutating the vault.
+    assert!(client::down_quiet("direct-e2e", direct_passphrase)
+        .await
+        .unwrap());
+    tokio::time::timeout(Duration::from_secs(5), daemon_task)
+        .await
+        .expect("broker did not stop before profile rotation")
+        .unwrap()
+        .unwrap();
+    assert!(!client::daemon_is_published().unwrap());
 
     let direct_identity = vault::verify_profile_identity("direct-e2e", direct_passphrase).unwrap();
     let rotated_direct_generation = vault::change_profile_passphrase(
