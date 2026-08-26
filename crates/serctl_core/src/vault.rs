@@ -44,13 +44,17 @@ const VAULT_FORMAT: u32 = 4;
 const LEGACY_VAULT_FORMAT: u32 = 2;
 const PROFILE_FORMAT_AAD: u8 = 2;
 const PROFILE_FORMAT_ENVELOPE: u8 = 4;
+#[cfg(any(windows, test))]
 const VERIFIER_TEXT: &[u8] = b"serctl-vault-verifier-v2";
+#[cfg(any(windows, test))]
 const VERIFIER_AAD: &[u8] = b"serctl/vault/verifier/v2";
 const PROFILE_CALL_KEY_DOMAIN: &[u8] = b"serctl/ipc/profile-call-key/v5\0";
 const PROFILE_KEY_AAD_DOMAIN: &str = "serctl/profile-key-package/v4";
 const PROFILE_PAYLOAD_AAD_DOMAIN: &str = "serctl/profile-payload/v4";
 const RECOVERY_CONFIG_TAG_DOMAIN: &[u8] = b"serctl/profile-recovery-config-tag/v4\0";
+#[cfg(any(windows, test))]
 const ADMIN_MARKER: &[u8] = b"serctl/windows-admin-policy/v4";
+#[cfg(any(windows, test))]
 const ADMIN_AAD_DOMAIN: &str = "serctl/admin-local-recovery-share/v4";
 const MAX_VAULT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LOCK_BYTES: u64 = 64 * 1024;
@@ -109,7 +113,6 @@ pub(crate) struct AuthorizedProfileMetadata {
 /// lifetime, so an exclusive master rotation cannot overlap credential use.
 pub struct ProfileLease {
     name: String,
-    exclusive: bool,
     profile: File,
     barrier: File,
 }
@@ -124,9 +127,9 @@ impl ProfileLease {
         barrier
     }
 
-    fn require_exclusive_profile(&self, expected: &str) -> Result<()> {
-        if self.name != expected || !self.exclusive {
-            bail!("exclusive profile lease does not authorize mutation of '{expected}'");
+    fn require_profile(&self, expected: &str) -> Result<()> {
+        if self.name != expected {
+            bail!("profile lease does not authorize TOFU pinning for '{expected}'");
         }
         Ok(())
     }
@@ -328,6 +331,7 @@ pub enum MigrationProgress {
     CommittingVault,
 }
 
+#[cfg(any(windows, test))]
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct AdminSecret {
     marker: Vec<u8>,
@@ -486,6 +490,7 @@ fn runtime_lease_path(profile: &str) -> Result<PathBuf> {
     Ok(run_dir()?.join(format!("{}.lease", hex::encode(digest))))
 }
 
+#[cfg(any(windows, test))]
 fn existing_runtime_lease_path(profile: &str) -> Result<PathBuf> {
     let digest = Sha256::digest(profile.as_bytes());
     Ok(run_dir_path()?.join(format!("{}.lease", hex::encode(digest))))
@@ -507,6 +512,7 @@ fn open_runtime_lease_file(profile: &str) -> Result<File> {
         .with_context(|| format!("open runtime lease {}", path.display()))
 }
 
+#[cfg(any(windows, test))]
 fn open_existing_runtime_lease_file(profile: &str) -> Result<Option<File>> {
     let path = existing_runtime_lease_path(profile)?;
     security::open_existing_protected_file(&path)
@@ -524,6 +530,7 @@ fn acquire_runtime_barrier_shared() -> Result<File> {
     }
 }
 
+#[cfg(any(windows, test))]
 fn acquire_runtime_barrier_exclusive() -> Result<File> {
     let barrier = open_runtime_barrier_file()?;
     match barrier.try_lock_exclusive() {
@@ -600,7 +607,6 @@ pub fn acquire_runtime_lease(profile: &str) -> Result<ProfileLease> {
     }
     Ok(ProfileLease {
         name: profile.to_owned(),
-        exclusive: true,
         profile: file,
         barrier,
     })
@@ -622,7 +628,6 @@ pub fn acquire_profile_use_lease(profile: &str) -> Result<ProfileLease> {
     }
     Ok(ProfileLease {
         name: profile.to_owned(),
-        exclusive: false,
         profile: file,
         barrier,
     })
@@ -638,7 +643,6 @@ fn acquire_profile_mutation_lease(profile: &str) -> Result<ProfileLease> {
     )?;
     Ok(ProfileLease {
         name: profile.to_owned(),
-        exclusive: true,
         profile: profile_file,
         barrier,
     })
@@ -1149,6 +1153,7 @@ fn derive_key(master: &[u8], salt: &[u8], config: &KdfConfig) -> Result<Zeroizin
     Ok(output)
 }
 
+#[cfg(any(windows, test))]
 fn vault_key(vault: &VaultFile, master: &str) -> Result<Zeroizing<[u8; 32]>> {
     let salt = B64.decode(&vault.salt).context("decode vault salt")?;
     let config = vault.kdf.clone().unwrap_or_default();
@@ -1177,6 +1182,7 @@ fn decode_nonce(encoded: &str) -> Result<[u8; 12]> {
         .map_err(|_| anyhow!("AEAD nonce must be exactly 12 bytes"))
 }
 
+#[cfg(any(windows, test))]
 fn profile_aad(name: &str, host: &str, port: u16) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&(
         "serctl/profile/v2",
@@ -1186,6 +1192,7 @@ fn profile_aad(name: &str, host: &str, port: u16) -> Result<Vec<u8>> {
     ))?)
 }
 
+#[cfg(any(windows, test))]
 fn reject_legacy_profile_for_network(name: &str, encrypted: &EncProfile) -> Result<()> {
     match encrypted.format {
         PROFILE_FORMAT_AAD => Ok(()),
@@ -1200,6 +1207,7 @@ fn reject_legacy_profile_for_network(name: &str, encrypted: &EncProfile) -> Resu
 /// Decrypt a v2 profile for normal use. The format check intentionally runs
 /// before nonce/ciphertext decoding so no legacy credential can be returned,
 /// even if an attacker has modified its host, port, pin, or encrypted body.
+#[cfg(any(windows, test))]
 fn decrypt_profile_with_key(name: &str, encrypted: &EncProfile, key: &[u8; 32]) -> Result<Creds> {
     reject_legacy_profile_for_network(name, encrypted)?;
     let creds = decrypt_profile_payload_with_key(name, encrypted, key)?;
@@ -1211,6 +1219,7 @@ fn decrypt_profile_with_key(name: &str, encrypted: &EncProfile, key: &[u8; 32]) 
 /// Raw legacy decryption exists only to verify a master passphrase before an
 /// offline replacement. Callers must never return this plaintext for SSH or
 /// inherit its unauthenticated host-key pin.
+#[cfg(any(windows, test))]
 fn decrypt_profile_payload_with_key(
     name: &str,
     encrypted: &EncProfile,
@@ -1343,6 +1352,7 @@ fn canonical_recovery_config(
     )
 }
 
+#[cfg(any(windows, test))]
 fn recovery_config_digest(config: &crate::recovery::RecoveryConfig) -> Result<[u8; 32]> {
     let canonical = canonical_recovery_config(config)?;
     Ok(Sha256::digest(canonical.as_slice()).into())
@@ -1672,6 +1682,7 @@ fn profile_call_key_v3(
     Ok(ProfileCallKey(key))
 }
 
+#[cfg(any(windows, test))]
 fn verify_master(vault: &VaultFile, key: &[u8; 32]) -> Result<()> {
     let Some(verifier) = &vault.verifier else {
         // Legacy vaults had no verifier. Successfully decrypting one existing
@@ -1916,6 +1927,7 @@ fn next_generation(current: u64) -> Result<u64> {
         .ok_or_else(|| anyhow!("profile generation is exhausted"))
 }
 
+#[cfg(any(windows, test))]
 fn admin_aad(recovery_id: &str) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&(ADMIN_AAD_DOMAIN, recovery_id))?)
 }
@@ -3183,10 +3195,14 @@ pub fn set_pinned_fp_with_lock_timeout(
     lock_timeout: Duration,
     profile_lease: &ProfileLease,
 ) -> Result<()> {
-    // Require the caller's barrier-backed lifetime lease instead of acquiring
-    // a second barrier after the profile lock. This preserves the one global-
-    // before-profile-before-vault lock order.
-    profile_lease.require_exclusive_profile(name)?;
+    // Require the caller's barrier-backed lease for this exact profile instead
+    // of acquiring a second barrier after the profile lock. A shared use lease
+    // is deliberately sufficient for this one mutation: TOFU only fills an
+    // absent pin, preserves package identity/generation, authenticates again
+    // under the exclusive vault-file lock, and rejects a concurrently stored
+    // different fingerprint. Ordinary profile edits still require the
+    // exclusive mutation lease.
+    profile_lease.require_profile(name)?;
     mutate_vault_with_lock_timeout(lock_timeout, |vault| {
         require_v3(vault)?;
         let encrypted = vault
@@ -3237,6 +3253,7 @@ fn verify_master_passphrase_from_vault(vault: &VaultFile, master: &str) -> Resul
     verify_master(vault, &key)
 }
 
+#[cfg(any(windows, test))]
 fn verify_established_master_for_rekey(vault: &VaultFile, master: &str) -> Result<()> {
     if vault.verifier.is_none() && vault.profiles.is_empty() {
         bail!("the empty vault has no established master passphrase to change");
@@ -3245,6 +3262,7 @@ fn verify_established_master_for_rekey(vault: &VaultFile, master: &str) -> Resul
     verify_master(vault, &key)
 }
 
+#[cfg(any(windows, test))]
 fn ensure_no_legacy_profile_lease_contention(
     profiles: &BTreeMap<String, EncProfile>,
 ) -> Result<()> {

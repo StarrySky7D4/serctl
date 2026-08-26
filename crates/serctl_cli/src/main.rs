@@ -83,7 +83,7 @@ enum Cmd {
         #[command(subcommand)]
         command: RecoveryCommand,
     },
-    /// Start the global broker and unlock one profile (foreground; Ctrl-C to stop).
+    /// Start the global broker in the foreground; profiles unlock per request.
     Up { name: Option<String> },
     /// Run a remote command through the on-demand global broker.
     Exec {
@@ -127,7 +127,7 @@ enum Cmd {
     /// Issue a bounded 30-minute OperationGrant for an agent frontend.
     GrantIssue {
         name: String,
-        /// Comma-separated operation kinds (exec, status, list, read, write, forward).
+        /// Comma-separated protocol operation kinds (for example ssh.exec or sftp.list).
         #[arg(long, value_delimiter = ',')]
         operations: Vec<String>,
         /// Maximum number of relayed operations (1..=1000).

@@ -1180,7 +1180,10 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         port: ssh_port,
         user: "tester".into(),
         password: "password".into(),
-        host_key: Some(fingerprint.clone()),
+        // Exercise the global-daemon first-use TOFU path. Its barrier-backed
+        // shared profile lease must permit this identity-preserving pin write
+        // before SSH password authentication.
+        host_key: None,
     };
     vault::create_profile(
         "e2e",
@@ -1254,6 +1257,14 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             .unwrap(),
         Some(client::DaemonStatus { profile, .. }) if profile == "e2e"
     ));
+    assert_eq!(
+        vault::decrypt("e2e", E2E_PROFILE_PASSPHRASE)
+            .unwrap()
+            .host_key
+            .as_deref(),
+        Some(fingerprint.as_str()),
+        "global daemon did not persist the first-use host-key pin"
+    );
 
     let mutation_error = vault::update_profile(
         "e2e",

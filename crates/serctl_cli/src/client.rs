@@ -1832,8 +1832,8 @@ pub(crate) async fn list_dir_at_generation(
     path: &str,
     master: &str,
     expected_generation: vault::ProfileIdentity,
+    timeout: Duration,
 ) -> Result<(String, Vec<RemoteEntry>)> {
-    let timeout = Duration::from_millis(ipc::DEFAULT_SFTP_TIMEOUT_MS);
     let timeout_ms = validated_sftp_timeout_ms(timeout)?;
     let deadline = tokio::time::Instant::now() + timeout;
     list_dir_inner(

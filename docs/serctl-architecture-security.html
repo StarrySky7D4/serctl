@@ -269,7 +269,7 @@ AuthSeed + name + profile_id + generation ── HMAC domain separation ── c
           <li>生成 instance id 与 256-bit activation secret；descriptor 只公开 PID/endpoint/protocol/build，secret 通过 stdin 引导并单独保存为受保护文件。</li>
           <li>绑定 Named Pipe/Unix Socket、发布 runtime 状态并进入 64 连接/8 重结果槽/8 tunnel-control accept loop；所有远程操作只走该 broker。</li>
           <li>首次 unlock 某 profile 时，在 v6 AEAD 内验证其口令并建立 SSH session/排他 lease；TOFU pin 持久化成功后才发送 SSH 密码。</li>
-          <li>profile pool 和 grant registry 每秒主动回收过期项；工作计数持续为空十分钟后 broker 自动退出并清除 runtime 状态。</li>
+          <li>profile pool 和 grant registry 每秒主动回收过期项；每个未过期 OperationGrant 都持有工作计数引用，防止 broker 在能力仍有效时空闲退出。最后一个 Grant/连接/长操作释放后，工作计数持续为空十分钟，broker 才自动退出并清除 runtime 状态。</li>
         </ol>
         <h3>IPC v6 互认证与 profile 调用授权</h3>
         <ol>
@@ -466,7 +466,7 @@ daemon  → V6Challenge(server nonce, transcript MAC)
 client  → V6Finish(transcript MAC)
 daemon  ↔ direction-separated AEAD frames with strict counters</code></pre>
         <p>HKDF-SHA256 从每次握手 transcript 派生 c2d/d2c 独立密钥；方向字节、计数器、版本、instance 与长度进入 nonce/AAD。重放、乱序、截断、篡改和 instance 错配均失败关闭。prelude 提交 operation kind 与实际根帧 SHA-256，一个连接只允许一个根请求。</p>
-        <p>激活密钥只建立安全通道。普通 profile 请求另以从 <code>AuthSeed + name + profile_id + generation</code> 派生的短期 call key，对除 proof 自身外的完整 prelude 做 HMAC-SHA256；daemon 核对 profile name/id、proof 和根帧 hash 后才调度业务。OperationGrant 则以 Ed25519 PoP 绑定完整 prelude、profile name/id、scope、budget、非零 deadline 与 30 分钟 TTL；registry 上限 1024 并主动清理。</p>
+        <p>激活密钥只建立安全通道。普通 profile 请求另以从 <code>AuthSeed + name + profile_id + generation</code> 派生的短期 call key，对除 proof 自身外的完整 prelude 做 HMAC-SHA256；daemon 核对 profile name/id、proof 和根帧 hash 后才调度业务。OperationGrant 则以 Ed25519 PoP 绑定完整 prelude、profile name/id、scope、budget、非零 deadline 与 30 分钟 TTL；registry 上限 1024 并主动清理。未过期 Grant 阻止自动空闲退出，但 registry 仍有意只存在于当前 daemon 实例：人工重启、升级或崩溃后必须重新签发，磁盘 Grant 文件不会被新实例直接恢复为授权。未知 Grant 与已过期 Grant 使用不同错误语义。</p>
         <div class="callout"><strong>控制请求同样授权：</strong><code>Status</code> 必须携带 profile proof；<code>Shutdown</code> 在 v6 AEAD 内重新验证所选 profile 口令，不建立新的 SSH 连接。仅窃取激活密钥不能操作已解锁 profile，也不能停机。</div>
         <div class="callout warn"><strong>升级边界：</strong>v6 全局 broker 没有旧 per-profile v5/v4 dual-stack，也没有 direct fallback。必须先用与活动旧 daemon 匹配的旧 binary 正常停止，再整体切换 client/daemon。</div>
         <h3>帧与并发预算</h3>
@@ -793,7 +793,7 @@ Get-FileHash target\release\serctl_cli.exe -Algorithm SHA256</code></pre>
           <li><a href="../build.rs">build.rs</a> — Git provenance 与 Cargo rerun 依赖</li>
           <li><a href="../.gitattributes">.gitattributes</a> — 仓库文本规范化与 LF 策略</li>
         </ul>
-        <p class="small">本文为静态、无脚本、无外部样式依赖的 UTF-8 HTML，可离线打开或打印。内容更新至 2026-08-25 的 vault/record v4、IPC v6 全局 broker、profile proof、OperationGrant、UI 分层限时授权与 loopback-only tunnel 工作树；正式发布仍须提交后 clean 重建并在仓库外交付记录更新制品身份。</p>
+        <p class="small">本文为静态、无脚本、无外部样式依赖的 UTF-8 HTML，可离线打开或打印。内容更新至 2026-08-26 的 vault/record v4、IPC v6 全局 broker、profile proof、OperationGrant、UI 分层限时授权与 loopback-only tunnel 工作树；正式发布仍须提交后 clean 重建并在仓库外交付记录更新制品身份。</p>
       </section>
     </main>
   </div>

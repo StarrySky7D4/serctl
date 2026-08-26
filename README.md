@@ -4,6 +4,8 @@
 
 当前重写版标记为预发布测试版本 **v0.2.0-test.1**；原 main 基线保存在远端 `V1` 分支。测试版本不应替代正式签名发行物。
 
+面向操作者的安装、首次配置、UI/CLI、备份恢复和故障处理流程见 [serctl 使用手册](docs/serctl-user-guide.md)。
+
 当前工作树使用 vault/record v4：每个 profile 有彼此独立的口令、Argon2id KDF、随机 DEK、IPC `AuthSeed` 与随机 128 位 `profile_id`，不存在可解锁全部主机的共享主口令。Windows 另设超管密码并配合离线介质形成 2-of-2 恢复；超管密码本身不能查看现有 profile 口令，也不能单独恢复 SSH 凭据。CLI 的每次远程调用都重新验证目标 profile 口令，桌面 UI 则按 `(name, profile_id, generation)` 保存固定五分钟、非滑动授权。SSH 隧道的所有 listener，以及 L/R 的固定目标地址，都强制为 `127.0.0.1`。实现级说明、威胁边界和验证证据见 [架构、安全与运维说明](docs/serctl-architecture-security.html)。
 
 ## 功能
@@ -91,7 +93,7 @@ $randomReceipt = Join-Path $env:USERPROFILE 'Documents\serctl-prod-passphrase.tx
 | `recovery rotate --old-media FILE --new-media FILE` | Windows：超管密码与旧介质共同认证后，全量原子轮转恢复 envelope；新路径不得存在 |
 | `recovery migrate-v2 --recovery-media FILE` | **仅 Windows**：旧共享 master、逐 profile 新口令、新超管密码与新介质组成全量原子 v2→v4 迁移；Linux 当前无升级路径并失败关闭 |
 | `recovery init NEW_MEDIA` | Linux root 接口；当前后端因缺少 root-owned share store 与目标用户边界而失败关闭 |
-| `up [NAME]` | 验证目标 profile 独立口令后前台启动持久连接 |
+| `up [NAME]` | 前台启动全局 broker；不预解锁 profile，名称参数仅为旧脚本兼容保留 |
 | `exec NAME [--timeout-secs N] -- <CMD...>` | 执行远端命令，默认硬 deadline 为 300 秒 |
 | `upload NAME LOCAL REMOTE [--timeout-secs N]` | 上传普通文件，不覆盖已有远端路径 |
 | `download NAME REMOTE LOCAL [--timeout-secs N]` | 下载文件，不覆盖已有本地路径 |
@@ -102,7 +104,7 @@ $randomReceipt = Join-Path $env:USERPROFILE 'Documents\serctl-prod-passphrase.tx
 | `status [NAME]` | 先离线验证该 profile 的独立口令，再查看 daemon 状态 |
 | `down [NAME]` | 先离线验证该 profile 的独立口令，再停止 daemon |
 
-`up`、`shell`、`status`、`down` 的 `NAME` 省略时为 `default`；`exec`、`upload`、`download`、`tunnel` 要求显式 profile。每个普通 profile 操作、每次 CLI 进程调用都必须重新提供并验证该 profile 的独立口令，不存在跨调用缓存；`list` 和 `admin status` 只读明文目录/策略元数据。`status` / `down` 也必须在 IPC connect 前从目标 profile 的 `AuthSeed` 派生 generation-scoped call key，并以精确 `Status` / `Shutdown` intent 完成协议授权；只有运行锁 token 的进程不能查询或停止 daemon。shell/隧道建立后，单个会话内不会按按键或每条 TCP 流重复询问。
+`shell`、`status`、`down` 的 `NAME` 省略时为 `default`；`up` 的可选名称参数仅为旧脚本兼容保留，当前全局 broker 不按名称预解锁 profile；`exec`、`upload`、`download`、`tunnel` 要求显式 profile。每个普通 profile 操作、每次 CLI 进程调用都必须重新提供并验证该 profile 的独立口令，不存在跨调用缓存；`list` 和 `admin status` 只读明文目录/策略元数据。`status` / `down` 也必须在 IPC connect 前从目标 profile 的 `AuthSeed` 派生 generation-scoped call key，并以精确 `Status` / `Shutdown` intent 完成协议授权；只有运行锁 token 的进程不能查询或停止 daemon。shell/隧道建立后，单个会话内不会按按键或每条 TCP 流重复询问。
 
 隧道公共选项只有 `--port`（默认 `0`，由系统选端口）和 `--max-connections`（默认 32，硬上限 128）。`--bind`、`--expose` 和 `--target-host` 已删除：L/D 的本地 listener、R 的 SSH 服务端 listener，以及 L/R 的固定目标地址都只能是 `127.0.0.1`；CLI/UI 只接受端口。动态 SOCKS5 使用 `NO AUTH`，每个 CONNECT 目标由本机 SOCKS 客户端请求，可访问已连接 SSH 主机能够到达的任意远端目标；强制回环只阻止代理 listener 直接向 LAN/公网暴露，并不限制代理目标，也不隔离同机进程。
 
@@ -162,7 +164,7 @@ UI 的 profile/admin/editor SSH secret 使用 `MaskedSecretTextBuffer`：egui �
 
 daemon 不监听本机 TCP。Windows 使用拒绝远程客户端的 Named Pipe；每个 pipe instance 在创建时即带禁止继承、仅 owner/SYSTEM/Administrators 可访问的 DACL。Unix 使用 `0700` runtime 目录中的 `0600` Unix Socket。
 
-受保护的 `daemon.secret` 只负责建立 IPC v6 的双向认证 AEAD 通道，不能单独授权 profile 操作或停机。`exec`、目录列出/创建、上传、下载、shell、tunnel、status 与 grant 签发均要求目标 profile 的短期 call key 证明；`down` 则在同一 AEAD 通道内重新验证所选 profile 口令，但不会为停机建立新的 SSH 连接。错误口令不会产生远端副作用。
+受保护的 `daemon.secret` 只负责建立 IPC v6 的双向认证 AEAD 通道，不能单独授权 profile 操作或停机。`exec`、目录列出/创建、上传、下载、shell、tunnel、status 与 grant 签发均要求目标 profile 的短期 call key 证明；`down` 则在同一 AEAD 通道内重新验证所选 profile 口令，但不会为停机建立新的 SSH 连接。错误口令不会产生远端副作用。daemon 签发的未过期 OperationGrant 会持有活跃引用，阻止 daemon 在 Grant 有效期内空闲退出；人工重启、升级或崩溃仍会使旧 Grant 失去进程内登记，新实例不会仅凭磁盘 Grant 文件恢复授权。
 
 客户端连接后先核对 OS 对端身份：Windows Named Pipe server PID 必须等于受保护 descriptor 中的 PID；Unix peer UID 必须等于当前 euid，且 peer PID 必须存在并匹配 descriptor。无法提供 peer PID 的 Unix 目标失败关闭，不降级为仅验证 UID。随后进行 transcript-bound HMAC 双向认证，以 HKDF-SHA256 派生双向独立密钥，并用严格递增计数器 nonce 的 ChaCha20-Poly1305 加密所有业务帧：
 

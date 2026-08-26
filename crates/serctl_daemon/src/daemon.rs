@@ -2019,10 +2019,12 @@ impl ProfilePool {
     }
 }
 
-/// Reference-counted live work: every accepted connection handler and every
-/// long-running operation (tunnel, shell, transfer) holds a guard for its
-/// lifetime. The broker exits only after the counter stays at zero for the
-/// whole idle window, so idle exit can never interrupt work in flight.
+/// Reference-counted live work: every accepted connection handler, every
+/// long-running operation (tunnel, shell, transfer), and every unexpired grant
+/// holds a guard for its lifetime. The broker exits only after the counter
+/// stays at zero for the whole idle window, so idle exit can never interrupt
+/// work in flight or discard a capability it issued while that capability is
+/// still valid.
 #[derive(Default)]
 struct IdleTracker {
     work: AtomicUsize,
@@ -2081,6 +2083,8 @@ const GRANTABLE_OPERATION_KINDS: &[&str] = &[
     "forward",
 ];
 
+const UNKNOWN_GRANT_ERROR: &str = "grant is not registered in this daemon instance; the daemon may have restarted, so reissue the grant";
+
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2090,21 +2094,21 @@ fn now_unix_ms() -> u64 {
 
 /// Live registry of issued grants. Grants die with the daemon instance: a
 /// restart rebinds every capability to a fresh activation secret.
-#[derive(Default)]
 struct GrantRegistry {
     grants: StdMutex<HashMap<[u8; 16], Arc<GrantRecord>>>,
+    idle: Arc<IdleTracker>,
 }
 
 impl GrantRegistry {
-    fn get(&self, grant_id: &[u8; 16]) -> Option<Arc<GrantRecord>> {
-        let mut grants = self.grants.lock().ok()?;
-        let expired = grants
-            .get(grant_id)
-            .is_some_and(|record| record.expires_at <= Instant::now());
-        if expired {
-            grants.remove(grant_id);
+    fn new(idle: Arc<IdleTracker>) -> Self {
+        Self {
+            grants: StdMutex::new(HashMap::new()),
+            idle,
         }
-        grants.get(grant_id).cloned()
+    }
+
+    fn get(&self, grant_id: &[u8; 16]) -> Option<Arc<GrantRecord>> {
+        self.grants.lock().ok()?.get(grant_id).cloned()
     }
 
     fn insert(&self, grant: serctl_protocol::grant::OperationGrant) -> Result<()> {
@@ -2119,7 +2123,11 @@ impl GrantRegistry {
             "grant registry is at its capacity"
         );
         ensure!(!grants.contains_key(&grant.grant_id), "grant id collision");
-        grants.insert(grant.grant_id, Arc::new(GrantRecord::new(grant, now)));
+        let idle_guard = self.idle.acquire();
+        grants.insert(
+            grant.grant_id,
+            Arc::new(GrantRecord::new(grant, now, idle_guard)),
+        );
         Ok(())
     }
 
@@ -2135,6 +2143,7 @@ struct GrantRecord {
     grant: serctl_protocol::grant::OperationGrant,
     remaining: AtomicUsize,
     expires_at: Instant,
+    _idle_guard: IdleGuard,
 }
 
 #[derive(serde::Serialize)]
@@ -2148,11 +2157,16 @@ struct GrantAuditLine {
 }
 
 impl GrantRecord {
-    fn new(grant: serctl_protocol::grant::OperationGrant, issued_at: Instant) -> Self {
+    fn new(
+        grant: serctl_protocol::grant::OperationGrant,
+        issued_at: Instant,
+        idle_guard: IdleGuard,
+    ) -> Self {
         Self {
             remaining: AtomicUsize::new(grant.budget as usize),
             grant,
             expires_at: issued_at + serctl_protocol::grant::GRANT_TTL,
+            _idle_guard: idle_guard,
         }
     }
 
@@ -2381,6 +2395,9 @@ async fn unlock_profile(
     let profile_owned = name.clone();
     let key_passphrase = passphrase.clone();
     let mut snapshot = tokio::task::spawn_blocking(move || {
+        // The global pool permits independent CLI processes to re-verify and
+        // share one live profile session, while the shared use lease still
+        // excludes ordinary profile mutation for the credential lifetime.
         let lease = vault::acquire_profile_use_lease(&profile_owned)?;
         let lock_timeout = deadline
             .checked_duration_since(Instant::now())
@@ -2605,7 +2622,7 @@ where
                 let record = match grants.get(&grant_id) {
                     Some(record) => record,
                     None => {
-                        let msg = "grant is unknown or expired".to_owned();
+                        let msg = UNKNOWN_GRANT_ERROR.to_owned();
                         return write_owned_frame_or_shutdown(
                             &mut wr,
                             ipc::Frame::Error { msg },
@@ -2764,9 +2781,9 @@ pub async fn run_global_with_idle_timeout(
     })?;
     daemon_runtime::write_secret(&secret)?;
 
-    let pool = Arc::new(ProfilePool::default());
-    let grants = Arc::new(GrantRegistry::default());
     let idle = Arc::new(IdleTracker::default());
+    let pool = Arc::new(ProfilePool::default());
+    let grants = Arc::new(GrantRegistry::new(Arc::clone(&idle)));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut daemon_shutdown = shutdown_rx.clone();
     let connection_slots = Arc::new(Semaphore::new(GLOBAL_CONNECTION_LIMIT));
@@ -3637,7 +3654,8 @@ mod tests {
         recover_invalid_startup_lock_read, status_info_frame, stop_tunnel_and_report,
         terminal_safe_error, validate_request_frame, validated_exec_timeout,
         validated_sftp_timeout, wait_for_tunnel_control_or_completion, write_all_until_or_shutdown,
-        write_frame_or_shutdown, ConnInfo, Creds, TunnelControlWait, MAX_UPLOAD_CHUNK_BYTES,
+        write_frame_or_shutdown, ConnInfo, Creds, GrantRegistry, IdleTracker, TunnelControlWait,
+        MAX_UPLOAD_CHUNK_BYTES, UNKNOWN_GRANT_ERROR,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -3888,6 +3906,65 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         serctl_core::vault::set_test_home(Some(base.clone()));
         base
+    }
+
+    #[test]
+    fn unexpired_grant_holds_daemon_idle_guard_until_reaped() {
+        use ed25519_dalek::SigningKey;
+        use serctl_protocol::grant::{OperationGrant, GRANT_TTL};
+        use serctl_protocol::v6::{V6RequestPrelude, IPC_PROTOCOL_VERSION_V6};
+
+        let idle = Arc::new(IdleTracker::default());
+        let grants = GrantRegistry::new(Arc::clone(&idle));
+        let holder = SigningKey::from_bytes(&[7_u8; 32]);
+        let grant = OperationGrant::new(
+            "grant-idle-test".into(),
+            [9_u8; 16],
+            vec!["daemon.status".into()],
+            1,
+            &holder.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+
+        assert!(idle.is_idle());
+        let grant_id = grant.grant_id;
+        grants.insert(grant).unwrap();
+        assert!(
+            !idle.is_idle(),
+            "an issued grant must prevent automatic daemon idle exit"
+        );
+
+        let record = grants.get(&grant_id).unwrap();
+        let expired_request = V6RequestPrelude {
+            protocol_version: IPC_PROTOCOL_VERSION_V6,
+            client_session_id: [1_u8; 16],
+            request_id: [2_u8; 16],
+            operation_kind: "daemon.status".into(),
+            profile_id: None,
+            profile_name: Some("grant-idle-test".into()),
+            grant_id: Some(grant_id),
+            pop_signature: None,
+            profile_proof: None,
+            requested_deadline_unix_ms: u64::MAX,
+            root_request_hash: [0_u8; 32],
+        };
+        let error = record
+            .check_and_spend(
+                &expired_request,
+                Instant::now() + GRANT_TTL + Duration::from_millis(1),
+                super::now_unix_ms(),
+            )
+            .unwrap_err();
+        assert_eq!(terminal_safe_error(&error), "grant has expired");
+        assert!(!UNKNOWN_GRANT_ERROR.contains("expired"));
+        drop(record);
+
+        grants.prune_expired(Instant::now() + GRANT_TTL + Duration::from_millis(1));
+        assert!(
+            idle.is_idle(),
+            "reaping the expired grant must release its idle guard"
+        );
     }
 
     #[tokio::test]

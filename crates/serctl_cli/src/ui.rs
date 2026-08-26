@@ -32,7 +32,9 @@ const MAX_UI_TUNNEL_CONNECTIONS: u16 = 128;
 const UI_AUTHORIZATION_TTL: Duration = Duration::from_secs(5 * 60);
 const UI_AUTHORIZATION_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 const UI_ADMIN_AUTHORIZATION_TTL: Duration = Duration::from_secs(2 * 60);
+const UI_DIRECTORY_REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RECOVERY_MEDIA_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const PROFILE_HEADER_HEIGHT: f32 = 52.0;
 
 /// Recovery media is intentionally portable, but it must still be created as
 /// a new regular, non-link object through a stable read/write handle. This is
@@ -1113,6 +1115,30 @@ fn add_secret_password_edit(
 ) -> egui::Response {
     let id = sensitive_text_edit_id(name);
     add_secret_password_edit_with_id(ui, enabled, id, secret, hint)
+}
+
+fn add_secret_password_edit_with_width(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    name: &'static str,
+    secret: &mut String,
+    hint: &str,
+    desired_width: f32,
+) -> egui::Response {
+    let id = sensitive_text_edit_id(name);
+    reset_text_edit_undo_state(ui.ctx(), id);
+    let mut buffer = MaskedSecretTextBuffer::new(secret);
+    let response = ui.add_enabled(
+        enabled,
+        TextEdit::singleline(&mut buffer)
+            .id(id)
+            .password(true)
+            .hint_text(hint)
+            .desired_width(desired_width.max(0.0)),
+    );
+    drop(buffer);
+    reset_text_edit_undo_state(ui.ctx(), id);
+    response
 }
 
 fn add_secret_password_edit_with_id(
@@ -3089,7 +3115,10 @@ impl SerctlApp {
             .operations
             .begin(
                 Some(request_profile.clone()),
-                format!("正在读取 {request_path}…"),
+                format!(
+                    "正在读取 {request_path}…（最长 {} 秒）",
+                    UI_DIRECTORY_REFRESH_TIMEOUT.as_secs()
+                ),
             )
             .with_profile_identity(expected_generation);
         self.send_future(ctx, async move {
@@ -3098,6 +3127,7 @@ impl SerctlApp {
                 &request_path,
                 &master,
                 expected_generation,
+                UI_DIRECTORY_REFRESH_TIMEOUT,
             )
             .await
             .map_err(|e| e.to_string());
@@ -4579,7 +4609,15 @@ impl SerctlApp {
             if profile.is_some() {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let response = add_secret_password_edit(
+                    // An infinite-width field consumes the whole row before the
+                    // authorization button is laid out. Reserve that trailing
+                    // space explicitly so the group cannot widen the panel and
+                    // push controls beyond the viewport.
+                    let button_width = 96.0;
+                    let field_width =
+                        (ui.available_width() - button_width - ui.spacing().item_spacing.x)
+                            .max(0.0);
+                    let response = add_secret_password_edit_with_width(
                         ui,
                         !busy,
                         "profile-workspace-passphrase",
@@ -4589,6 +4627,7 @@ impl SerctlApp {
                         } else {
                             "输入该主机独立口令"
                         },
+                        field_width,
                     );
                     let authorize = ui.add_enabled(
                         !busy,
@@ -4596,7 +4635,8 @@ impl SerctlApp {
                             "重新授权"
                         } else {
                             "授权 5 分钟"
-                        }),
+                        })
+                        .min_size(egui::vec2(button_width, 0.0)),
                     );
                     if !busy
                         && (authorize.clicked()
@@ -4768,14 +4808,15 @@ impl SerctlApp {
                 return;
             };
 
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.heading(&profile.name);
-                    let mut endpoint = format!("{}:{}", profile.host, profile.port);
-                    ui.label(RichText::new(endpoint.as_str()).color(Color32::GRAY));
-                    endpoint.zeroize();
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Lay out the actions from the right edge first. Keep this scope at
+            // the height of the two-line title: `with_layout` consumes all
+            // available space, which would vertically center this row in the
+            // entire workspace and push the tabs to the bottom of the window.
+            let header_width = ui.available_width();
+            let header = ui.allocate_ui_with_layout(
+                egui::vec2(header_width, PROFILE_HEADER_HEIGHT),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
                     if ui.add_enabled(!busy, egui::Button::new("删除")).clicked() {
                         self.delete_candidate = Some(profile.name.clone());
                     }
@@ -4806,8 +4847,17 @@ impl SerctlApp {
                         }
                         ui.label(RichText::new("○ 未连接").color(Color32::GRAY));
                     }
-                });
-            });
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.vertical(|ui| {
+                            ui.heading(&profile.name);
+                            let mut endpoint = format!("{}:{}", profile.host, profile.port);
+                            ui.label(RichText::new(endpoint.as_str()).color(Color32::GRAY));
+                            endpoint.zeroize();
+                        });
+                    });
+                },
+            );
+            debug_assert!(header.response.rect.height() <= PROFILE_HEADER_HEIGHT);
             ui.add_space(18.0);
             ui.separator();
             ui.add_space(14.0);
@@ -4929,58 +4979,87 @@ impl SerctlApp {
         ui.add_space(6.0);
 
         let mut navigate = None;
-        let mut entries = self.remote_entries.clone();
-        egui::ScrollArea::vertical()
-            .max_height(245.0)
-            .show(ui, |ui| {
-                egui::Grid::new("remote_files")
-                    .num_columns(3)
-                    .striped(true)
-                    .min_col_width(90.0)
-                    .show(ui, |ui| {
-                        ui.strong("名称");
-                        ui.strong("类型");
-                        ui.strong("大小");
-                        ui.end_row();
-                        for entry in &entries {
-                            let selected = self
-                                .selected_remote
-                                .as_ref()
-                                .is_some_and(|selected| selected.path == entry.path);
-                            let icon = if entry.is_dir { "▣" } else { "▤" };
-                            let mut label = format!("{icon}  {}", entry.name);
-                            let response = ui.selectable_label(selected, label.as_str());
-                            label.zeroize();
-                            if response.clicked() {
-                                if !entry.is_dir && self.local_download.is_empty() {
-                                    self.local_download = entry.name.clone();
-                                }
-                                if let Some(mut previous) = self.selected_remote.take() {
-                                    previous.name.zeroize();
-                                    previous.path.zeroize();
-                                }
-                                self.selected_remote = Some(entry.clone());
-                            }
-                            if !busy && response.double_clicked() && entry.is_dir {
-                                navigate = Some(entry.path.clone());
-                            }
-                            ui.label(if entry.is_dir {
-                                "目录"
-                            } else if entry.is_symlink {
-                                "链接"
-                            } else {
-                                "文件"
-                            });
-                            ui.label(if entry.is_dir {
-                                "—".into()
-                            } else {
-                                format_bytes(entry.size)
-                            });
-                            ui.end_row();
+        let mut select = None;
+        let row_height = ui.spacing().interact_size.y;
+        let column_spacing = ui.spacing().item_spacing.x;
+        let type_width = 90.0;
+        let size_width = 90.0;
+        // Reserve the scrollbar as well as the two fixed columns. Keeping the
+        // widths stable prevents long names from changing the visible range.
+        let name_width =
+            (ui.available_width() - type_width - size_width - column_spacing * 2.0 - 20.0)
+                .max(90.0);
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [name_width, row_height],
+                egui::Label::new(RichText::new("名称").strong()).truncate(),
+            );
+            ui.add_sized(
+                [type_width, row_height],
+                egui::Label::new(RichText::new("类型").strong()).truncate(),
+            );
+            ui.add_sized(
+                [size_width, row_height],
+                egui::Label::new(RichText::new("大小").strong()).truncate(),
+            );
+        });
+        // A remote directory may legally contain up to 10,000 entries. Do not
+        // clone or lay out the entire result on every frame: only materialize
+        // the rows intersecting the scroll viewport and defer mutations until
+        // the immutable directory-list borrow has ended.
+        egui::ScrollArea::vertical().max_height(245.0).show_rows(
+            ui,
+            row_height,
+            self.remote_entries.len(),
+            |ui, row_range| {
+                for index in row_range {
+                    let entry = &self.remote_entries[index];
+                    ui.horizontal(|ui| {
+                        let selected = self
+                            .selected_remote
+                            .as_ref()
+                            .is_some_and(|selected| selected.path == entry.path);
+                        let icon = if entry.is_dir { "▣" } else { "▤" };
+                        let mut label = format!("{icon}  {}", entry.name);
+                        let response = ui.add_sized(
+                            [name_width, row_height],
+                            egui::Button::selectable(selected, label.as_str()).truncate(),
+                        );
+                        label.zeroize();
+                        if response.clicked() {
+                            select = Some(entry.clone());
                         }
+                        if !busy && response.double_clicked() && entry.is_dir {
+                            navigate = Some(entry.path.clone());
+                        }
+                        let kind = if entry.is_dir {
+                            "目录"
+                        } else if entry.is_symlink {
+                            "链接"
+                        } else {
+                            "文件"
+                        };
+                        ui.add_sized([type_width, row_height], egui::Label::new(kind).truncate());
+                        let size = if entry.is_dir {
+                            "—".into()
+                        } else {
+                            format_bytes(entry.size)
+                        };
+                        ui.add_sized([size_width, row_height], egui::Label::new(size).truncate());
                     });
-            });
-        zeroize_remote_entries(&mut entries);
+                }
+            },
+        );
+        if let Some(entry) = select {
+            if !entry.is_dir && self.local_download.is_empty() {
+                self.local_download = entry.name.clone();
+            }
+            if let Some(mut previous) = self.selected_remote.take() {
+                previous.name.zeroize();
+                previous.path.zeroize();
+            }
+            self.selected_remote = Some(entry);
+        }
         if let Some(path) = navigate {
             self.refresh_directory(ctx, profile.name.clone(), path);
         }
@@ -6651,6 +6730,98 @@ mod tests {
     }
 
     #[test]
+    fn connected_profile_header_does_not_consume_the_workspace_height() {
+        let (mut app, _) = test_app();
+        add_test_profile(&mut app, "alpha", 1);
+        app.profiles[0].daemon = Some(client::DaemonStatus {
+            profile: "alpha".into(),
+            host: "example.test".into(),
+            user: "tester".into(),
+            started_unix: 0,
+            endpoint: "test-endpoint".into(),
+        });
+        app.selected = Some("alpha".into());
+        grant_test_profile(&mut app, "alpha", 1, "test-passphrase", Instant::now());
+
+        let ctx = egui::Context::default();
+        let workspace_rect =
+            egui::Rect::from_min_size(egui::pos2(270.0, 0.0), egui::vec2(850.0, 720.0));
+        let mut command_rect = None;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1120.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |_ui| {
+            let mut root = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("profile-header-layout-test"),
+                egui::UiBuilder::new().max_rect(workspace_rect),
+            );
+            app.central_panel(&mut root);
+            command_rect = ctx
+                .read_response(sensitive_text_edit_id("command"))
+                .map(|response| response.rect);
+        });
+
+        let command_rect = command_rect.expect("command workspace was not laid out");
+        assert!(
+            command_rect.bottom() < workspace_rect.bottom(),
+            "profile header pushed the command workspace below the viewport: {command_rect:?}"
+        );
+        assert!(
+            command_rect.top() < 400.0,
+            "profile header consumed the remaining workspace height: {command_rect:?}"
+        );
+    }
+
+    #[test]
+    fn large_directory_workspace_only_materializes_visible_rows() {
+        let (mut app, _) = test_app();
+        add_test_profile(&mut app, "alpha", 1);
+        app.selected = Some("alpha".into());
+        for index in 0..10_000 {
+            app.remote_entries.push(RemoteEntry {
+                name: format!("entry-{index}"),
+                path: format!("/tmp/entry-{index}"),
+                is_dir: false,
+                is_symlink: false,
+                size: index,
+                modified_unix: None,
+            });
+        }
+        let profile = app.profiles[0].clone();
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1120.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |_ui| {
+            let mut root = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("large-directory-layout-test"),
+                egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(850.0, 640.0),
+                )),
+            );
+            app.files_workspace(&mut root, &ctx, &profile);
+        });
+
+        assert_eq!(app.remote_entries.len(), 10_000);
+        assert!(
+            output.shapes.len() < 1_000,
+            "large directory rendered every row instead of the visible viewport: {} shapes",
+            output.shapes.len()
+        );
+    }
+
+    #[test]
     fn recovery_media_io_is_bounded_verified_regular_and_never_overwritten() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7973,6 +8144,15 @@ mod tests {
 
         requests.invalidate();
         assert!(!requests.is_current(Some("alpha"), 4, Some(identity), &second));
+    }
+
+    #[test]
+    fn directory_refresh_timeout_is_shorter_than_bulk_transfer_timeout() {
+        assert_eq!(UI_DIRECTORY_REFRESH_TIMEOUT, Duration::from_secs(20));
+        assert!(
+            UI_DIRECTORY_REFRESH_TIMEOUT
+                < Duration::from_millis(serctl_protocol::DEFAULT_SFTP_TIMEOUT_MS)
+        );
     }
 
     #[test]
