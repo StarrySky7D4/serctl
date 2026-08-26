@@ -4,7 +4,15 @@
 
 当前重写版标记为预发布测试版本 **v0.2.0-test.1**；原 main 基线保存在远端 `V1` 分支。测试版本不应替代正式签名发行物。
 
-面向操作者的安装、首次配置、UI/CLI、备份恢复和故障处理流程见 [serctl 使用手册](docs/serctl-user-guide.md)。
+面向操作者的安装、首次配置、UI/CLI、备份恢复和故障处理流程见 [serctl 使用手册](docs/serctl-user-guide.md)；版本变化见 [更新日志](CHANGELOG.md)。
+
+### 最近更新（2026-08-26）
+
+- 修复远端文件刷新长时间停留在“正在读取”：目录刷新采用独立 20 秒上限，大目录只渲染可见行，避免每帧克隆和布局最多 10,000 条记录。
+- 修复 Windows 新建主机在安全授权或恢复介质轮转后不能继续保存的问题，并补充迁移阶段的可见进度反馈。
+- 修复首次 TOFU host-key pin 被 profile 使用租约错误拒绝的问题；该受限写入仍在 vault 排他锁内复核，不放宽普通 profile mutation。
+- 修复 OperationGrant 尚未过期时 daemon 因空闲退出而丢失内存登记的问题；未知当前实例与真正过期现在使用不同错误信息。人工重启、升级或崩溃后仍必须重新签发 Grant。
+- CI 测试改为单线程执行，降低进程级测试 home/daemon 状态互相干扰的风险。
 
 当前工作树使用 vault/record v4：每个 profile 有彼此独立的口令、Argon2id KDF、随机 DEK、IPC `AuthSeed` 与随机 128 位 `profile_id`，不存在可解锁全部主机的共享主口令。Windows 另设超管密码并配合离线介质形成 2-of-2 恢复；超管密码本身不能查看现有 profile 口令，也不能单独恢复 SSH 凭据。CLI 的每次远程调用都重新验证目标 profile 口令，桌面 UI 则按 `(name, profile_id, generation)` 保存固定五分钟、非滑动授权。SSH 隧道的所有 listener，以及 L/R 的固定目标地址，都强制为 `127.0.0.1`。实现级说明、威胁边界和验证证据见 [架构、安全与运维说明](docs/serctl-architecture-security.html)。
 
@@ -239,7 +247,7 @@ target\release\serctl_cli.exe --version
 
 测试套件除单元测试外，还会在随机本地端口启动临时 SSH/SFTP 服务和真实 daemon；daemon IPC 使用当前平台的 Named Pipe/Unix Socket，覆盖认证、错误令牌拒绝、exec 正常退出、deadline、客户端断连取消，以及上传/下载内容往返。所有状态写入 `target` 下的隔离临时目录，不读取或修改真实凭证库；外部服务器兼容性验证仍需要可访问的测试服务器。
 
-当前源码尚未提交；本轮最终构建结果应以源码与文档冻结后的外部交付记录为准。任何 dirty 工作树构建都只能作为验证证据，不能作为正式发布身份。
+最近一轮功能修补已作为提交 `8bb97801fdca996296d89f79b43713f81ec0935f` 推送到 `origin/main`。该提交位于 `v0.2.0-test.1` 标签之后，尚未形成新的签名发行版；正式构建结果仍应以源码与文档冻结后的 clean commit/tag 及仓库外交付记录为准。
 
 ### Release 体积策略
 
@@ -272,10 +280,12 @@ strip = "symbols"
 
 上一轮 IPC v4 dirty 功能树的标准 Release 曾为 **11,273,216 B**，SHA-256 `A464F57EE7D60ACB583C0300D399E183F1BCB328C60B88CE6498D4C46592DE53`；单独 PDB 为 **2,797,568 B**。对应 debug EXE 为 **49,509,376 B**，SHA-256 `E2BEA438B1DFE10CF5996D69C829F009F383112424667332D4FC0DA67EE87FF8`；两者版本均为 `serctl 0.1.0 (git 94fb37118f4b-dirty)`。源码现已进入 v6，本地同名路径可能已被覆盖，因此这些只作为上一轮记录，不描述当前文件，也不是正式 clean artifact。
 
-当前 vault/record v4 / IPC v6 工作树须以本次验收报告中的最新门禁为准；不得把较早 v5 工作树的 **258/258** 与本轮数字相加。验证证据如下：
+`v0.2.0-test.1` 标签的完整发布门禁与标签后的 `8bb9780` 修补复核是两个独立证据集，不与较早 v5 工作树的 **258/258** 相加。验证证据如下：
 
 - **PASS：**Rust 1.97.1 下 `cargo fmt -- --check`、`git diff --check`、locked/offline all-target/all-feature `cargo check` 与严格 `clippy -D warnings`；
-- **PASS：**locked/offline all-target/all-feature 串行测试 **293/293**；测试报告执行 **116.68 s**；`build.rs` standalone tests **15/15**；
+- **PASS（`v0.2.0-test.1` 标签）：**locked/offline all-target/all-feature 串行测试 **293/293**；测试报告执行 **116.68 s**；`build.rs` standalone tests **15/15**；
+- **PASS（提交 `8bb9780` 后分包复核）：**CLI **134/134**、Core **115/115**、Daemon **27/27**、Protocol **43/43**，合计 **319/319**；Daemon `clippy --all-targets -- -D warnings`、`cargo fmt --check` 与 `git diff --check` 通过；
+- **测试环境说明：**一次并行 workspace 运行中的既有 Windows KEX deadline 套接字测试遇到本机 `10053 ConnectionAborted`；该单项立即复跑通过，随后 Core 全套 **115/115** 通过。该现象未发生在 Grant、UI 或 vault 租约修补路径，不把首次失败的 workspace 命令记为全绿；
 - **PASS（带新鲜度边界）：**`cargo-audit 0.22.2 --no-fetch` 扫描 **531 dependencies / 1198 advisories**，exit 0；同时报告 cache/index warning，因此只证明本机离线缓存快照，不证明 advisory 数据库在线最新；
 - **PASS：**`cargo-deny 0.20.2` 的 bans、licenses、sources 检查均 exit 0；
 - v4 定向覆盖包括独立 KDF/key package、随机 128 位 profile identity、identity/generation-bound call key、明文 catalog、Windows admin + USB 2-of-2、介质 create-new/同步/回读、CLI 随机口令“先交付文件、后提交”失败路径、UI 随机口令“先显示确认、后提交”取消路径、profile 手动/随机轮转、保留式恢复、破坏性重置、全量 v2→v4 迁移、未发布中间 v3 fail-closed、Linux `--target-user` NSS 绑定/不可逆降权与 offline recovery fail-closed，以及 UI 的 5 分钟 profile / 2 分钟 admin 授权；
