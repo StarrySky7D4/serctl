@@ -177,7 +177,7 @@ jobs:
               throw "$($entry.Key) version unexpectedly reports a dirty worktree: $($entry.Value)"
             }
             if ($entry.Value -notmatch " $([regex]::Escape($packageVersion)) ") {
-              throw "$($entry.Key) version does not match package version $packageVersion: $($entry.Value)"
+              throw "$($entry.Key) version does not match package version ${packageVersion}: $($entry.Value)"
             }
           }
           if (-not $daemonVersion.Contains("IPC v8..=v8")) {
