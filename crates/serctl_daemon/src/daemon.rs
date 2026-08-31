@@ -3504,21 +3504,39 @@ pub async fn run_global_with_idle_timeout(
     build_commit: String,
     idle_exit_timeout: Duration,
 ) -> Result<()> {
+    // The daemon, not its launcher, owns global-startup arbitration. A CLI can
+    // crash after spawning us, so holding the singleton in the parent would
+    // leave a window where two children can publish. Keep this lock through
+    // listener bind and readiness publication, then release it before serving.
+    let lock_deadline = std::time::Instant::now() + CONTROL_SETUP_TIMEOUT;
+    let startup_lock = tokio::task::spawn_blocking(move || {
+        daemon_runtime::acquire_startup_lock_until(lock_deadline)
+    })
+    .await
+    .context("join global daemon startup-lock acquisition")??;
+    if let Some(existing) = daemon_runtime::reconcile_runtime(&startup_lock)? {
+        bail!(
+            "a global daemon is already running (pid {}, instance {})",
+            existing.pid,
+            existing.instance_id
+        );
+    }
     let endpoint = daemon_runtime::v6_endpoint(&instance_id)?;
     let mut listener = ipc::LocalListener::bind(&endpoint)?;
     #[cfg(unix)]
     serctl_core::security::harden_file(std::path::Path::new(&endpoint))?;
-    daemon_runtime::write_descriptor(&DaemonRuntimeDescriptor {
+    let runtime_descriptor = DaemonRuntimeDescriptor {
         version: DESCRIPTOR_SCHEMA_VERSION,
         instance_id: instance_id.as_hex(),
         pid: std::process::id(),
-        endpoint,
+        endpoint: endpoint.clone(),
         protocol_min: IPC_PROTOCOL_VERSION_V6,
         protocol_max: IPC_PROTOCOL_VERSION_V6,
         started_unix: now_unix(),
         build_commit,
-    })?;
-    daemon_runtime::write_secret(&secret)?;
+    };
+    daemon_runtime::publish_runtime(&startup_lock, &runtime_descriptor, &secret)?;
+    drop(startup_lock);
 
     let idle = Arc::new(IdleTracker::default());
     let pool = Arc::new(ProfilePool::default());
@@ -3644,7 +3662,13 @@ pub async fn run_global_with_idle_timeout(
         handlers.abort_all();
         while handlers.join_next().await.is_some() {}
     }
-    daemon_runtime::clear_runtime_state()?;
+    let cleanup_deadline = std::time::Instant::now() + CONTROL_SETUP_TIMEOUT;
+    let cleanup_lock = tokio::task::spawn_blocking(move || {
+        daemon_runtime::acquire_startup_lock_until(cleanup_deadline)
+    })
+    .await
+    .context("join global daemon owner-cleanup lock acquisition")??;
+    daemon_runtime::cleanup_runtime_if_owner(&cleanup_lock, &runtime_descriptor, &secret)?;
     result
 }
 

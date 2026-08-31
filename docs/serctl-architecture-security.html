@@ -591,7 +591,7 @@ target\release\serctl_cli.exe --version
           <div class="card"><div class="kpi">三件套</div><div class="label">共享 provenance standalone wrappers；fmt/diff/check/strict-clippy PASS</div></div>
           <div class="card"><div class="kpi">exit 0</div><div class="label">cargo-audit 0.22.2 与 cargo-deny 0.20.2；离线新鲜度边界见下文</div></div>
         </div>
-        <div class="callout"><strong>beta-2 冻结前本机源码门禁：</strong>Rust 1.97.1；<code>cargo fmt --all -- --check</code>、<code>git diff --check</code>、locked workspace all-target/all-feature <code>cargo check</code> 与严格 <code>clippy -D warnings</code> 均通过。完整测试为 360 通过、0 失败、1 忽略；正式 Release 只构建 workspace binaries，禁止 <code>--all-features</code>，避免启用 <code>serctl-core/test-support</code> 的测试 KDF。</div>
+        <div class="callout"><strong>beta-2 冻结前本机源码门禁：</strong>Rust 1.97.1；<code>cargo fmt --all -- --check</code>、<code>git diff --check</code>、locked workspace all-target/all-feature <code>cargo check</code> 与严格 <code>clippy -D warnings</code> 均通过。完整测试为 365 通过、0 失败、1 忽略；正式 Release 只构建 workspace binaries，禁止 <code>--all-features</code>，避免启用 <code>serctl-core/test-support</code> 的测试 KDF。</div>
         <h3>本轮必须验证的 vault / CLI / UI 覆盖</h3>
         <ul>
           <li>每 profile 独立 salt/KDF/KEK；KeyPackage 与 payload 的双 AEAD 绑定 domain/name/profile_id/host/port/generation；错误口令、跨 profile 口令、identity/generation/package mismatch 与篡改拒绝；</li>

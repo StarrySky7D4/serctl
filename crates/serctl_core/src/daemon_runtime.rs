@@ -14,7 +14,7 @@
 
 use crate::security;
 use crate::vault;
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use fs2::FileExt;
 use serctl_protocol::v6::{ActivationSecret, InstanceId, IPC_PROTOCOL_VERSION_V8};
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,8 @@ use std::fs::File;
 #[cfg(any(unix, test))]
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 /// Schema version of the runtime descriptor file.
@@ -38,7 +40,7 @@ const GRANT_AUDIT_NAME: &str = "grant-audit.jsonl";
 
 /// Non-secret identity of one running daemon instance, persisted for the CLI
 /// and cleaned up on daemon exit.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonRuntimeDescriptor {
     pub version: u8,
@@ -174,6 +176,24 @@ pub fn acquire_startup_lock() -> Result<StartupLockAcquire> {
     }
 }
 
+/// Take the startup singleton within a bounded deadline. This is used by the
+/// daemon itself: launchers are allowed to disappear after spawning, so they
+/// must never be the authority that serializes publication.
+pub fn acquire_startup_lock_until(deadline: Instant) -> Result<StartupLock> {
+    loop {
+        match acquire_startup_lock()? {
+            StartupLockAcquire::Acquired(lock) => return Ok(lock),
+            StartupLockAcquire::Contended if Instant::now() >= deadline => {
+                bail!("daemon startup singleton remained contended past its deadline")
+            }
+            StartupLockAcquire::Contended => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(25)));
+            }
+        }
+    }
+}
+
 /// Atomically persist the runtime descriptor through the protected-file
 /// machinery. The daemon writes this only after its listener is bound, so a
 /// descriptor on disk always names a reachable endpoint.
@@ -237,6 +257,150 @@ pub fn clear_runtime_state() -> Result<()> {
     Ok(())
 }
 
+fn secret_matches(left: &ActivationSecret, right: &ActivationSecret) -> bool {
+    bool::from(left.as_bytes().ct_eq(right.as_bytes()))
+}
+
+fn remove_secret_if_matches(expected: &ActivationSecret) -> Result<bool> {
+    let Some(actual) = read_secret()? else {
+        return Ok(false);
+    };
+    if !secret_matches(&actual, expected) {
+        return Ok(false);
+    }
+    match std::fs::remove_file(secret_path()?) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("remove owned daemon activation secret"),
+    }
+}
+
+/// Publish a listener-owning daemon under the startup singleton. The secret
+/// is written before the descriptor, which is the sole readiness signal. If
+/// descriptor publication fails after an atomic secret replacement committed,
+/// remove only the matching secret that this caller owns.
+pub fn publish_runtime(
+    lock: &StartupLock,
+    descriptor: &DaemonRuntimeDescriptor,
+    secret: &ActivationSecret,
+) -> Result<()> {
+    publish_runtime_with_descriptor_writer(lock, descriptor, secret, write_descriptor)
+}
+
+fn publish_runtime_with_descriptor_writer<F>(
+    _lock: &StartupLock,
+    descriptor: &DaemonRuntimeDescriptor,
+    secret: &ActivationSecret,
+    write_descriptor_record: F,
+) -> Result<()>
+where
+    F: FnOnce(&DaemonRuntimeDescriptor) -> Result<()>,
+{
+    descriptor.validate()?;
+    ensure!(
+        read_descriptor()?.is_none(),
+        "cannot publish global daemon over an existing runtime descriptor"
+    );
+    ensure!(
+        read_secret()?.is_none(),
+        "cannot publish global daemon over an existing activation secret"
+    );
+    if let Err(error) = write_secret(secret) {
+        return match remove_secret_if_matches(secret) {
+            Ok(_) => Err(error).context("publish daemon activation secret"),
+            Err(rollback_error) => Err(anyhow::anyhow!(
+                "{error:#}; failed owned activation-secret rollback: {rollback_error:#}"
+            )),
+        };
+    }
+    if let Err(error) = write_descriptor_record(descriptor) {
+        // A protected atomic writer can report a durability failure after it
+        // has already replaced the descriptor. Withdraw that readiness record
+        // when it is still ours; if no descriptor committed, roll back only
+        // our matching secret.
+        let rollback = match cleanup_runtime_if_owner(_lock, descriptor, secret) {
+            Ok(true) => Ok(true),
+            Ok(false) => remove_secret_if_matches(secret),
+            Err(error) => Err(error),
+        };
+        return match rollback {
+            Ok(_) => Err(error).context("publish daemon runtime descriptor"),
+            Err(rollback_error) => Err(anyhow::anyhow!(
+                "{error:#}; failed owned activation-secret rollback: {rollback_error:#}"
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// Remove runtime state only when both records still identify this daemon.
+/// The descriptor is removed first, withdrawing readiness before the secret.
+/// A competing daemon can never be harmed: all publication and cleanup paths
+/// hold the same lock, and the secret comparison is constant-time.
+pub fn cleanup_runtime_if_owner(
+    _lock: &StartupLock,
+    descriptor: &DaemonRuntimeDescriptor,
+    secret: &ActivationSecret,
+) -> Result<bool> {
+    let Some(actual_descriptor) = read_descriptor()? else {
+        return Ok(false);
+    };
+    if actual_descriptor != *descriptor {
+        return Ok(false);
+    }
+    let Some(actual_secret) = read_secret()? else {
+        return Ok(false);
+    };
+    if !secret_matches(&actual_secret, secret) {
+        return Ok(false);
+    }
+    match std::fs::remove_file(descriptor_path()?) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("remove owned daemon runtime descriptor"),
+    }
+    remove_secret_if_matches(secret)?;
+    Ok(true)
+}
+
+/// Reconcile runtime files while holding the startup singleton. A live
+/// descriptor wins arbitration. Dead records are removed only with their
+/// currently matching secret; an orphan secret (no descriptor) is likewise
+/// deleted only after a constant-time self-match.
+pub fn reconcile_runtime(_lock: &StartupLock) -> Result<Option<DaemonRuntimeDescriptor>> {
+    let Some(descriptor) = read_descriptor()? else {
+        if let Some(secret) = read_secret()? {
+            remove_secret_if_matches(&secret)?;
+        }
+        return Ok(None);
+    };
+    if pid_is_alive(descriptor.pid) {
+        return Ok(Some(descriptor));
+    }
+    match read_secret()? {
+        Some(secret) => {
+            cleanup_runtime_if_owner(_lock, &descriptor, &secret)?;
+        }
+        None => match std::fs::remove_file(descriptor_path()?) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove stale daemon runtime descriptor"),
+        },
+    }
+    // The Unix listener removes its socket on drop, but a crashed daemon
+    // leaves the stale socket behind; the endpoint names it.
+    #[cfg(unix)]
+    {
+        let path = Path::new(&descriptor.endpoint);
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove stale daemon Unix socket"),
+        }
+    }
+    Ok(None)
+}
+
 /// Best-effort liveness of a recorded PID. Documented limitation: a local
 /// privileged process can always arrange PID reuse; this check only prevents
 /// accidental deletion of a live daemon's state.
@@ -281,25 +445,10 @@ pub fn pid_is_alive(pid: u32) -> bool {
 /// and only after the recorded PID is confirmed dead. Returns whether cleanup
 /// happened.
 pub fn cleanup_stale_runtime_if_dead(_lock: &StartupLock) -> Result<bool> {
-    let Some(descriptor) = read_descriptor()? else {
-        return Ok(false);
-    };
-    if pid_is_alive(descriptor.pid) {
-        return Ok(false);
-    }
-    clear_runtime_state()?;
-    // The Unix listener removes its socket on drop, but a crashed daemon
-    // leaves the stale socket behind; the endpoint names it.
-    #[cfg(unix)]
-    {
-        let path = Path::new(&descriptor.endpoint);
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("remove stale daemon Unix socket"),
-        }
-    }
-    Ok(true)
+    let was_stale =
+        matches!(read_descriptor()?, Some(ref descriptor) if !pid_is_alive(descriptor.pid));
+    let _ = reconcile_runtime(_lock)?;
+    Ok(was_stale)
 }
 
 #[cfg(test)]
@@ -499,6 +648,87 @@ mod tests {
         write_descriptor(&alive).unwrap();
         assert!(!cleanup_stale_runtime_if_dead(&lock).unwrap());
         assert!(read_descriptor().unwrap().is_some());
+        clear_home(&base);
+    }
+
+    #[test]
+    fn owner_cleanup_never_removes_another_daemons_records() {
+        let (_guard, base) = test_home();
+        let owner_a = descriptor();
+        let secret_a = ActivationSecret::random();
+        let owner_b = descriptor();
+        let secret_b = ActivationSecret::random();
+        write_descriptor(&owner_b).unwrap();
+        write_secret(&secret_b).unwrap();
+        let lock = match acquire_startup_lock().unwrap() {
+            StartupLockAcquire::Acquired(lock) => lock,
+            StartupLockAcquire::Contended => panic!("lock contended in test"),
+        };
+
+        assert!(!cleanup_runtime_if_owner(&lock, &owner_a, &secret_a).unwrap());
+        assert_eq!(read_descriptor().unwrap().unwrap(), owner_b);
+        let actual_secret = read_secret().unwrap().unwrap();
+        assert!(secret_matches(&actual_secret, &secret_b));
+        clear_home(&base);
+    }
+
+    #[test]
+    fn publication_writes_secret_before_descriptor_and_rolls_back_its_secret() {
+        let (_guard, base) = test_home();
+        let owner = descriptor();
+        let secret = ActivationSecret::random();
+        let lock = match acquire_startup_lock().unwrap() {
+            StartupLockAcquire::Acquired(lock) => lock,
+            StartupLockAcquire::Contended => panic!("lock contended in test"),
+        };
+
+        publish_runtime(&lock, &owner, &secret).unwrap();
+        assert_eq!(read_descriptor().unwrap().unwrap(), owner);
+        assert!(secret_matches(&read_secret().unwrap().unwrap(), &secret));
+        assert!(cleanup_runtime_if_owner(&lock, &owner, &secret).unwrap());
+
+        let publish_error =
+            publish_runtime_with_descriptor_writer(&lock, &owner, &secret, |record| {
+                write_descriptor(record)?;
+                anyhow::bail!("injected post-commit descriptor durability failure")
+            })
+            .unwrap_err();
+        assert!(publish_error
+            .to_string()
+            .contains("publish daemon runtime descriptor"));
+        assert!(read_descriptor().unwrap().is_none());
+        assert!(read_secret().unwrap().is_none());
+        clear_home(&base);
+    }
+
+    #[test]
+    fn reconciliation_removes_only_a_valid_orphan_secret() {
+        let (_guard, base) = test_home();
+        let secret = ActivationSecret::random();
+        write_secret(&secret).unwrap();
+        let lock = match acquire_startup_lock().unwrap() {
+            StartupLockAcquire::Acquired(lock) => lock,
+            StartupLockAcquire::Contended => panic!("lock contended in test"),
+        };
+        assert!(reconcile_runtime(&lock).unwrap().is_none());
+        assert!(read_secret().unwrap().is_none());
+        clear_home(&base);
+    }
+
+    #[test]
+    fn reconciliation_selects_the_live_publisher_as_the_winner() {
+        let (_guard, base) = test_home();
+        let live = descriptor();
+        let secret = ActivationSecret::random();
+        write_descriptor(&live).unwrap();
+        write_secret(&secret).unwrap();
+        let lock = match acquire_startup_lock().unwrap() {
+            StartupLockAcquire::Acquired(lock) => lock,
+            StartupLockAcquire::Contended => panic!("lock contended in test"),
+        };
+
+        assert_eq!(reconcile_runtime(&lock).unwrap(), Some(live));
+        assert!(secret_matches(&read_secret().unwrap().unwrap(), &secret));
         clear_home(&base);
     }
 

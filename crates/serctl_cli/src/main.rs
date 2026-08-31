@@ -1714,9 +1714,10 @@ async fn run_cli(cmd: Cmd, mut secrets: StartupSecrets) -> Result<()> {
             // argument is accepted for compatibility but no longer scopes the
             // daemon, and no passphrase is needed (profiles unlock per request).
             let _ = name;
-            if client::daemon_is_published()? {
-                bail!("the daemon is already running");
-            }
+            // Do not treat a lock-free descriptor observation as authority:
+            // the child daemon serializes and arbitrates publication itself.
+            // Concurrent `up` commands can therefore never create two
+            // publishers even when both reach this point together.
             // The daemon is a sibling binary; this CLI process supervises it
             // in the foreground and mirrors its exit status.
             let code = launcher::run_global_daemon_foreground().await?;

@@ -30,6 +30,7 @@
 - 修复 Windows 按需启动的后台 daemon 仍附着于签发 CLI 控制台、CLI/终端退出可终止 broker 并丢失 Grant 登记的问题。红绿探针证明 `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` 仍会继承控制台；后台启动现改为 `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`，前台 `up` 保持原有 Ctrl-C 协调语义。
 - 修复 Agent 上传错误 JSON 泄露本地绝对路径或原始凭据标记的问题；grant 文件载入时还会先校验 TTL 策略、holder 私钥与公钥匹配及过期状态，失败时不进入请求循环。
 - 修复 runtime descriptor 协议诊断仍显示 IPC v6 的陈旧信息；当前统一按 IPC v8 校验，旧 v7-only descriptor 即使 PID 已死也保留 descriptor/secret 证据并失败关闭。
+- 修复全局 daemon 把 runtime descriptor 先于 activation secret 发布、并由 launcher 过早释放启动锁造成的竞态。现在 daemon 自身在有界 startup singleton 内仲裁，先写 secret、最后写 descriptor 作为唯一 readiness 信号；并发候选接受已验证的赢家，退出或发布失败时只清理同时匹配自身 descriptor 与 secret 的状态，不会误删另一实例。
 - daemon 与 helper 新增不启动服务、不读取 vault 的 `--version` 自检；daemon 同时报告 build identity 与 `IPC v8..=v8`，helper 报告 transfer protocol version，便于成套 staging/升级时发现半升级。
 - CLI 的 Clap 诊断统一为恰好一个结尾换行，避免 `--version` 在 PowerShell 中被拆成含空元素的数组，从而使三件套 clean-commit 发布校验可稳定执行。
 - 修复 Ubuntu/macOS E2E 把 Unix socket 放在过长 checkout 路径下、超过 `sun_path` 后只误报 descriptor 超时的问题；测试现在使用原子创建的 0700 短路径并直接报告 daemon 早退原因，同时用精确平台 `cfg` 消除非 Windows 构建中的 migration/recovery 死代码警告。
@@ -61,7 +62,7 @@
 
 ### 本地验证
 
-- 2026-08-31 beta-2 冻结前的 dirty 工作树完成 `cargo fmt --all -- --check`、`git diff --check`、严格 workspace Clippy `-D warnings` 与 `cargo test --locked --offline --workspace --all-targets --all-features -- --test-threads=1`：CLI 147 通过/1 忽略、Core 117、Daemon 31、Protocol 46、Transfer Protocol 5、helper 14，合计 360 通过、0 失败、1 忽略。
+- 2026-08-31 beta-2 冻结前的 dirty 工作树完成 `cargo fmt --all -- --check`、`git diff --check`、严格 workspace Clippy `-D warnings` 与 `cargo test --locked --workspace --all-targets --all-features -- --test-threads=1`：CLI 148 通过/1 忽略、Core 121、Daemon 31、Protocol 46、Transfer Protocol 5、helper 14，合计 365 通过、0 失败、1 忽略。
 - 独立 `target/staging-v0.3/release` 完成冻结前锁定离线 Release 三件套构建，未覆盖 `target/release`；CLI/daemon 均报告 build `5690281a2535-dirty`，daemon 报告 `IPC v8..=v8`，helper 报告 transfer protocol v1。该 dirty staging 仅为冻结前证据，不是 beta-2 clean 制品或签名发布证据。
 - 受控完整链路通过固定 1,298,223-byte 上传、内容一致性、首事件时延与 Agent `transfer.write` grant E2E；纯 SFTP 4/8/16/32 KiB × in-flight 1/2/8 及丢失 STATUS 矩阵通过。
 - 新增完整 russh exec/SFTP 服务端的 4/8/16/32 KiB 首帧矩阵，所有尺寸均能到达 handler 并获 ACK；这排除了 core ChannelStream、SSH window/flush 与服务端分帧本身是 2 KiB 根因，但尚未覆盖真实 OpenSSH + `serctl-xfer` 子进程 stdio，当前 2 KiB cap 因而保持不变。
@@ -71,7 +72,7 @@
 ### 验证记录
 
 - 基线提交：`8bb97801fdca996296d89f79b43713f81ec0935f`，已推送至 `origin/main`。
-- 2026-08-31 workspace 串行门禁：360 通过、0 失败、1 忽略；严格 Clippy、Rustfmt 与 Git diff whitespace 检查通过。
+- 2026-08-31 workspace 串行门禁：365 通过、0 失败、1 忽略；严格 Clippy、Rustfmt 与 Git diff whitespace 检查通过。
 - 先前分包复核的 319/319 与一次并行 Windows `10053 ConnectionAborted` 仅保留为历史证据；本轮单线程全工作区测试已覆盖并通过对应链路。
 
 ## v0.2.0-test.1 - 2026-08-25

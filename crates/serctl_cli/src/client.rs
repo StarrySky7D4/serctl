@@ -1023,28 +1023,20 @@ async fn ensure_daemon_until(deadline: tokio::time::Instant) -> Result<DaemonAcc
             return Ok(access);
         }
         match serctl_core::daemon_runtime::acquire_startup_lock()? {
-            serctl_core::daemon_runtime::StartupLockAcquire::Acquired(lock) => {
-                // Recheck under the lock to avoid a TOCTOU double spawn, then
-                // hold the lock across spawn + publication so only one CLI
-                // launches the broker.
+            serctl_core::daemon_runtime::StartupLockAcquire::Acquired(startup_lock) => {
+                // The CLI lock is only an advisory launch-throttling hint.
+                // The daemon owns authoritative arbitration and takes this
+                // lock itself through listener publication. Never wait for a
+                // child while holding it: that would deadlock the child.
                 if let Some(access) = resolve_daemon_until(deadline).await? {
                     return Ok(access);
                 }
-                let (instance, _secret) = crate::launcher::spawn_global_daemon()?;
-                drop(lock);
-                // Wait for the descriptor naming exactly this instance.
-                let instance_hex = instance.as_hex();
-                loop {
-                    if let Some(access) = resolve_daemon_until(deadline).await? {
-                        if access.instance_id.as_hex() == instance_hex {
-                            return Ok(access);
-                        }
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        bail!("daemon did not publish its runtime descriptor in time");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
+                let (_instance, _secret) = crate::launcher::spawn_global_daemon()?;
+                drop(startup_lock);
+                return wait_for_published_daemon_until(deadline, || {
+                    resolve_daemon_until(deadline)
+                })
+                .await;
             }
             serctl_core::daemon_runtime::StartupLockAcquire::Contended => {
                 if tokio::time::Instant::now() >= deadline {
@@ -1053,6 +1045,28 @@ async fn ensure_daemon_until(deadline: tokio::time::Instant) -> Result<DaemonAcc
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         }
+    }
+}
+
+/// Wait for any fully published daemon. A spawned candidate may lose daemon
+/// arbitration to a sibling; the client must accept that verified winner
+/// rather than wait only for its own instance id.
+async fn wait_for_published_daemon_until<R, F>(
+    deadline: tokio::time::Instant,
+    mut resolve: R,
+) -> Result<DaemonAccess>
+where
+    R: FnMut() -> F,
+    F: Future<Output = Result<Option<DaemonAccess>>>,
+{
+    loop {
+        if let Some(access) = resolve().await? {
+            return Ok(access);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("daemon did not publish its runtime descriptor in time");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -5704,10 +5718,10 @@ mod tests {
         shutdown_daemon_exchange, spawn_stdin_pump_with, start_ipc_shell_until,
         terminal_safe_error, terminal_safe_field, upload_file_with_timeout_inner,
         validate_shell_input, validated_sftp_timeout_ms, verify_owned_file_identities_until_with,
-        wait_for_daemon_absent_until, write_command_output_to,
+        wait_for_daemon_absent_until, wait_for_published_daemon_until, write_command_output_to,
         write_daemon_create_dir_request_until, write_daemon_exec_request_until,
         write_shutdown_request_until, AgentGrantFile, AgentRequest,
-        AgentTransferWriteScopeRequired, CommandOutput, DaemonStatus,
+        AgentTransferWriteScopeRequired, CommandOutput, DaemonAccess, DaemonStatus,
         OwnedPendingProfileAuthorization, PendingProfileAuthorization, ShellEvent, TransferOptions,
         TransferRateTracker, TunnelEvent, UnclaimedLocalPartial, UploadCommitOutcomeUnknown,
         AGENT_TRANSFER_WRITE_OPERATION, DAEMON_LOCK_RELEASE_TIMEOUT, MAX_SHELL_INPUT_BYTES,
@@ -6613,6 +6627,35 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn losing_spawn_candidate_accepts_any_published_daemon() {
+        let winning_instance = ipc::v6::InstanceId::random();
+        let winner = DaemonAccess {
+            instance_id: winning_instance,
+            secret: ipc::v6::ActivationSecret::random(),
+            endpoint: "winning-endpoint".into(),
+            pid: 11,
+        };
+        let mut observation = 0_u8;
+
+        let access = wait_for_published_daemon_until(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            move || {
+                observation += 1;
+                let candidate = match observation {
+                    1 => None,
+                    _ => Some(winner.clone()),
+                };
+                std::future::ready(Ok::<_, anyhow::Error>(candidate))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(access.instance_id.as_hex(), winning_instance.as_hex());
+        assert_eq!(access.endpoint, "winning-endpoint");
     }
 
     #[tokio::test(flavor = "current_thread")]

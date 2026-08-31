@@ -1612,6 +1612,12 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             .unwrap()
             .is_some()
         {
+            assert!(
+                serctl_core::daemon_runtime::read_secret()
+                    .unwrap()
+                    .is_some(),
+                "global daemon published its readiness descriptor before its activation secret"
+            );
             break;
         }
         if daemon_task.is_finished() {
@@ -1642,9 +1648,12 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     let wrong_status = client::daemon_status("e2e", "definitely-wrong-master")
         .await
         .unwrap_err();
-    assert!(wrong_status
-        .to_string()
-        .contains("wrong profile passphrase"));
+    let wrong_status_chain = format!("{wrong_status:#}");
+    assert!(
+        wrong_status_chain.contains("wrong profile passphrase"),
+        "wrong-passphrase status probe failed outside broker vault authentication: {}",
+        wrong_status_chain.escape_debug()
+    );
     let wrong_passphrase_after = state.latest_exec_generation().await;
     let wrong_passphrase = client::exec_capture_with_timeout(
         "e2e",
