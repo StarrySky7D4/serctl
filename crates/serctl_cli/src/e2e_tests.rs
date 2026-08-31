@@ -168,6 +168,8 @@ struct RemoteForwardEvents {
 struct TestState {
     files: Mutex<HashMap<String, Vec<u8>>>,
     next_connection: AtomicU64,
+    closed_connections: Mutex<HashSet<u64>>,
+    connection_changed: Notify,
     password_auth_attempts: AtomicU64,
     exec_events: Mutex<ExecEvents>,
     exec_changed: Notify,
@@ -192,6 +194,29 @@ struct TestState {
 }
 
 impl TestState {
+    fn latest_connection_id(&self) -> Option<u64> {
+        self.next_connection.load(Ordering::SeqCst).checked_sub(1)
+    }
+
+    async fn record_connection_closed(&self, connection: u64) {
+        self.closed_connections.lock().await.insert(connection);
+        self.connection_changed.notify_waiters();
+    }
+
+    async fn wait_for_connection_closed(&self, connection: u64, context: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = self.connection_changed.notified();
+                if self.closed_connections.lock().await.contains(&connection) {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("SSH connection {connection} did not close after {context}"));
+    }
+
     async fn latest_exec_generation(&self) -> u64 {
         self.exec_events.lock().await.generation
     }
@@ -1491,14 +1516,17 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     let ssh_task = tokio::spawn(async move {
         loop {
             let (socket, _) = ssh_listener.accept().await.unwrap();
+            let connection = ssh_state.next_connection.fetch_add(1, Ordering::SeqCst);
             let handler = TestSsh {
                 state: ssh_state.clone(),
-                connection: ssh_state.next_connection.fetch_add(1, Ordering::SeqCst),
+                connection,
                 channels: Arc::new(Mutex::new(HashMap::new())),
             };
             let config = config.clone();
+            let connection_state = ssh_state.clone();
             tokio::spawn(async move {
                 let _ = russh::server::run_stream(config, socket, handler).await;
+                connection_state.record_connection_closed(connection).await;
             });
         }
     });
@@ -2178,6 +2206,13 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     }));
 
     state.sftp_hang.store(false, Ordering::SeqCst);
+    let timed_out_connection = state
+        .latest_connection_id()
+        .expect("SFTP timeout did not use an SSH connection");
+    state
+        .wait_for_connection_closed(timed_out_connection, "the SFTP timeout")
+        .await;
+    let after_timeout_generation = state.latest_exec_generation().await;
     let after_timeout = client::exec_capture_with_timeout(
         "e2e",
         "ok",
@@ -2186,6 +2221,26 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     )
     .await
     .unwrap();
+    let recovery_channel = state
+        .wait_for_exec_start(after_timeout_generation, b"ok")
+        .await;
+    assert!(
+        recovery_channel.connection > timed_out_connection,
+        "post-timeout exec reused closed SSH connection {timed_out_connection}"
+    );
+    let recovery_starts = state
+        .exec_events
+        .lock()
+        .await
+        .started
+        .iter()
+        .filter(|event| event.generation > after_timeout_generation && event.command == b"ok")
+        .count();
+    assert_eq!(
+        recovery_starts, 1,
+        "post-timeout exec was replayed instead of failing closed"
+    );
+    assert_eq!(after_timeout.stdout, b"evidence\n");
     assert_eq!(after_timeout.code, Some(0));
 
     let shutdown_after = state.latest_exec_generation().await;
