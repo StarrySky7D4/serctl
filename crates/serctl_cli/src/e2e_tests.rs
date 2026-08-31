@@ -17,6 +17,7 @@ use serctl_protocol as ipc;
 use serctl_transfer_protocol as native;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
@@ -29,6 +30,56 @@ const E2E_PROFILE_PASSPHRASE: &str = "daemon-profile-passphrase";
 const TOFU_PROFILE_PASSPHRASE: &str = "tofu-profile-passphrase";
 const DIRECT_PROFILE_PASSPHRASE: &str = "direct-profile-passphrase";
 const E2E_ADMINISTRATOR_PASSPHRASE: &str = "e2e-administrator-passphrase";
+
+struct E2eTestHome {
+    path: PathBuf,
+}
+
+impl E2eTestHome {
+    fn create(unique: u128) -> Self {
+        #[cfg(unix)]
+        let path =
+            PathBuf::from("/tmp").join(format!("sctl-e2e-{}-{unique:x}", std::process::id()));
+        #[cfg(windows)]
+        let path = std::env::current_dir()
+            .expect("resolve E2E checkout")
+            .join("target")
+            .join(format!("e2e-{}-{unique}", std::process::id()));
+
+        #[cfg(windows)]
+        std::fs::create_dir_all(path.parent().expect("E2E home has a parent"))
+            .expect("create E2E target directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&path).expect("create protected E2E home");
+        }
+        #[cfg(windows)]
+        std::fs::create_dir(&path).expect("create isolated E2E home");
+        vault::set_test_home(Some(path.clone()));
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for E2eTestHome {
+    fn drop(&mut self) {
+        vault::set_test_home(None);
+        if let Err(error) = std::fs::remove_dir_all(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "failed to remove isolated E2E home {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
 
 struct CompatibleOsRng(OsRng);
 
@@ -1401,12 +1452,8 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let test_home = std::env::current_dir()
-        .unwrap()
-        .join("target")
-        .join(format!("e2e-{}-{unique}", std::process::id()));
-    std::fs::create_dir_all(&test_home).unwrap();
-    vault::set_test_home(Some(test_home.clone()));
+    let test_home_guard = E2eTestHome::create(unique);
+    let test_home = test_home_guard.path().to_owned();
     // Start from a real empty v4 vault. On Windows the administrator policy
     // and the removable-media half of 2-of-2 recovery must exist before the
     // first profile can be created. Keep the media only in this test's memory;
@@ -1547,7 +1594,14 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
 
     let daemon_instance = ipc::v6::InstanceId::random();
     let daemon_secret = ipc::v6::ActivationSecret::random();
-    let daemon_task = tokio::spawn(daemon::run_global(
+    let daemon_endpoint = serctl_core::daemon_runtime::v6_endpoint(&daemon_instance).unwrap();
+    #[cfg(unix)]
+    assert!(
+        daemon_endpoint.len() < 100,
+        "E2E Unix socket path is not conservatively below macOS/Linux sun_path limits: {} bytes ({daemon_endpoint})",
+        daemon_endpoint.len()
+    );
+    let mut daemon_task = tokio::spawn(daemon::run_global(
         daemon_instance,
         daemon_secret,
         "e2e-test-commit".to_owned(),
@@ -1560,8 +1614,18 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         {
             break;
         }
+        if daemon_task.is_finished() {
+            let outcome = (&mut daemon_task).await;
+            panic!(
+                "global daemon exited before publishing its runtime descriptor at {daemon_endpoint}: {outcome:?}"
+            );
+        }
         if tokio::time::Instant::now() >= publish_deadline {
-            panic!("global daemon did not publish its runtime descriptor");
+            panic!(
+                "global daemon did not publish its runtime descriptor at {daemon_endpoint} ({} bytes; test home {})",
+                daemon_endpoint.len(),
+                test_home.display()
+            );
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -2153,7 +2217,14 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     // the whole v6 handshake again instead of reusing any session state.
     let daemon_instance = ipc::v6::InstanceId::random();
     let daemon_secret = ipc::v6::ActivationSecret::random();
-    let daemon_task = tokio::spawn(daemon::run_global_with_idle_timeout(
+    let daemon_endpoint = serctl_core::daemon_runtime::v6_endpoint(&daemon_instance).unwrap();
+    #[cfg(unix)]
+    assert!(
+        daemon_endpoint.len() < 100,
+        "second E2E Unix socket path exceeds the conservative sun_path budget: {} bytes ({daemon_endpoint})",
+        daemon_endpoint.len()
+    );
+    let mut daemon_task = tokio::spawn(daemon::run_global_with_idle_timeout(
         daemon_instance,
         daemon_secret,
         "e2e-test-commit".to_owned(),
@@ -2167,8 +2238,18 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         {
             break;
         }
+        if daemon_task.is_finished() {
+            let outcome = (&mut daemon_task).await;
+            panic!(
+                "second global daemon exited before publishing its runtime descriptor at {daemon_endpoint}: {outcome:?}"
+            );
+        }
         if tokio::time::Instant::now() >= publish_deadline {
-            panic!("second global daemon did not publish its runtime descriptor");
+            panic!(
+                "second global daemon did not publish its runtime descriptor at {daemon_endpoint} ({} bytes; test home {})",
+                daemon_endpoint.len(),
+                test_home.display()
+            );
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -2600,6 +2681,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         vault::verify_profile_passphrase("e2e", rotated_direct_passphrase).is_err(),
         "one profile's replacement passphrase unexpectedly authorized another profile"
     );
+    #[cfg(windows)]
     let rotated_direct_identity =
         vault::verify_profile_identity("direct-e2e", rotated_direct_passphrase).unwrap();
 
@@ -2674,6 +2756,10 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
 
     echo_task.abort();
     ssh_task.abort();
-    vault::set_test_home(None);
-    std::fs::remove_dir_all(test_home).unwrap();
+    drop(test_home_guard);
+    assert!(
+        !test_home.exists(),
+        "isolated E2E home was not removed: {}",
+        test_home.display()
+    );
 }

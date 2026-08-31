@@ -52,9 +52,9 @@ const PROFILE_CALL_KEY_DOMAIN: &[u8] = b"serctl/ipc/profile-call-key/v5\0";
 const PROFILE_KEY_AAD_DOMAIN: &str = "serctl/profile-key-package/v4";
 const PROFILE_PAYLOAD_AAD_DOMAIN: &str = "serctl/profile-payload/v4";
 const RECOVERY_CONFIG_TAG_DOMAIN: &[u8] = b"serctl/profile-recovery-config-tag/v4\0";
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const ADMIN_MARKER: &[u8] = b"serctl/windows-admin-policy/v4";
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const ADMIN_AAD_DOMAIN: &str = "serctl/admin-local-recovery-share/v4";
 const MAX_VAULT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LOCK_BYTES: u64 = 64 * 1024;
@@ -331,7 +331,7 @@ pub enum MigrationProgress {
     CommittingVault,
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct AdminSecret {
     marker: Vec<u8>,
@@ -490,7 +490,7 @@ fn runtime_lease_path(profile: &str) -> Result<PathBuf> {
     Ok(run_dir()?.join(format!("{}.lease", hex::encode(digest))))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn existing_runtime_lease_path(profile: &str) -> Result<PathBuf> {
     let digest = Sha256::digest(profile.as_bytes());
     Ok(run_dir_path()?.join(format!("{}.lease", hex::encode(digest))))
@@ -512,7 +512,7 @@ fn open_runtime_lease_file(profile: &str) -> Result<File> {
         .with_context(|| format!("open runtime lease {}", path.display()))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn open_existing_runtime_lease_file(profile: &str) -> Result<Option<File>> {
     let path = existing_runtime_lease_path(profile)?;
     security::open_existing_protected_file(&path)
@@ -530,7 +530,7 @@ fn acquire_runtime_barrier_shared() -> Result<File> {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn acquire_runtime_barrier_exclusive() -> Result<File> {
     let barrier = open_runtime_barrier_file()?;
     match barrier.try_lock_exclusive() {
@@ -1352,7 +1352,7 @@ fn canonical_recovery_config(
     )
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn recovery_config_digest(config: &crate::recovery::RecoveryConfig) -> Result<[u8; 32]> {
     let canonical = canonical_recovery_config(config)?;
     Ok(Sha256::digest(canonical.as_slice()).into())
@@ -1927,7 +1927,7 @@ fn next_generation(current: u64) -> Result<u64> {
         .ok_or_else(|| anyhow!("profile generation is exhausted"))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn admin_aad(recovery_id: &str) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&(ADMIN_AAD_DOMAIN, recovery_id))?)
 }
@@ -3253,7 +3253,7 @@ fn verify_master_passphrase_from_vault(vault: &VaultFile, master: &str) -> Resul
     verify_master(vault, &key)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn verify_established_master_for_rekey(vault: &VaultFile, master: &str) -> Result<()> {
     if vault.verifier.is_none() && vault.profiles.is_empty() {
         bail!("the empty vault has no established master passphrase to change");
@@ -3262,7 +3262,7 @@ fn verify_established_master_for_rekey(vault: &VaultFile, master: &str) -> Resul
     verify_master(vault, &key)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn ensure_no_legacy_profile_lease_contention(
     profiles: &BTreeMap<String, EncProfile>,
 ) -> Result<()> {

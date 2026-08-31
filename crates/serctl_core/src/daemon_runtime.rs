@@ -356,10 +356,7 @@ mod tests {
             c
         };
         #[cfg(unix)]
-        let mut command = {
-            let mut c = std::process::Command::new("true");
-            c
-        };
+        let mut command = std::process::Command::new("true");
         #[cfg(not(any(windows, unix)))]
         let mut command = std::process::Command::new("echo");
         let mut child = command.spawn().unwrap();

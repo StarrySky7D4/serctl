@@ -629,10 +629,12 @@ enum UiMessage {
         profile: String,
         result: Result<u64, String>,
     },
+    #[cfg(windows)]
     Migrated {
         operation: OperationContext,
         result: Result<usize, String>,
     },
+    #[cfg(any(windows, test))]
     MigrationProgress {
         operation_id: u64,
         progress: vault::MigrationProgress,
@@ -778,12 +780,14 @@ impl UiMessage {
                     error.zeroize();
                 }
             }
+            #[cfg(windows)]
             Self::Migrated { operation, result } => {
                 zeroize_operation_context(operation);
                 if let Err(error) = result {
                     error.zeroize();
                 }
             }
+            #[cfg(any(windows, test))]
             Self::MigrationProgress { progress, .. } => {
                 if let vault::MigrationProgress::MigratingProfile { profile, .. } = progress {
                     profile.zeroize();
@@ -1222,6 +1226,7 @@ fn schedule_active_operation_poll(ctx: &egui::Context, active: bool) {
     }
 }
 
+#[cfg(any(windows, test))]
 fn send_migration_progress(
     tx: &UiMessageSender,
     repaint: &egui::Context,
@@ -2347,6 +2352,7 @@ impl SerctlApp {
         });
     }
 
+    #[cfg(any(windows, test))]
     fn submit_v2_migration(&mut self, _ctx: &egui::Context) {
         // Validation errors are produced after the status panel has already
         // been painted for the click frame. Always schedule another frame so
@@ -2514,6 +2520,7 @@ impl SerctlApp {
         let original_name = self.editor.original_name.clone();
         let saved_original_name = original_name.clone();
         let expected_identity = self.editor.expected_identity;
+        #[cfg(windows)]
         let creating = original_name.is_none();
         if let Some(original) = original_name.as_deref() {
             if expected_identity.is_none() || self.profile_identity(original) != expected_identity {
@@ -3863,6 +3870,7 @@ impl SerctlApp {
                     }
                     profile.zeroize();
                 }
+                #[cfg(windows)]
                 UiMessage::Migrated { operation, result } => {
                     self.operations.finish(operation);
                     zeroize_operation_context(operation);
@@ -3877,6 +3885,7 @@ impl SerctlApp {
                         Err(error) => self.set_notice(std::mem::take(error), true),
                     }
                 }
+                #[cfg(any(windows, test))]
                 UiMessage::MigrationProgress {
                     operation_id,
                     progress,
@@ -5458,7 +5467,7 @@ impl SerctlApp {
                         .color(Color32::YELLOW),
                     );
                 });
-            return true;
+            true
         }
         #[cfg(windows)]
         {
@@ -5861,8 +5870,14 @@ impl SerctlApp {
             let mut visible = true;
             let mut rotate_manual = false;
             let mut rotate_random = false;
+            #[cfg(windows)]
             let mut preserve = false;
+            #[cfg(not(windows))]
+            let preserve = false;
+            #[cfg(windows)]
             let mut preserve_random = false;
+            #[cfg(not(windows))]
+            let preserve_random = false;
             let mut destructive_reset = false;
             let mut destructive_random = false;
             let mut open_admin = false;

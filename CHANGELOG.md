@@ -32,6 +32,7 @@
 - 修复 runtime descriptor 协议诊断仍显示 IPC v6 的陈旧信息；当前统一按 IPC v8 校验，旧 v7-only descriptor 即使 PID 已死也保留 descriptor/secret 证据并失败关闭。
 - daemon 与 helper 新增不启动服务、不读取 vault 的 `--version` 自检；daemon 同时报告 build identity 与 `IPC v8..=v8`，helper 报告 transfer protocol version，便于成套 staging/升级时发现半升级。
 - CLI 的 Clap 诊断统一为恰好一个结尾换行，避免 `--version` 在 PowerShell 中被拆成含空元素的数组，从而使三件套 clean-commit 发布校验可稳定执行。
+- 修复 Ubuntu/macOS E2E 把 Unix socket 放在过长 checkout 路径下、超过 `sun_path` 后只误报 descriptor 超时的问题；测试现在使用原子创建的 0700 短路径并直接报告 daemon 早退原因，同时用精确平台 `cfg` 消除非 Windows 构建中的 migration/recovery 死代码警告。
 - 将 `grant-issue` 可签发 scope 收紧为当前 Agent JSONL 实际可消费的 `ssh.exec`、`daemon.status`、`sftp.list`、`sftp.write` 和 `transfer.write`；协议预留但尚无 Agent handler 的 read/status/cancel/forward 不再生成不可用 Grant。
 - 将 Grant 错误拆分为“当前 daemon 实例未登记”和“Grant 已过期”。新实例不会仅凭磁盘 Grant 文件恢复授权，避免削弱实例绑定和签发边界。
 - 修复远端文件刷新可能长期卡在“正在读取”的问题：UI 目录请求使用独立 20 秒上限，并在状态文本中显示该上限。
