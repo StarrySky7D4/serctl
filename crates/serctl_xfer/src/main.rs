@@ -1591,14 +1591,19 @@ mod tests {
         let transfer_id = "13".repeat(16);
         let partial = native_partial_path(&target, &transfer_id).unwrap();
         let payload = vec![0x41_u8; 256];
+        let payload_len = payload.len() as u64;
         let expected_sha256 = hex::encode(Sha256::digest(&payload));
-        let (mut client_in, mut client_out, helper) = helper_session(256, 1024).await;
+        // Make this one chunk fill the negotiated credit window. The helper
+        // must therefore sync the write and report it durable before ACKing;
+        // a merely confirmed ACK is not a disk-write completion barrier on
+        // Windows because Tokio may still have a blocking file write in flight.
+        let (mut client_in, mut client_out, helper) = helper_session(256, 256).await;
         protocol::write_control(
             &mut client_in,
             &protocol::Control::BeginPush {
                 transfer_id: transfer_id.clone(),
                 target: target.display().to_string(),
-                size: payload.len() as u64,
+                size: payload_len,
                 sha256: expected_sha256,
                 resume_token: "14".repeat(32),
                 resume: false,
@@ -1621,10 +1626,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let _ack = protocol::read_frame(&mut client_out)
-            .await
-            .unwrap()
-            .unwrap();
+        let Some(protocol::Frame::Control(protocol::Control::Ack {
+            confirmed_offset,
+            durable_offset,
+            ..
+        })) = protocol::read_frame(&mut client_out).await.unwrap()
+        else {
+            panic!("helper did not acknowledge the complete durable test payload")
+        };
+        assert_eq!(confirmed_offset, payload_len);
+        assert_eq!(durable_offset, payload_len);
 
         let mut tamper = std::fs::OpenOptions::new()
             .write(true)
