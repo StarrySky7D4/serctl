@@ -1554,7 +1554,13 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             let config = config.clone();
             let connection_state = ssh_state.clone();
             tokio::spawn(async move {
-                let _ = russh::server::run_stream(config, socket, handler).await;
+                let result = match russh::server::run_stream(config, socket, handler).await {
+                    Ok(running) => running.await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    eprintln!("test SSH transport failed: {error:#}");
+                }
                 connection_state.record_connection_closed(connection).await;
             });
         }
