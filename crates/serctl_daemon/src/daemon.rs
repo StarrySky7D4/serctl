@@ -5548,6 +5548,199 @@ mod tests {
     /// serialize on it for their whole lifetime.
     static TEST_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[cfg(unix)]
+    static TEST_HOME_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Owns the process-global test-home override and its private directory.
+    /// The lock remains held until cleanup so a panic cannot leak either state
+    /// into the next global-daemon test.
+    struct GlobalTestHome {
+        base: std::path::PathBuf,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl GlobalTestHome {
+        async fn create() -> Self {
+            let lock = TEST_HOME_LOCK.lock().await;
+            let base = create_global_test_base();
+            serctl_core::vault::set_test_home(Some(base.clone()));
+            Self { base, _lock: lock }
+        }
+
+        #[cfg(windows)]
+        fn path(&self) -> &std::path::Path {
+            &self.base
+        }
+    }
+
+    impl Drop for GlobalTestHome {
+        fn drop(&mut self) {
+            serctl_core::vault::set_test_home(None);
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_global_test_base() -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock predates the Unix epoch")
+            .as_nanos();
+        for _ in 0..64 {
+            let sequence = TEST_HOME_SEQUENCE.fetch_add(1, Ordering::Relaxed) as u128;
+            let nonce = stamp.wrapping_add(sequence) as u32;
+            let base = std::path::Path::new("/tmp")
+                .join(format!("sctl-dmn-{:x}-{nonce:08x}", std::process::id()));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&base) {
+                Ok(()) => return base,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!(
+                    "failed to atomically create global-daemon test home {}: {error}",
+                    base.display()
+                ),
+            }
+        }
+        panic!("failed to allocate a unique global-daemon test home under /tmp");
+    }
+
+    #[cfg(not(unix))]
+    fn create_global_test_base() -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Preserve the established Windows temp-directory layout. Named pipes
+        // are not constrained by Unix sockaddr_un::sun_path.
+        let base = std::env::temp_dir().join(format!(
+            "serctl-global-daemon-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock predates the Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap_or_else(|error| {
+            panic!(
+                "failed to create global-daemon test home {}: {error}",
+                base.display()
+            )
+        });
+        base
+    }
+
+    #[cfg(unix)]
+    fn assert_global_test_endpoint_fits(endpoint: &str) {
+        // macOS has the narrowest supported sockaddr_un::sun_path (104 bytes,
+        // including its trailing NUL). Keeping the assertion at that boundary
+        // also leaves Linux comfortably below its 108-byte limit.
+        const MACOS_SUN_PATH_CAPACITY: usize = 104;
+        assert!(
+            endpoint.len() < MACOS_SUN_PATH_CAPACITY,
+            "global-daemon test endpoint is {} bytes and does not fit Unix sun_path: {endpoint}",
+            endpoint.len()
+        );
+    }
+
+    #[cfg(not(unix))]
+    fn assert_global_test_endpoint_fits(_endpoint: &str) {}
+
+    struct GlobalDaemonTask {
+        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl GlobalDaemonTask {
+        fn new(handle: tokio::task::JoinHandle<anyhow::Result<()>>) -> Self {
+            Self { handle }
+        }
+
+        fn is_finished(&self) -> bool {
+            self.handle.is_finished()
+        }
+
+        async fn assert_running(&mut self, context: &str) {
+            if !self.handle.is_finished() {
+                return;
+            }
+            match (&mut self.handle).await {
+                Ok(Ok(())) => panic!("{context}: daemon exited successfully before readiness"),
+                Ok(Err(error)) => panic!("{context}: daemon exited with error: {error:#}"),
+                Err(error) => panic!("{context}: daemon task failed: {error}"),
+            }
+        }
+
+        async fn wait_for_exit(&mut self, timeout: Duration, context: &str) {
+            match tokio::time::timeout(timeout, &mut self.handle).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => panic!("{context}: daemon exited with error: {error:#}"),
+                Ok(Err(error)) => panic!("{context}: daemon task failed: {error}"),
+                Err(_) => panic!("{context}"),
+            }
+        }
+    }
+
+    impl Drop for GlobalDaemonTask {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn wait_for_global_descriptor(
+        daemon_task: &mut GlobalDaemonTask,
+        timeout: Duration,
+    ) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match serctl_core::daemon_runtime::read_descriptor() {
+                Ok(Some(descriptor)) => {
+                    assert_global_test_endpoint_fits(&descriptor.endpoint);
+                    return descriptor.endpoint;
+                }
+                Ok(None) => {}
+                Err(error) => panic!("failed to read global-daemon runtime descriptor: {error:#}"),
+            }
+            daemon_task
+                .assert_running("global daemon exited before publishing its runtime descriptor")
+                .await;
+            if Instant::now() >= deadline {
+                panic!("global daemon did not publish its runtime descriptor within {timeout:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn connect_global_until(
+        daemon_task: &mut GlobalDaemonTask,
+        endpoint: &str,
+        timeout: Duration,
+    ) -> ipc::ClientStream {
+        let deadline = Instant::now() + timeout;
+        let mut last_error = None;
+        loop {
+            daemon_task
+                .assert_running("global daemon exited before an IPC connection was established")
+                .await;
+            let now = Instant::now();
+            if now >= deadline {
+                panic!(
+                    "failed to connect to global daemon within {timeout:?}; last error: {}",
+                    last_error
+                        .as_deref()
+                        .unwrap_or("connection attempt timed out")
+                );
+            }
+            let attempt_timeout = (deadline - now).min(Duration::from_millis(100));
+            match tokio::time::timeout(attempt_timeout, ipc::connect(endpoint)).await {
+                Ok(Ok(stream)) => return stream,
+                Ok(Err(error)) => last_error = Some(format!("{error:#}")),
+                Err(_) => last_error = Some("connection attempt timed out".into()),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[test]
     fn grantable_operations_match_the_current_agent_gateway() {
         assert_eq!(
@@ -5638,26 +5831,15 @@ mod tests {
             v6_client_handshake, ActivationSecret, InstanceId, V6ClientIo, V6RequestPrelude,
             IPC_PROTOCOL_VERSION_V6,
         };
-        use std::time::{SystemTime, UNIX_EPOCH};
 
-        let _home_guard = TEST_HOME_LOCK.lock().await;
-
-        let base = std::env::temp_dir().join(format!(
-            "serctl-global-daemon-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        vault::set_test_home(Some(base.clone()));
+        let _test_home = GlobalTestHome::create().await;
 
         // Windows profile creation requires an initialized administrator
         // policy with a persisted 2-of-2 recovery share.
         #[cfg(windows)]
         vault::initialize_admin_password("test-administrator-password", |media| {
-            std::fs::write(base.join("recovery.bin"), media).map_err(anyhow::Error::from)
+            std::fs::write(_test_home.path().join("recovery.bin"), media)
+                .map_err(anyhow::Error::from)
         })
         .unwrap();
 
@@ -5677,29 +5859,22 @@ mod tests {
 
         let instance = InstanceId::random();
         let secret = ActivationSecret::random();
-        let daemon_task = tokio::spawn(super::run_global(
+        let expected_endpoint = daemon_runtime::v6_endpoint(&instance).unwrap();
+        assert_global_test_endpoint_fits(&expected_endpoint);
+        let mut daemon_task = GlobalDaemonTask::new(tokio::spawn(super::run_global(
             instance,
             secret.clone(),
             "testbuild".into(),
-        ));
+        )));
 
         // Wait for the runtime descriptor: the daemon writes it only after the
         // listener is bound.
-        let endpoint = loop {
-            if let Some(descriptor) = daemon_runtime::read_descriptor().unwrap() {
-                break descriptor.endpoint;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        let endpoint = wait_for_global_descriptor(&mut daemon_task, Duration::from_secs(5)).await;
         let deadline = Instant::now() + Duration::from_secs(10);
 
         // Catalog listing needs no unlock and no SSH.
-        let stream = loop {
-            match ipc::connect(&endpoint).await {
-                Ok(stream) => break stream,
-                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
-        };
+        let stream =
+            connect_global_until(&mut daemon_task, &endpoint, Duration::from_secs(2)).await;
         let list_frame = ipc::Frame::ListProfiles;
         let list_hash = serctl_protocol::v6::root_request_hash(&list_frame).unwrap();
         let list_prelude = V6RequestPrelude {
@@ -5733,7 +5908,8 @@ mod tests {
         assert_eq!(profiles[0].name, "v6test");
 
         // A wrong passphrase fails the unlock before any SSH connection.
-        let stream = ipc::connect(&endpoint).await.unwrap();
+        let stream =
+            connect_global_until(&mut daemon_task, &endpoint, Duration::from_secs(2)).await;
         let unlock_frame = ipc::Frame::Unlock {
             passphrase: "wrong-passphrase".into(),
         };
@@ -5765,7 +5941,8 @@ mod tests {
         assert!(matches!(reply, ipc::Frame::Error { .. }));
 
         // Possession of the activation secret alone cannot stop the broker.
-        let stream = ipc::connect(&endpoint).await.unwrap();
+        let stream =
+            connect_global_until(&mut daemon_task, &endpoint, Duration::from_secs(2)).await;
         let rejected_shutdown = ipc::Frame::Shutdown {
             passphrase: "wrong-passphrase".into(),
         };
@@ -5798,7 +5975,8 @@ mod tests {
         assert!(daemon_runtime::read_descriptor().unwrap().is_some());
 
         // A verified profile passphrase closes the daemon and clears runtime state.
-        let stream = ipc::connect(&endpoint).await.unwrap();
+        let stream =
+            connect_global_until(&mut daemon_task, &endpoint, Duration::from_secs(2)).await;
         let shutdown_frame = ipc::Frame::Shutdown {
             passphrase: "correct-passphrase".into(),
         };
@@ -5829,19 +6007,18 @@ mod tests {
             .unwrap();
         assert!(matches!(reply, ipc::Frame::Ack));
 
-        tokio::time::timeout(Duration::from_secs(5), daemon_task)
-            .await
-            .expect("global daemon did not exit after shutdown")
-            .unwrap()
-            .unwrap();
+        daemon_task
+            .wait_for_exit(
+                Duration::from_secs(5),
+                "global daemon did not exit after shutdown",
+            )
+            .await;
         assert!(daemon_runtime::read_descriptor().unwrap().is_none());
         assert!(daemon_runtime::read_secret().unwrap().is_none());
-
-        vault::set_test_home(None);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     async fn v6_io_for(
+        daemon_task: &mut GlobalDaemonTask,
         endpoint: &str,
         secret: &serctl_protocol::v6::ActivationSecret,
         instance: serctl_protocol::v6::InstanceId,
@@ -5849,26 +6026,11 @@ mod tests {
         deadline: Instant,
     ) -> serctl_protocol::v6::V6ClientIo<ipc::ClientStream> {
         use serctl_protocol::v6::{v6_client_handshake, V6ClientIo};
-        let stream = ipc::connect(endpoint).await.unwrap();
+        let stream = connect_global_until(daemon_task, endpoint, Duration::from_secs(2)).await;
         let session = v6_client_handshake(stream, secret, instance, prelude, deadline)
             .await
             .unwrap();
         V6ClientIo::new(session)
-    }
-
-    async fn global_test_base() -> std::path::PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let base = std::env::temp_dir().join(format!(
-            "serctl-global-daemon-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        serctl_core::vault::set_test_home(Some(base.clone()));
-        base
     }
 
     #[test]
@@ -5941,71 +6103,52 @@ mod tests {
 
     #[tokio::test]
     async fn global_daemon_exits_after_its_idle_window_with_no_work() {
-        use serctl_core::{daemon_runtime, vault};
+        use serctl_core::daemon_runtime;
         use serctl_protocol::v6::{ActivationSecret, InstanceId};
 
-        let _home_guard = TEST_HOME_LOCK.lock().await;
-        let base = global_test_base().await;
+        let _test_home = GlobalTestHome::create().await;
         let instance = InstanceId::random();
         let secret = ActivationSecret::random();
-        let daemon_task = tokio::spawn(super::run_global_with_idle_timeout(
-            instance,
-            secret,
-            "testbuild".into(),
-            Duration::from_millis(300),
-        ));
+        let expected_endpoint = daemon_runtime::v6_endpoint(&instance).unwrap();
+        assert_global_test_endpoint_fits(&expected_endpoint);
+        let mut daemon_task =
+            GlobalDaemonTask::new(tokio::spawn(super::run_global_with_idle_timeout(
+                instance,
+                secret,
+                "testbuild".into(),
+                Duration::from_millis(300),
+            )));
 
         // Wait for publication, then let the idle window expire.
-        let publish_deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if daemon_runtime::read_descriptor().unwrap().is_some() {
-                break;
-            }
-            if Instant::now() >= publish_deadline {
-                panic!("global daemon did not publish its runtime descriptor");
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        tokio::time::timeout(Duration::from_secs(5), daemon_task)
-            .await
-            .expect("global daemon did not idle-exit")
-            .unwrap()
-            .unwrap();
+        wait_for_global_descriptor(&mut daemon_task, Duration::from_secs(5)).await;
+        daemon_task
+            .wait_for_exit(Duration::from_secs(5), "global daemon did not idle-exit")
+            .await;
         assert!(daemon_runtime::read_descriptor().unwrap().is_none());
         assert!(daemon_runtime::read_secret().unwrap().is_none());
-
-        vault::set_test_home(None);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn global_daemon_keeps_serving_while_live_work_holds_the_idle_counter() {
-        use serctl_core::{daemon_runtime, vault};
+        use serctl_core::daemon_runtime;
         use serctl_protocol::v6::{
             frame_kind, ActivationSecret, InstanceId, V6RequestPrelude, IPC_PROTOCOL_VERSION_V6,
         };
 
-        let _home_guard = TEST_HOME_LOCK.lock().await;
-        let base = global_test_base().await;
+        let _test_home = GlobalTestHome::create().await;
         let instance = InstanceId::random();
         let secret = ActivationSecret::random();
-        let daemon_task = tokio::spawn(super::run_global_with_idle_timeout(
-            instance,
-            secret.clone(),
-            "testbuild".into(),
-            Duration::from_secs(2),
-        ));
+        let expected_endpoint = daemon_runtime::v6_endpoint(&instance).unwrap();
+        assert_global_test_endpoint_fits(&expected_endpoint);
+        let mut daemon_task =
+            GlobalDaemonTask::new(tokio::spawn(super::run_global_with_idle_timeout(
+                instance,
+                secret.clone(),
+                "testbuild".into(),
+                Duration::from_secs(2),
+            )));
 
-        let publish_deadline = Instant::now() + Duration::from_secs(5);
-        let endpoint = loop {
-            if let Some(descriptor) = daemon_runtime::read_descriptor().unwrap() {
-                break descriptor.endpoint;
-            }
-            if Instant::now() >= publish_deadline {
-                panic!("global daemon did not publish its runtime descriptor");
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        let endpoint = wait_for_global_descriptor(&mut daemon_task, Duration::from_secs(5)).await;
 
         // One open, authenticated connection is live work: it must postpone
         // idle exit well beyond the idle window.
@@ -6025,7 +6168,15 @@ mod tests {
             root_request_hash: list_hash,
         };
         let deadline = Instant::now() + Duration::from_secs(10);
-        let held = v6_io_for(&endpoint, &secret, instance, prelude, deadline).await;
+        let held = v6_io_for(
+            &mut daemon_task,
+            &endpoint,
+            &secret,
+            instance,
+            prelude,
+            deadline,
+        )
+        .await;
 
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(
@@ -6034,15 +6185,13 @@ mod tests {
         );
 
         drop(held);
-        tokio::time::timeout(Duration::from_secs(5), daemon_task)
-            .await
-            .expect("global daemon did not idle-exit after the last connection closed")
-            .unwrap()
-            .unwrap();
+        daemon_task
+            .wait_for_exit(
+                Duration::from_secs(5),
+                "global daemon did not idle-exit after the last connection closed",
+            )
+            .await;
         assert!(daemon_runtime::read_descriptor().unwrap().is_none());
-
-        vault::set_test_home(None);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
