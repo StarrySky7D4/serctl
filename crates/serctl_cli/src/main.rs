@@ -13,10 +13,13 @@ use serctl_core::vault;
 mod e2e_tests;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::{
     collections::BTreeMap,
+    io::IsTerminal,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -112,6 +115,11 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
     },
+    /// Observable, cancellable file transfer with remote-confirmed progress.
+    Transfer {
+        #[command(subcommand)]
+        command: TransferCommand,
+    },
     /// Open an interactive PTY shell through the on-demand global broker.
     Shell { name: Option<String> },
     /// Run a loopback-only SSH TCP tunnel in the foreground until Ctrl+C.
@@ -124,15 +132,23 @@ enum Cmd {
     Status { name: Option<String> },
     /// Stop a running daemon after verifying one profile passphrase.
     Down { name: Option<String> },
-    /// Issue a bounded 30-minute OperationGrant for an agent frontend.
+    /// Issue a policy-bounded OperationGrant for an agent frontend.
     GrantIssue {
         name: String,
-        /// Comma-separated protocol operation kinds (for example ssh.exec or sftp.list).
+        /// Comma-separated protocol operation kinds, such as ssh.exec,
+        /// sftp.list, sftp.write (create-dir only), or transfer.write.
         #[arg(long, value_delimiter = ',')]
         operations: Vec<String>,
         /// Maximum number of relayed operations (1..=1000).
         #[arg(long, default_value_t = 32)]
         budget: u32,
+        /// Capability lifetime in whole minutes (1..=40; default 30).
+        #[arg(
+            long,
+            default_value_t = 30,
+            value_parser = clap::value_parser!(u32).range(1..=40)
+        )]
+        ttl_minutes: u32,
         /// File to write the grant plus its agent private key to.
         #[arg(long, value_name = "FILE")]
         output: PathBuf,
@@ -144,6 +160,193 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         grant: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum TransferCommand {
+    /// Push a local file to a new remote destination.
+    Push(TransferPushArgs),
+    /// Pull a remote file to a new local destination.
+    Pull(TransferPullArgs),
+    /// Read sanitized transfer snapshots for one profile.
+    Status {
+        name: String,
+        transfer_id: Option<String>,
+        #[arg(long)]
+        watch: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel one active transfer owned by this profile.
+    Cancel { name: String, transfer_id: String },
+}
+
+#[derive(Args)]
+struct TransferPushArgs {
+    name: String,
+    local: PathBuf,
+    remote: String,
+    #[command(flatten)]
+    options: TransferCliOptions,
+}
+
+#[derive(Args)]
+struct TransferPullArgs {
+    name: String,
+    remote: String,
+    local: PathBuf,
+    #[command(flatten)]
+    options: TransferCliOptions,
+}
+
+#[derive(Args)]
+struct TransferCliOptions {
+    /// Backend selection: auto probes native then reports an explicit SFTP fallback.
+    #[arg(long, value_enum, default_value_t = CliTransferBackend::Auto)]
+    backend: CliTransferBackend,
+    /// Resume policy. `auto` requires the native backend and fails closed if unavailable.
+    #[arg(long, value_enum, default_value_t = CliResumeMode::Never)]
+    resume: CliResumeMode,
+    /// Fail after this many seconds without newly confirmed remote bytes.
+    #[arg(long, default_value_t = 30)]
+    idle_timeout_secs: u64,
+    /// Optional hard deadline for the complete transfer, independent of idle time.
+    #[arg(long)]
+    deadline_secs: Option<u64>,
+    /// Progress output: terminal display, stable NDJSON, quiet, or TTY auto-detection.
+    #[arg(long, value_enum, default_value_t = CliProgressMode::Auto)]
+    progress: CliProgressMode,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliTransferBackend {
+    Auto,
+    Native,
+    Sftp,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliResumeMode {
+    Auto,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CliProgressMode {
+    Auto,
+    Tty,
+    Json,
+    Quiet,
+}
+
+impl From<CliTransferBackend> for serctl_protocol::TransferBackend {
+    fn from(value: CliTransferBackend) -> Self {
+        match value {
+            CliTransferBackend::Auto => Self::Auto,
+            CliTransferBackend::Native => Self::Native,
+            CliTransferBackend::Sftp => Self::Sftp,
+        }
+    }
+}
+
+impl From<CliResumeMode> for serctl_protocol::TransferResumeMode {
+    fn from(value: CliResumeMode) -> Self {
+        match value {
+            CliResumeMode::Auto => Self::Auto,
+            CliResumeMode::Never => Self::Never,
+        }
+    }
+}
+
+fn effective_progress_mode(mode: CliProgressMode) -> CliProgressMode {
+    if mode == CliProgressMode::Auto {
+        if std::io::stderr().is_terminal() {
+            CliProgressMode::Tty
+        } else {
+            CliProgressMode::Json
+        }
+    } else {
+        mode
+    }
+}
+
+fn transfer_progress_percent(progress: &serctl_protocol::TransferProgress) -> f64 {
+    if progress.stage == serctl_protocol::TransferStage::Completed {
+        100.0
+    } else if progress.total_bytes == 0 {
+        0.0
+    } else {
+        (progress.confirmed_bytes as f64 * 100.0 / progress.total_bytes as f64).min(99.9)
+    }
+}
+
+fn transfer_progress_sink(mode: CliProgressMode) -> Option<client::TransferProgressSink> {
+    let mode = effective_progress_mode(mode);
+    match mode {
+        CliProgressMode::Quiet => None,
+        CliProgressMode::Json => Some(Arc::new(|progress| {
+            if let Ok(line) = serde_json::to_string(&progress) {
+                println!("{line}");
+            }
+        })),
+        CliProgressMode::Tty => Some(Arc::new(|progress| {
+            let eta = progress
+                .eta_ms
+                .map(|value| format!("{:.1}s", value as f64 / 1000.0))
+                .unwrap_or_else(|| "--".to_owned());
+            eprint!(
+                "\r{:?}  {:>5.1}%  {}/{}  win {:.1} KiB/s  avg {:.1} KiB/s  ETA {}  backend={} chunk={} window={} id={}      ",
+                progress.stage,
+                transfer_progress_percent(&progress),
+                progress.confirmed_bytes,
+                progress.total_bytes,
+                progress.window_bps / 1024.0,
+                progress.average_bps / 1024.0,
+                eta,
+                transfer_backend_name(progress.backend),
+                progress.chunk_bytes,
+                progress.window_bytes,
+                progress.transfer_id.as_str(),
+            );
+            if matches!(
+                progress.stage,
+                serctl_protocol::TransferStage::Completed
+                    | serctl_protocol::TransferStage::Failed
+                    | serctl_protocol::TransferStage::Cancelled
+            ) {
+                eprintln!();
+            }
+        })),
+        CliProgressMode::Auto => unreachable!("auto progress mode must be resolved"),
+    }
+}
+
+fn transfer_backend_name(backend: serctl_protocol::TransferBackend) -> &'static str {
+    match backend {
+        serctl_protocol::TransferBackend::Auto => "auto",
+        serctl_protocol::TransferBackend::Native => "native",
+        serctl_protocol::TransferBackend::Sftp => "sftp",
+        serctl_protocol::TransferBackend::SftpFallback => "sftp_fallback",
+    }
+}
+
+fn transfer_client_options(options: &TransferCliOptions) -> client::TransferOptions {
+    client::TransferOptions {
+        backend: options.backend.into(),
+        resume: options.resume.into(),
+        idle_timeout: std::time::Duration::from_secs(options.idle_timeout_secs),
+        deadline: options.deadline_secs.map(std::time::Duration::from_secs),
+        progress: transfer_progress_sink(options.progress),
+    }
+}
+
+fn transfer_is_terminal(stage: serctl_protocol::TransferStage) -> bool {
+    matches!(
+        stage,
+        serctl_protocol::TransferStage::Completed
+            | serctl_protocol::TransferStage::Failed
+            | serctl_protocol::TransferStage::Cancelled
+    )
 }
 
 #[derive(Subcommand)]
@@ -609,6 +812,7 @@ impl StartupSecrets {
             | Cmd::Exec { .. }
             | Cmd::Upload { .. }
             | Cmd::Download { .. }
+            | Cmd::Transfer { .. }
             | Cmd::Shell { .. }
             | Cmd::Tunnel { .. }
             | Cmd::Remove { .. }
@@ -938,12 +1142,17 @@ fn exit_with_clap_diagnostic(error: clap::Error) -> ! {
     use std::io::Write as _;
 
     let diagnostic = terminal_safe_clap_diagnostic(&error);
+    let text = clap_diagnostic_without_trailing_line_endings(&diagnostic.text);
     if diagnostic.use_stderr {
-        let _ = writeln!(std::io::stderr().lock(), "{}", diagnostic.text);
+        let _ = writeln!(std::io::stderr().lock(), "{text}");
     } else {
-        let _ = writeln!(std::io::stdout().lock(), "{}", diagnostic.text);
+        let _ = writeln!(std::io::stdout().lock(), "{text}");
     }
     std::process::exit(diagnostic.exit_code);
+}
+
+fn clap_diagnostic_without_trailing_line_endings(text: &str) -> &str {
+    text.trim_end_matches(['\r', '\n'])
 }
 
 fn saved_profile_message(name: &str) -> String {
@@ -962,16 +1171,17 @@ fn upload_success_message(bytes: u64, remote: &str) -> String {
     format!("uploaded {bytes} bytes to {}", terminal_safe_field(remote))
 }
 
-fn grant_issued_message(grant_id: &str, expires_unix_ms: u64, output: &Path) -> String {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0);
-    let remaining_minutes = expires_unix_ms.saturating_sub(now_ms) / 60_000;
+fn grant_issued_message(
+    grant_id: &str,
+    ttl_minutes: u32,
+    expires_unix_ms: u64,
+    output: &Path,
+) -> String {
     format!(
-        "grant {} issued for {} minutes; agent credentials written to {}",
+        "grant {} issued with TTL {} minutes (expires_unix_ms={}); agent credentials written to {}",
         terminal_safe_field(grant_id),
-        remaining_minutes,
+        ttl_minutes,
+        expires_unix_ms,
         terminal_safe_field(&output.display().to_string())
     )
 }
@@ -1571,6 +1781,94 @@ async fn run_cli(cmd: Cmd, mut secrets: StartupSecrets) -> Result<()> {
             .await?;
             println!("{}", download_success_message(bytes, &local));
         }
+        Cmd::Transfer { command } => match command {
+            TransferCommand::Push(args) => {
+                let progress_mode = effective_progress_mode(args.options.progress);
+                let options = transfer_client_options(&args.options);
+                let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
+                let bytes = client::transfer_push_with_master_cancellable(
+                    &args.name,
+                    &args.local,
+                    &args.remote,
+                    options,
+                    Some(master),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await?;
+                if progress_mode == CliProgressMode::Quiet {
+                    let _ = bytes;
+                }
+            }
+            TransferCommand::Pull(args) => {
+                let progress_mode = effective_progress_mode(args.options.progress);
+                let options = transfer_client_options(&args.options);
+                let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
+                let bytes = client::transfer_pull_with_master_cancellable(
+                    &args.name,
+                    &args.remote,
+                    &args.local,
+                    options,
+                    Some(master),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await?;
+                if progress_mode == CliProgressMode::Quiet {
+                    let _ = bytes;
+                }
+            }
+            TransferCommand::Status {
+                name,
+                transfer_id,
+                watch,
+                json,
+            } => {
+                let transfer_id = transfer_id
+                    .as_deref()
+                    .map(serctl_protocol::TransferId::parse)
+                    .transpose()?;
+                let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
+                loop {
+                    let snapshots =
+                        client::transfer_status(&name, &master, transfer_id.clone()).await?;
+                    if json {
+                        for snapshot in &snapshots {
+                            println!("{}", serde_json::to_string(snapshot)?);
+                        }
+                    } else if snapshots.is_empty() {
+                        println!("no retained transfers for this profile");
+                    } else {
+                        for snapshot in &snapshots {
+                            println!(
+                                "{} {:?} {:?} {}/{} backend={} chunk={} window={}",
+                                snapshot.transfer_id.as_str(),
+                                snapshot.direction,
+                                snapshot.stage,
+                                snapshot.confirmed_bytes,
+                                snapshot.total_bytes,
+                                transfer_backend_name(snapshot.backend),
+                                snapshot.chunk_bytes,
+                                snapshot.window_bytes,
+                            );
+                        }
+                    }
+                    if snapshots.is_empty()
+                        || !watch
+                        || snapshots
+                            .iter()
+                            .all(|snapshot| transfer_is_terminal(snapshot.stage))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+            TransferCommand::Cancel { name, transfer_id } => {
+                let transfer_id = serctl_protocol::TransferId::parse(&transfer_id)?;
+                let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
+                client::transfer_cancel(&name, &master, transfer_id).await?;
+                println!("transfer cancellation requested");
+            }
+        },
         Cmd::Shell { name } => {
             let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
             client::shell_with_master(&nm(name), Some(master)).await?;
@@ -1593,14 +1891,27 @@ async fn run_cli(cmd: Cmd, mut secrets: StartupSecrets) -> Result<()> {
             name,
             operations,
             budget,
+            ttl_minutes,
             output,
         } => {
             let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
-            let grant =
-                client::issue_grant_until(&name, &master, operations, budget, &output).await?;
+            let grant = client::issue_grant_with_ttl_until(
+                &name,
+                &master,
+                operations,
+                budget,
+                Duration::from_secs(u64::from(ttl_minutes).saturating_mul(60)),
+                &output,
+            )
+            .await?;
             println!(
                 "{}",
-                grant_issued_message(&grant.grant_id_hex(), grant.expires_unix_ms, &output)
+                grant_issued_message(
+                    &grant.grant_id_hex(),
+                    ttl_minutes,
+                    grant.expires_unix_ms,
+                    &output,
+                )
             );
         }
         Cmd::Agent { grant } => {
@@ -1615,14 +1926,15 @@ mod cli_tests {
     #[cfg(not(windows))]
     use super::reject_unsupported_platform_command;
     use super::{
-        commit_generated_profile_passphrase_with, download_success_message,
-        enter_linux_admin_target_for_command, local_exit_code, missing_profile_message,
-        persist_generated_profile_passphrase, persist_new_recovery_media, read_recovery_media,
-        removed_profile_message, required_profile_passphrase, saved_profile_message,
-        take_supported_secret_envs_from, terminal_safe_clap_diagnostic, terminal_safe_error,
-        terminal_safe_field, unix_exit_code, upload_success_message, AdminCommand, Cli, Cmd,
-        ProfilePasswordCommand, RecoveryCommand, SecretEnvAccess, StartupSecrets,
-        SupportedSecretEnvs, CLI_FAILURE_EXIT_CODE, MAX_RECOVERY_MEDIA_BYTES,
+        clap_diagnostic_without_trailing_line_endings, commit_generated_profile_passphrase_with,
+        download_success_message, enter_linux_admin_target_for_command, local_exit_code,
+        missing_profile_message, persist_generated_profile_passphrase, persist_new_recovery_media,
+        read_recovery_media, removed_profile_message, required_profile_passphrase,
+        saved_profile_message, take_supported_secret_envs_from, terminal_safe_clap_diagnostic,
+        terminal_safe_error, terminal_safe_field, transfer_backend_name, unix_exit_code,
+        upload_success_message, AdminCommand, Cli, Cmd, ProfilePasswordCommand, RecoveryCommand,
+        SecretEnvAccess, StartupSecrets, SupportedSecretEnvs, TransferCommand,
+        CLI_FAILURE_EXIT_CODE, MAX_RECOVERY_MEDIA_BYTES,
     };
     use clap::Parser;
     use std::{collections::BTreeMap, ffi::OsString, path::Path};
@@ -1631,6 +1943,19 @@ mod cli_tests {
     struct MemorySecretEnv {
         values: BTreeMap<String, OsString>,
         removals: Vec<String>,
+    }
+
+    #[test]
+    fn human_transfer_backend_names_match_the_json_contract() {
+        use serctl_protocol::TransferBackend;
+
+        assert_eq!(transfer_backend_name(TransferBackend::Auto), "auto");
+        assert_eq!(transfer_backend_name(TransferBackend::Native), "native");
+        assert_eq!(transfer_backend_name(TransferBackend::Sftp), "sftp");
+        assert_eq!(
+            transfer_backend_name(TransferBackend::SftpFallback),
+            "sftp_fallback"
+        );
     }
 
     impl SecretEnvAccess for MemorySecretEnv {
@@ -1756,6 +2081,89 @@ mod cli_tests {
         ])
         .unwrap();
         assert!(matches!(download.cmd, Some(Cmd::Download { .. })));
+
+        let transfer = Cli::try_parse_from([
+            "serctl",
+            "transfer",
+            "push",
+            "prod",
+            "evidence.json",
+            "/tmp/evidence.json",
+            "--backend",
+            "sftp",
+            "--resume",
+            "never",
+            "--idle-timeout-secs",
+            "30",
+            "--progress",
+            "json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            transfer.cmd,
+            Some(Cmd::Transfer {
+                command: TransferCommand::Push(_)
+            })
+        ));
+
+        let status = Cli::try_parse_from([
+            "serctl",
+            "transfer",
+            "status",
+            "prod",
+            "00000000000000000000000000000001",
+            "--watch",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            status.cmd,
+            Some(Cmd::Transfer {
+                command: TransferCommand::Status {
+                    watch: true,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn grant_ttl_cli_accepts_forty_minutes_and_rejects_policy_overflow() {
+        let parsed = Cli::try_parse_from([
+            "serctl",
+            "grant-issue",
+            "prod",
+            "--operations",
+            "ssh.exec",
+            "--ttl-minutes",
+            "40",
+            "--output",
+            "grant.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.cmd,
+            Some(Cmd::GrantIssue {
+                ttl_minutes: 40,
+                ..
+            })
+        ));
+
+        for invalid in ["0", "41"] {
+            assert!(Cli::try_parse_from([
+                "serctl",
+                "grant-issue",
+                "prod",
+                "--operations",
+                "ssh.exec",
+                "--ttl-minutes",
+                invalid,
+                "--output",
+                "grant.json",
+            ])
+            .is_err());
+        }
     }
 
     #[test]
@@ -2311,5 +2719,6 @@ mod cli_tests {
         assert!(!help.use_stderr);
         assert_eq!(help.exit_code, 0);
         assert!(help.text.contains('\n'));
+        assert!(!clap_diagnostic_without_trailing_line_endings(&help.text).ends_with(['\r', '\n']));
     }
 }

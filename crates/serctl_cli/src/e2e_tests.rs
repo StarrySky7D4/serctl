@@ -14,11 +14,13 @@ use russh_sftp::protocol::{
 use serctl_core::vault;
 use serctl_daemon::daemon;
 use serctl_protocol as ipc;
+use serctl_transfer_protocol as native;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify};
 use zeroize::Zeroizing;
@@ -120,6 +122,12 @@ struct TestState {
     exec_changed: Notify,
     sftp_hang: AtomicBool,
     sftp_write_hang: AtomicBool,
+    sftp_write_delay_ms: AtomicU64,
+    sftp_write_hang_at: AtomicU64,
+    sftp_write_calls: AtomicU64,
+    sftp_open_calls: AtomicU64,
+    sftp_stat_calls: AtomicU64,
+    sftp_wire_read_bytes: AtomicU64,
     sftp_large_dir: AtomicBool,
     upload_partial_events: Mutex<UploadPartialEvents>,
     upload_partial_changed: Notify,
@@ -414,6 +422,213 @@ struct TestSsh {
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
 }
 
+struct ObservedSftpStream<S> {
+    inner: S,
+    state: Arc<TestState>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ObservedSftpStream<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = std::pin::Pin::new(&mut self.inner).poll_read(context, buffer);
+        if matches!(result, std::task::Poll::Ready(Ok(()))) {
+            self.state
+                .sftp_wire_read_bytes
+                .fetch_add((buffer.filled().len() - before) as u64, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ObservedSftpStream<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+async fn run_test_native_helper<S>(mut stream: S, state: Arc<TestState>) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    native::write_control(
+        &mut stream,
+        &native::Control::Hello {
+            version: native::VERSION,
+            max_chunk: native::DEFAULT_CHUNK_BYTES,
+            max_window: native::MAX_WINDOW_BYTES,
+            resume: true,
+            sha256: true,
+            fsync: true,
+            no_replace: true,
+        },
+    )
+    .await?;
+    let (chunk, window) = match native::read_frame(&mut stream).await? {
+        Some(native::Frame::Control(native::Control::Hello {
+            version,
+            max_chunk,
+            max_window,
+            sha256,
+            fsync,
+            no_replace,
+            ..
+        })) if version == native::VERSION && sha256 && fsync && no_replace => (
+            max_chunk.min(native::DEFAULT_CHUNK_BYTES),
+            max_window.min(native::MAX_WINDOW_BYTES),
+        ),
+        _ => anyhow::bail!("test native client did not complete the handshake"),
+    };
+    anyhow::ensure!(chunk > 0 && window >= chunk, "invalid native limits");
+    match native::read_frame(&mut stream).await? {
+        Some(native::Frame::Control(native::Control::BeginPush {
+            transfer_id,
+            target,
+            size,
+            sha256,
+            ..
+        })) => {
+            let transfer_id_bytes = native::parse_transfer_id(&transfer_id)?;
+            anyhow::ensure!(
+                !state.files.lock().await.contains_key(&target),
+                "destination already exists"
+            );
+            native::write_control(
+                &mut stream,
+                &native::Control::Ready {
+                    chunk,
+                    window,
+                    durable_offset: 0,
+                },
+            )
+            .await?;
+            let mut payload = Vec::with_capacity(size as usize);
+            loop {
+                match native::read_frame(&mut stream).await? {
+                    Some(native::Frame::Data(data)) => {
+                        anyhow::ensure!(
+                            data.transfer_id == transfer_id_bytes
+                                && data.offset == payload.len() as u64,
+                            "native push offset mismatch"
+                        );
+                        payload.extend_from_slice(&data.payload);
+                        anyhow::ensure!(payload.len() as u64 <= size, "native push overflow");
+                        native::write_control(
+                            &mut stream,
+                            &native::Control::Ack {
+                                confirmed_offset: payload.len() as u64,
+                                durable_offset: payload.len() as u64,
+                                receiver_window: window,
+                            },
+                        )
+                        .await?;
+                    }
+                    Some(native::Frame::Control(native::Control::Commit)) => break,
+                    Some(native::Frame::Control(control)) => {
+                        anyhow::bail!("unexpected native push control: {control:?}")
+                    }
+                    None => anyhow::bail!("native push stream closed before commit"),
+                }
+            }
+            anyhow::ensure!(payload.len() as u64 == size, "native push size mismatch");
+            let actual_sha256 = hex::encode(Sha256::digest(&payload));
+            anyhow::ensure!(actual_sha256 == sha256, "native push SHA-256 mismatch");
+            let replaced = state.files.lock().await.insert(target, payload);
+            anyhow::ensure!(replaced.is_none(), "native no-replace race");
+            native::write_control(
+                &mut stream,
+                &native::Control::Completed {
+                    size,
+                    sha256: actual_sha256,
+                },
+            )
+            .await?;
+        }
+        Some(native::Frame::Control(native::Control::BeginPull {
+            transfer_id,
+            source,
+            offset,
+        })) => {
+            let transfer_id_bytes = native::parse_transfer_id(&transfer_id)?;
+            let payload = state
+                .files
+                .lock()
+                .await
+                .get(&source)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("native source not found"))?;
+            anyhow::ensure!(
+                offset <= payload.len() as u64,
+                "native pull offset overflow"
+            );
+            let sha256 = hex::encode(Sha256::digest(&payload));
+            native::write_control(
+                &mut stream,
+                &native::Control::PullReady {
+                    chunk,
+                    window,
+                    size: payload.len() as u64,
+                    sha256: sha256.clone(),
+                    start_offset: offset,
+                },
+            )
+            .await?;
+            let mut confirmed = offset;
+            while confirmed < payload.len() as u64 {
+                let end = (confirmed as usize + chunk as usize).min(payload.len());
+                let data = native::DataFrame::new(
+                    transfer_id_bytes,
+                    confirmed,
+                    payload[confirmed as usize..end].to_vec(),
+                )?;
+                native::write_data(&mut stream, &data).await?;
+                match native::read_frame(&mut stream).await? {
+                    Some(native::Frame::Control(native::Control::Ack {
+                        confirmed_offset,
+                        durable_offset,
+                        ..
+                    })) if confirmed_offset == end as u64 && durable_offset <= confirmed_offset => {
+                        confirmed = confirmed_offset;
+                    }
+                    _ => anyhow::bail!("native pull acknowledgement mismatch"),
+                }
+            }
+            native::write_control(
+                &mut stream,
+                &native::Control::Completed {
+                    size: payload.len() as u64,
+                    sha256,
+                },
+            )
+            .await?;
+        }
+        None => return Ok(()),
+        _ => anyhow::bail!("unexpected native transfer root"),
+    }
+    Ok(())
+}
+
 async fn run_test_remote_forward_listener(
     listener: TcpListener,
     handle: russh::server::Handle,
@@ -596,6 +811,20 @@ impl russh::server::Handler for TestSsh {
         };
         self.state.record_exec_start(exec_channel, command).await;
         match command {
+            b"serctl-xfer serve --stdio" => {
+                let channel = self
+                    .channels
+                    .lock()
+                    .await
+                    .remove(&channel)
+                    .ok_or_else(|| anyhow::anyhow!("native exec channel was not registered"))?;
+                let state = Arc::clone(&self.state);
+                tokio::spawn(async move {
+                    if let Err(error) = run_test_native_helper(channel.into_stream(), state).await {
+                        eprintln!("test native helper failed: {error:#}");
+                    }
+                });
+            }
             b"ok" => {
                 session.data(channel, b"evidence\n".to_vec())?;
                 session.exit_status_request(channel, 0)?;
@@ -674,7 +903,11 @@ impl russh::server::Handler for TestSsh {
             directory_handles: HashMap::new(),
             directories_read: HashSet::new(),
         };
-        tokio::spawn(russh_sftp::server::run(channel.into_stream(), sftp));
+        let stream = ObservedSftpStream {
+            inner: channel.into_stream(),
+            state: self.state.clone(),
+        };
+        tokio::spawn(russh_sftp::server::run(stream, sftp));
         Ok(())
     }
 }
@@ -721,6 +954,7 @@ impl russh_sftp::server::Handler for MemorySftp {
         flags: OpenFlags,
         attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
+        self.state.sftp_open_calls.fetch_add(1, Ordering::SeqCst);
         if self.state.sftp_hang.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -754,6 +988,19 @@ impl russh_sftp::server::Handler for MemorySftp {
         self.directory_handles.remove(&handle);
         self.directories_read.remove(&handle);
         Ok(ok_status(id))
+    }
+
+    async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+        let path = self.handles.get(&handle).ok_or(StatusCode::Failure)?;
+        let files = self.state.files.lock().await;
+        let file = files.get(path).ok_or(StatusCode::NoSuchFile)?;
+        Ok(Attrs {
+            id,
+            attrs: FileAttributes {
+                size: Some(file.len() as u64),
+                ..FileAttributes::default()
+            },
+        })
     }
 
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
@@ -825,8 +1072,16 @@ impl russh_sftp::server::Handler for MemorySftp {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
+        let call = self.state.sftp_write_calls.fetch_add(1, Ordering::SeqCst) + 1;
         if self.state.sftp_write_hang.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
+        }
+        if self.state.sftp_write_hang_at.load(Ordering::SeqCst) == call {
+            std::future::pending::<()>().await;
+        }
+        let delay_ms = self.state.sftp_write_delay_ms.load(Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
         let path = self.handles.get(&handle).ok_or(StatusCode::Failure)?;
         let mut files = self.state.files.lock().await;
@@ -862,6 +1117,7 @@ impl russh_sftp::server::Handler for MemorySftp {
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        self.state.sftp_stat_calls.fetch_add(1, Ordering::SeqCst);
         if self.state.sftp_hang.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -946,6 +1202,102 @@ impl russh_sftp::server::Handler for MemorySftp {
             .ok_or(StatusCode::NoSuchFile)?;
         files.insert(hardlink.newpath, data);
         Ok(Packet::Status(ok_status(id)))
+    }
+}
+
+async fn matrix_sftp_session(
+    state: Arc<TestState>,
+    max_concurrent_writes: usize,
+) -> (russh_sftp::client::SftpSession, tokio::task::JoinHandle<()>) {
+    let (client, server) = tokio::io::duplex(2 * 1024 * 1024);
+    let handler = MemorySftp {
+        state,
+        handles: HashMap::new(),
+        directory_handles: HashMap::new(),
+        directories_read: HashSet::new(),
+    };
+    let server = tokio::spawn(russh_sftp::server::run(server, handler));
+    let client = russh_sftp::client::SftpSession::new_with_config(
+        client,
+        russh_sftp::client::Config {
+            max_packet_len: 256 * 1024,
+            max_concurrent_writes,
+            request_timeout_secs: 2,
+        },
+    )
+    .await
+    .unwrap();
+    (client, server)
+}
+
+#[tokio::test]
+async fn sftp_chunk_window_and_delayed_or_lost_status_matrix() {
+    use tokio::io::AsyncWriteExt as _;
+
+    for chunk_bytes in [4, 8, 16, 32].map(|kib| kib * 1024) {
+        for max_concurrent_writes in [1, 2, 8] {
+            let state = Arc::new(TestState::default());
+            state
+                .files
+                .lock()
+                .await
+                .insert("/matrix.bin".into(), Vec::new());
+            state.sftp_write_delay_ms.store(2, Ordering::SeqCst);
+            let (sftp, server) =
+                matrix_sftp_session(Arc::clone(&state), max_concurrent_writes).await;
+            let mut file = sftp
+                .open_with_flags("/matrix.bin", OpenFlags::WRITE | OpenFlags::TRUNCATE)
+                .await
+                .unwrap();
+            let payload = vec![0x5a; chunk_bytes * 4];
+            for chunk in payload.chunks(chunk_bytes) {
+                file.write_all(chunk).await.unwrap();
+            }
+            file.shutdown().await.unwrap();
+            assert_eq!(
+                state.files.lock().await.get("/matrix.bin").unwrap(),
+                &payload,
+                "chunk={chunk_bytes} window={max_concurrent_writes}"
+            );
+            sftp.close().await.unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    for max_concurrent_writes in [1, 2, 8] {
+        let state = Arc::new(TestState::default());
+        state
+            .files
+            .lock()
+            .await
+            .insert("/lost-ack.bin".into(), Vec::new());
+        state.sftp_write_hang_at.store(1, Ordering::SeqCst);
+        let (sftp, server) = matrix_sftp_session(Arc::clone(&state), max_concurrent_writes).await;
+        let mut file = sftp
+            .open_with_flags("/lost-ack.bin", OpenFlags::WRITE | OpenFlags::TRUNCATE)
+            .await
+            .unwrap();
+        for queued in 0..max_concurrent_writes {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                file.write_all(&[queued as u8; 4096]),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("WRITE {queued} blocked before the configured window was full")
+            })
+            .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), file.write_all(&[0xaa; 4096]))
+                .await
+                .is_err(),
+            "window={max_concurrent_writes} did not block at WRITE N+1 after the first STATUS was lost"
+        );
+        drop(file);
+        drop(sftp);
+        server.abort();
+        let _ = server.await;
     }
 }
 
@@ -1489,6 +1841,133 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         0o600
     );
 
+    // Regression for the real-world 1,298,223-byte snapshot that previously
+    // left a zero-byte partial. This is controlled-server evidence; the
+    // separate Local-Linux2 run remains an external acceptance gate.
+    vault::create_profile(
+        "e2e-large",
+        &daemon_creds,
+        E2E_PROFILE_PASSPHRASE,
+        administrator_passphrase,
+    )
+    .unwrap();
+    vault::set_pinned_fp("e2e-large", fingerprint.clone(), E2E_PROFILE_PASSPHRASE).unwrap();
+    let fixed_snapshot = (0..1_298_223_u32)
+        .map(|index| ((index.wrapping_mul(31) + 7) % 251) as u8)
+        .collect::<Vec<_>>();
+    let fixed_source = test_home.join("fixed-snapshot.bin");
+    std::fs::write(&fixed_source, &fixed_snapshot).unwrap();
+    let baseline_stat = state.sftp_stat_calls.load(Ordering::SeqCst);
+    let baseline_open = state.sftp_open_calls.load(Ordering::SeqCst);
+    let baseline_write = state.sftp_write_calls.load(Ordering::SeqCst);
+    let baseline_wire_bytes = state.sftp_wire_read_bytes.load(Ordering::SeqCst);
+    let baseline_partial_opens = state.upload_partial_events.lock().await.opened.len();
+    let observed_progress = Arc::new(StdMutex::new(Vec::new()));
+    let observed_sink = Arc::clone(&observed_progress);
+    let progress_started = StdInstant::now();
+    let progress: client::TransferProgressSink = Arc::new(move |progress| {
+        observed_sink
+            .lock()
+            .unwrap()
+            .push((progress_started.elapsed(), progress));
+    });
+    let fixed_result = client::transfer_push_with_master_cancellable(
+        "e2e-large",
+        &fixed_source,
+        "/fixed-snapshot.bin",
+        client::TransferOptions {
+            backend: ipc::TransferBackend::Sftp,
+            resume: ipc::TransferResumeMode::Never,
+            idle_timeout: Duration::from_secs(30),
+            deadline: Some(Duration::from_secs(120)),
+            progress: Some(progress),
+        },
+        Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    if let Err(error) = &fixed_result {
+        let server_files = state.files.lock().await.keys().cloned().collect::<Vec<_>>();
+        let partial_open_delta =
+            state.upload_partial_events.lock().await.opened.len() - baseline_partial_opens;
+        let observed = observed_progress.lock().unwrap();
+        panic!(
+            "fixed snapshot upload failed: {error:#}; last progress: {:?}; server stat/open/write delta: {}/{}/{}; partial-open delta: {}; wire-read delta: {}; server files: {:?}",
+            observed.last(),
+            state.sftp_stat_calls.load(Ordering::SeqCst) - baseline_stat,
+            state.sftp_open_calls.load(Ordering::SeqCst) - baseline_open,
+            state.sftp_write_calls.load(Ordering::SeqCst) - baseline_write,
+            partial_open_delta,
+            state.sftp_wire_read_bytes.load(Ordering::SeqCst) - baseline_wire_bytes,
+            server_files,
+        );
+    }
+    assert_eq!(fixed_result.unwrap(), fixed_snapshot.len() as u64);
+    assert_eq!(
+        state.files.lock().await.get("/fixed-snapshot.bin"),
+        Some(&fixed_snapshot)
+    );
+    {
+        let observed_progress = observed_progress.lock().unwrap();
+        let negotiating = observed_progress
+            .iter()
+            .find(|(_, progress)| progress.stage == ipc::TransferStage::Negotiating)
+            .expect("missing negotiating progress event");
+        assert!(negotiating.0 <= Duration::from_millis(500));
+        assert!(observed_progress
+            .windows(2)
+            .all(|pair| pair[0].1.confirmed_bytes <= pair[1].1.confirmed_bytes));
+        let completed = &observed_progress.last().unwrap().1;
+        assert_eq!(completed.stage, ipc::TransferStage::Completed);
+        assert_eq!(completed.confirmed_bytes, fixed_snapshot.len() as u64);
+        assert_eq!(completed.durable_bytes, fixed_snapshot.len() as u64);
+        assert_eq!(completed.chunk_bytes, ipc::SFTP_SAFE_CHUNK_BYTES as u32);
+        assert_eq!(completed.window_bytes, ipc::SFTP_SAFE_CHUNK_BYTES as u32);
+    }
+
+    // Exercise the M3 backend over the same real SSH transport. The server
+    // accepts only the fixed helper command and then speaks the bounded raw
+    // transfer protocol on that channel; paths never enter the exec string.
+    let native_options = client::TransferOptions {
+        backend: ipc::TransferBackend::Native,
+        resume: ipc::TransferResumeMode::Never,
+        idle_timeout: Duration::from_secs(30),
+        deadline: Some(Duration::from_secs(120)),
+        progress: None,
+    };
+    assert_eq!(
+        client::transfer_push_with_master_cancellable(
+            "e2e-large",
+            &fixed_source,
+            "/native-fixed-snapshot.bin",
+            native_options.clone(),
+            Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap(),
+        fixed_snapshot.len() as u64
+    );
+    assert_eq!(
+        state.files.lock().await.get("/native-fixed-snapshot.bin"),
+        Some(&fixed_snapshot)
+    );
+    let native_download = test_home.join("native-fixed-snapshot-download.bin");
+    assert_eq!(
+        client::transfer_pull_with_master_cancellable(
+            "e2e-large",
+            "/native-fixed-snapshot.bin",
+            &native_download,
+            native_options,
+            Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap(),
+        fixed_snapshot.len() as u64
+    );
+    assert_eq!(std::fs::read(native_download).unwrap(), fixed_snapshot);
+
     // The hardlink is the durable commit point. If unlinking the owned
     // temporary name then stalls until the request deadline, the daemon must
     // reconcile success before attempting its fresh bounded cleanup. Waiting
@@ -1674,10 +2153,11 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     // the whole v6 handshake again instead of reusing any session state.
     let daemon_instance = ipc::v6::InstanceId::random();
     let daemon_secret = ipc::v6::ActivationSecret::random();
-    let daemon_task = tokio::spawn(daemon::run_global(
+    let daemon_task = tokio::spawn(daemon::run_global_with_idle_timeout(
         daemon_instance,
         daemon_secret,
         "e2e-test-commit".to_owned(),
+        Duration::from_secs(10),
     ));
     let publish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1879,6 +2359,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .keys()
         .any(|path| path.starts_with("/direct-timeout.txt.serctl-part-")));
     assert!(!state.files.lock().await.contains_key("/direct-timeout.txt"));
+    state.sftp_write_hang.store(false, Ordering::SeqCst);
 
     // ── OperationGrant: issuance, relay, scope, budget, PoP, audit ───────
     let grant_path = test_home.join("agent-grant.json");
@@ -1894,6 +2375,16 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     let (loaded_grant, signing) = client::load_agent_grant(&grant_path).unwrap();
     assert_eq!(loaded_grant.grant_id, grant.grant_id);
     assert_eq!(loaded_grant.operations, vec!["ssh.exec", "sftp.list"]);
+
+    // Grant issuance uses a short-lived authenticated connection. Once that
+    // caller has returned, wait longer than this broker's ten-second idle
+    // window and reconnect from a fresh client operation. The grant's active
+    // reference must keep the daemon and its in-memory registration alive.
+    tokio::time::sleep(Duration::from_millis(10_500)).await;
+    assert!(
+        client::daemon_is_published().unwrap(),
+        "broker exited after the grant-issuing client disconnected"
+    );
 
     // A grant relay executes against the daemon's pooled session.
     let exec_value = client::agent_exec_until(&loaded_grant, &signing, "ok", 3_000)
@@ -1954,6 +2445,55 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     assert!(listing["entries"]
         .as_array()
         .is_some_and(|entries| entries.iter().any(|entry| entry["name"] == "evidence.txt")));
+
+    // `sftp.write` remains the create-directory scope. File upload uses the
+    // separate transfer.write root intent and never falls through ssh.exec.
+    let transfer_grant_path = test_home.join("transfer-grant.json");
+    client::issue_grant_until(
+        "direct-e2e",
+        direct_passphrase,
+        vec!["transfer.write".into()],
+        1,
+        &transfer_grant_path,
+    )
+    .await
+    .unwrap();
+    let (transfer_grant, transfer_signing) =
+        client::load_agent_grant(&transfer_grant_path).unwrap();
+    let transfer_value = client::agent_transfer_push_until(
+        &transfer_grant,
+        &transfer_signing,
+        &upload_source,
+        "/agent-transfer-evidence.txt",
+        client::TransferOptions {
+            backend: ipc::TransferBackend::Sftp,
+            resume: ipc::TransferResumeMode::Never,
+            idle_timeout: Duration::from_millis(3_000),
+            deadline: Some(Duration::from_millis(5_000)),
+            progress: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(transfer_value["bytes"], 15);
+    assert_eq!(transfer_value["backend"], "sftp");
+    assert_eq!(
+        transfer_value["chunk_bytes"],
+        ipc::SFTP_SAFE_CHUNK_BYTES as u64
+    );
+    assert_eq!(
+        transfer_value["window_bytes"],
+        ipc::SFTP_SAFE_CHUNK_BYTES as u64
+    );
+    assert_eq!(
+        state
+            .files
+            .lock()
+            .await
+            .get("/agent-transfer-evidence.txt")
+            .cloned(),
+        Some(b"server evidence".to_vec())
+    );
 
     // Proof of possession: a different key cannot relay with this grant.
     let other_key = SigningKey::generate(&mut OsRng);

@@ -1,0 +1,16 @@
+[package]
+name = "serctl-transfer-protocol"
+description = "Bounded binary protocol for the serctl native SSH transfer helper."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+zeroize.workspace = true

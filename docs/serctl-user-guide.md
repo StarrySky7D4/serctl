@@ -1,12 +1,15 @@
 # serctl 使用手册
 
-适用版本：`v0.2.0-test.1`（预发布测试版）
-最后更新：2026-08-26
+适用版本：`v0.3.0-beta.2`（预发布测试版）
+最后更新：2026-08-31
 
 > [!WARNING]
 > 当前版本是测试版本，不应直接替代经过签名和独立验收的正式发行版。生产凭证必须先备份，再进行安装、升级或迁移。
 >
 > 当前源码的测试目录隔离仍在加固中。存有真实 `%USERPROFILE%\.serctl` 的 Windows 账户不得运行默认并行的 `cargo test`。开发测试必须使用专用操作系统账户，并严格使用 `-- --test-threads=1`。如果真实凭证库中出现 `v6test`、`e2e`、`prod`、`tester` 或 `127.0.0.1:22` 等测试数据，请立即停止 serctl 和测试，不要继续保存或初始化。
+
+> [!NOTE]
+> 策略 DSL、typed remote helper、可恢复作业 receipt、远端审计锚定、IPC v9 codec 和 QUIC 高速通道仍是目标设计，不是本手册中的可用命令。设计决策和验收路线见 [目标架构与演进路线](serctl-design-roadmap.md)；当前能力以本手册、二进制 `--help` 和 [架构、安全与运维说明](serctl-architecture-security.html)为准。
 
 ## 1. serctl 是什么
 
@@ -218,6 +221,8 @@ $Fingerprint = 'SHA256:请替换为真实指纹'
 
 上传和下载都不会覆盖已有目标。上传要求 SSH 服务端支持 OpenSSH `hardlink@openssh.com` 扩展；不支持时 serctl 会安全失败，不降级为可能覆盖目标的重命名操作。
 
+文件页现在显示结构化传输卡：阶段、远端确认字节、进度条、3 秒窗口速度、平均速度、ETA、实际 backend、chunk/window 与 transfer id，并可取消。进度不按本地读取或 IPC 写入量虚报；只有完整性验证和 no-overwrite commit 都成功后才显示 100%。`auto` 会先探测固定命令 `serctl-xfer serve --stdio`：兼容 helper 存在时显示 `native`，否则明确显示 `sftp_fallback`。勾选“启用断点续传”后 helper 不可用会失败关闭，不会悄悄降级成不可恢复的 SFTP。
+
 若上传或创建目录提示“提交结果未知”，应先检查远端最终路径和可能存在的 `.serctl-part-*` 临时文件，再决定是否重试。
 
 ### 6.5 Bash 页
@@ -270,6 +275,8 @@ $Fingerprint = 'SHA256:请替换为真实指纹'
 
 默认超时为 300 秒。远端返回非零状态时，serctl 也返回非零本地退出码。
 
+`exec` 只提供一次性、absolute-deadline 约束的远程执行，不支持 daemon 重启后恢复、跨进程查询命令进度或可靠取回已越过 deadline 的最终退出状态。W2 vendor Linux 冷构建先在 900 秒边界没有 Cargo/测试终态；后续外层 1,200 秒请求也返回 timeout，但独立只读校验发现同一命令已经写入 `BUILD-READY-v1` receipt（SHA-256 `b1e8041912e6e1838ee2f9c2ec0405bf92a5fbfd52d54120a66d85fb5239564c`）。因此 timeout 首先必须归类为 `unknown`，只有预先约定、严格绑定输入和输出身份且经独立读取验证的 receipt 才能恢复成功状态。对于长时间编译，建议把 `fetch/vendor`、`cargo test --no-run`、测试执行和结果收集拆成独立阶段，将日志、退出码与 receipt 原子写入远端受控目录，再用新的短命令查询；内层远端命令应早于外层 relay deadline 结束，并至少预留三分钟用于 marker、终态读取和清理。当前产品尚未提供心跳进度或可恢复命令状态查询。
+
 ### 7.4 交互 shell
 
 ```powershell
@@ -281,11 +288,23 @@ $Fingerprint = 'SHA256:请替换为真实指纹'
 ### 7.5 上传与下载
 
 ```powershell
-& $Serctl upload prod '.\request.json' '/tmp/request.json' --timeout-secs 120
-& $Serctl download prod '/tmp/result.json' '.\result.json' --timeout-secs 120
+& $Serctl transfer push prod '.\request.json' '/tmp/request.json' `
+  --backend auto --resume never --idle-timeout-secs 30 --deadline-secs 120
+& $Serctl transfer pull prod '/tmp/result.json' '.\result.json' `
+  --backend auto --resume never --idle-timeout-secs 30 --deadline-secs 120
 ```
 
-本地和远端目标已存在时均不会覆盖。
+本地和远端目标已存在时均不会覆盖。TTY 显示结构化进度；非 TTY 默认逐行输出无 ANSI 的 JSON。也可显式使用 `--progress tty|json|quiet`。`transfer status prod [TRANSFER_ID] --watch --json` 可从另一已授权客户端读取同 profile 的脱敏快照，`transfer cancel prod TRANSFER_ID` 可取消活动传输。
+
+SFTP fallback 固定使用保守的 2 KiB chunk 和单 WRITE/STATUS 窗口；每个 WRITE 都必须收到 request-id 匹配的远端 SFTP STATUS 后才推进 `confirmed_bytes`。纯 SFTP 的 4/8/16/32 KiB、并发窗口 1/2/8 矩阵，以及完整 russh exec/SFTP 服务端的 4/8/16/32 KiB 首帧矩阵均能完成；因此通用 ChannelStream、SSH window/flush 与服务端分帧已被排除为 2 KiB 根因。尚待定位的是现实 OpenSSH + `serctl-xfer` 子进程 stdio 边界。native wire 支持更大的 raw chunk/window，但外部实机完成前 daemon 仍限制为 2 KiB；native 功能可用不等于吞吐已达到 `scp` 基线。
+
+`--resume auto` 使用 profile id/generation 绑定的受保护 journal。上传恢复还要求 schema 2 远端 sidecar 的 token hash、transfer id、size、SHA-256、durable offset、partial device/inode 与 receiving/committed state 全部一致；下载恢复要求远端重新报告的 size/SHA-256 与 journal 一致，并只保留已同步的本地连续前缀。任一项不符都会安全拒绝，且不会截断未知文件。committed receipt 当前没有消费 ACK/GC/保留期，只能由同一 id/token 的显式恢复请求对账。默认仍为 `--resume never`。旧 `upload` / `download` 命令暂作兼容别名，但不提供新的可观测参数。
+
+恢复被接受时会出现 `resumed` 事件，速度与 ETA 从既有 durable prefix 之后重新计量。Linux native 的 `outcome_unknown` 只表示已经进入 descriptor-bound no-replace 调用或其后的可信终态丢失；`cleanup_incomplete` 表示目标可能已提交，但经过身份验证的 partial/sidecar 清理没有全部完成。两者都不得直接重试，应先独立核对目标的 size/SHA-256 与 partial/sidecar 状态；`resume=never` 没有 receipt 恢复保证。
+
+native helper 必须是与远端操作系统/架构匹配的 `serctl-xfer`，由 SSH 用户拥有、不可被其他用户写入、具有执行权限，并位于该用户非交互 SSH exec 的 `PATH`。当前仓库尚未提供签名包驱动的 `transfer bootstrap`，因此首次安装需通过可信的软件包/运维通道完成；不要把本机 Windows `serctl-xfer.exe` 上传到 Linux，也不要用 `ssh.exec` + Base64 分块冒充 bootstrap。未满足这些条件时使用 `--backend auto --resume never` 可明确回退到 SFTP。
+
+当前生产 native helper server 只支持 Linux 远端的 durability/no-follow/no-replace 语义。macOS、BSD 与 Windows helper 会在能力 Hello 前失败关闭，不会宣称可用；Windows 本地 CLI 到 Linux 远端仍可使用 native，其他远端则应选择 `auto` 并接受明确的 SFTP fallback。Linux 提交依赖 `/proc/self/fd`、`linkat` 与 parent-dirfd fsync；本轮 Windows 主机只完成 Linux target 交叉编译/Clippy，正式启用前仍须 Ubuntu 实机验证。
 
 ### 7.6 隧道
 
@@ -447,12 +466,13 @@ v2 使用共享主口令；v4 要求每个 profile 独立口令。迁移只在 W
 
 ### 11.2 有界 OperationGrant
 
-签发最多 30 分钟、带操作范围和次数预算的 grant：
+签发带操作范围、次数预算和显式 TTL 的 grant。默认 TTL 为 30 分钟，允许范围为 1–40 分钟；CLI 和 daemon 都会独立拒绝越界值：
 
 ```powershell
 & $Serctl grant-issue prod `
-  --operations ssh.exec,daemon.status,sftp.list `
+  --operations ssh.exec,daemon.status,sftp.list,sftp.write,transfer.write `
   --budget 20 `
+  --ttl-minutes 40 `
   --output 'C:\Secure\prod-agent-grant.json'
 ```
 
@@ -469,11 +489,12 @@ v2 使用共享主口令；v4 要求每个 profile 独立口令。迁移只在 W
 {"op":"exec","request_id":2,"cmd":"uname -a","timeout_ms":30000}
 {"op":"list-dir","request_id":3,"path":"/tmp","timeout_ms":30000}
 {"op":"create-dir","request_id":4,"path":"/tmp/example","timeout_ms":30000}
+{"op":"transfer-push","request_id":5,"local":"C:\\staging\\archive.tar.zst","remote":"/tmp/archive.tar.zst","backend":"auto","resume":"never","idle_timeout_ms":30000,"deadline_ms":300000}
 ```
 
-grant 文件同时包含 agent 私钥，应按密码文件保护。daemon 会在 Grant 有效期间保持运行，避免空闲退出丢失内存登记；Grant 过期后才恢复正常的空闲退出。若 daemon 因人工操作、升级或崩溃而重新启动，旧文件不会被新实例直接信任，必须重新签发。此时错误会明确报告“未在当前 daemon 实例登记”，而不会与“已过期”合并。过期、超预算或超出操作范围后同样必须重新签发。
+grant 文件同时包含 agent 私钥，应按密码文件保护。40 分钟是当前策略硬上限，只应用于有明确 owner、操作范围和预算的单次长任务，并为业务运行与结果读取留出余量；它不会延长单个远端请求自身声明的 deadline。daemon 会在 Grant 有效期间保持运行，避免空闲退出丢失内存登记；Grant 过期后才恢复正常的空闲退出。若 daemon 因人工操作、升级或崩溃而重新启动，旧文件不会被新实例直接信任，必须重新签发。此时错误会明确报告“未在当前 daemon 实例登记”，而不会与“已过期”合并。过期、超预算或超出操作范围后同样必须重新签发。
 
-`--operations` 使用协议中的精确操作种类：Agent 网关当前对应 `ssh.exec`、`daemon.status`、`sftp.list` 和 `sftp.write`。不要使用界面显示名称代替这些值。
+`--operations` 只接受当前 Agent JSONL 已实现的精确操作种类：`ssh.exec` 执行命令，`daemon.status` 查询状态，`sftp.list` 列目录，`sftp.write` **只允许 `create-dir`**，`transfer.write` 才允许 `transfer-push` 上传。协议中的 `transfer.read/status/cancel`、`sftp.read` 和 `forward` 尚无 Agent handler，当前签发器会拒绝，避免生成无法消费的 Grant。`sftp.write` 不包含 grant-backed upload，顶层兼容命令 `upload` 也不接受 `--grant`。不要用 `ssh.exec` + Base64 分块绕过传输授权，也不要使用界面显示名称代替这些值。当前 Agent 上传使用同一个经过 PoP 认证的 `transfer.write` 根 intent，后续 chunk/ack 不单独消耗 grant budget，且不会读取 profile 口令。
 
 ## 12. Linux 与 macOS 差异
 
@@ -577,6 +598,10 @@ serctl_cli up [NAME]
 serctl_cli exec NAME [--timeout-secs N] -- COMMAND
 serctl_cli upload NAME LOCAL REMOTE [--timeout-secs N]
 serctl_cli download NAME REMOTE LOCAL [--timeout-secs N]
+serctl_cli transfer push NAME LOCAL REMOTE [--backend auto|native|sftp] [--resume auto|never] [--idle-timeout-secs N] [--deadline-secs N] [--progress auto|tty|json|quiet]
+serctl_cli transfer pull NAME REMOTE LOCAL [同上]
+serctl_cli transfer status NAME [TRANSFER_ID] [--watch] [--json]
+serctl_cli transfer cancel NAME TRANSFER_ID
 serctl_cli shell [NAME]
 serctl_cli tunnel NAME local --target-port P [--port P] [--max-connections N]
 serctl_cli tunnel NAME remote --target-port P [--port P] [--max-connections N]
@@ -584,7 +609,7 @@ serctl_cli tunnel NAME dynamic [--port P] [--max-connections N]
 serctl_cli status [NAME]
 serctl_cli down [NAME]
 
-serctl_cli grant-issue NAME --operations OPS --budget N --output FILE
+serctl_cli grant-issue NAME --operations OPS --budget N [--ttl-minutes 1..=40] --output FILE
 serctl_cli agent --grant FILE
 ```
 

@@ -13,8 +13,13 @@ all-features = true
 ignore = []
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
+skip-tree = [
+    { crate = "russh@0.62.5", reason = "russh pins ssh-key 0.7.0-rc.11 and its RustCrypto 0.11/RC generation; serctl keeps its audited stable credential and IPC crypto generation until that upstream stack stabilizes." },
+    { crate = "eframe@0.35.0", reason = "eframe intentionally combines platform backends whose Winit, clipboard, Wayland, macOS, windows-sys, and proc-macro dependencies advance on independent version lines." },
+    { crate = "atomic-write-file@0.3.0", reason = "atomic-write-file 0.3 pins rand 0.9 independently of serctl's stable rand 0.8 and russh's rand 0.10 generation." },
+]
 
 [sources]
 unknown-registry = "deny"

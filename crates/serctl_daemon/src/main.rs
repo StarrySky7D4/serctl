@@ -21,10 +21,15 @@ fn main() {
 }
 
 fn try_main() -> Result<()> {
+    let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
+    if raw_args.as_slice() == [std::ffi::OsStr::new("--version")] {
+        println!("{}", daemon_version_line());
+        return Ok(());
+    }
     let mut profile: Option<String> = None;
     let mut global_instance: Option<String> = None;
     let mut expected_generation: Option<serctl_core::vault::ProfileIdentity> = None;
-    let mut args = std::env::args_os().skip(1);
+    let mut args = raw_args.into_iter();
     while let Some(arg) = args.next() {
         let arg = arg
             .to_str()
@@ -120,6 +125,17 @@ fn try_main() -> Result<()> {
         })
 }
 
+fn daemon_version_line() -> String {
+    let version = serctl_protocol::v6::IPC_PROTOCOL_VERSION_V8;
+    format!(
+        "serctl_daemon {} (git {}; IPC v{}..=v{})",
+        env!("CARGO_PKG_VERSION"),
+        env!("SERCTL_BUILD_COMMIT"),
+        version,
+        version
+    )
+}
+
 fn bail_on_incompatible(
     profile: &Option<String>,
     expected_generation: &Option<serctl_core::vault::ProfileIdentity>,
@@ -177,4 +193,17 @@ fn read_bootstrap_payload(max_bytes: usize, magic: &[u8; 4]) -> Result<Zeroizing
         Ok(_) => bail!("daemon bootstrap frame has trailing data"),
     }
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::daemon_version_line;
+
+    #[test]
+    fn version_reports_build_identity_and_supported_ipc_range() {
+        let line = daemon_version_line();
+        assert!(line.contains(env!("CARGO_PKG_VERSION")));
+        assert!(line.contains(env!("SERCTL_BUILD_COMMIT")));
+        assert!(line.contains("IPC v8..=v8"));
+    }
 }

@@ -56,6 +56,8 @@ jobs:
           ./target/cli-build-script-tests
           rustc --edition=2021 --test crates/serctl_daemon/build.rs -o target/daemon-build-script-tests
           ./target/daemon-build-script-tests
+          rustc --edition=2021 --test crates/serctl_xfer/build.rs -o target/xfer-build-script-tests
+          ./target/xfer-build-script-tests
 
       - name: Generate dependency evidence
         run: |
@@ -158,14 +160,33 @@ jobs:
         shell: pwsh
         run: |
           $expected = "${{ github.sha }}".Substring(0, 12)
-          $version = & .\target\release\serctl_cli.exe --version
-          if ($version -notmatch "git $expected\)") {
-            throw "release version does not identify the checked-out commit: $version"
+          $cliVersion = & .\target\release\serctl_cli.exe --version
+          $daemonVersion = & .\target\release\serctl_daemon.exe --version
+          $helperVersion = & .\target\release\serctl-xfer.exe --version
+          $packageVersion = ($cliVersion -split ' ')[1]
+          $versions = @{
+            cli = $cliVersion
+            daemon = $daemonVersion
+            helper = $helperVersion
           }
-          if ($version -match "-dirty") {
-            throw "release version unexpectedly reports a dirty worktree: $version"
+          foreach ($entry in $versions.GetEnumerator()) {
+            if (-not $entry.Value.Contains("git $expected")) {
+              throw "$($entry.Key) version does not identify the checked-out commit: $($entry.Value)"
+            }
+            if ($entry.Value -match "-dirty") {
+              throw "$($entry.Key) version unexpectedly reports a dirty worktree: $($entry.Value)"
+            }
+            if ($entry.Value -notmatch " $([regex]::Escape($packageVersion)) ") {
+              throw "$($entry.Key) version does not match package version $packageVersion: $($entry.Value)"
+            }
           }
-          Get-FileHash .\target\release\serctl_cli.exe, .\target\release\serctl_cli.pdb, .\target\release\serctl_daemon.exe, .\target\release\serctl_daemon.pdb -Algorithm SHA256 |
+          if (-not $daemonVersion.Contains("IPC v8..=v8")) {
+            throw "daemon does not report the required IPC range: $daemonVersion"
+          }
+          if (-not $helperVersion.Contains("transfer protocol v1")) {
+            throw "helper does not report the required transfer protocol: $helperVersion"
+          }
+          Get-FileHash .\target\release\serctl_cli.exe, .\target\release\serctl_cli.pdb, .\target\release\serctl_daemon.exe, .\target\release\serctl_daemon.pdb, .\target\release\serctl-xfer.exe, .\target\release\serctl_xfer.pdb -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash)  $([IO.Path]::GetFileName($_.Path))" } |
             Set-Content -Path release-sha256.txt -Encoding utf8
           @(
@@ -175,7 +196,9 @@ jobs:
             "runner_image=$env:ImageOS-$env:ImageVersion"
             "rustc=$(& rustc --version)"
             "cargo=$(& cargo --version)"
-            "version=$version"
+            "cli_version=$cliVersion"
+            "daemon_version=$daemonVersion"
+            "helper_version=$helperVersion"
           ) | Out-File release-environment.txt
 
       - name: Upload release evidence
@@ -187,6 +210,8 @@ jobs:
             target/release/serctl_cli.pdb
             target/release/serctl_daemon.exe
             target/release/serctl_daemon.pdb
+            target/release/serctl-xfer.exe
+            target/release/serctl_xfer.pdb
             release-sha256.txt
             release-environment.txt
           if-no-files-found: error

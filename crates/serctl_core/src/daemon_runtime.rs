@@ -16,7 +16,7 @@ use crate::security;
 use crate::vault;
 use anyhow::{ensure, Context, Result};
 use fs2::FileExt;
-use serctl_protocol::v6::{ActivationSecret, InstanceId, IPC_PROTOCOL_VERSION_V6};
+use serctl_protocol::v6::{ActivationSecret, InstanceId, IPC_PROTOCOL_VERSION_V8};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 #[cfg(any(unix, test))]
@@ -69,9 +69,9 @@ impl DaemonRuntimeDescriptor {
         );
         ensure!(
             self.protocol_min <= self.protocol_max
-                && self.protocol_min <= IPC_PROTOCOL_VERSION_V6
-                && IPC_PROTOCOL_VERSION_V6 <= self.protocol_max,
-            "daemon runtime descriptor protocol range does not cover IPC v6"
+                && self.protocol_min <= IPC_PROTOCOL_VERSION_V8
+                && IPC_PROTOCOL_VERSION_V8 <= self.protocol_max,
+            "daemon runtime descriptor protocol range does not cover IPC v{IPC_PROTOCOL_VERSION_V8}"
         );
         ensure!(
             !self.build_commit.is_empty() && self.build_commit.len() <= 128,
@@ -339,8 +339,8 @@ mod tests {
             instance_id: instance.as_hex(),
             pid: std::process::id(),
             endpoint: v6_endpoint(&instance).unwrap(),
-            protocol_min: IPC_PROTOCOL_VERSION_V6,
-            protocol_max: IPC_PROTOCOL_VERSION_V6,
+            protocol_min: IPC_PROTOCOL_VERSION_V8,
+            protocol_max: IPC_PROTOCOL_VERSION_V8,
             started_unix: 1_700_000_000,
             build_commit: "testbuild".into(),
         }
@@ -382,11 +382,67 @@ mod tests {
         bad.version = 2;
         assert!(bad.validate().is_err());
         let mut bad = descriptor.clone();
-        bad.protocol_min = IPC_PROTOCOL_VERSION_V6 + 1;
+        bad.protocol_min = IPC_PROTOCOL_VERSION_V8 + 1;
+        let error = bad.validate().unwrap_err().to_string();
+        assert!(error.contains("IPC v8"));
+        assert!(!error.contains("IPC v6"));
+        let mut bad = descriptor.clone();
+        bad.protocol_max = IPC_PROTOCOL_VERSION_V8 - 1;
         assert!(bad.validate().is_err());
+        let mut bad = descriptor.clone();
+        bad.protocol_min = IPC_PROTOCOL_VERSION_V8 + 1;
+        bad.protocol_max = IPC_PROTOCOL_VERSION_V8 - 1;
+        assert!(bad.validate().is_err());
+        let mut compatible_range = descriptor.clone();
+        compatible_range.protocol_min = IPC_PROTOCOL_VERSION_V8 - 1;
+        compatible_range.protocol_max = IPC_PROTOCOL_VERSION_V8 + 1;
+        compatible_range.validate().unwrap();
         let mut bad = descriptor.clone();
         bad.instance_id = "not-hex".into();
         assert!(bad.validate().is_err());
+        clear_home(&base);
+    }
+
+    #[test]
+    fn old_protocol_descriptor_fails_closed_without_deleting_runtime_state() {
+        let (_guard, base) = test_home();
+        let mut old = descriptor();
+        old.pid = dead_pid();
+        old.protocol_min = IPC_PROTOCOL_VERSION_V8 - 1;
+        old.protocol_max = IPC_PROTOCOL_VERSION_V8 - 1;
+
+        // `write_descriptor` correctly refuses this record, so emulate the
+        // protected file left by an older, matching binary without weakening
+        // its existing file permissions.
+        let valid = descriptor();
+        write_descriptor(&valid).unwrap();
+        let descriptor_bytes = serde_json::to_vec(&old).unwrap();
+        let descriptor_path = descriptor_path().unwrap();
+        std::fs::write(&descriptor_path, &descriptor_bytes).unwrap();
+
+        let secret = ActivationSecret::random();
+        write_secret(&secret).unwrap();
+        let secret_path = secret_path().unwrap();
+        let secret_bytes = std::fs::read(&secret_path).unwrap();
+
+        let read_error = read_descriptor().unwrap_err().to_string();
+        assert!(read_error.contains("IPC v8"));
+
+        let lock = match acquire_startup_lock().unwrap() {
+            StartupLockAcquire::Acquired(lock) => lock,
+            StartupLockAcquire::Contended => panic!("lock contended in test"),
+        };
+        let cleanup_error = cleanup_stale_runtime_if_dead(&lock)
+            .unwrap_err()
+            .to_string();
+        assert!(cleanup_error.contains("IPC v8"));
+        assert_eq!(std::fs::read(&descriptor_path).unwrap(), descriptor_bytes);
+        assert_eq!(std::fs::read(&secret_path).unwrap(), secret_bytes);
+        assert_eq!(
+            read_secret().unwrap().unwrap().as_bytes(),
+            secret.as_bytes()
+        );
+
         clear_home(&base);
     }
 

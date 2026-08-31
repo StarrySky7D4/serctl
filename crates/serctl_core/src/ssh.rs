@@ -5,8 +5,8 @@ use rand::{rngs::OsRng, RngCore};
 use russh::{client, keys::ssh_key, Channel, ChannelId, ChannelMsg, ChannelOpenFailure};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{
-    Close, File, FileAttributes, Handle, Init, Name, OpenDir, Packet, ReadDir, RealPath, Status,
-    StatusCode, VERSION,
+    Close, File, FileAttributes, Handle, Init, Name, Open, OpenDir, OpenFlags, Packet, ReadDir,
+    RealPath, Status, StatusCode, Write, VERSION,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -1141,6 +1141,130 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for BoundedSftpStream<S> {
     }
 }
 
+trait ConfirmedSftpIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> ConfirmedSftpIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+/// Raw SFTP v3 upload handle whose `write_confirmed` method returns only after
+/// the server's matching STATUS response. This avoids russh-sftp `File`'s
+/// queued-WRITE semantics without converting every chunk acknowledgement into
+/// an OpenSSH fsync request.
+pub struct ConfirmedSftpUpload {
+    stream: BoundedSftpStream<Box<dyn ConfirmedSftpIo>>,
+    handle: Option<String>,
+    next_request_id: u32,
+    offset: u64,
+}
+
+impl ConfirmedSftpUpload {
+    async fn initialize(
+        mut stream: BoundedSftpStream<Box<dyn ConfirmedSftpIo>>,
+        path: &str,
+    ) -> Result<Self> {
+        write_sftp_packet(&mut stream, Packet::Init(Init::default())).await?;
+        match read_sftp_packet_bounded(&mut stream).await? {
+            Packet::Version(version) if version.version == VERSION => {}
+            Packet::Version(version) => bail!(
+                "SFTP server selected unsupported protocol version {}",
+                version.version
+            ),
+            packet => bail!(
+                "SFTP initialization returned unexpected {} packet",
+                packet_kind(&packet)
+            ),
+        }
+
+        let request_id = 1;
+        write_sftp_packet(
+            &mut stream,
+            Packet::Open(Open {
+                id: request_id,
+                filename: path.to_owned(),
+                pflags: OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                attrs: protected_upload_file_attributes(),
+            }),
+        )
+        .await?;
+        let handle = expect_upload_handle(
+            read_sftp_packet_bounded(&mut stream).await?,
+            request_id,
+            "open protected upload partial",
+        )?
+        .handle;
+        Ok(Self {
+            stream,
+            handle: Some(handle),
+            next_request_id: request_id,
+            offset: 0,
+        })
+    }
+
+    pub async fn write_confirmed(&mut self, data: &[u8]) -> Result<u64> {
+        ensure!(!data.is_empty(), "SFTP upload chunk is empty");
+        ensure!(
+            data.len() <= serctl_protocol::SFTP_SAFE_CHUNK_BYTES,
+            "SFTP upload chunk exceeds the confirmed-write limit"
+        );
+        let next_offset = self
+            .offset
+            .checked_add(data.len() as u64)
+            .context("SFTP upload offset overflow")?;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .context("SFTP upload request id overflow")?;
+        let handle = self
+            .handle
+            .as_ref()
+            .context("SFTP upload handle is already closed")?
+            .clone();
+        write_sftp_packet(
+            &mut self.stream,
+            Packet::Write(Write {
+                id: self.next_request_id,
+                handle,
+                offset: self.offset,
+                data: data.to_vec(),
+            }),
+        )
+        .await?;
+        expect_upload_ok_status(
+            read_sftp_packet_bounded(&mut self.stream).await?,
+            self.next_request_id,
+            "write upload chunk",
+        )?;
+        self.offset = next_offset;
+        Ok(self.offset)
+    }
+
+    pub async fn close_confirmed(&mut self) -> Result<u64> {
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .context("SFTP upload request id overflow")?;
+        let handle = self
+            .handle
+            .as_ref()
+            .context("SFTP upload handle is already closed")?
+            .clone();
+        write_sftp_packet(
+            &mut self.stream,
+            Packet::Close(Close {
+                id: self.next_request_id,
+                handle,
+            }),
+        )
+        .await?;
+        expect_upload_ok_status(
+            read_sftp_packet_bounded(&mut self.stream).await?,
+            self.next_request_id,
+            "close upload partial",
+        )?;
+        self.handle = None;
+        Ok(self.offset)
+    }
+}
+
 /// A key-exchanged SSH transport that has observed and validated the server
 /// host key but has not sent any user authentication secret yet.
 pub struct StagedSshSession {
@@ -1247,6 +1371,25 @@ impl StagedSshSession {
 }
 
 impl SshSession {
+    /// Start the fixed native transfer helper without interpolating any
+    /// user-controlled path or argument into the SSH exec command. Paths and
+    /// transfer metadata are exchanged only through bounded protocol frames
+    /// on the returned stdio stream.
+    pub async fn native_transfer_stream_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<russh::ChannelStream<russh::client::Msg>> {
+        let mut channel = self.open_exec_until(deadline).await?;
+        if let Err(error) = channel
+            .request_exec_until("serctl-xfer serve --stdio", deadline)
+            .await
+        {
+            channel.cancel().await;
+            return Err(error);
+        }
+        Ok(channel.into_stream())
+    }
+
     /// Complete TCP connection, SSH key exchange, and host-key validation
     /// without sending a password. The TCP stream is kept behind a
     /// cancellation-aware proxy because russh spawns its session task before
@@ -1766,6 +1909,10 @@ impl SshSession {
         let stream = BoundedSftpStream::new(channel.into_stream(), self.transport_trip());
         let config = russh_sftp::client::Config {
             max_packet_len: MAX_SFTP_PACKET_BYTES as u32,
+            // Keep any incidental high-level write path to one in-flight
+            // request. File-transfer uploads use ConfirmedSftpUpload below,
+            // which performs an explicit WRITE/STATUS exchange per chunk.
+            max_concurrent_writes: 1,
             ..Default::default()
         };
 
@@ -1782,6 +1929,26 @@ impl SshSession {
                 self.invalidate().await;
                 bail!("SFTP initialization exceeded its deadline");
             }
+        }
+    }
+
+    /// Open a create-new 0600 upload partial over a raw SFTP v3 channel. Each
+    /// write on the returned handle is a request/STATUS exchange, so callers
+    /// can report exact remote confirmation without relying on the high-level
+    /// client's in-flight queue or issuing per-chunk fsync.
+    pub async fn confirmed_sftp_upload_until(
+        &self,
+        path: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<ConfirmedSftpUpload> {
+        validate_upload_remote_path(path)?;
+        let channel = self.open_sftp_channel_until(deadline).await?;
+        let stream: Box<dyn ConfirmedSftpIo> = Box::new(channel.into_stream());
+        let stream = BoundedSftpStream::new(stream, self.transport_trip());
+        match tokio::time::timeout_at(deadline, ConfirmedSftpUpload::initialize(stream, path)).await
+        {
+            Ok(result) => result,
+            Err(_) => bail!("SFTP upload initialization exceeded its deadline"),
         }
     }
 
@@ -2722,6 +2889,73 @@ where
     Ok(packet)
 }
 
+async fn read_sftp_packet_bounded<R>(reader: &mut R) -> Result<Packet>
+where
+    R: AsyncRead + Unpin,
+{
+    let body_bytes = reader
+        .read_u32()
+        .await
+        .context("read SFTP response length")? as usize;
+    ensure!(
+        body_bytes <= MAX_SFTP_PACKET_BYTES,
+        "SFTP response packet exceeds the {} MiB safety limit",
+        MAX_SFTP_PACKET_BYTES / (1024 * 1024)
+    );
+    let mut body = Zeroizing::new(vec![0_u8; body_bytes]);
+    reader
+        .read_exact(&mut body)
+        .await
+        .context("read SFTP response body")?;
+    let mut encoded = Bytes::copy_from_slice(&body);
+    let packet = Packet::try_from(&mut encoded).context("decode SFTP response")?;
+    ensure!(encoded.is_empty(), "SFTP response contains trailing bytes");
+    Ok(packet)
+}
+
+fn explicit_sftp_status(mut status: Status) -> anyhow::Error {
+    status.error_message = status
+        .error_message
+        .chars()
+        .flat_map(char::escape_default)
+        .collect();
+    russh_sftp::client::error::Error::Status(status).into()
+}
+
+fn expect_upload_handle(packet: Packet, request_id: u32, operation: &str) -> Result<Handle> {
+    match packet {
+        Packet::Handle(handle) => {
+            ensure_response_id(handle.id, request_id, operation)?;
+            Ok(handle)
+        }
+        Packet::Status(status) => {
+            ensure_response_id(status.id, request_id, operation)?;
+            Err(explicit_sftp_status(status))
+        }
+        packet => bail!(
+            "SFTP {operation} request returned unexpected {} packet",
+            packet_kind(&packet)
+        ),
+    }
+}
+
+fn expect_upload_ok_status(packet: Packet, request_id: u32, operation: &str) -> Result<()> {
+    match packet {
+        Packet::Status(status) => {
+            ensure_response_id(status.id, request_id, operation)?;
+            if status.status_code == StatusCode::Ok {
+                Ok(())
+            } else {
+                Err(explicit_sftp_status(status))
+            }
+        }
+        packet => bail!(
+            "SFTP {operation} request returned unexpected {} packet",
+            packet_kind(&packet)
+        ),
+    }
+}
+
 fn expect_name(packet: Packet, request_id: u32, operation: &str) -> Result<Name> {
     match packet {
         Packet::Name(name) => {
@@ -2933,6 +3167,12 @@ async fn terminate_channel(
 }
 
 impl RunningCommand {
+    /// Convert a successfully submitted fixed command into its bidirectional
+    /// stdio stream. Dropping the stream closes the SSH channel.
+    pub fn into_stream(self) -> russh::ChannelStream<russh::client::Msg> {
+        self.channel.into_stream()
+    }
+
     pub async fn request_exec_until(
         &mut self,
         cmd: &str,
@@ -3016,21 +3256,26 @@ mod tests {
         await_exec_request_queued_until, bridge_streams, commit_remote_upload_no_replace_with,
         extend_command_output, is_explicit_sftp_status, literal_socket_addr,
         poll_remote_mutation_until, protected_upload_file_attributes, push_directory_entry,
-        read_sftp_packet, remote_forward_channel_is_loopback_only, require_server_fingerprint,
-        secure_client_algorithms, socks5_handshake, status_error, temporary_remote_path,
-        validate_remote_command, validate_remote_path, validate_shell_dimensions,
-        validate_upload_remote_path, BoundedSftpStream, CreateDirOutcomeUnknown,
-        CreateDirSubmissionState, DirectoryBudget, DirectoryLimits, ExecOutcomeUnknown,
-        ExecSubmissionState, RemoteForwardRegistry, SocksTarget, SshSession, TransportTrip,
-        TunnelMode, TunnelSpec, ValidatedTunnelSpec, DEFAULT_TUNNEL_CONNECTIONS, DIRECTORY_LIMITS,
-        MAX_DIRECTORY_ENTRIES, MAX_DIRECTORY_STRING_BYTES, MAX_REMOTE_COMMAND_BYTES,
-        MAX_REMOTE_PATH_BYTES, MAX_SFTP_PACKET_BYTES, MAX_SHELL_DIMENSION, MAX_TUNNEL_CONNECTIONS,
+        read_sftp_packet, read_sftp_packet_bounded, remote_forward_channel_is_loopback_only,
+        require_server_fingerprint, secure_client_algorithms, socks5_handshake, status_error,
+        temporary_remote_path, validate_remote_command, validate_remote_path,
+        validate_shell_dimensions, validate_upload_remote_path, write_sftp_packet,
+        BoundedSftpStream, CreateDirOutcomeUnknown, CreateDirSubmissionState, DirectoryBudget,
+        DirectoryLimits, ExecOutcomeUnknown, ExecSubmissionState, RemoteForwardRegistry,
+        SocksTarget, SshSession, TransportTrip, TunnelMode, TunnelSpec, ValidatedTunnelSpec,
+        DEFAULT_TUNNEL_CONNECTIONS, DIRECTORY_LIMITS, MAX_DIRECTORY_ENTRIES,
+        MAX_DIRECTORY_STRING_BYTES, MAX_REMOTE_COMMAND_BYTES, MAX_REMOTE_PATH_BYTES,
+        MAX_SFTP_PACKET_BYTES, MAX_SHELL_DIMENSION, MAX_TUNNEL_CONNECTIONS,
         REMOTE_PARTIAL_SUFFIX_BYTES,
     };
     use crate::vault::Creds;
-    use russh::keys::ssh_key;
+    use rand::{rngs::OsRng, RngCore as Rand08RngCore};
+    use russh::keys::{ssh_key, Algorithm, PrivateKey};
+    use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
+    use russh::{Channel, ChannelId};
     use russh_sftp::client::{Config as SftpConfig, SftpSession};
-    use russh_sftp::protocol::{File, FileAttributes, Status, StatusCode};
+    use russh_sftp::protocol::{File, FileAttributes, Packet, Status, StatusCode, Write};
+    use std::collections::HashMap;
     use std::future::Future;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3038,7 +3283,293 @@ mod tests {
     use std::task::Poll;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Mutex as TokioMutex;
     use tokio_util::sync::CancellationToken;
+
+    struct CompatibleOsRng(OsRng);
+
+    impl ssh_key::rand_core::TryRng for CompatibleOsRng {
+        type Error = ssh_key::rand_core::Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.0.next_u32())
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(self.0.next_u64())
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            self.0.fill_bytes(dst);
+            Ok(())
+        }
+    }
+
+    impl ssh_key::rand_core::TryCryptoRng for CompatibleOsRng {}
+
+    #[derive(Clone)]
+    struct MatrixSshServer {
+        channels: Arc<TokioMutex<HashMap<ChannelId, Channel<Msg>>>>,
+        observed: tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>,
+    }
+
+    impl russh::server::Handler for MatrixSshServer {
+        type Error = anyhow::Error;
+
+        async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+            Ok(if user == "matrix" && password == "matrix-password" {
+                Auth::Accept
+            } else {
+                Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                }
+            })
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: Channel<Msg>,
+            reply: ChannelOpenHandle,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.channels.lock().await.insert(channel.id(), channel);
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: ChannelId,
+            command: &[u8],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if command != b"serctl-xfer serve --stdio" {
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+            let channel = self
+                .channels
+                .lock()
+                .await
+                .remove(&channel)
+                .ok_or_else(|| anyhow::anyhow!("matrix exec channel was not registered"))?;
+            session.channel_success(channel.id())?;
+            let observed = self.observed.clone();
+            tokio::spawn(async move {
+                let mut stream = channel.into_stream();
+                let result = async {
+                    // This small server-first marker models the native Hello
+                    // exchange before the first larger client frame.
+                    stream.write_all(b"ready").await?;
+                    stream.flush().await?;
+                    let mut header = [0_u8; 12];
+                    stream.read_exact(&mut header).await?;
+                    anyhow::ensure!(&header[..4] == b"SCTX", "matrix frame magic mismatch");
+                    anyhow::ensure!(
+                        u16::from_be_bytes([header[4], header[5]]) == 1,
+                        "matrix frame version mismatch"
+                    );
+                    let body_len =
+                        u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
+                    anyhow::ensure!(body_len <= 32 * 1024 + 56, "matrix frame is oversized");
+                    let mut body = vec![0_u8; body_len];
+                    stream.read_exact(&mut body).await?;
+                    observed
+                        .send((b'e', body))
+                        .map_err(|_| anyhow::anyhow!("matrix observer closed"))?;
+                    stream.write_u32(body_len as u32).await?;
+                    stream.flush().await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    eprintln!("matrix SSH server failed: {error:#}");
+                }
+            });
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            channel: ChannelId,
+            name: &str,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if name != "sftp" {
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+            let channel = self
+                .channels
+                .lock()
+                .await
+                .remove(&channel)
+                .ok_or_else(|| anyhow::anyhow!("matrix SFTP channel was not registered"))?;
+            session.channel_success(channel.id())?;
+            let observed = self.observed.clone();
+            tokio::spawn(async move {
+                let mut stream = channel.into_stream();
+                let result = async {
+                    stream.write_all(b"ready").await?;
+                    stream.flush().await?;
+                    let packet = read_sftp_packet_bounded(&mut stream).await?;
+                    let Packet::Write(write) = packet else {
+                        anyhow::bail!("matrix expected an SFTP WRITE packet")
+                    };
+                    let body_len = write.data.len();
+                    observed
+                        .send((b's', write.data))
+                        .map_err(|_| anyhow::anyhow!("matrix observer closed"))?;
+                    stream.write_u32(body_len as u32).await?;
+                    stream.flush().await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    eprintln!("matrix SFTP server failed: {error:#}");
+                }
+            });
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn full_russh_exec_and_sftp_channels_carry_first_frames_above_two_kib() {
+        let mut rng = CompatibleOsRng(OsRng);
+        let key = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        let fingerprint = key
+            .public_key()
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
+        let config = Arc::new(russh::server::Config {
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![key],
+            ..Default::default()
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let handler = MatrixSshServer {
+                    channels: Arc::new(TokioMutex::new(HashMap::new())),
+                    observed: observed_tx.clone(),
+                };
+                let config = Arc::clone(&config);
+                tokio::spawn(async move {
+                    if let Err(error) = russh::server::run_stream(config, socket, handler).await {
+                        eprintln!("matrix SSH transport failed: {error:#}");
+                    }
+                });
+            }
+        });
+        let creds = Creds {
+            host: "127.0.0.1".into(),
+            port,
+            user: "matrix".into(),
+            password: "matrix-password".into(),
+            host_key: Some(fingerprint.clone()),
+        };
+        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let (session, observed_fingerprint) =
+            SshSession::connect_until(&creds, Some(fingerprint.clone()), connect_deadline)
+                .await
+                .unwrap();
+        assert_eq!(observed_fingerprint, fingerprint);
+
+        for payload_len in [4, 8, 16, 32].map(|kib| kib * 1024) {
+            let payload = (0..payload_len)
+                .map(|index| ((index * 17 + payload_len) % 251) as u8)
+                .collect::<Vec<_>>();
+            let transfer_id = [0x31_u8; 16];
+            let offset = 0x0102_0304_0506_0708_u64.to_be_bytes();
+            let chunk_hash = [0xa5_u8; 32];
+            let mut expected = Vec::with_capacity(56 + payload_len);
+            expected.extend_from_slice(&transfer_id);
+            expected.extend_from_slice(&offset);
+            expected.extend_from_slice(&chunk_hash);
+            expected.extend_from_slice(&payload);
+            let exchange = async {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                let mut stream = session.native_transfer_stream_until(deadline).await?;
+                let mut ready = [0_u8; 5];
+                stream.read_exact(&mut ready).await?;
+                anyhow::ensure!(&ready == b"ready", "matrix helper marker mismatch");
+                // Match native::write_data's separate header/metadata/payload
+                // writes. At 32 KiB the complete frame necessarily crosses
+                // russh's default 32 KiB channel-packet boundary.
+                stream.write_all(b"SCTX").await?;
+                stream.write_u16(1).await?;
+                stream.write_u8(2).await?;
+                stream.write_u8(0).await?;
+                stream.write_u32(expected.len() as u32).await?;
+                stream.write_all(&transfer_id).await?;
+                stream.write_all(&offset).await?;
+                stream.write_all(&chunk_hash).await?;
+                stream.write_all(&payload).await?;
+                stream.flush().await?;
+                let acknowledged = stream.read_u32().await? as usize;
+                anyhow::ensure!(acknowledged == expected.len(), "matrix ACK length mismatch");
+                let (route, observed) = observed_rx
+                    .recv()
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("matrix observer closed"))?;
+                anyhow::ensure!(route == b'e', "matrix observation route mismatch");
+                anyhow::ensure!(observed == expected, "matrix frame body mismatch");
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::time::timeout(Duration::from_secs(5), exchange)
+                .await
+                .unwrap_or_else(|_| panic!("{payload_len}-byte first frame stalled"))
+                .unwrap();
+        }
+
+        for payload_len in [4, 8, 16, 32].map(|kib| kib * 1024) {
+            let expected = (0..payload_len)
+                .map(|index| ((index * 29 + payload_len) % 251) as u8)
+                .collect::<Vec<_>>();
+            let exchange = async {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                let channel = session.open_sftp_channel_until(deadline).await?;
+                let mut stream = channel.into_stream();
+                let mut ready = [0_u8; 5];
+                stream.read_exact(&mut ready).await?;
+                anyhow::ensure!(&ready == b"ready", "matrix SFTP marker mismatch");
+                write_sftp_packet(
+                    &mut stream,
+                    Packet::Write(Write {
+                        id: 7,
+                        handle: "matrix-handle".into(),
+                        offset: 0,
+                        data: expected.clone(),
+                    }),
+                )
+                .await?;
+                let acknowledged = stream.read_u32().await? as usize;
+                anyhow::ensure!(acknowledged == payload_len, "matrix SFTP ACK mismatch");
+                let (route, observed) = observed_rx
+                    .recv()
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("matrix observer closed"))?;
+                anyhow::ensure!(route == b's', "matrix observation route mismatch");
+                anyhow::ensure!(observed == expected, "matrix SFTP payload mismatch");
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::time::timeout(Duration::from_secs(5), exchange)
+                .await
+                .unwrap_or_else(|_| panic!("{payload_len}-byte first SFTP frame stalled"))
+                .unwrap();
+        }
+
+        session.invalidate().await;
+        server.abort();
+        let _ = server.await;
+    }
 
     #[test]
     fn literal_ssh_addresses_use_their_explicit_socket_family() {

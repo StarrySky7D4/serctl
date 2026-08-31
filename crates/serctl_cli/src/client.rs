@@ -9,11 +9,14 @@ use crossterm::{
 use ed25519_dalek::SigningKey;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::future::Future;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::time::{Duration, Instant as StdInstant};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
@@ -26,7 +29,7 @@ use serctl_core::ssh::{
 };
 use serctl_core::vault::{self, now_unix};
 use serctl_protocol as ipc;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 
 pub use serctl_core::ssh::{TunnelMode, TunnelReady, TunnelSpec};
@@ -58,6 +61,640 @@ const LOCAL_COMMIT_RECONCILE_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_COMMIT_RECONCILE_TIMEOUT: Duration = Duration::from_millis(2250);
 const MAX_AGENT_GRANT_BYTES: usize = 64 * 1024;
 const MAX_AGENT_REQUEST_LINE_BYTES: usize = 1024 * 1024;
+const AGENT_TRANSFER_WRITE_OPERATION: &str = "transfer.write";
+const DOWNLOAD_DURABLE_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+const TRANSFER_JOURNAL_SCHEMA: u8 = 1;
+const MAX_TRANSFER_JOURNAL_BYTES: u64 = 64 * 1024;
+
+pub type TransferProgressSink = Arc<dyn Fn(ipc::TransferProgress) + Send + Sync + 'static>;
+
+#[derive(Clone)]
+pub struct TransferOptions {
+    pub backend: ipc::TransferBackend,
+    pub resume: ipc::TransferResumeMode,
+    pub idle_timeout: Duration,
+    pub deadline: Option<Duration>,
+    pub progress: Option<TransferProgressSink>,
+}
+
+impl TransferOptions {
+    fn legacy(timeout: Duration) -> Self {
+        Self {
+            backend: ipc::TransferBackend::Sftp,
+            resume: ipc::TransferResumeMode::Never,
+            idle_timeout: timeout,
+            deadline: Some(timeout),
+            progress: None,
+        }
+    }
+
+    fn request_bound(&self) -> Duration {
+        self.deadline
+            .unwrap_or(serctl_protocol::v6::CREDENTIAL_LEASE_TTL)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UploadTransferJournal {
+    schema: u8,
+    transfer_id: String,
+    profile_name: String,
+    profile_id: String,
+    profile_generation: u64,
+    direction: ipc::TransferDirection,
+    remote_target: String,
+    size: u64,
+    sha256: String,
+    backend: ipc::TransferBackend,
+    resume_token: String,
+    durable_offset: u64,
+}
+
+impl Drop for UploadTransferJournal {
+    fn drop(&mut self) {
+        self.profile_name.zeroize();
+        self.profile_id.zeroize();
+        self.remote_target.zeroize();
+        self.sha256.zeroize();
+        self.resume_token.zeroize();
+    }
+}
+
+struct UploadResumeJournal {
+    path: PathBuf,
+    state: StdMutex<UploadTransferJournal>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DownloadTransferJournal {
+    schema: u8,
+    transfer_id: String,
+    profile_name: String,
+    profile_id: String,
+    profile_generation: u64,
+    direction: ipc::TransferDirection,
+    remote_source: String,
+    local_target: String,
+    partial_path: String,
+    expected_size: Option<u64>,
+    expected_sha256: Option<String>,
+    backend: ipc::TransferBackend,
+    durable_offset: u64,
+}
+
+impl Drop for DownloadTransferJournal {
+    fn drop(&mut self) {
+        self.profile_name.zeroize();
+        self.profile_id.zeroize();
+        self.remote_source.zeroize();
+        self.local_target.zeroize();
+        self.partial_path.zeroize();
+        self.expected_sha256.zeroize();
+    }
+}
+
+struct DownloadResumeJournal {
+    path: PathBuf,
+    state: StdMutex<DownloadTransferJournal>,
+}
+
+struct DownloadResumeSnapshot {
+    transfer_id: ipc::TransferId,
+    partial_path: PathBuf,
+    durable_offset: u64,
+    expected_size: Option<u64>,
+    expected_sha256: Option<String>,
+}
+
+impl DownloadResumeJournal {
+    fn snapshot(&self) -> Result<DownloadResumeSnapshot> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("download journal lock is poisoned"))?;
+        Ok(DownloadResumeSnapshot {
+            transfer_id: ipc::TransferId::parse(&state.transfer_id)?,
+            partial_path: PathBuf::from(&state.partial_path),
+            durable_offset: state.durable_offset,
+            expected_size: state.expected_size,
+            expected_sha256: state.expected_sha256.clone(),
+        })
+    }
+
+    fn record_remote_identity(&self, size: u64, sha256: &str) -> Result<()> {
+        ensure!(
+            sha256.len() == 64
+                && sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "download journal received an invalid SHA-256"
+        );
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("download journal lock is poisoned"))?;
+        match (&state.expected_size, &state.expected_sha256) {
+            (None, None) => {
+                state.expected_size = Some(size);
+                state.expected_sha256 = Some(sha256.to_owned());
+                persist_download_journal(&self.path, &state)?;
+            }
+            (Some(expected_size), Some(expected_sha256)) => {
+                ensure!(
+                    *expected_size == size && expected_sha256 == sha256,
+                    "remote source identity changed since the download journal was written"
+                );
+            }
+            _ => bail!("download journal carries incomplete remote identity"),
+        }
+        Ok(())
+    }
+
+    fn record_durable(&self, offset: u64) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("download journal lock is poisoned"))?;
+        let size = state
+            .expected_size
+            .context("download journal has no remote size")?;
+        ensure!(
+            offset <= size,
+            "download durable offset exceeds remote size"
+        );
+        ensure!(
+            offset >= state.durable_offset,
+            "download durable offset moved backwards"
+        );
+        if offset > state.durable_offset {
+            state.durable_offset = offset;
+            persist_download_journal(&self.path, &state)?;
+        }
+        Ok(())
+    }
+
+    fn remove(self: &Arc<Self>) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("remove completed download journal"),
+        }
+    }
+}
+
+fn persist_download_journal(path: &Path, journal: &DownloadTransferJournal) -> Result<()> {
+    let bytes = Zeroizing::new(
+        serde_json::to_vec(journal).context("serialize protected download journal")?,
+    );
+    ensure!(
+        bytes.len() as u64 <= MAX_TRANSFER_JOURNAL_BYTES,
+        "download journal exceeds its size cap"
+    );
+    security::write_protected_atomic(path, &bytes)
+        .with_context(|| format!("persist download journal {}", path.display()))
+}
+
+fn prepare_download_resume_journal(
+    profile: &ipc::WireProfile,
+    remote: &str,
+    local: &Path,
+    backend: ipc::TransferBackend,
+    new_transfer_id: &ipc::TransferId,
+) -> Result<Arc<DownloadResumeJournal>> {
+    let directory = vault::dir()?.join("transfers");
+    prepare_download_resume_journal_in(&directory, profile, remote, local, backend, new_transfer_id)
+}
+
+fn prepare_download_resume_journal_in(
+    directory: &Path,
+    profile: &ipc::WireProfile,
+    remote: &str,
+    local: &Path,
+    backend: ipc::TransferBackend,
+    new_transfer_id: &ipc::TransferId,
+) -> Result<Arc<DownloadResumeJournal>> {
+    ensure!(
+        matches!(
+            backend,
+            ipc::TransferBackend::Auto | ipc::TransferBackend::Native
+        ),
+        "resume=auto requires backend auto or native"
+    );
+    let local_text = local
+        .to_str()
+        .context("resume=auto requires a Unicode local destination path")?;
+    std::fs::create_dir_all(directory).context("create protected transfer journal directory")?;
+    security::harden_directory(directory)?;
+    let mut key = Sha256::new();
+    key.update(b"serctl/download-journal/v1\0");
+    key.update(profile.profile_id.as_bytes());
+    key.update(profile.generation.to_be_bytes());
+    key.update(remote.as_bytes());
+    key.update(local_text.as_bytes());
+    let path = directory.join(format!("{}.json", hex::encode(key.finalize())));
+    let journal = if let Some(file) = security::open_existing_protected_file(&path)? {
+        let length = file.metadata()?.len();
+        ensure!(
+            (1..=MAX_TRANSFER_JOURNAL_BYTES).contains(&length),
+            "download journal is empty or too large"
+        );
+        let mut bytes = Zeroizing::new(Vec::with_capacity(length as usize));
+        file.take(MAX_TRANSFER_JOURNAL_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 == length,
+            "download journal changed while reading"
+        );
+        let journal: DownloadTransferJournal =
+            serde_json::from_slice(&bytes).context("parse protected download journal")?;
+        ensure!(
+            journal.schema == TRANSFER_JOURNAL_SCHEMA,
+            "unsupported download journal schema"
+        );
+        ipc::TransferId::parse(&journal.transfer_id)?;
+        ensure!(
+            journal.profile_name == profile.name,
+            "download journal profile name mismatch"
+        );
+        ensure!(
+            journal.profile_id == profile.profile_id,
+            "download journal profile id mismatch"
+        );
+        ensure!(
+            journal.profile_generation == profile.generation,
+            "download journal profile generation mismatch"
+        );
+        ensure!(
+            journal.direction == ipc::TransferDirection::Pull,
+            "download journal direction mismatch"
+        );
+        ensure!(
+            journal.remote_source == remote,
+            "download journal source mismatch"
+        );
+        ensure!(
+            journal.local_target == local_text,
+            "download journal target mismatch"
+        );
+        ensure!(
+            journal.backend == backend,
+            "download journal backend mismatch"
+        );
+        ensure!(
+            journal.expected_size.is_some() == journal.expected_sha256.is_some(),
+            "download journal remote identity is incomplete"
+        );
+        if let Some(size) = journal.expected_size {
+            ensure!(
+                journal.durable_offset <= size,
+                "download journal durable offset exceeds remote size"
+            );
+        } else {
+            ensure!(
+                journal.durable_offset == 0,
+                "download journal without identity has a durable prefix"
+            );
+        }
+        journal
+    } else {
+        let mut partial = local.as_os_str().to_os_string();
+        partial.push(format!(".serctl-resume-{}", new_transfer_id.as_str()));
+        let partial_path = PathBuf::from(partial);
+        let partial_text = partial_path
+            .to_str()
+            .context("resume=auto requires a Unicode partial path")?;
+        let journal = DownloadTransferJournal {
+            schema: TRANSFER_JOURNAL_SCHEMA,
+            transfer_id: new_transfer_id.as_str().to_owned(),
+            profile_name: profile.name.clone(),
+            profile_id: profile.profile_id.clone(),
+            profile_generation: profile.generation,
+            direction: ipc::TransferDirection::Pull,
+            remote_source: remote.to_owned(),
+            local_target: local_text.to_owned(),
+            partial_path: partial_text.to_owned(),
+            expected_size: None,
+            expected_sha256: None,
+            backend,
+            durable_offset: 0,
+        };
+        persist_download_journal(&path, &journal)?;
+        journal
+    };
+    Ok(Arc::new(DownloadResumeJournal {
+        path,
+        state: StdMutex::new(journal),
+    }))
+}
+
+impl UploadResumeJournal {
+    fn transfer_id(&self) -> Result<ipc::TransferId> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("transfer journal lock is poisoned"))?;
+        ipc::TransferId::parse(&state.transfer_id)
+    }
+
+    fn resume_token(&self) -> Result<Zeroizing<String>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("transfer journal lock is poisoned"))?;
+        Ok(Zeroizing::new(state.resume_token.clone()))
+    }
+
+    fn durable_offset(&self) -> Result<u64> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("transfer journal lock is poisoned"))?;
+        Ok(state.durable_offset)
+    }
+
+    fn observe(&self, progress: &ipc::TransferProgress) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("transfer journal lock is poisoned"))?;
+        ensure!(
+            progress.transfer_id.as_str() == state.transfer_id,
+            "daemon progress names a different transfer than its journal"
+        );
+        ensure!(
+            progress.durable_bytes <= state.size,
+            "daemon durable offset exceeds the journaled source size"
+        );
+        if progress.durable_bytes > state.durable_offset {
+            state.durable_offset = progress.durable_bytes;
+            persist_upload_journal(&self.path, &state)?;
+        }
+        Ok(())
+    }
+
+    fn remove(self: &Arc<Self>) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("remove completed transfer journal"),
+        }
+    }
+}
+
+fn persist_upload_journal(path: &Path, journal: &UploadTransferJournal) -> Result<()> {
+    let bytes = Zeroizing::new(
+        serde_json::to_vec(journal).context("serialize protected transfer journal")?,
+    );
+    ensure!(
+        bytes.len() as u64 <= MAX_TRANSFER_JOURNAL_BYTES,
+        "transfer journal exceeds its size cap"
+    );
+    security::write_protected_atomic(path, &bytes)
+        .with_context(|| format!("persist transfer journal {}", path.display()))
+}
+
+fn prepare_upload_resume_journal(
+    profile: &ipc::WireProfile,
+    remote: &str,
+    size: u64,
+    sha256: &str,
+    backend: ipc::TransferBackend,
+    new_transfer_id: &ipc::TransferId,
+) -> Result<Arc<UploadResumeJournal>> {
+    let directory = vault::dir()?.join("transfers");
+    prepare_upload_resume_journal_in(
+        &directory,
+        profile,
+        remote,
+        size,
+        sha256,
+        backend,
+        new_transfer_id,
+    )
+}
+
+fn prepare_upload_resume_journal_in(
+    directory: &Path,
+    profile: &ipc::WireProfile,
+    remote: &str,
+    size: u64,
+    sha256: &str,
+    backend: ipc::TransferBackend,
+    new_transfer_id: &ipc::TransferId,
+) -> Result<Arc<UploadResumeJournal>> {
+    ensure!(
+        matches!(
+            backend,
+            ipc::TransferBackend::Auto | ipc::TransferBackend::Native
+        ),
+        "resume=auto requires backend auto or native"
+    );
+    std::fs::create_dir_all(directory).context("create protected transfer journal directory")?;
+    security::harden_directory(directory)?;
+    let mut key = Sha256::new();
+    key.update(b"serctl/upload-journal/v1\0");
+    key.update(profile.profile_id.as_bytes());
+    key.update(profile.generation.to_be_bytes());
+    key.update(remote.as_bytes());
+    key.update(size.to_be_bytes());
+    key.update(sha256.as_bytes());
+    let path = directory.join(format!("{}.json", hex::encode(key.finalize())));
+
+    let expected = |journal: &UploadTransferJournal| -> Result<()> {
+        ensure!(
+            journal.schema == TRANSFER_JOURNAL_SCHEMA,
+            "unsupported transfer journal schema"
+        );
+        ipc::TransferId::parse(&journal.transfer_id)?;
+        ensure!(
+            journal.profile_name == profile.name,
+            "transfer journal profile name mismatch"
+        );
+        ensure!(
+            journal.profile_id == profile.profile_id,
+            "transfer journal profile id mismatch"
+        );
+        ensure!(
+            journal.profile_generation == profile.generation,
+            "transfer journal profile generation mismatch"
+        );
+        ensure!(
+            journal.direction == ipc::TransferDirection::Push,
+            "transfer journal direction mismatch"
+        );
+        ensure!(
+            journal.remote_target == remote,
+            "transfer journal target mismatch"
+        );
+        ensure!(journal.size == size, "transfer journal size mismatch");
+        ensure!(
+            journal.sha256 == sha256,
+            "transfer journal SHA-256 mismatch"
+        );
+        ensure!(
+            journal.backend == backend,
+            "transfer journal backend mismatch"
+        );
+        ensure!(
+            journal.resume_token.len() == 64
+                && journal
+                    .resume_token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "transfer journal resume token is invalid"
+        );
+        ensure!(
+            journal.durable_offset <= size,
+            "transfer journal durable offset exceeds source size"
+        );
+        Ok(())
+    };
+
+    let journal = if let Some(file) = security::open_existing_protected_file(&path)? {
+        let length = file.metadata()?.len();
+        ensure!(
+            (1..=MAX_TRANSFER_JOURNAL_BYTES).contains(&length),
+            "transfer journal is empty or too large"
+        );
+        let mut bytes = Zeroizing::new(Vec::with_capacity(length as usize));
+        file.take(MAX_TRANSFER_JOURNAL_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 == length,
+            "transfer journal changed while reading"
+        );
+        let journal: UploadTransferJournal =
+            serde_json::from_slice(&bytes).context("parse protected transfer journal")?;
+        expected(&journal)?;
+        journal
+    } else {
+        let mut token = Zeroizing::new([0_u8; 32]);
+        OsRng.fill_bytes(&mut *token);
+        let journal = UploadTransferJournal {
+            schema: TRANSFER_JOURNAL_SCHEMA,
+            transfer_id: new_transfer_id.as_str().to_owned(),
+            profile_name: profile.name.clone(),
+            profile_id: profile.profile_id.clone(),
+            profile_generation: profile.generation,
+            direction: ipc::TransferDirection::Push,
+            remote_target: remote.to_owned(),
+            size,
+            sha256: sha256.to_owned(),
+            backend,
+            resume_token: hex::encode(*token),
+            durable_offset: 0,
+        };
+        persist_upload_journal(&path, &journal)?;
+        journal
+    };
+    Ok(Arc::new(UploadResumeJournal {
+        path,
+        state: StdMutex::new(journal),
+    }))
+}
+
+struct TransferRateTracker {
+    started: StdInstant,
+    last_advanced: StdInstant,
+    baseline_confirmed: u64,
+    last_confirmed: u64,
+    observations: VecDeque<(StdInstant, u64)>,
+}
+
+impl TransferRateTracker {
+    fn new(now: StdInstant) -> Self {
+        let mut observations = VecDeque::new();
+        observations.push_back((now, 0));
+        Self {
+            started: now,
+            last_advanced: now,
+            baseline_confirmed: 0,
+            last_confirmed: 0,
+            observations,
+        }
+    }
+
+    fn enrich(
+        &mut self,
+        mut progress: ipc::TransferProgress,
+        now: StdInstant,
+    ) -> Result<ipc::TransferProgress> {
+        progress.validate()?;
+        if progress.event == "resumed" {
+            self.started = now;
+            self.last_advanced = now;
+            self.baseline_confirmed = progress.confirmed_bytes;
+            self.last_confirmed = progress.confirmed_bytes;
+            self.observations.clear();
+            self.observations.push_back((now, progress.confirmed_bytes));
+        }
+        ensure!(
+            progress.confirmed_bytes >= self.last_confirmed,
+            "transfer confirmation moved backwards"
+        );
+        if progress.confirmed_bytes > self.last_confirmed {
+            self.last_advanced = now;
+            self.last_confirmed = progress.confirmed_bytes;
+            self.observations.push_back((now, progress.confirmed_bytes));
+        }
+        while self.observations.len() > 1
+            && now.duration_since(self.observations[1].0) >= Duration::from_secs(3)
+        {
+            self.observations.pop_front();
+        }
+        let (window_started, window_bytes) = self
+            .observations
+            .front()
+            .copied()
+            .unwrap_or((now, progress.confirmed_bytes));
+        let window_elapsed = now.duration_since(window_started).as_secs_f64();
+        progress.window_bps = if window_elapsed > 0.0 {
+            progress.confirmed_bytes.saturating_sub(window_bytes) as f64 / window_elapsed
+        } else {
+            0.0
+        };
+        if now.duration_since(self.last_advanced) >= Duration::from_secs(3) {
+            progress.window_bps = 0.0;
+        }
+        let elapsed = now.duration_since(self.started).as_secs_f64();
+        progress.average_bps = if elapsed > 0.0 {
+            progress
+                .confirmed_bytes
+                .saturating_sub(self.baseline_confirmed) as f64
+                / elapsed
+        } else {
+            0.0
+        };
+        progress.eta_ms = if progress.window_bps > 0.0 {
+            Some(
+                ((progress
+                    .total_bytes
+                    .saturating_sub(progress.confirmed_bytes) as f64
+                    / progress.window_bps)
+                    * 1000.0)
+                    .min(u64::MAX as f64) as u64,
+            )
+        } else {
+            None
+        };
+        progress.validate()?;
+        Ok(progress)
+    }
+}
+
+fn emit_transfer_progress(
+    tracker: &mut TransferRateTracker,
+    sink: Option<&TransferProgressSink>,
+    progress: ipc::TransferProgress,
+) -> Result<()> {
+    let progress = tracker.enrich(progress, StdInstant::now())?;
+    if let Some(sink) = sink {
+        sink(progress);
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 struct ShutdownRejected(String);
@@ -420,11 +1057,11 @@ async fn ensure_daemon_until(deadline: tokio::time::Instant) -> Result<DaemonAcc
 }
 
 /// Fetch the sanitized profile catalog and resolve one profile id.
-async fn catalog_profile_id_until(
+async fn catalog_profile_until(
     access: &DaemonAccess,
     profile: &str,
     deadline: tokio::time::Instant,
-) -> Result<[u8; 16]> {
+) -> Result<ipc::WireProfile> {
     let prelude = v6_prelude(&ipc::Frame::ListProfiles, None, None, deadline)?;
     let connection = connect_v6_until(access, prelude, deadline).await?;
     let mut stream = connection.stream;
@@ -440,10 +1077,18 @@ async fn catalog_profile_id_until(
     let ipc::Frame::ProfileList { profiles } = reply else {
         bail!("daemon returned an unexpected catalog response")
     };
-    let found = profiles
+    profiles
         .into_iter()
         .find(|entry| entry.name == profile)
-        .with_context(|| format!("profile '{profile}' does not exist"))?;
+        .with_context(|| format!("profile '{profile}' does not exist"))
+}
+
+async fn catalog_profile_id_until(
+    access: &DaemonAccess,
+    profile: &str,
+    deadline: tokio::time::Instant,
+) -> Result<[u8; 16]> {
+    let found = catalog_profile_until(access, profile, deadline).await?;
     let bytes = hex::decode(&found.profile_id).context("catalog carries an invalid profile id")?;
     bytes
         .try_into()
@@ -573,12 +1218,18 @@ async fn connect_daemon_for_request_until(
     request: &ipc::Frame,
     request_deadline: tokio::time::Instant,
 ) -> Result<DaemonConnection> {
-    // The generation-bound UI grant verifies the current record before this
-    // call. The v6 authorization proof below additionally binds the daemon's
-    // per-profile call key to the complete request prelude.
-    let _ = expected_generation;
     let access = ensure_daemon_until(request_deadline).await?;
-    connect_authorized_request_until(&access, profile, master, request, request_deadline).await
+    let catalog = catalog_profile_until(&access, profile, request_deadline).await?;
+    validate_expected_catalog_identity(&catalog, expected_generation)?;
+    connect_authorized_catalog_request_until(
+        &access,
+        profile,
+        master,
+        &catalog,
+        request,
+        request_deadline,
+    )
+    .await
 }
 
 /// Authorize exactly `request` against one already-resolved daemon instance:
@@ -590,7 +1241,50 @@ async fn connect_authorized_request_until(
     request: &ipc::Frame,
     request_deadline: tokio::time::Instant,
 ) -> Result<DaemonConnection> {
-    let profile_id = catalog_profile_id_until(access, profile, request_deadline).await?;
+    let catalog = catalog_profile_until(access, profile, request_deadline).await?;
+    connect_authorized_catalog_request_until(
+        access,
+        profile,
+        master,
+        &catalog,
+        request,
+        request_deadline,
+    )
+    .await
+}
+
+fn wire_profile_id(profile: &ipc::WireProfile) -> Result<[u8; 16]> {
+    let bytes =
+        hex::decode(&profile.profile_id).context("catalog carries an invalid profile id")?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("catalog profile id must decode to 16 bytes"))
+}
+
+fn validate_expected_catalog_identity(
+    catalog: &ipc::WireProfile,
+    expected: Option<vault::ProfileIdentity>,
+) -> Result<()> {
+    if let Some(expected) = expected {
+        ensure!(
+            wire_profile_id(catalog)? == expected.profile_id
+                && catalog.generation == expected.generation,
+            "profile changed after the operation was authorized"
+        );
+    }
+    Ok(())
+}
+
+async fn connect_authorized_catalog_request_until(
+    access: &DaemonAccess,
+    profile: &str,
+    master: &str,
+    catalog: &ipc::WireProfile,
+    request: &ipc::Frame,
+    request_deadline: tokio::time::Instant,
+) -> Result<DaemonConnection> {
+    ensure!(catalog.name == profile, "catalog profile name mismatch");
+    let profile_id = wire_profile_id(catalog)?;
     let call_key =
         ensure_profile_unlocked(access, profile, master, profile_id, request_deadline).await?;
     let mut prelude = v6_prelude(
@@ -653,12 +1347,24 @@ pub fn load_agent_grant(
         .map_err(|_| anyhow!("agent key seed must decode to 32 bytes"))?;
     let seed = Zeroizing::new(seed);
     let key = SigningKey::from_bytes(&seed);
+    file.grant
+        .policy_ttl()
+        .context("agent grant TTL violates the current policy")?;
+    ensure!(
+        key.verifying_key().to_bytes() == file.grant.holder_key,
+        "agent grant key does not match its holder binding"
+    );
+    ensure!(
+        !file.grant.is_expired(now_unix_ms()),
+        "agent grant has expired"
+    );
     Ok((file.grant, key))
 }
 
-/// Issue a bounded 30-minute grant for an agent frontend. The profile must be
+/// Issue a default-lifetime grant for an agent frontend. The profile must be
 /// unlocked first (the same unlock authorizes the issuance), and the grant
 /// plus the agent's private key are written atomically to `output`.
+#[cfg(test)]
 pub async fn issue_grant_until(
     profile: &str,
     master: &str,
@@ -666,12 +1372,43 @@ pub async fn issue_grant_until(
     budget: u32,
     output: &Path,
 ) -> Result<serctl_protocol::grant::OperationGrant> {
+    issue_grant_with_ttl_until(
+        profile,
+        master,
+        operations,
+        budget,
+        serctl_protocol::grant::GRANT_DEFAULT_TTL,
+        output,
+    )
+    .await
+}
+
+/// Issue a grant with an explicit protocol-policy-bounded lifetime.
+pub async fn issue_grant_with_ttl_until(
+    profile: &str,
+    master: &str,
+    operations: Vec<String>,
+    budget: u32,
+    ttl: Duration,
+    output: &Path,
+) -> Result<serctl_protocol::grant::OperationGrant> {
+    ensure!(
+        (serctl_protocol::grant::GRANT_MIN_TTL..=serctl_protocol::grant::GRANT_MAX_TTL)
+            .contains(&ttl)
+            && ttl.subsec_nanos() == 0
+            && ttl.as_secs().is_multiple_of(60),
+        "grant TTL must be between {} and {} whole minutes",
+        serctl_protocol::grant::GRANT_MIN_TTL.as_secs() / 60,
+        serctl_protocol::grant::GRANT_MAX_TTL.as_secs() / 60
+    );
+    let ttl_secs = u32::try_from(ttl.as_secs()).context("grant TTL exceeds the wire range")?;
     let signing = SigningKey::generate(&mut OsRng);
     let holder_key = B64.encode(signing.verifying_key().to_bytes());
     let request = ipc::Frame::IssueGrant {
         profile: profile.to_owned(),
         operations: operations.clone(),
         budget,
+        ttl_secs,
         holder_key,
     };
     let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
@@ -698,11 +1435,12 @@ pub async fn issue_grant_until(
     })
     .await
     .map_err(|_| anyhow!("grant issuance exceeded its deadline"))??;
-    let (grant_id, expires_unix_ms) = match reply {
+    let (grant_id, issued_unix_ms, expires_unix_ms) = match reply {
         ipc::Frame::GrantIssued {
             grant_id,
+            issued_unix_ms,
             expires_unix_ms,
-        } => (grant_id, expires_unix_ms),
+        } => (grant_id, issued_unix_ms, expires_unix_ms),
         ipc::Frame::Error { msg } => bail!("{msg}"),
         mut other => {
             other.zeroize_sensitive();
@@ -719,10 +1457,14 @@ pub async fn issue_grant_until(
         profile_id,
         operations,
         budget,
-        issued_unix_ms: now_unix_ms(),
+        issued_unix_ms,
         expires_unix_ms,
         holder_key: signing.verifying_key().to_bytes(),
     };
+    ensure!(
+        grant.policy_ttl()? == ttl,
+        "daemon returned a grant with a different TTL"
+    );
     let mut file = AgentGrantFile {
         grant: grant.clone(),
         agent_key: B64.encode(signing.to_bytes()),
@@ -801,9 +1543,58 @@ enum AgentRequest {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+    TransferPush {
+        request_id: u64,
+        local: PathBuf,
+        remote: String,
+        #[serde(default)]
+        backend: Option<ipc::TransferBackend>,
+        #[serde(default)]
+        resume: Option<ipc::TransferResumeMode>,
+        #[serde(default)]
+        idle_timeout_ms: Option<u64>,
+        #[serde(default)]
+        deadline_ms: Option<u64>,
+    },
     Status {
         request_id: u64,
     },
+}
+
+#[derive(Debug)]
+struct AgentTransferWriteScopeRequired;
+
+impl std::fmt::Display for AgentTransferWriteScopeRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("grant does not authorize transfer.write")
+    }
+}
+
+impl std::error::Error for AgentTransferWriteScopeRequired {}
+
+fn require_agent_transfer_write_scope(
+    grant: &serctl_protocol::grant::OperationGrant,
+) -> Result<()> {
+    if grant
+        .operations
+        .iter()
+        .any(|operation| operation == AGENT_TRANSFER_WRITE_OPERATION)
+    {
+        Ok(())
+    } else {
+        Err(AgentTransferWriteScopeRequired.into())
+    }
+}
+
+/// Agent JSON must not echo local paths, protected state locations, or lower
+/// error-chain values that could eventually carry credentials. Scope rejection
+/// is a stable, non-secret diagnostic; all other detail remains local only.
+fn agent_visible_transfer_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<AgentTransferWriteScopeRequired>() {
+        error
+    } else {
+        anyhow!("transfer-push failed (local diagnostic detail withheld)")
+    }
 }
 
 /// One result line of the agent stdio protocol: the visible relay record.
@@ -932,6 +1723,34 @@ async fn dispatch_agent_request(
             )
             .await,
         ),
+        AgentRequest::TransferPush {
+            request_id,
+            local,
+            remote,
+            backend,
+            resume,
+            idle_timeout_ms,
+            deadline_ms,
+        } => {
+            let outcome = agent_transfer_push_until(
+                grant,
+                signing,
+                &local,
+                &remote,
+                TransferOptions {
+                    backend: backend.unwrap_or(ipc::TransferBackend::Auto),
+                    resume: resume.unwrap_or(ipc::TransferResumeMode::Never),
+                    idle_timeout: Duration::from_millis(
+                        idle_timeout_ms.unwrap_or(ipc::DEFAULT_TRANSFER_IDLE_TIMEOUT_MS),
+                    ),
+                    deadline: deadline_ms.map(Duration::from_millis),
+                    progress: None,
+                },
+            )
+            .await
+            .map_err(agent_visible_transfer_error);
+            (request_id, outcome)
+        }
         AgentRequest::Status { request_id } => {
             (request_id, agent_status_until(grant, signing).await)
         }
@@ -1060,6 +1879,113 @@ async fn agent_create_dir_until(
             bail!("daemon returned an unexpected create-directory response")
         }
     }
+}
+
+pub(crate) async fn agent_transfer_push_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    local: &Path,
+    remote: &str,
+    options: TransferOptions,
+) -> Result<serde_json::Value> {
+    // Reject aliases before opening or hashing a caller-selected local file.
+    // The daemon repeats the authoritative check against the signed root
+    // prelude; this local check is a fail-fast confidentiality boundary.
+    require_agent_transfer_write_scope(grant)?;
+    validate_upload_remote_path(remote)?;
+    let idle_timeout_ms = validated_sftp_timeout_ms(options.idle_timeout)?;
+    let deadline_ms = options
+        .deadline
+        .map(validated_sftp_timeout_ms)
+        .transpose()?;
+    let operation_timeout = options.request_bound();
+    let backend = options.backend;
+    let deadline = tokio::time::Instant::now() + operation_timeout;
+    let cancellation = CancellationToken::new();
+    let (mut source, size) =
+        open_local_upload_source(local, deadline, &cancellation, idle_timeout_ms).await?;
+    let sha256 = hash_stable_upload_source(&mut source, size, deadline, &cancellation).await?;
+    let candidate_transfer_id = ipc::TransferId::random();
+    let resume_journal = if options.resume == ipc::TransferResumeMode::Auto {
+        let access = ensure_daemon_until(deadline).await?;
+        let catalog = catalog_profile_until(&access, &grant.profile_name, deadline).await?;
+        ensure!(
+            wire_profile_id(&catalog)? == grant.profile_id,
+            "grant profile was replaced before transfer resume preparation"
+        );
+        Some(prepare_upload_resume_journal(
+            &catalog,
+            remote,
+            size,
+            &sha256,
+            backend,
+            &candidate_transfer_id,
+        )?)
+    } else {
+        None
+    };
+    let transfer_id = match resume_journal.as_ref() {
+        Some(journal) => journal.transfer_id()?,
+        None => candidate_transfer_id,
+    };
+    let resume_token = resume_journal
+        .as_ref()
+        .map(|journal| journal.resume_token())
+        .transpose()?;
+    let request = ZeroizingRequestFrame(ipc::Frame::UploadBegin {
+        transfer_id: transfer_id.clone(),
+        path: remote.to_owned(),
+        size,
+        sha256,
+        backend,
+        resume: options.resume,
+        resume_token: resume_token.as_ref().map(|token| token.to_string()),
+        idle_timeout_ms,
+        deadline_ms,
+    });
+    ensure!(
+        serctl_protocol::v6::frame_kind(&request.0) == AGENT_TRANSFER_WRITE_OPERATION,
+        "internal transfer-push root operation mismatch"
+    );
+    let daemon = connect_grant_request_until(grant, signing, &request.0, operation_timeout).await?;
+    let diagnostics = Arc::new(StdMutex::new(None));
+    let diagnostics_sink = diagnostics.clone();
+    let progress_sink: TransferProgressSink = Arc::new(move |progress| {
+        if let Ok(mut current) = diagnostics_sink.lock() {
+            *current = Some((
+                progress.backend,
+                progress.chunk_bytes,
+                progress.window_bytes,
+            ));
+        }
+    });
+    let bytes = upload_file_via_daemon(UploadDaemonRequest {
+        daemon,
+        source,
+        size,
+        timeout_ms: idle_timeout_ms,
+        request,
+        deadline,
+        cancellation,
+        progress_sink: Some(progress_sink),
+        resume_journal: resume_journal.clone(),
+    })
+    .await?;
+    if let Some(journal) = resume_journal {
+        journal.remove()?;
+    }
+    let (actual_backend, chunk_bytes, window_bytes) = diagnostics
+        .lock()
+        .map_err(|_| anyhow!("transfer diagnostic lock is poisoned"))?
+        .unwrap_or((backend, 0, 0));
+    Ok(serde_json::json!({
+        "transfer_id": transfer_id.as_str(),
+        "bytes": bytes,
+        "backend_requested": backend,
+        "backend": actual_backend,
+        "chunk_bytes": chunk_bytes,
+        "window_bytes": window_bytes,
+    }))
 }
 
 pub(crate) async fn agent_status_until(
@@ -1497,6 +2423,66 @@ fn elapsed_nonnegative_seconds(now: i64, started: i64) -> i64 {
 
 pub async fn daemon_status(profile: &str, master: &str) -> Result<Option<DaemonStatus>> {
     daemon_status_at_optional_generation(profile, master, None, true).await
+}
+
+pub async fn transfer_status(
+    profile: &str,
+    master: &str,
+    transfer_id: Option<ipc::TransferId>,
+) -> Result<Vec<ipc::TransferProgress>> {
+    let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
+    let access = ensure_daemon_until(deadline).await?;
+    let request = ipc::Frame::TransferStatus { transfer_id };
+    let daemon =
+        connect_authorized_request_until(&access, profile, master, &request, deadline).await?;
+    let mut stream = daemon.stream;
+    ipc::write_frame_limited(&mut stream, &request, ipc::MAX_CONTROL_FRAME).await?;
+    match tokio::time::timeout_at(
+        deadline,
+        ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME),
+    )
+    .await
+    {
+        Ok(Ok(Some(ipc::Frame::TransferStatusInfo { transfers }))) => Ok(transfers),
+        Ok(Ok(Some(ipc::Frame::Error { msg }))) => bail!(msg),
+        Ok(Ok(Some(mut unexpected))) => {
+            unexpected.zeroize_sensitive();
+            bail!("daemon returned an unexpected transfer status response")
+        }
+        Ok(Ok(None)) => bail!("daemon disconnected during transfer status exchange"),
+        Ok(Err(error)) => Err(error),
+        Err(_) => bail!("transfer status exchange exceeded its deadline"),
+    }
+}
+
+pub async fn transfer_cancel(
+    profile: &str,
+    master: &str,
+    transfer_id: ipc::TransferId,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
+    let access = ensure_daemon_until(deadline).await?;
+    let request = ipc::Frame::TransferCancel { transfer_id };
+    let daemon =
+        connect_authorized_request_until(&access, profile, master, &request, deadline).await?;
+    let mut stream = daemon.stream;
+    ipc::write_frame_limited(&mut stream, &request, ipc::MAX_CONTROL_FRAME).await?;
+    match tokio::time::timeout_at(
+        deadline,
+        ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME),
+    )
+    .await
+    {
+        Ok(Ok(Some(ipc::Frame::Ack))) => Ok(()),
+        Ok(Ok(Some(ipc::Frame::Error { msg }))) => bail!(msg),
+        Ok(Ok(Some(mut unexpected))) => {
+            unexpected.zeroize_sensitive();
+            bail!("daemon returned an unexpected transfer cancellation response")
+        }
+        Ok(Ok(None)) => bail!("daemon disconnected during transfer cancellation"),
+        Ok(Err(error)) => Err(error),
+        Err(_) => bail!("transfer cancellation exchange exceeded its deadline"),
+    }
 }
 
 /// Status for one profile, launching the broker on demand (CLI `status`).
@@ -2126,17 +3112,41 @@ pub async fn upload_with_timeout_and_master_cancellable(
             prompt_if_missing: prompt_if_direct,
             expected_generation: None,
         },
-        timeout,
+        TransferOptions::legacy(timeout),
         cancellation,
     )
     .await
 }
 
-pub(crate) async fn upload_with_timeout_at_generation_cancellable(
+pub async fn transfer_push_with_master_cancellable(
     profile: &str,
     local: &Path,
     remote: &str,
-    timeout: Duration,
+    options: TransferOptions,
+    master: Option<Zeroizing<String>>,
+    cancellation: CancellationToken,
+) -> Result<u64> {
+    let prompt_if_direct = master.is_none();
+    upload_file_with_timeout_inner(
+        profile,
+        local,
+        remote,
+        PendingProfileAuthorization {
+            passphrase: master.as_ref().map(|value| value.as_str()),
+            prompt_if_missing: prompt_if_direct,
+            expected_generation: None,
+        },
+        options,
+        cancellation,
+    )
+    .await
+}
+
+pub(crate) async fn transfer_push_at_generation_cancellable(
+    profile: &str,
+    local: &Path,
+    remote: &str,
+    options: TransferOptions,
     master: Zeroizing<String>,
     expected_generation: vault::ProfileIdentity,
     cancellation: CancellationToken,
@@ -2150,7 +3160,7 @@ pub(crate) async fn upload_with_timeout_at_generation_cancellable(
             prompt_if_missing: false,
             expected_generation: Some(expected_generation),
         },
-        timeout,
+        options,
         cancellation,
     )
     .await
@@ -2161,11 +3171,15 @@ async fn upload_file_with_timeout_inner(
     local: &Path,
     remote: &str,
     authorization: PendingProfileAuthorization<'_>,
-    timeout: Duration,
+    options: TransferOptions,
     cancellation: CancellationToken,
 ) -> Result<u64> {
     validate_upload_remote_path(remote)?;
-    let timeout_ms = validated_sftp_timeout_ms(timeout)?;
+    let idle_timeout_ms = validated_sftp_timeout_ms(options.idle_timeout)?;
+    let deadline_ms = options
+        .deadline
+        .map(validated_sftp_timeout_ms)
+        .transpose()?;
     let prompted_master = if authorization.passphrase.is_none() && authorization.prompt_if_missing {
         Some(ask_master()?)
     } else {
@@ -2175,44 +3189,128 @@ async fn upload_file_with_timeout_inner(
         .passphrase
         .or_else(|| prompted_master.as_ref().map(|value| value.as_str()))
         .ok_or_else(|| anyhow!("master passphrase is required"))?;
-    let deadline = tokio::time::Instant::now() + timeout;
-    let (source, size) =
-        open_local_upload_source(local, deadline, &cancellation, timeout_ms).await?;
-    let request = ZeroizingRequestFrame(ipc::Frame::UploadBegin {
-        path: remote.to_owned(),
-        size,
-        timeout_ms,
-    });
-    let daemon = match tokio::time::timeout_at(
-        deadline,
-        connect_daemon_for_request_until(
-            profile,
-            master,
-            authorization.expected_generation,
-            &request.0,
-            deadline,
-        ),
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => bail!("SFTP upload exceeded its deadline of {timeout_ms} ms"),
+    let deadline = tokio::time::Instant::now() + options.request_bound();
+    let (mut source, size) =
+        open_local_upload_source(local, deadline, &cancellation, idle_timeout_ms).await?;
+    let candidate_transfer_id = ipc::TransferId::random();
+    let local_progress = |stage, event: &str| ipc::TransferProgress {
+        schema_version: ipc::TRANSFER_PROGRESS_SCHEMA_VERSION,
+        event: event.to_owned(),
+        transfer_id: candidate_transfer_id.clone(),
+        direction: ipc::TransferDirection::Push,
+        stage,
+        total_bytes: size,
+        confirmed_bytes: 0,
+        durable_bytes: 0,
+        window_bps: 0.0,
+        average_bps: 0.0,
+        eta_ms: None,
+        backend: options.backend,
+        chunk_bytes: 0,
+        window_bytes: 0,
+        updated_unix_ms: now_unix_ms(),
     };
+    if let Some(sink) = options.progress.as_ref() {
+        sink(local_progress(ipc::TransferStage::Preflight, "preflight"));
+        sink(local_progress(ipc::TransferStage::Hash, "hash"));
+    }
+    let sha256 = hash_stable_upload_source(&mut source, size, deadline, &cancellation).await?;
+    let (_transfer_id, resume_token, resume_journal, daemon) =
+        if options.resume == ipc::TransferResumeMode::Auto {
+            let access = ensure_daemon_until(deadline).await?;
+            let catalog = catalog_profile_until(&access, profile, deadline).await?;
+            validate_expected_catalog_identity(&catalog, authorization.expected_generation)?;
+            let journal = prepare_upload_resume_journal(
+                &catalog,
+                remote,
+                size,
+                &sha256,
+                options.backend,
+                &candidate_transfer_id,
+            )?;
+            let transfer_id = journal.transfer_id()?;
+            let resume_token = journal.resume_token()?;
+            let request = ZeroizingRequestFrame(ipc::Frame::UploadBegin {
+                transfer_id: transfer_id.clone(),
+                path: remote.to_owned(),
+                size,
+                sha256: sha256.clone(),
+                backend: options.backend,
+                resume: options.resume,
+                resume_token: Some(resume_token.to_string()),
+                idle_timeout_ms,
+                deadline_ms,
+            });
+            let daemon = connect_authorized_catalog_request_until(
+                &access, profile, master, &catalog, &request.0, deadline,
+            )
+            .await?;
+            (
+                transfer_id,
+                Some(resume_token),
+                Some(journal),
+                (request, daemon),
+            )
+        } else {
+            let request = ZeroizingRequestFrame(ipc::Frame::UploadBegin {
+                transfer_id: candidate_transfer_id.clone(),
+                path: remote.to_owned(),
+                size,
+                sha256: sha256.clone(),
+                backend: options.backend,
+                resume: options.resume,
+                resume_token: None,
+                idle_timeout_ms,
+                deadline_ms,
+            });
+            let daemon = match tokio::time::timeout_at(
+                deadline,
+                connect_daemon_for_request_until(
+                    profile,
+                    master,
+                    authorization.expected_generation,
+                    &request.0,
+                    deadline,
+                ),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => bail!("transfer upload exceeded its request bound"),
+            };
+            (candidate_transfer_id, None, None, (request, daemon))
+        };
+    let (request, daemon) = daemon;
+    drop(resume_token);
 
     let worker_cancel = cancellation.clone();
+    let worker_journal = resume_journal.clone();
     let worker = tokio::spawn(async move {
-        upload_file_via_daemon(
+        upload_file_via_daemon(UploadDaemonRequest {
             daemon,
             source,
             size,
-            timeout_ms,
+            timeout_ms: idle_timeout_ms,
             request,
             deadline,
-            worker_cancel,
-        )
+            cancellation: worker_cancel,
+            progress_sink: options.progress,
+            resume_journal: worker_journal,
+        })
         .await
     });
-    await_owned_upload_worker(worker, cancellation).await
+    let result = await_owned_upload_worker(worker, cancellation).await;
+    if result.is_ok() {
+        if let Some(journal) = resume_journal {
+            if let Err(error) = journal.remove() {
+                log::warn!(
+                    "upload committed but completed transfer journal could not be removed: {}",
+                    terminal_safe_error(&error)
+                );
+            }
+        }
+    }
+    result
 }
 
 async fn open_local_upload_source(
@@ -2240,6 +3338,61 @@ async fn open_local_upload_source(
         Ok((source, size))
     })
     .await
+}
+
+async fn hash_stable_upload_source(
+    source: &mut tokio::fs::File,
+    size: u64,
+    deadline: tokio::time::Instant,
+    cancellation: &CancellationToken,
+) -> Result<String> {
+    let before = source
+        .metadata()
+        .await
+        .context("inspect upload source before hashing")?;
+    ensure!(
+        before.len() == size,
+        "upload source size changed before hashing"
+    );
+    source.seek(std::io::SeekFrom::Start(0)).await?;
+    let mut hasher = Sha256::new();
+    let mut hashed = 0_u64;
+    let mut buffer = Zeroizing::new(vec![0_u8; 256 * 1024]);
+    loop {
+        let read = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => bail!("transfer cancelled while hashing the source"),
+            result = tokio::time::timeout_at(deadline, source.read(&mut buffer)) => match result {
+                Ok(result) => result?,
+                Err(_) => bail!("transfer deadline elapsed while hashing the source"),
+            },
+        };
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        hashed = hashed
+            .checked_add(read as u64)
+            .context("upload hash byte count overflow")?;
+        ensure!(hashed <= size, "upload source grew while hashing");
+    }
+    ensure!(hashed == size, "upload source shrank while hashing");
+    let after = source
+        .metadata()
+        .await
+        .context("inspect upload source after hashing")?;
+    ensure!(
+        after.len() == before.len(),
+        "upload source size changed while hashing"
+    );
+    if let (Ok(before_modified), Ok(after_modified)) = (before.modified(), after.modified()) {
+        ensure!(
+            before_modified == after_modified,
+            "upload source modification time changed while hashing"
+        );
+    }
+    source.seek(std::io::SeekFrom::Start(0)).await?;
+    Ok(hex::encode(hasher.finalize()))
 }
 
 async fn open_local_upload_source_with<F>(
@@ -2336,20 +3489,30 @@ impl Drop for ZeroizingRequestFrame {
     }
 }
 
-async fn read_daemon_upload_commit_response<R>(reader: &mut R, expected: u64) -> Result<u64>
+async fn read_daemon_upload_commit_response<R>(
+    reader: &mut R,
+    expected: u64,
+    rate_tracker: &mut TransferRateTracker,
+    progress_sink: Option<&TransferProgressSink>,
+) -> Result<u64>
 where
     R: AsyncRead + Unpin,
 {
-    let frame = ipc::read_frame_limited(reader, ipc::MAX_CONTROL_FRAME)
-        .await
-        .map_err(|error| {
-            UploadCommitOutcomeUnknown(format!(
-                "SFTP upload commit outcome unknown after an invalid daemon response: {error:#}; \
-                 inspect the target before retry"
-            ))
-        })?;
-    match frame {
-        Some(ipc::Frame::TransferDone { bytes }) if bytes == expected => Ok(bytes),
+    loop {
+        let frame = ipc::read_frame_limited(reader, ipc::MAX_CONTROL_FRAME)
+            .await
+            .map_err(|error| {
+                UploadCommitOutcomeUnknown(format!(
+                    "SFTP upload commit outcome unknown after an invalid daemon response: {error:#}; \
+                     inspect the target before retry"
+                ))
+            })?;
+        match frame {
+        Some(ipc::Frame::TransferProgress { progress }) => {
+            emit_transfer_progress(rate_tracker, progress_sink, progress)?;
+            continue;
+        }
+        Some(ipc::Frame::TransferDone { bytes }) if bytes == expected => return Ok(bytes),
         Some(ipc::Frame::TransferDone { bytes }) => bail!(
             "upload commit completed with a size mismatch: expected {expected}, daemon stored \
              {bytes}; inspect the target before retry"
@@ -2357,18 +3520,19 @@ where
         Some(ipc::Frame::Error { msg }) => bail!(msg),
         Some(mut frame) => {
             frame.zeroize_sensitive();
-            Err(UploadCommitOutcomeUnknown(
+            return Err(UploadCommitOutcomeUnknown(
                 "SFTP upload commit outcome unknown: daemon returned an unexpected response; \
                  inspect the target before retry"
                     .into(),
             )
             .into())
         }
-        None => Err(UploadCommitOutcomeUnknown(
+        None => return Err(UploadCommitOutcomeUnknown(
             "SFTP upload commit outcome unknown after daemon disconnect; inspect the target before retry"
                 .into(),
         )
         .into()),
+        }
     }
 }
 
@@ -2378,33 +3542,55 @@ async fn await_daemon_upload_commit_response<R>(
     request_deadline: tokio::time::Instant,
     cancellation: &CancellationToken,
     reconciliation_only: bool,
+    rate_tracker: &mut TransferRateTracker,
+    progress_sink: Option<&TransferProgressSink>,
 ) -> Result<u64>
 where
     R: AsyncRead + Unpin,
 {
     await_daemon_upload_commit_response_with_grace(
         reader,
-        expected,
-        request_deadline,
-        cancellation,
-        reconciliation_only,
-        REMOTE_COMMIT_RECONCILE_TIMEOUT,
+        CommitWait {
+            expected,
+            request_deadline,
+            cancellation,
+            reconciliation_only,
+            reconciliation_grace: REMOTE_COMMIT_RECONCILE_TIMEOUT,
+            rate_tracker,
+            progress_sink,
+        },
     )
     .await
 }
 
-async fn await_daemon_upload_commit_response_with_grace<R>(
-    reader: &mut R,
+struct CommitWait<'a> {
     expected: u64,
     request_deadline: tokio::time::Instant,
-    cancellation: &CancellationToken,
+    cancellation: &'a CancellationToken,
     reconciliation_only: bool,
     reconciliation_grace: Duration,
+    rate_tracker: &'a mut TransferRateTracker,
+    progress_sink: Option<&'a TransferProgressSink>,
+}
+
+async fn await_daemon_upload_commit_response_with_grace<R>(
+    reader: &mut R,
+    wait: CommitWait<'_>,
 ) -> Result<u64>
 where
     R: AsyncRead + Unpin,
 {
-    let response = read_daemon_upload_commit_response(reader, expected);
+    let CommitWait {
+        expected,
+        request_deadline,
+        cancellation,
+        reconciliation_only,
+        reconciliation_grace,
+        rate_tracker,
+        progress_sink,
+    } = wait;
+    let response =
+        read_daemon_upload_commit_response(reader, expected, rate_tracker, progress_sink);
     tokio::pin!(response);
 
     if !reconciliation_only && request_deadline > tokio::time::Instant::now() {
@@ -2433,35 +3619,87 @@ where
     }
 }
 
-async fn upload_file_via_daemon(
+struct UploadDaemonRequest {
     daemon: DaemonConnection,
-    mut source: tokio::fs::File,
+    source: tokio::fs::File,
     size: u64,
     timeout_ms: u64,
     request: ZeroizingRequestFrame,
     deadline: tokio::time::Instant,
     cancellation: CancellationToken,
-) -> Result<u64> {
-    let mut buffer = Zeroizing::new(vec![0_u8; 32 * 1024]);
+    progress_sink: Option<TransferProgressSink>,
+    resume_journal: Option<Arc<UploadResumeJournal>>,
+}
+
+async fn upload_file_via_daemon(request: UploadDaemonRequest) -> Result<u64> {
+    let UploadDaemonRequest {
+        daemon,
+        mut source,
+        size,
+        timeout_ms,
+        request,
+        deadline,
+        cancellation,
+        progress_sink,
+        resume_journal,
+    } = request;
     let upload_end_started = std::sync::atomic::AtomicBool::new(false);
     let upload_end_sent = std::sync::atomic::AtomicBool::new(false);
 
     let mut stream = daemon.stream;
+    let mut rate_tracker = TransferRateTracker::new(StdInstant::now());
     let operation = async {
+        let mut negotiated_chunk = ipc::SFTP_SAFE_CHUNK_BYTES;
+        let mut resume_offset = 0_u64;
         ensure!(
             matches!(&request.0, ipc::Frame::UploadBegin { .. }),
             "daemon upload worker received a non-upload root request"
         );
         ipc::write_frame_limited(&mut stream, &request.0, ipc::MAX_REQUEST_FRAME).await?;
-        match ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME).await? {
-            Some(ipc::Frame::Ack) => {}
-            Some(ipc::Frame::Error { msg }) => bail!(msg),
-            Some(mut frame) => {
-                frame.zeroize_sensitive();
-                bail!("daemon rejected the upload")
+        loop {
+            match ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME).await? {
+                Some(ipc::Frame::TransferProgress { progress }) => {
+                    if progress.chunk_bytes > 0 {
+                        let announced = progress.chunk_bytes as usize;
+                        ensure!(
+                            announced <= MAX_UPLOAD_CHUNK_BYTES,
+                            "daemon negotiated an upload chunk above the IPC safety limit"
+                        );
+                        negotiated_chunk = announced;
+                    }
+                    ensure!(
+                        progress.durable_bytes <= size,
+                        "daemon announced a resume offset beyond the source size"
+                    );
+                    resume_offset = resume_offset.max(progress.durable_bytes);
+                    if let Some(journal) = resume_journal.as_ref() {
+                        journal.observe(&progress)?;
+                    }
+                    emit_transfer_progress(&mut rate_tracker, progress_sink.as_ref(), progress)?;
+                    continue;
+                }
+                Some(ipc::Frame::Ack) => break,
+                Some(ipc::Frame::Error { msg }) => bail!(msg),
+                Some(mut frame) => {
+                    frame.zeroize_sensitive();
+                    bail!("daemon rejected the upload")
+                }
+                None => bail!("daemon disconnected before accepting the upload"),
             }
-            None => bail!("daemon disconnected before accepting the upload"),
         }
+        if let Some(journal) = resume_journal.as_ref() {
+            ensure!(
+                resume_offset == journal.durable_offset()?,
+                "daemon resume offset does not match the protected journal"
+            );
+        } else {
+            ensure!(resume_offset == 0, "daemon resumed an unjournaled upload");
+        }
+        source
+            .seek(std::io::SeekFrom::Start(resume_offset))
+            .await
+            .context("seek stable upload source to durable resume offset")?;
+        let mut buffer = Zeroizing::new(vec![0_u8; negotiated_chunk]);
         loop {
             let read = source.read(&mut buffer).await?;
             if read == 0 {
@@ -2478,14 +3716,27 @@ async fn upload_file_via_daemon(
             // Exactly one chunk may be outstanding. This makes every daemon
             // SFTP wait a safe point for detecting client disconnect without
             // consuming the next frame prefix.
-            match ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME).await? {
-                Some(ipc::Frame::Ack) => {}
-                Some(ipc::Frame::Error { msg }) => bail!(msg),
-                Some(mut frame) => {
-                    frame.zeroize_sensitive();
-                    bail!("daemon did not acknowledge an upload chunk")
+            loop {
+                match ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME).await? {
+                    Some(ipc::Frame::TransferProgress { progress }) => {
+                        if let Some(journal) = resume_journal.as_ref() {
+                            journal.observe(&progress)?;
+                        }
+                        emit_transfer_progress(
+                            &mut rate_tracker,
+                            progress_sink.as_ref(),
+                            progress,
+                        )?;
+                        continue;
+                    }
+                    Some(ipc::Frame::Ack) => break,
+                    Some(ipc::Frame::Error { msg }) => bail!(msg),
+                    Some(mut frame) => {
+                        frame.zeroize_sensitive();
+                        bail!("daemon did not acknowledge an upload chunk")
+                    }
+                    None => bail!("daemon disconnected before acknowledging an upload chunk"),
                 }
-                None => bail!("daemon disconnected before acknowledging an upload chunk"),
             }
         }
         upload_end_started.store(true, std::sync::atomic::Ordering::Release);
@@ -2510,25 +3761,57 @@ async fn upload_file_via_daemon(
     let precommit_failure = !commit_phase && !matches!(&end, End::Finished(Ok(())));
     let result = match end {
         End::Finished(Ok(())) => {
-            await_daemon_upload_commit_response(&mut stream, size, deadline, &cancellation, false)
-                .await
+            await_daemon_upload_commit_response(
+                &mut stream,
+                size,
+                deadline,
+                &cancellation,
+                false,
+                &mut rate_tracker,
+                progress_sink.as_ref(),
+            )
+            .await
         }
         End::Finished(Err(error)) if commit_phase => {
             log::warn!(
                 "upload commit frame write was interrupted: {}",
                 terminal_safe_error(&error)
             );
-            await_daemon_upload_commit_response(&mut stream, size, deadline, &cancellation, true)
-                .await
+            await_daemon_upload_commit_response(
+                &mut stream,
+                size,
+                deadline,
+                &cancellation,
+                true,
+                &mut rate_tracker,
+                progress_sink.as_ref(),
+            )
+            .await
         }
         End::Finished(Err(error)) => Err(error),
         End::Cancelled if commit_phase => {
-            await_daemon_upload_commit_response(&mut stream, size, deadline, &cancellation, true)
-                .await
+            await_daemon_upload_commit_response(
+                &mut stream,
+                size,
+                deadline,
+                &cancellation,
+                true,
+                &mut rate_tracker,
+                progress_sink.as_ref(),
+            )
+            .await
         }
         End::TimedOut if commit_phase => {
-            await_daemon_upload_commit_response(&mut stream, size, deadline, &cancellation, true)
-                .await
+            await_daemon_upload_commit_response(
+                &mut stream,
+                size,
+                deadline,
+                &cancellation,
+                true,
+                &mut rate_tracker,
+                progress_sink.as_ref(),
+            )
+            .await
         }
         End::Cancelled => {
             // Closing IPC makes the daemon's flow-controlled remote step select
@@ -2594,17 +3877,41 @@ pub async fn download_with_timeout_and_master_cancellable(
             prompt_if_missing: prompt_if_direct,
             expected_generation: None,
         },
-        timeout,
+        TransferOptions::legacy(timeout),
         cancellation,
     )
     .await
 }
 
-pub(crate) async fn download_with_timeout_at_generation_cancellable(
+pub async fn transfer_pull_with_master_cancellable(
     profile: &str,
     remote: &str,
     local: &Path,
-    timeout: Duration,
+    options: TransferOptions,
+    master: Option<Zeroizing<String>>,
+    cancellation: CancellationToken,
+) -> Result<u64> {
+    let prompt_if_direct = master.is_none();
+    download_file_with_timeout_owned(
+        profile,
+        remote,
+        local,
+        OwnedPendingProfileAuthorization {
+            passphrase: master,
+            prompt_if_missing: prompt_if_direct,
+            expected_generation: None,
+        },
+        options,
+        cancellation,
+    )
+    .await
+}
+
+pub(crate) async fn transfer_pull_at_generation_cancellable(
+    profile: &str,
+    remote: &str,
+    local: &Path,
+    options: TransferOptions,
     master: Zeroizing<String>,
     expected_generation: vault::ProfileIdentity,
     cancellation: CancellationToken,
@@ -2618,7 +3925,7 @@ pub(crate) async fn download_with_timeout_at_generation_cancellable(
             prompt_if_missing: false,
             expected_generation: Some(expected_generation),
         },
-        timeout,
+        options,
         cancellation,
     )
     .await
@@ -2629,7 +3936,7 @@ async fn download_file_with_timeout_owned(
     remote: &str,
     local: &Path,
     authorization: OwnedPendingProfileAuthorization,
-    timeout: Duration,
+    options: TransferOptions,
     cancellation: CancellationToken,
 ) -> Result<u64> {
     validate_remote_path(remote, false)?;
@@ -2643,7 +3950,7 @@ async fn download_file_with_timeout_owned(
             &remote,
             &local,
             authorization,
-            timeout,
+            options,
             worker_cancellation,
         )
         .await
@@ -2656,11 +3963,16 @@ async fn download_file_worker(
     remote: &str,
     local: &Path,
     authorization: OwnedPendingProfileAuthorization,
-    timeout: Duration,
+    options: TransferOptions,
     cancellation: CancellationToken,
 ) -> Result<u64> {
-    let timeout_ms = validated_sftp_timeout_ms(timeout)?;
-    let mut deadline = tokio::time::Instant::now() + timeout;
+    let idle_timeout_ms = validated_sftp_timeout_ms(options.idle_timeout)?;
+    let deadline_ms = options
+        .deadline
+        .map(validated_sftp_timeout_ms)
+        .transpose()?;
+    let request_bound = options.request_bound();
+    let mut deadline = tokio::time::Instant::now() + request_bound;
     // Reject the obvious local conflict before connecting or prompting. The
     // inner check plus atomic commit still enforce this against later races.
     let exists = tokio::select! {
@@ -2668,7 +3980,7 @@ async fn download_file_worker(
         _ = cancellation.cancelled() => bail!("SFTP download cancelled"),
         result = tokio::time::timeout_at(deadline, tokio::fs::try_exists(local)) => match result {
             Ok(result) => result?,
-            Err(_) => bail!("SFTP download exceeded its deadline of {timeout_ms} ms"),
+            Err(_) => bail!("transfer download exceeded its request bound"),
         },
     };
     if exists {
@@ -2680,7 +3992,7 @@ async fn download_file_worker(
         None
     };
     if prompted_master.is_some() {
-        deadline = tokio::time::Instant::now() + timeout;
+        deadline = tokio::time::Instant::now() + request_bound;
     }
     let master = authorization
         .passphrase
@@ -2688,26 +4000,66 @@ async fn download_file_worker(
         .map(|value| value.as_str())
         .or_else(|| prompted_master.as_ref().map(|value| value.as_str()))
         .ok_or_else(|| anyhow!("master passphrase is required"))?;
-    let root_request = ZeroizingRequestFrame(ipc::Frame::Download {
-        path: remote.to_owned(),
-        timeout_ms,
-    });
-    let daemon = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => bail!("SFTP download cancelled"),
-        result = tokio::time::timeout_at(
-            deadline,
-            connect_daemon_for_request_until(
-                profile,
-                master,
-                authorization.expected_generation,
-                &root_request.0,
+    let candidate_transfer_id = ipc::TransferId::random();
+    let (root_request, daemon, resume_journal) = if options.resume == ipc::TransferResumeMode::Auto
+    {
+        let access = ensure_daemon_until(deadline).await?;
+        let catalog = catalog_profile_until(&access, profile, deadline).await?;
+        validate_expected_catalog_identity(&catalog, authorization.expected_generation)?;
+        let journal = prepare_download_resume_journal(
+            &catalog,
+            remote,
+            local,
+            options.backend,
+            &candidate_transfer_id,
+        )?;
+        let snapshot = journal.snapshot()?;
+        let root = ZeroizingRequestFrame(ipc::Frame::Download {
+            transfer_id: snapshot.transfer_id,
+            path: remote.to_owned(),
+            backend: options.backend,
+            resume: options.resume,
+            resume_offset: snapshot.durable_offset,
+            expected_size: snapshot.expected_size,
+            expected_sha256: snapshot.expected_sha256,
+            idle_timeout_ms,
+            deadline_ms,
+        });
+        let daemon = connect_authorized_catalog_request_until(
+            &access, profile, master, &catalog, &root.0, deadline,
+        )
+        .await?;
+        (root, daemon, Some(journal))
+    } else {
+        let root = ZeroizingRequestFrame(ipc::Frame::Download {
+            transfer_id: candidate_transfer_id,
+            path: remote.to_owned(),
+            backend: options.backend,
+            resume: options.resume,
+            resume_offset: 0,
+            expected_size: None,
+            expected_sha256: None,
+            idle_timeout_ms,
+            deadline_ms,
+        });
+        let daemon = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => bail!("SFTP download cancelled"),
+            result = tokio::time::timeout_at(
                 deadline,
-            ),
-        ) => match result {
-            Ok(result) => result?,
-            Err(_) => bail!("SFTP download exceeded its deadline of {timeout_ms} ms"),
-        },
+                connect_daemon_for_request_until(
+                    profile,
+                    master,
+                    authorization.expected_generation,
+                    &root.0,
+                    deadline,
+                ),
+            ) => match result {
+                Ok(result) => result?,
+                Err(_) => bail!("transfer download exceeded its request bound"),
+            },
+        };
+        (root, daemon, None)
     };
     if cancellation.is_cancelled() {
         bail!("SFTP download cancelled");
@@ -2716,28 +4068,76 @@ async fn download_file_worker(
         local,
         daemon,
         root_request,
-        timeout_ms,
+        timeout_ms: idle_timeout_ms,
         deadline,
         cancellation,
+        progress_sink: options.progress,
+        resume_journal,
     })
     .await
 }
 
-async fn download_via_daemon_until(
-    daemon: DaemonConnection,
+struct DownloadDaemonRequest<'a> {
+    daemon: &'a mut DaemonConnection,
     root_request: ZeroizingRequestFrame,
-    destination: &mut tokio::fs::File,
+    destination: &'a mut tokio::fs::File,
     timeout_ms: u64,
     deadline: tokio::time::Instant,
-    cancellation: &CancellationToken,
-) -> Result<u64> {
-    let mut stream = daemon.stream;
+    cancellation: &'a CancellationToken,
+    progress_sink: Option<&'a TransferProgressSink>,
+    rate_tracker: &'a mut TransferRateTracker,
+    resume_journal: Option<&'a Arc<DownloadResumeJournal>>,
+}
+
+async fn download_via_daemon_until(request: DownloadDaemonRequest<'_>) -> Result<u64> {
+    let DownloadDaemonRequest {
+        daemon,
+        root_request,
+        destination,
+        timeout_ms,
+        deadline,
+        cancellation,
+        progress_sink,
+        rate_tracker,
+        resume_journal,
+    } = request;
+    let mut stream = &mut daemon.stream;
     let operation = async {
         ensure!(
             matches!(&root_request.0, ipc::Frame::Download { .. }),
             "daemon download worker received a non-download root request"
         );
-        let mut received = 0_u64;
+        let expected_transfer_id = match &root_request.0 {
+            ipc::Frame::Download { transfer_id, .. } => transfer_id.clone(),
+            _ => unreachable!("download root request was checked above"),
+        };
+        let resume_offset = resume_journal
+            .map(|journal| journal.snapshot().map(|snapshot| snapshot.durable_offset))
+            .transpose()?
+            .unwrap_or(0);
+        let mut received = resume_offset;
+        let mut received_hasher = Sha256::new();
+        let mut expected_digest: Option<String> = None;
+        let mut announced_total: Option<u64> = None;
+        if resume_offset > 0 {
+            destination.seek(std::io::SeekFrom::Start(0)).await?;
+            let mut remaining = resume_offset;
+            let mut prefix = Zeroizing::new(vec![0_u8; MAX_UPLOAD_CHUNK_BYTES]);
+            while remaining > 0 {
+                let limit = usize::try_from(remaining.min(prefix.len() as u64))?;
+                let read = destination.read(&mut prefix[..limit]).await?;
+                ensure!(
+                    read > 0,
+                    "local resume partial ended before its durable offset"
+                );
+                received_hasher.update(&prefix[..read]);
+                remaining -= read as u64;
+            }
+            destination
+                .seek(std::io::SeekFrom::Start(resume_offset))
+                .await?;
+        }
+        let mut durable = resume_offset;
         ipc::write_frame_limited(&mut stream, &root_request.0, ipc::MAX_REQUEST_FRAME).await?;
         loop {
             match ipc::read_frame_limited(&mut stream, ipc::MAX_RESPONSE_FRAME).await? {
@@ -2748,6 +4148,7 @@ async fn download_via_daemon_until(
                         bail!("daemon download chunk is empty or exceeds its safety limit");
                     }
                     let write = destination.write_all(&data).await;
+                    received_hasher.update(data.as_slice());
                     let next_received = received.checked_add(data.len() as u64);
                     data.zeroize();
                     write?;
@@ -2757,8 +4158,64 @@ async fn download_via_daemon_until(
                         "download exceeds the {} byte safety limit",
                         MAX_TRANSFER_BYTES
                     );
+                    if let Some(journal) = resume_journal {
+                        if received.saturating_sub(durable) >= DOWNLOAD_DURABLE_WINDOW_BYTES {
+                            destination.sync_data().await?;
+                            durable = received;
+                            journal.record_durable(durable)?;
+                        }
+                    }
+                    ipc::write_frame_limited(
+                        stream,
+                        &ipc::Frame::TransferAck {
+                            confirmed_bytes: received,
+                            durable_bytes: durable,
+                        },
+                        ipc::MAX_CONTROL_FRAME,
+                    )
+                    .await?;
                 }
-                Some(ipc::Frame::TransferDone { bytes }) if bytes == received => break Ok(bytes),
+                Some(ipc::Frame::TransferProgress { progress }) => {
+                    announced_total = Some(progress.total_bytes);
+                    emit_transfer_progress(rate_tracker, progress_sink, progress)?;
+                }
+                Some(ipc::Frame::TransferDigest {
+                    transfer_id,
+                    sha256,
+                }) => {
+                    ensure!(
+                        transfer_id == expected_transfer_id,
+                        "daemon returned a digest for the wrong transfer"
+                    );
+                    ensure!(
+                        sha256.len() == 64
+                            && sha256.bytes().all(|byte| {
+                                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+                            }),
+                        "daemon returned an invalid transfer SHA-256"
+                    );
+                    if let Some(journal) = resume_journal {
+                        let total = announced_total.context(
+                            "daemon sent a download digest before announcing the remote size",
+                        )?;
+                        journal.record_remote_identity(total, &sha256)?;
+                    }
+                    expected_digest = Some(sha256);
+                }
+                Some(ipc::Frame::TransferDone { bytes }) if bytes == received => {
+                    let expected_digest = expected_digest
+                        .take()
+                        .context("daemon did not provide a download SHA-256")?;
+                    ensure!(
+                        hex::encode(received_hasher.finalize()) == expected_digest,
+                        "download SHA-256 mismatch"
+                    );
+                    if let Some(journal) = resume_journal {
+                        destination.sync_data().await?;
+                        journal.record_durable(received)?;
+                    }
+                    break Ok(bytes);
+                }
                 Some(ipc::Frame::TransferDone { bytes }) => {
                     break Err(anyhow!(
                         "download size mismatch: daemon reported {bytes}, received {received}"
@@ -2778,7 +4235,6 @@ async fn download_via_daemon_until(
         _ = cancellation.cancelled() => None,
         result = tokio::time::timeout_at(deadline, operation) => Some(result),
     };
-    drop(stream);
     match result {
         Some(Ok(result)) => result,
         Some(Err(_)) => bail!("SFTP download exceeded its deadline of {timeout_ms} ms"),
@@ -2793,6 +4249,8 @@ struct DownloadRequest<'a> {
     timeout_ms: u64,
     deadline: tokio::time::Instant,
     cancellation: CancellationToken,
+    progress_sink: Option<TransferProgressSink>,
+    resume_journal: Option<Arc<DownloadResumeJournal>>,
 }
 
 async fn download_file_inner(request: DownloadRequest<'_>) -> Result<u64> {
@@ -2803,6 +4261,8 @@ async fn download_file_inner(request: DownloadRequest<'_>) -> Result<u64> {
         timeout_ms,
         deadline,
         cancellation,
+        progress_sink,
+        resume_journal,
     } = request;
     let exists = tokio::select! {
         biased;
@@ -2815,7 +4275,10 @@ async fn download_file_inner(request: DownloadRequest<'_>) -> Result<u64> {
     if exists {
         bail!("local destination already exists: {}", local.display());
     }
-    let partial = partial_download_path(local);
+    let partial = match resume_journal.as_ref() {
+        Some(journal) => journal.snapshot()?.partial_path,
+        None => partial_download_path(local),
+    };
     ensure!(!cancellation.is_cancelled(), "SFTP download cancelled");
     ensure!(
         tokio::time::Instant::now() < deadline,
@@ -2825,34 +4288,70 @@ async fn download_file_inner(request: DownloadRequest<'_>) -> Result<u64> {
     // value has definite ownership semantics: only a successful create arms
     // cleanup. An AlreadyExists or other open failure can never delete a path
     // that belonged to another request.
-    let (mut destination, mut partial_cleanup) =
-        create_local_download_partial(&partial, deadline, &cancellation, timeout_ms).await?;
+    let (mut destination, mut partial_cleanup) = if let Some(journal) = resume_journal.as_ref() {
+        let snapshot = journal.snapshot()?;
+        ensure!(
+            snapshot.partial_path == partial,
+            "download journal partial path mismatch"
+        );
+        let file = match security::open_existing_protected_file(&partial)? {
+            Some(file) => file,
+            None if snapshot.durable_offset == 0 => security::create_new_protected_file(&partial)?,
+            None => bail!("owned download partial is missing for a nonzero durable offset"),
+        };
+        let length = file.metadata()?.len();
+        ensure!(
+            length >= snapshot.durable_offset,
+            "owned download partial is shorter than its durable offset"
+        );
+        if length != snapshot.durable_offset {
+            file.set_len(snapshot.durable_offset)
+                .context("truncate owned download partial to its durable prefix")?;
+            file.sync_all().context("sync truncated download partial")?;
+        }
+        (tokio::fs::File::from_std(file), None::<LocalPartialCleanup>)
+    } else {
+        let (file, cleanup) =
+            create_local_download_partial(&partial, deadline, &cancellation, timeout_ms).await?;
+        (file, Some(cleanup))
+    };
     if cancellation.is_cancelled() {
         drop(destination);
-        partial_cleanup.cleanup().await;
+        if let Some(cleanup) = partial_cleanup.as_mut() {
+            cleanup.cleanup().await;
+        }
         bail!("SFTP download cancelled");
     }
     if tokio::time::Instant::now() >= deadline {
         drop(destination);
-        partial_cleanup.cleanup().await;
+        if let Some(cleanup) = partial_cleanup.as_mut() {
+            cleanup.cleanup().await;
+        }
         bail!("SFTP download exceeded its deadline of {timeout_ms} ms");
     }
 
-    let transfer: Result<u64> = download_via_daemon_until(
-        daemon,
+    let mut daemon = daemon;
+    let mut rate_tracker = TransferRateTracker::new(StdInstant::now());
+    let transfer: Result<u64> = download_via_daemon_until(DownloadDaemonRequest {
+        daemon: &mut daemon,
         root_request,
-        &mut destination,
+        destination: &mut destination,
         timeout_ms,
         deadline,
-        &cancellation,
-    )
+        cancellation: &cancellation,
+        progress_sink: progress_sink.as_ref(),
+        rate_tracker: &mut rate_tracker,
+        resume_journal: resume_journal.as_ref(),
+    })
     .await;
 
     match transfer {
         Ok(bytes) => {
             if cancellation.is_cancelled() {
                 drop(destination);
-                partial_cleanup.cleanup().await;
+                if let Some(cleanup) = partial_cleanup.as_mut() {
+                    cleanup.cleanup().await;
+                }
                 bail!("SFTP download cancelled");
             }
             // Hard-link creation is the linearization point. Once local commit
@@ -2873,19 +4372,59 @@ async fn download_file_inner(request: DownloadRequest<'_>) -> Result<u64> {
                 Ok(partial_removed) => partial_removed,
                 Err(error) => {
                     drop(destination);
-                    partial_cleanup.cleanup().await;
+                    if let Some(cleanup) = partial_cleanup.as_mut() {
+                        cleanup.cleanup().await;
+                    }
                     return Err(error);
                 }
             };
             drop(destination);
             if partial_removed {
-                partial_cleanup.disarm();
+                if let Some(cleanup) = partial_cleanup.as_mut() {
+                    cleanup.disarm();
+                }
+            } else if partial_cleanup.is_none() {
+                let _cleanup = partial_cleanup.insert(LocalPartialCleanup::new(partial.clone()));
+            }
+            ipc::write_frame_limited(&mut daemon.stream, &ipc::Frame::Ack, ipc::MAX_CONTROL_FRAME)
+                .await?;
+            match ipc::read_frame_limited(&mut daemon.stream, ipc::MAX_CONTROL_FRAME).await? {
+                Some(ipc::Frame::TransferProgress { progress })
+                    if progress.stage == ipc::TransferStage::Completed =>
+                {
+                    emit_transfer_progress(&mut rate_tracker, progress_sink.as_ref(), progress)?;
+                }
+                Some(ipc::Frame::Error { msg }) => bail!(msg),
+                Some(mut unexpected) => {
+                    unexpected.zeroize_sensitive();
+                    bail!("daemon did not confirm the completed local download commit")
+                }
+                None => bail!("daemon disconnected before confirming the local download commit"),
+            }
+            if let Some(journal) = resume_journal {
+                if let Err(error) = journal.remove() {
+                    log::warn!(
+                        "download committed but completed transfer journal could not be removed: {}",
+                        terminal_safe_error(&error)
+                    );
+                }
             }
             Ok(bytes)
         }
         Err(error) => {
             drop(destination);
-            partial_cleanup.cleanup().await;
+            if let Some(cleanup) = partial_cleanup.as_mut() {
+                cleanup.cleanup().await;
+            } else if let Some(journal) = resume_journal.as_ref() {
+                let snapshot = journal.snapshot()?;
+                if let Some(file) = security::open_existing_protected_file(&snapshot.partial_path)?
+                {
+                    file.set_len(snapshot.durable_offset)
+                        .context("truncate failed download to its durable prefix")?;
+                    file.sync_all()
+                        .context("sync failed download durable prefix")?;
+                }
+            }
             Err(error)
         }
     }
@@ -4148,15 +5687,17 @@ fn key_to_bytes(ev: &Event) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_stdio_loop_with, await_daemon_upload_commit_response_with_grace,
-        await_owned_upload_worker, classify_daemon_exec_read_error,
-        commit_local_no_replace_with_hook, commit_local_no_replace_with_hook_and_link,
-        complete_shell_input_write_until, create_dir_inner, create_local_download_partial,
-        create_local_download_partial_with, daemon_absent_line, daemon_down_line,
-        daemon_status_line, download_file_with_timeout_owned, elapsed_nonnegative_seconds,
-        enter_raw_mode_with, exec_capture_with_timeout_inner, finalize_local_download,
-        join_blocking_until, key_to_bytes, list_dir_inner, open_local_upload_source,
-        open_local_upload_source_with, read_daemon_create_dir_response_until,
+        agent_stdio_loop_with, agent_transfer_push_until,
+        await_daemon_upload_commit_response_with_grace, await_owned_upload_worker,
+        classify_daemon_exec_read_error, commit_local_no_replace_with_hook,
+        commit_local_no_replace_with_hook_and_link, complete_shell_input_write_until,
+        create_dir_inner, create_local_download_partial, create_local_download_partial_with,
+        daemon_absent_line, daemon_down_line, daemon_status_line, dispatch_agent_request,
+        download_file_with_timeout_owned, elapsed_nonnegative_seconds, enter_raw_mode_with,
+        exec_capture_with_timeout_inner, finalize_local_download, join_blocking_until,
+        key_to_bytes, list_dir_inner, load_agent_grant, open_local_upload_source,
+        open_local_upload_source_with, prepare_download_resume_journal_in,
+        prepare_upload_resume_journal_in, read_daemon_create_dir_response_until,
         read_daemon_tunnel_ready_until, read_exec_response, read_shell_frame_pump,
         read_shell_frame_pump_inner, reconcile_shutdown_exchange, run_gui_ipc_shell,
         run_gui_ipc_tunnel, run_local_partial_cleanup_with, send_gui_shell_output_or_cancel,
@@ -4165,12 +5706,15 @@ mod tests {
         validate_shell_input, validated_sftp_timeout_ms, verify_owned_file_identities_until_with,
         wait_for_daemon_absent_until, write_command_output_to,
         write_daemon_create_dir_request_until, write_daemon_exec_request_until,
-        write_shutdown_request_until, AgentGrantFile, CommandOutput, DaemonStatus,
-        OwnedPendingProfileAuthorization, PendingProfileAuthorization, ShellEvent, TunnelEvent,
-        UnclaimedLocalPartial, UploadCommitOutcomeUnknown, DAEMON_LOCK_RELEASE_TIMEOUT,
-        MAX_SHELL_INPUT_BYTES,
+        write_shutdown_request_until, AgentGrantFile, AgentRequest,
+        AgentTransferWriteScopeRequired, CommandOutput, DaemonStatus,
+        OwnedPendingProfileAuthorization, PendingProfileAuthorization, ShellEvent, TransferOptions,
+        TransferRateTracker, TunnelEvent, UnclaimedLocalPartial, UploadCommitOutcomeUnknown,
+        AGENT_TRANSFER_WRITE_OPERATION, DAEMON_LOCK_RELEASE_TIMEOUT, MAX_SHELL_INPUT_BYTES,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
     use serctl_core::ssh::{
         CreateDirOutcomeUnknown, CreateDirSubmissionState, ExecOutcomeUnknown, ExecSubmissionState,
         TunnelMode, TunnelReady, TunnelSpec,
@@ -4183,7 +5727,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::{Condvar, Mutex as StdMutex};
     use std::task::{Context, Poll};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot, Notify};
     use tokio_util::sync::CancellationToken;
@@ -4193,6 +5737,260 @@ mod tests {
     struct FlushTrackingWriter {
         bytes: Vec<u8>,
         flushed: bool,
+    }
+
+    fn test_transfer_progress(confirmed_bytes: u64) -> ipc::TransferProgress {
+        ipc::TransferProgress {
+            schema_version: ipc::TRANSFER_PROGRESS_SCHEMA_VERSION,
+            event: "progress".into(),
+            transfer_id: ipc::TransferId::parse("00000000000000000000000000000001").unwrap(),
+            direction: ipc::TransferDirection::Push,
+            stage: ipc::TransferStage::Transferring,
+            total_bytes: 10 * 1024 * 1024,
+            confirmed_bytes,
+            durable_bytes: 0,
+            window_bps: 0.0,
+            average_bps: 0.0,
+            eta_ms: None,
+            backend: ipc::TransferBackend::Sftp,
+            chunk_bytes: ipc::SFTP_SAFE_CHUNK_BYTES as u32,
+            window_bytes: ipc::SFTP_SAFE_CHUNK_BYTES as u32,
+            updated_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn transfer_rate_tracker_is_monotonic_finite_and_stalls_to_zero() {
+        let start = Instant::now();
+        let mut tracker = TransferRateTracker::new(start);
+        let initial = tracker.enrich(test_transfer_progress(0), start).unwrap();
+        assert_eq!(initial.window_bps, 0.0);
+        assert_eq!(initial.average_bps, 0.0);
+        assert_eq!(initial.eta_ms, None);
+        assert!(initial.window_bps.is_finite());
+
+        let one_mib = 1024 * 1024;
+        let moving = tracker
+            .enrich(
+                test_transfer_progress(one_mib),
+                start + Duration::from_secs(1),
+            )
+            .unwrap();
+        let expected = one_mib as f64;
+        assert!((moving.window_bps - expected).abs() / expected <= 0.10);
+        assert!((moving.average_bps - expected).abs() / expected <= 0.10);
+        assert!(moving.eta_ms.is_some());
+
+        let stalled = tracker
+            .enrich(
+                test_transfer_progress(one_mib),
+                start + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(stalled.window_bps, 0.0);
+        assert_eq!(stalled.eta_ms, None);
+        assert!(tracker
+            .enrich(
+                test_transfer_progress(one_mib - 1),
+                start + Duration::from_secs(6),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn transfer_rate_tracker_does_not_count_resumed_prefix_as_new_throughput() {
+        let start = Instant::now();
+        let mut tracker = TransferRateTracker::new(start);
+        let mut resumed = test_transfer_progress(8 * 1024 * 1024);
+        resumed.event = "resumed".into();
+        resumed.durable_bytes = resumed.confirmed_bytes;
+        let resumed = tracker
+            .enrich(resumed, start + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(resumed.window_bps, 0.0);
+        assert_eq!(resumed.average_bps, 0.0);
+        assert_eq!(resumed.eta_ms, None);
+
+        let transferred = tracker
+            .enrich(
+                test_transfer_progress(9 * 1024 * 1024),
+                start + Duration::from_secs(2),
+            )
+            .unwrap();
+        let expected = (1024 * 1024) as f64;
+        assert!((transferred.window_bps - expected).abs() / expected <= 0.10);
+        assert!((transferred.average_bps - expected).abs() / expected <= 0.10);
+    }
+
+    #[test]
+    fn upload_resume_journal_reuses_only_exact_profile_generation_and_intent() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "serctl-upload-journal-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let profile = ipc::WireProfile {
+            name: "journal-profile".into(),
+            host: "127.0.0.1".into(),
+            port: 22,
+            generation: 7,
+            profile_id: "11".repeat(16),
+        };
+        let first_id = ipc::TransferId::parse("01".repeat(16).as_str()).unwrap();
+        let first = prepare_upload_resume_journal_in(
+            &directory,
+            &profile,
+            "/tmp/target",
+            100,
+            &"22".repeat(32),
+            ipc::TransferBackend::Native,
+            &first_id,
+        )
+        .unwrap();
+        let token = first.resume_token().unwrap();
+        let mut progress = test_transfer_progress(75);
+        progress.transfer_id = first_id.clone();
+        progress.total_bytes = 100;
+        progress.durable_bytes = 75;
+        progress.backend = ipc::TransferBackend::Native;
+        first.observe(&progress).unwrap();
+        drop(first);
+
+        let replacement_id = ipc::TransferId::parse("02".repeat(16).as_str()).unwrap();
+        let resumed = prepare_upload_resume_journal_in(
+            &directory,
+            &profile,
+            "/tmp/target",
+            100,
+            &"22".repeat(32),
+            ipc::TransferBackend::Native,
+            &replacement_id,
+        )
+        .unwrap();
+        assert_eq!(resumed.transfer_id().unwrap(), first_id);
+        assert_eq!(resumed.resume_token().unwrap().as_str(), token.as_str());
+        assert_eq!(resumed.durable_offset().unwrap(), 75);
+
+        let mut rotated = profile.clone();
+        rotated.generation += 1;
+        let rotated_journal = prepare_upload_resume_journal_in(
+            &directory,
+            &rotated,
+            "/tmp/target",
+            100,
+            &"22".repeat(32),
+            ipc::TransferBackend::Native,
+            &replacement_id,
+        )
+        .unwrap();
+        assert_eq!(rotated_journal.transfer_id().unwrap(), replacement_id);
+        assert_eq!(rotated_journal.durable_offset().unwrap(), 0);
+
+        serctl_core::security::write_protected_atomic(&resumed.path, b"{\"schema\":99}").unwrap();
+        assert!(prepare_upload_resume_journal_in(
+            &directory,
+            &profile,
+            "/tmp/target",
+            100,
+            &"22".repeat(32),
+            ipc::TransferBackend::Native,
+            &replacement_id,
+        )
+        .is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn download_resume_journal_binds_remote_identity_and_profile_generation() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "serctl-download-journal-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let local = directory.join("result.bin");
+        let profile = ipc::WireProfile {
+            name: "download-journal-profile".into(),
+            host: "127.0.0.1".into(),
+            port: 22,
+            generation: 9,
+            profile_id: "33".repeat(16),
+        };
+        let first_id = ipc::TransferId::parse("03".repeat(16).as_str()).unwrap();
+        let first = prepare_download_resume_journal_in(
+            &directory,
+            &profile,
+            "/tmp/source",
+            &local,
+            ipc::TransferBackend::Native,
+            &first_id,
+        )
+        .unwrap();
+        let first_snapshot = first.snapshot().unwrap();
+        assert_eq!(first_snapshot.durable_offset, 0);
+        assert_eq!(first_snapshot.expected_size, None);
+        assert_eq!(first_snapshot.expected_sha256, None);
+        assert_ne!(first_snapshot.partial_path, local);
+        let partial = first_snapshot.partial_path;
+
+        let sha256 = "44".repeat(32);
+        first.record_remote_identity(100, &sha256).unwrap();
+        first.record_durable(75).unwrap();
+        assert!(first.record_remote_identity(101, &sha256).is_err());
+        drop(first);
+
+        let replacement_id = ipc::TransferId::parse("04".repeat(16).as_str()).unwrap();
+        let resumed = prepare_download_resume_journal_in(
+            &directory,
+            &profile,
+            "/tmp/source",
+            &local,
+            ipc::TransferBackend::Native,
+            &replacement_id,
+        )
+        .unwrap();
+        let resumed_snapshot = resumed.snapshot().unwrap();
+        assert_eq!(resumed_snapshot.transfer_id, first_id);
+        assert_eq!(resumed_snapshot.partial_path, partial);
+        assert_eq!(resumed_snapshot.durable_offset, 75);
+        assert_eq!(resumed_snapshot.expected_size, Some(100));
+        assert_eq!(
+            resumed_snapshot.expected_sha256.as_deref(),
+            Some(sha256.as_str())
+        );
+
+        let mut rotated = profile.clone();
+        rotated.generation += 1;
+        let rotated_journal = prepare_download_resume_journal_in(
+            &directory,
+            &rotated,
+            "/tmp/source",
+            &local,
+            ipc::TransferBackend::Native,
+            &replacement_id,
+        )
+        .unwrap();
+        let rotated_snapshot = rotated_journal.snapshot().unwrap();
+        assert_eq!(rotated_snapshot.transfer_id, replacement_id);
+        assert_eq!(rotated_snapshot.durable_offset, 0);
+        assert_eq!(rotated_snapshot.expected_size, None);
+
+        serctl_core::security::write_protected_atomic(&resumed.path, b"{\"schema\":99}").unwrap();
+        assert!(prepare_download_resume_journal_in(
+            &directory,
+            &profile,
+            "/tmp/source",
+            &local,
+            ipc::TransferBackend::Native,
+            &replacement_id,
+        )
+        .is_err());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     impl AsyncWrite for FlushTrackingWriter {
@@ -4671,13 +6469,18 @@ mod tests {
             .unwrap();
         });
         let cancellation = CancellationToken::new();
+        let mut rate_tracker = TransferRateTracker::new(Instant::now());
         let bytes = await_daemon_upload_commit_response_with_grace(
             &mut client,
-            37,
-            tokio::time::Instant::now(),
-            &cancellation,
-            true,
-            std::time::Duration::from_millis(100),
+            super::CommitWait {
+                expected: 37,
+                request_deadline: tokio::time::Instant::now(),
+                cancellation: &cancellation,
+                reconciliation_only: true,
+                reconciliation_grace: std::time::Duration::from_millis(100),
+                rate_tracker: &mut rate_tracker,
+                progress_sink: None,
+            },
         )
         .await
         .unwrap();
@@ -4692,13 +6495,18 @@ mod tests {
         daemon.write_all(b"{").await.unwrap();
         drop(daemon);
         let cancellation = CancellationToken::new();
+        let mut rate_tracker = TransferRateTracker::new(Instant::now());
         let error = await_daemon_upload_commit_response_with_grace(
             &mut client,
-            37,
-            tokio::time::Instant::now(),
-            &cancellation,
-            true,
-            std::time::Duration::from_millis(100),
+            super::CommitWait {
+                expected: 37,
+                request_deadline: tokio::time::Instant::now(),
+                cancellation: &cancellation,
+                reconciliation_only: true,
+                reconciliation_grace: std::time::Duration::from_millis(100),
+                rate_tracker: &mut rate_tracker,
+                progress_sink: None,
+            },
         )
         .await
         .unwrap_err();
@@ -4875,6 +6683,185 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn agent_transfer_push_requires_exact_transfer_write_scope_before_local_io() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            [2_u8; 16],
+            vec!["sftp.write".into(), "ssh.exec".into()],
+            2,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let local = std::env::temp_dir()
+            .join("serctl-agent-scope-must-not-open")
+            .join("credential-material.bin");
+        let error = agent_transfer_push_until(
+            &grant,
+            &signing,
+            &local,
+            "/tmp/agent-scope-test",
+            TransferOptions {
+                backend: ipc::TransferBackend::Sftp,
+                resume: ipc::TransferResumeMode::Never,
+                idle_timeout: Duration::from_secs(1),
+                deadline: Some(Duration::from_secs(2)),
+                progress: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<AgentTransferWriteScopeRequired>());
+        assert_eq!(error.to_string(), "grant does not authorize transfer.write");
+        assert!(!error.to_string().contains(local.to_string_lossy().as_ref()));
+
+        let root = ipc::Frame::UploadBegin {
+            transfer_id: ipc::TransferId::random(),
+            path: "/tmp/agent-scope-test".into(),
+            size: 1,
+            sha256: "00".repeat(32),
+            backend: ipc::TransferBackend::Sftp,
+            resume: ipc::TransferResumeMode::Never,
+            resume_token: None,
+            idle_timeout_ms: 1_000,
+            deadline_ms: Some(2_000),
+        };
+        assert_eq!(
+            serctl_protocol::v6::frame_kind(&root),
+            AGENT_TRANSFER_WRITE_OPERATION
+        );
+        assert_ne!(serctl_protocol::v6::frame_kind(&root), "sftp.write");
+        assert_ne!(serctl_protocol::v6::frame_kind(&root), "ssh.exec");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_transfer_push_json_error_withholds_local_path_and_credentials() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            [2_u8; 16],
+            vec![AGENT_TRANSFER_WRITE_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let marker = "PROFILE_PASSWORD_DO_NOT_LEAK";
+        let local = std::env::temp_dir()
+            .join(format!(
+                "serctl-agent-private-{}-{marker}",
+                std::process::id()
+            ))
+            .join("missing-source.bin");
+        let result = dispatch_agent_request(
+            &grant,
+            &signing,
+            AgentRequest::TransferPush {
+                request_id: 77,
+                local: local.clone(),
+                remote: "/tmp/agent-redaction-test".into(),
+                backend: Some(ipc::TransferBackend::Sftp),
+                resume: Some(ipc::TransferResumeMode::Never),
+                idle_timeout_ms: Some(1_000),
+                deadline_ms: Some(2_000),
+            },
+        )
+        .await;
+        assert_eq!(result.request_id, 77);
+        assert!(!result.ok);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("transfer-push failed (local diagnostic detail withheld)")
+        );
+        assert!(result.data.is_none());
+
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains(local.to_string_lossy().as_ref()));
+        assert!(!encoded.contains(marker));
+        assert!(!encoded.contains("missing-source.bin"));
+    }
+
+    #[test]
+    fn load_agent_grant_rejects_holder_key_mismatch_without_leaking_key() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "serctl-agent-grant-key-mismatch-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let signing = SigningKey::from_bytes(&[7_u8; 32]);
+        let other = SigningKey::from_bytes(&[8_u8; 32]);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            [2_u8; 16],
+            vec![AGENT_TRANSFER_WRITE_OPERATION.into()],
+            1,
+            &other.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let encoded_key = B64.encode(signing.to_bytes());
+        let file = AgentGrantFile {
+            grant,
+            agent_key: encoded_key.clone(),
+        };
+        let path = base.join("agent-grant.json");
+        super::write_agent_grant_file(&path, &serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let error = load_agent_grant(&path).unwrap_err();
+        let message = error.to_string();
+        assert_eq!(message, "agent grant key does not match its holder binding");
+        assert!(!message.contains(&encoded_key));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn load_agent_grant_rejects_expired_grant_before_request_processing() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "serctl-agent-grant-expired-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let signing = SigningKey::from_bytes(&[9_u8; 32]);
+        let ttl_ms = u64::try_from(serctl_protocol::grant::GRANT_DEFAULT_TTL.as_millis()).unwrap();
+        let issued_unix_ms = super::now_unix_ms().checked_sub(ttl_ms + 1_000).unwrap();
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            [2_u8; 16],
+            vec![AGENT_TRANSFER_WRITE_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            issued_unix_ms,
+        )
+        .unwrap();
+        assert!(grant.is_expired(super::now_unix_ms()));
+        let file = AgentGrantFile {
+            grant,
+            agent_key: B64.encode(signing.to_bytes()),
+        };
+        let path = base.join("agent-grant.json");
+        super::write_agent_grant_file(&path, &serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let error = load_agent_grant(&path).unwrap_err();
+        assert_eq!(error.to_string(), "agent grant has expired");
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn agent_stdio_gateway_reports_invalid_request_lines_without_a_daemon() {
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
@@ -4887,19 +6874,22 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&base).unwrap();
+        let issued_unix_ms = super::now_unix_ms();
+        let signing = SigningKey::from_bytes(&[7_u8; 32]);
         let grant = serctl_protocol::grant::OperationGrant {
             grant_id: [1_u8; 16],
             profile_name: "prod".into(),
             profile_id: [2_u8; 16],
             operations: vec!["ssh.exec".into()],
             budget: 1,
-            issued_unix_ms: 0,
-            expires_unix_ms: u64::MAX / 2,
-            holder_key: [0_u8; 32],
+            issued_unix_ms,
+            expires_unix_ms: issued_unix_ms
+                + u64::try_from(serctl_protocol::grant::GRANT_DEFAULT_TTL.as_millis()).unwrap(),
+            holder_key: signing.verifying_key().to_bytes(),
         };
         let file = AgentGrantFile {
             grant,
-            agent_key: B64.encode([7_u8; 32]),
+            agent_key: B64.encode(signing.to_bytes()),
         };
         let path = base.join("agent-grant.json");
         super::write_agent_grant_file(&path, &serde_json::to_vec(&file).unwrap()).unwrap();
@@ -5414,7 +7404,7 @@ mod tests {
                 prompt_if_missing: false,
                 expected_generation: None,
             },
-            timeout,
+            TransferOptions::legacy(timeout),
             CancellationToken::new(),
         )
         .await
@@ -5430,7 +7420,7 @@ mod tests {
                 prompt_if_missing: false,
                 expected_generation: None,
             },
-            timeout,
+            TransferOptions::legacy(timeout),
             CancellationToken::new(),
         )
         .await

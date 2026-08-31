@@ -1,0 +1,24 @@
+[package]
+name = "serctl-xfer"
+description = "Remote native serctl transfer helper over a fixed SSH stdio channel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "serctl-xfer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+atomic-write-file.workspace = true
+hex.workspace = true
+serctl-transfer-protocol = { version = "0.3.0-beta.2", path = "../serctl_transfer_protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

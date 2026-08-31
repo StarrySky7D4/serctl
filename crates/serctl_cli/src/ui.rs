@@ -696,6 +696,10 @@ enum UiMessage {
         refresh: Option<DirectoryRequest>,
         result: Result<String, String>,
     },
+    TransferProgress {
+        operation_id: u64,
+        progress: serctl_protocol::TransferProgress,
+    },
     ShellOpened {
         operation: OperationContext,
         result: Result<(String, client::GuiShell), String>,
@@ -887,6 +891,9 @@ impl UiMessage {
                     zeroize_directory_request(refresh);
                 }
                 zeroize_string_result(result);
+            }
+            Self::TransferProgress { progress, .. } => {
+                progress.event.zeroize();
             }
             Self::ShellOpened { operation, result } => {
                 zeroize_operation_context(operation);
@@ -1587,6 +1594,7 @@ impl MigrationWizard {
 struct PendingTransfer {
     cancellation: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
+    progress: Option<serctl_protocol::TransferProgress>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1802,6 +1810,7 @@ struct SerctlApp {
     local_upload: String,
     remote_upload: String,
     local_download: String,
+    transfer_resume: bool,
     shell: Option<client::GuiShell>,
     shell_profile: Option<String>,
     shell_input: String,
@@ -1865,6 +1874,7 @@ impl SerctlApp {
             local_upload: String::new(),
             remote_upload: String::new(),
             local_download: String::new(),
+            transfer_resume: false,
             shell: None,
             shell_profile: None,
             shell_input: String::new(),
@@ -3203,14 +3213,36 @@ impl SerctlApp {
         let operation_id = operation.id;
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
+        let resume = if self.transfer_resume {
+            serctl_protocol::TransferResumeMode::Auto
+        } else {
+            serctl_protocol::TransferResumeMode::Never
+        };
         let tx = self.tx.clone();
         let repaint = ctx.clone();
         let handle = self.runtime().spawn(async move {
-            let result = client::upload_with_timeout_at_generation_cancellable(
+            let progress_tx = tx.clone();
+            let progress_repaint = repaint.clone();
+            let progress: client::TransferProgressSink = Arc::new(move |progress| {
+                let _ = progress_tx.send(UiMessage::TransferProgress {
+                    operation_id,
+                    progress,
+                });
+                progress_repaint.request_repaint();
+            });
+            let result = client::transfer_push_at_generation_cancellable(
                 &profile,
                 &local,
                 &remote,
-                Duration::from_millis(serctl_protocol::DEFAULT_SFTP_TIMEOUT_MS),
+                client::TransferOptions {
+                    backend: serctl_protocol::TransferBackend::Auto,
+                    resume,
+                    idle_timeout: Duration::from_millis(
+                        serctl_protocol::DEFAULT_TRANSFER_IDLE_TIMEOUT_MS,
+                    ),
+                    deadline: None,
+                    progress: Some(progress),
+                },
                 master,
                 expected_generation,
                 worker_cancellation,
@@ -3230,6 +3262,7 @@ impl SerctlApp {
             PendingTransfer {
                 cancellation,
                 handle,
+                progress: None,
             },
         );
     }
@@ -3260,14 +3293,36 @@ impl SerctlApp {
         let operation_id = operation.id;
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
+        let resume = if self.transfer_resume {
+            serctl_protocol::TransferResumeMode::Auto
+        } else {
+            serctl_protocol::TransferResumeMode::Never
+        };
         let tx = self.tx.clone();
         let repaint = ctx.clone();
         let handle = self.runtime().spawn(async move {
-            let result = client::download_with_timeout_at_generation_cancellable(
+            let progress_tx = tx.clone();
+            let progress_repaint = repaint.clone();
+            let progress: client::TransferProgressSink = Arc::new(move |progress| {
+                let _ = progress_tx.send(UiMessage::TransferProgress {
+                    operation_id,
+                    progress,
+                });
+                progress_repaint.request_repaint();
+            });
+            let result = client::transfer_pull_at_generation_cancellable(
                 &profile,
                 &remote,
                 &local,
-                Duration::from_millis(serctl_protocol::DEFAULT_SFTP_TIMEOUT_MS),
+                client::TransferOptions {
+                    backend: serctl_protocol::TransferBackend::Auto,
+                    resume,
+                    idle_timeout: Duration::from_millis(
+                        serctl_protocol::DEFAULT_TRANSFER_IDLE_TIMEOUT_MS,
+                    ),
+                    deadline: None,
+                    progress: Some(progress),
+                },
                 master,
                 expected_generation,
                 worker_cancellation,
@@ -3287,6 +3342,7 @@ impl SerctlApp {
             PendingTransfer {
                 cancellation,
                 handle,
+                progress: None,
             },
         );
     }
@@ -4198,6 +4254,14 @@ impl SerctlApp {
                         }
                     }
                 }
+                UiMessage::TransferProgress {
+                    operation_id,
+                    progress,
+                } => {
+                    if let Some(transfer) = self.pending_transfers.get_mut(operation_id) {
+                        transfer.progress = Some(progress.clone());
+                    }
+                }
                 UiMessage::Transfer {
                     operation,
                     refresh,
@@ -5065,6 +5129,65 @@ impl SerctlApp {
         }
 
         ui.separator();
+        for (operation_id, transfer) in &self.pending_transfers {
+            let Some(progress) = transfer.progress.as_ref() else {
+                continue;
+            };
+            let fraction = if progress.stage == serctl_protocol::TransferStage::Completed {
+                1.0
+            } else if progress.total_bytes == 0 {
+                0.0
+            } else {
+                (progress.confirmed_bytes as f32 / progress.total_bytes as f32).min(0.999)
+            };
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(format!("传输 {}", progress.transfer_id.as_str()));
+                    ui.label(format!("{:?}", progress.stage));
+                    ui.label(format!("backend={:?}", progress.backend));
+                    ui.label(format!(
+                        "chunk={} / window={}",
+                        format_bytes(u64::from(progress.chunk_bytes)),
+                        format_bytes(u64::from(progress.window_bytes))
+                    ));
+                    if ui.small_button("取消").clicked() {
+                        transfer.cancellation.cancel();
+                    }
+                });
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .show_percentage()
+                        .text(format!(
+                            "{} / {}",
+                            format_bytes(progress.confirmed_bytes),
+                            format_bytes(progress.total_bytes)
+                        )),
+                );
+                let eta = progress
+                    .eta_ms
+                    .map(|value| format!("{:.1} 秒", value as f64 / 1000.0))
+                    .unwrap_or_else(|| "—".to_owned());
+                ui.small(format!(
+                    "窗口 {:.1} KiB/s · 平均 {:.1} KiB/s · ETA {} · operation {}",
+                    progress.window_bps / 1024.0,
+                    progress.average_bps / 1024.0,
+                    eta,
+                    operation_id,
+                ));
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.transfer_resume, "启用断点续传");
+            ui.label(
+                RichText::new(if self.transfer_resume {
+                    "需要远端 serctl-xfer；源文件或远端身份变化会安全拒绝"
+                } else {
+                    "兼容模式：失败后清理本次 partial，不保留恢复点"
+                })
+                .small()
+                .color(Color32::GRAY),
+            );
+        });
         egui::Grid::new("file_transfer")
             .num_columns(4)
             .spacing([8.0, 6.0])
@@ -6672,6 +6795,12 @@ mod tests {
         (SerctlApp::with_channels(runtime, tx.clone(), rx), tx)
     }
 
+    #[test]
+    fn transfer_resume_is_explicitly_opt_in() {
+        let (app, _) = test_app();
+        assert!(!app.transfer_resume);
+    }
+
     fn test_identity(generation: u64) -> vault::ProfileIdentity {
         vault::ProfileIdentity {
             profile_id: [generation as u8; 16],
@@ -7535,6 +7664,7 @@ mod tests {
             PendingTransfer {
                 cancellation: transfer_cancellation,
                 handle: transfer_handle,
+                progress: None,
             },
         );
 
@@ -8058,6 +8188,7 @@ mod tests {
                 PendingTransfer {
                     cancellation: transfer_cancellation,
                     handle: transfer_handle,
+                    progress: None,
                 },
             );
             app.profile_passphrase_input = "secret-profile-passphrase".into();
@@ -8083,6 +8214,7 @@ mod tests {
             PendingTransfer {
                 cancellation: transfer_cancellation,
                 handle: transfer_handle,
+                progress: None,
             },
         );
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -8397,6 +8529,7 @@ mod tests {
             PendingTransfer {
                 cancellation: upload_cancellation,
                 handle: upload_handle,
+                progress: None,
             },
         );
 
@@ -8690,6 +8823,7 @@ mod tests {
             PendingTransfer {
                 cancellation,
                 handle,
+                progress: None,
             },
         );
 
@@ -8721,6 +8855,7 @@ mod tests {
             PendingTransfer {
                 cancellation,
                 handle,
+                progress: None,
             },
         );
         tokio::time::timeout(Duration::from_secs(1), async {

@@ -95,6 +95,7 @@ fn spawn_global_daemon_with_stdio(
         command
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        configure_background_process(&mut command);
     }
     let mut child = command.spawn().with_context(|| {
         format!(
@@ -120,6 +121,26 @@ fn spawn_global_daemon_with_stdio(
     Ok((instance, secret, child))
 }
 
+/// Keep an on-demand Windows broker out of the launching CLI's console
+/// process group. Without this, closing a short-lived CLI console can deliver
+/// the same console teardown/control event to the daemon, discarding its
+/// in-memory grant registry even though an unexpired grant holds an idle
+/// reference. `DETACHED_PROCESS` gives the broker no console to inherit;
+/// stdout/stderr remain explicitly closed above. This is stronger than
+/// `CREATE_NO_WINDOW` for this lifecycle: a recursive console-process probe
+/// demonstrated that `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` still
+/// retained the launching console on the supported Windows runner.
+#[cfg(windows)]
+fn configure_background_process(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+#[cfg(not(windows))]
+fn configure_background_process(_command: &mut std::process::Command) {}
+
 /// Supervise a foreground daemon child: swallow Ctrl-C here because the
 /// daemon is a sibling process attached to the same console and receives the
 /// event itself; when it exits we mirror its status.
@@ -143,4 +164,230 @@ async fn supervise_daemon_foreground(child: &mut std::process::Child) -> Result<
         }
     };
     Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::configure_background_process;
+    use std::io::{Read as _, Write as _};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, ExitStatus, Stdio};
+    use std::time::{Duration, Instant};
+
+    const PROBE_TEST_NAME: &str = "launcher::tests::windows_background_lifecycle_probe";
+    const ROLE_ENV: &str = "SERCTL_TEST_LAUNCHER_ROLE";
+    const READY_ENV: &str = "SERCTL_TEST_LAUNCHER_READY";
+    const OBSERVED_ENV: &str = "SERCTL_TEST_LAUNCHER_OBSERVED";
+    const SURVIVED_ENV: &str = "SERCTL_TEST_LAUNCHER_SURVIVED";
+    const ROLE_LAUNCHER: &str = "launcher";
+    const ROLE_DAEMON: &str = "daemon";
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn GetConsoleCP() -> u32;
+    }
+
+    /// This ignored test is recursively invoked in two subprocess roles by
+    /// `windows_background_daemon_outlives_its_console_owner`. Keeping the
+    /// probe inside the test executable avoids launching a real daemon or
+    /// opening a vault.
+    #[test]
+    #[ignore = "subprocess-only launcher lifecycle probe"]
+    fn windows_background_lifecycle_probe() {
+        match std::env::var(ROLE_ENV).as_deref() {
+            Ok(ROLE_LAUNCHER) => spawn_detached_probe(),
+            Ok(ROLE_DAEMON) => run_detached_probe(),
+            role => panic!("unexpected launcher lifecycle probe role: {role:?}"),
+        }
+    }
+
+    /// Prove the property required by on-demand broker startup without a real
+    /// profile: a console-owning CLI exits and drops its Child handle, while
+    /// the configured background process has no console and can still
+    /// exchange a marker with a third process afterwards.
+    ///
+    /// This covers Windows console/process-group lifetime. It deliberately
+    /// does not claim escape from an external Job Object configured to kill
+    /// every descendant when that job is closed.
+    #[test]
+    fn windows_background_daemon_outlives_its_console_owner() {
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+
+        let root = ProbeDirectory::new();
+        let ready = root.path().join("ready");
+        let observed = root.path().join("observed");
+        let survived = root.path().join("survived");
+
+        // Give the intermediate CLI its own console. A plain child would be
+        // attached to that console and inherit its teardown; the daemon probe
+        // must instead be created by configure_background_process.
+        let mut launcher = probe_command(ROLE_LAUNCHER, &ready, &observed, &survived);
+        launcher.creation_flags(CREATE_NEW_CONSOLE);
+        let mut launcher = launcher
+            .spawn()
+            .expect("spawn console-owning launcher lifecycle probe");
+        let status = wait_for_exit(&mut launcher, PROBE_TIMEOUT)
+            .expect("console-owning launcher probe did not exit");
+        assert!(status.success(), "launcher probe failed with {status}");
+
+        assert!(
+            wait_for_path(&ready, PROBE_TIMEOUT),
+            "background probe did not publish readiness after its launcher exited"
+        );
+        let readiness = std::fs::read_to_string(&ready)
+            .expect("read background probe console attachment result");
+        let (console_cp, capability_id) = readiness
+            .split_once('\n')
+            .expect("background probe readiness must contain console and capability state");
+        assert_eq!(
+            console_cp, "0",
+            "background probe remained attached to the launching CLI console"
+        );
+
+        // This write models a later CLI observing the descriptor and talking
+        // to the already-running broker after the signing/launching CLI died.
+        // Echoing a random id generated only by the probe also demonstrates
+        // that its in-memory registration state survived the launcher exit.
+        std::fs::write(&observed, capability_id)
+            .expect("publish cross-process launcher observation");
+        assert!(
+            wait_for_path(&survived, PROBE_TIMEOUT),
+            "background probe did not survive for a later CLI observation"
+        );
+    }
+
+    fn spawn_detached_probe() {
+        let ready = required_path(READY_ENV);
+        let observed = required_path(OBSERVED_ENV);
+        let survived = required_path(SURVIVED_ENV);
+        let mut daemon = probe_command(ROLE_DAEMON, &ready, &observed, &survived);
+        daemon.stdin(Stdio::piped());
+        configure_background_process(&mut daemon);
+        let mut daemon = daemon
+            .spawn()
+            .expect("spawn configured background lifecycle probe");
+        let capability_id = serctl_protocol::v6::InstanceId::random().as_hex();
+        let mut stdin = daemon
+            .stdin
+            .take()
+            .expect("background lifecycle probe has no activation pipe");
+        stdin
+            .write_all(capability_id.as_bytes())
+            .expect("write background lifecycle capability frame");
+        stdin
+            .flush()
+            .expect("flush background lifecycle capability frame");
+        drop(stdin);
+        // Dropping Child is intentional: spawn_global_daemon returns no Child
+        // handle to an on-demand CLI, and Windows must keep the process alive.
+        drop(daemon);
+    }
+
+    fn run_detached_probe() {
+        let ready = required_path(READY_ENV);
+        let observed = required_path(OBSERVED_ENV);
+        let survived = required_path(SURVIVED_ENV);
+        // SAFETY: GetConsoleCP takes no pointers. Zero means this process is
+        // not attached to a console, which DETACHED_PROCESS must guarantee.
+        let console_cp = unsafe { GetConsoleCP() };
+        let mut capability_id = String::new();
+        std::io::stdin()
+            .take(128)
+            .read_to_string(&mut capability_id)
+            .expect("read background lifecycle capability frame");
+        assert_eq!(
+            capability_id.len(),
+            32,
+            "background lifecycle capability frame has an invalid length"
+        );
+        assert!(
+            capability_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "background lifecycle capability frame is not hexadecimal"
+        );
+        std::fs::write(&ready, format!("{console_cp}\n{capability_id}"))
+            .expect("publish background probe readiness");
+        assert!(
+            wait_for_path(&observed, PROBE_TIMEOUT),
+            "later process did not observe the background probe"
+        );
+        let presented =
+            std::fs::read_to_string(&observed).expect("read cross-process capability presentation");
+        assert_eq!(
+            presented, capability_id,
+            "background probe lost or replaced its in-memory capability state"
+        );
+        std::fs::write(&survived, b"survived").expect("publish background probe survival");
+    }
+
+    fn probe_command(role: &str, ready: &Path, observed: &Path, survived: &Path) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("resolve test executable"));
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg(PROBE_TEST_NAME)
+            .env(ROLE_ENV, role)
+            .env(READY_ENV, ready)
+            .env(OBSERVED_ENV, observed)
+            .env(SURVIVED_ENV, survived)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    fn required_path(name: &str) -> PathBuf {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing launcher lifecycle path {name}"))
+    }
+
+    struct ProbeDirectory(PathBuf);
+
+    impl ProbeDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "serctl-launcher-lifecycle-{}-{}",
+                std::process::id(),
+                serctl_protocol::v6::InstanceId::random().as_hex()
+            ));
+            std::fs::create_dir(&path).expect("create launcher lifecycle probe directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ProbeDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn wait_for_path(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if path.is_file() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        path.is_file()
+    }
+
+    fn wait_for_exit(child: &mut std::process::Child, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("poll launcher lifecycle probe: {error}"),
+            }
+        }
+        let _ = child.kill();
+        child.wait().ok()
+    }
 }

@@ -34,8 +34,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
 use zeroize::Zeroizing;
 
-/// Wire protocol version carried by every v6 handshake frame.
-pub const IPC_PROTOCOL_VERSION_V6: u16 = 6;
+/// Wire protocol version carried by the authenticated handshake. Persistent
+/// transfer resume tokens are intentionally a wire break: mixed v7/v8
+/// binaries fail closed during the prelude instead of silently dropping the
+/// ownership proof and weakening resume semantics.
+pub const IPC_PROTOCOL_VERSION_V8: u16 = 8;
+/// Compatibility name for callers while the module is split into a dedicated
+/// v8 source file. Its value is v8; no older transport is accepted.
+pub const IPC_PROTOCOL_VERSION_V6: u16 = IPC_PROTOCOL_VERSION_V8;
 
 /// Cap for the plaintext handshake frames.
 pub const V6_MAX_AUTH_FRAME: usize = 4 * 1024;
@@ -152,8 +158,12 @@ pub fn frame_kind(frame: &Frame) -> &'static str {
         Frame::IssueGrant { .. } => "daemon.issue-grant",
         Frame::ListDir { .. } => "sftp.list",
         Frame::CreateDir { .. } => "sftp.write",
-        Frame::Download { .. } => "sftp.read",
-        Frame::UploadBegin { .. } | Frame::UploadChunk { .. } | Frame::UploadEnd => "sftp.write",
+        Frame::Download { .. } => "transfer.read",
+        Frame::UploadBegin { .. } | Frame::UploadChunk { .. } | Frame::UploadEnd => {
+            "transfer.write"
+        }
+        Frame::TransferStatus { .. } => "transfer.status",
+        Frame::TransferCancel { .. } => "transfer.cancel",
         Frame::TunnelOpen { .. } | Frame::TunnelStop => "forward",
         Frame::ExecOut { .. }
         | Frame::ExecErr { .. }
@@ -165,9 +175,13 @@ pub fn frame_kind(frame: &Frame) -> &'static str {
         | Frame::ProfileAuthorized { .. }
         | Frame::StatusInfo { .. }
         | Frame::Ack
+        | Frame::TransferAck { .. }
         | Frame::DirList { .. }
         | Frame::FileChunk { .. }
         | Frame::TransferDone { .. }
+        | Frame::TransferDigest { .. }
+        | Frame::TransferProgress { .. }
+        | Frame::TransferStatusInfo { .. }
         | Frame::TunnelReady { .. }
         | Frame::TunnelClosed
         | Frame::Error { .. } => "stream",

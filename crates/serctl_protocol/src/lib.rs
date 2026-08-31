@@ -33,6 +33,9 @@ pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 pub const MAX_EXEC_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 pub const DEFAULT_SFTP_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 pub const MAX_SFTP_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+pub const DEFAULT_TRANSFER_IDLE_TIMEOUT_MS: u64 = 30 * 1000;
+pub const TRANSFER_PROGRESS_SCHEMA_VERSION: u16 = 1;
+pub const SFTP_SAFE_CHUNK_BYTES: usize = 2 * 1024;
 
 fn default_exec_timeout_ms() -> u64 {
     DEFAULT_EXEC_TIMEOUT_MS
@@ -40,6 +43,140 @@ fn default_exec_timeout_ms() -> u64 {
 
 fn default_sftp_timeout_ms() -> u64 {
     DEFAULT_SFTP_TIMEOUT_MS
+}
+
+fn default_transfer_idle_timeout_ms() -> u64 {
+    DEFAULT_TRANSFER_IDLE_TIMEOUT_MS
+}
+
+/// Opaque, random identifier for one transfer. It is deliberately unrelated
+/// to a path, profile name, or credential so progress snapshots can be shown
+/// without disclosing sensitive request fields.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct TransferId(String);
+
+impl TransferId {
+    pub fn random() -> Self {
+        let mut bytes = [0_u8; 16];
+        OsRng.fill_bytes(&mut bytes);
+        Self(hex::encode(bytes))
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        ensure!(
+            value.len() == 32,
+            "transfer id must contain 32 lowercase hex characters"
+        );
+        ensure!(
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "transfer id must contain 32 lowercase hex characters"
+        );
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirection {
+    Push,
+    Pull,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferStage {
+    Preflight,
+    Hash,
+    Negotiating,
+    Transferring,
+    Verifying,
+    Committing,
+    Cleanup,
+    Completed,
+    Failed,
+    Cancelled,
+    Stalled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferBackend {
+    Auto,
+    Native,
+    Sftp,
+    SftpFallback,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferResumeMode {
+    Auto,
+    Never,
+}
+
+/// Sanitized cumulative progress. `confirmed_bytes` advances only after the
+/// receiver has acknowledged the corresponding bytes. The client fills in
+/// rate and ETA fields from monotonic observations; daemon snapshots keep
+/// those fields at zero/None.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferProgress {
+    pub schema_version: u16,
+    pub event: String,
+    pub transfer_id: TransferId,
+    pub direction: TransferDirection,
+    pub stage: TransferStage,
+    pub total_bytes: u64,
+    pub confirmed_bytes: u64,
+    pub durable_bytes: u64,
+    pub window_bps: f64,
+    pub average_bps: f64,
+    pub eta_ms: Option<u64>,
+    pub backend: TransferBackend,
+    /// Negotiated payload size. Zero means negotiation has not completed.
+    pub chunk_bytes: u32,
+    /// Maximum remotely outstanding payload bytes. Zero means unknown.
+    pub window_bytes: u32,
+    pub updated_unix_ms: u64,
+}
+
+impl TransferProgress {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema_version == TRANSFER_PROGRESS_SCHEMA_VERSION,
+            "unsupported transfer progress schema version"
+        );
+        ensure!(
+            self.confirmed_bytes <= self.total_bytes,
+            "confirmed bytes exceed total"
+        );
+        ensure!(
+            self.durable_bytes <= self.confirmed_bytes,
+            "durable bytes exceed confirmed"
+        );
+        ensure!(
+            self.window_bps.is_finite() && self.window_bps >= 0.0,
+            "window rate must be finite and non-negative"
+        );
+        ensure!(
+            self.average_bps.is_finite() && self.average_bps >= 0.0,
+            "average rate must be finite and non-negative"
+        );
+        ensure!(
+            !self.event.is_empty()
+                && self.event.len() <= 64
+                && !self.event.chars().any(char::is_control),
+            "transfer progress event is invalid"
+        );
+        Ok(())
+    }
 }
 
 /// Validate a profile name that can appear in a local IPC endpoint or lock
@@ -659,12 +796,16 @@ pub enum Frame {
         profile: String,
         operations: Vec<String>,
         budget: u32,
+        /// Explicit capability lifetime in seconds. Both client and daemon
+        /// enforce the protocol policy bounds.
+        ttl_secs: u32,
         /// Base64 Ed25519 public key of the grant holder.
         holder_key: String,
     },
     /// v6 response: the issued grant id and its absolute expiry.
     GrantIssued {
         grant_id: String,
+        issued_unix_ms: u64,
         expires_unix_ms: u64,
     },
     ListDir {
@@ -678,21 +819,46 @@ pub enum Frame {
         timeout_ms: u64,
     },
     Download {
+        transfer_id: TransferId,
         path: String,
-        #[serde(default = "default_sftp_timeout_ms")]
-        timeout_ms: u64,
+        backend: TransferBackend,
+        resume: TransferResumeMode,
+        /// Locally durable prefix requested for native pull resume.
+        resume_offset: u64,
+        /// Prior remote identity proof from the protected download journal.
+        expected_size: Option<u64>,
+        expected_sha256: Option<String>,
+        #[serde(default = "default_transfer_idle_timeout_ms")]
+        idle_timeout_ms: u64,
+        deadline_ms: Option<u64>,
     },
     UploadBegin {
+        transfer_id: TransferId,
         path: String,
         size: u64,
-        #[serde(default = "default_sftp_timeout_ms")]
-        timeout_ms: u64,
+        /// Lowercase SHA-256 of the stable local source handle.
+        sha256: String,
+        backend: TransferBackend,
+        resume: TransferResumeMode,
+        /// Random per-transfer ownership secret. Present only for
+        /// `resume=auto`; it is protected by the IPC AEAD and never persisted
+        /// by the daemon or remote helper in recoverable form.
+        resume_token: Option<String>,
+        #[serde(default = "default_transfer_idle_timeout_ms")]
+        idle_timeout_ms: u64,
+        deadline_ms: Option<u64>,
     },
     UploadChunk {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     UploadEnd,
+    TransferStatus {
+        transfer_id: Option<TransferId>,
+    },
+    TransferCancel {
+        transfer_id: TransferId,
+    },
     TunnelOpen {
         spec: TunnelSpec,
     },
@@ -733,6 +899,14 @@ pub enum Frame {
         started_unix: i64,
     },
     Ack,
+    /// Client-to-daemon cumulative acknowledgement for native downloads.
+    /// `confirmed_bytes` means the bytes were accepted by the stable local
+    /// handle; `durable_bytes` advances only after local sync and journal
+    /// persistence, and therefore may lag behind confirmation.
+    TransferAck {
+        confirmed_bytes: u64,
+        durable_bytes: u64,
+    },
     DirList {
         path: String,
         entries: Vec<RemoteEntry>,
@@ -743,6 +917,16 @@ pub enum Frame {
     },
     TransferDone {
         bytes: u64,
+    },
+    TransferDigest {
+        transfer_id: TransferId,
+        sha256: String,
+    },
+    TransferProgress {
+        progress: TransferProgress,
+    },
+    TransferStatusInfo {
+        transfers: Vec<TransferProgress>,
     },
     TunnelReady {
         ready: TunnelReady,
@@ -789,10 +973,26 @@ impl Zeroize for Frame {
             | Frame::ExecErr { data }
             | Frame::ShellOut { data }
             | Frame::FileChunk { data } => data.zeroize(),
-            Frame::ListDir { path, .. }
-            | Frame::CreateDir { path, .. }
-            | Frame::Download { path, .. }
-            | Frame::UploadBegin { path, .. } => path.zeroize(),
+            Frame::ListDir { path, .. } | Frame::CreateDir { path, .. } => path.zeroize(),
+            Frame::Download {
+                path,
+                expected_sha256,
+                ..
+            } => {
+                path.zeroize();
+                expected_sha256.zeroize();
+            }
+            Frame::UploadBegin {
+                path,
+                sha256,
+                resume_token,
+                ..
+            } => {
+                path.zeroize();
+                sha256.zeroize();
+                resume_token.zeroize();
+            }
+            Frame::TransferDigest { sha256, .. } => sha256.zeroize(),
             Frame::TunnelReady { ready } => ready.bind_host.zeroize(),
             Frame::AuthChallenge {
                 server_nonce,
@@ -843,17 +1043,27 @@ impl Zeroize for Frame {
                 }
                 profiles.clear();
             }
+            Frame::TransferStatusInfo { transfers } => {
+                for transfer in transfers.iter_mut() {
+                    transfer.event.zeroize();
+                }
+                transfers.clear();
+            }
+            Frame::TransferProgress { progress } => progress.event.zeroize(),
             Frame::Shell { .. }
             | Frame::TunnelOpen { .. }
             | Frame::AuthAccepted
             | Frame::Status
             | Frame::ListProfiles
             | Frame::UploadEnd
+            | Frame::TransferStatus { .. }
+            | Frame::TransferCancel { .. }
             | Frame::TunnelStop
             | Frame::TunnelClosed
             | Frame::ExecExit { .. }
             | Frame::ShellClosed
             | Frame::Ack
+            | Frame::TransferAck { .. }
             | Frame::TransferDone { .. } => {}
         }
     }
@@ -951,20 +1161,53 @@ fn canonical_request_digest(frame: &Frame) -> Result<Zeroizing<[u8; 32]>> {
             update_length_prefixed(&mut digest, path.as_bytes())?;
             digest.update(timeout_ms.to_be_bytes());
         }
-        Frame::Download { path, timeout_ms } => {
+        Frame::Download {
+            transfer_id,
+            path,
+            backend,
+            resume,
+            resume_offset,
+            expected_size,
+            expected_sha256,
+            idle_timeout_ms,
+            deadline_ms,
+        } => {
             digest.update([7]);
+            update_length_prefixed(&mut digest, transfer_id.as_str().as_bytes())?;
             update_length_prefixed(&mut digest, path.as_bytes())?;
-            digest.update(timeout_ms.to_be_bytes());
+            digest.update([*backend as u8, *resume as u8]);
+            digest.update(resume_offset.to_be_bytes());
+            digest.update(expected_size.unwrap_or(0).to_be_bytes());
+            update_length_prefixed(
+                &mut digest,
+                expected_sha256.as_deref().unwrap_or_default().as_bytes(),
+            )?;
+            digest.update(idle_timeout_ms.to_be_bytes());
+            digest.update(deadline_ms.unwrap_or(0).to_be_bytes());
         }
         Frame::UploadBegin {
+            transfer_id,
             path,
             size,
-            timeout_ms,
+            sha256,
+            backend,
+            resume,
+            resume_token,
+            idle_timeout_ms,
+            deadline_ms,
         } => {
             digest.update([8]);
+            update_length_prefixed(&mut digest, transfer_id.as_str().as_bytes())?;
             update_length_prefixed(&mut digest, path.as_bytes())?;
             digest.update(size.to_be_bytes());
-            digest.update(timeout_ms.to_be_bytes());
+            update_length_prefixed(&mut digest, sha256.as_bytes())?;
+            digest.update([*backend as u8, *resume as u8]);
+            update_length_prefixed(
+                &mut digest,
+                resume_token.as_deref().unwrap_or_default().as_bytes(),
+            )?;
+            digest.update(idle_timeout_ms.to_be_bytes());
+            digest.update(deadline_ms.unwrap_or(0).to_be_bytes());
         }
         Frame::TunnelOpen { spec } => {
             digest.update([9]);
@@ -976,6 +1219,18 @@ fn canonical_request_digest(frame: &Frame) -> Result<Zeroizing<[u8; 32]>> {
             digest.update(spec.bind_port.to_be_bytes());
             digest.update(spec.target_port.to_be_bytes());
             digest.update(spec.max_connections.to_be_bytes());
+        }
+        Frame::TransferStatus { transfer_id } => {
+            digest.update([12]);
+            if let Some(transfer_id) = transfer_id {
+                update_length_prefixed(&mut digest, transfer_id.as_str().as_bytes())?;
+            } else {
+                update_length_prefixed(&mut digest, &[])?;
+            }
+        }
+        Frame::TransferCancel { transfer_id } => {
+            digest.update([13]);
+            update_length_prefixed(&mut digest, transfer_id.as_str().as_bytes())?;
         }
         _ => bail!("IPC frame is not an authorizable root request"),
     }
@@ -1767,19 +2022,37 @@ mod tests {
             .as_ref(),
         );
         let first = Frame::UploadBegin {
+            transfer_id: TransferId::parse("00000000000000000000000000000001").unwrap(),
             path: "/tmp/file".into(),
             size: 17,
-            timeout_ms: 5_000,
+            sha256: "00".repeat(32),
+            backend: TransferBackend::Sftp,
+            resume: TransferResumeMode::Never,
+            resume_token: None,
+            idle_timeout_ms: 5_000,
+            deadline_ms: Some(10_000),
         };
         let changed_size = Frame::UploadBegin {
+            transfer_id: TransferId::parse("00000000000000000000000000000001").unwrap(),
             path: "/tmp/file".into(),
             size: 18,
-            timeout_ms: 5_000,
+            sha256: "00".repeat(32),
+            backend: TransferBackend::Sftp,
+            resume: TransferResumeMode::Never,
+            resume_token: None,
+            idle_timeout_ms: 5_000,
+            deadline_ms: Some(10_000),
         };
         let changed_timeout = Frame::UploadBegin {
+            transfer_id: TransferId::parse("00000000000000000000000000000001").unwrap(),
             path: "/tmp/file".into(),
             size: 17,
-            timeout_ms: 5_001,
+            sha256: "00".repeat(32),
+            backend: TransferBackend::Sftp,
+            resume: TransferResumeMode::Never,
+            resume_token: None,
+            idle_timeout_ms: 5_001,
+            deadline_ms: Some(10_000),
         };
         assert_ne!(
             request_intent_commitment(&key, &first).unwrap().as_ref(),
@@ -1801,6 +2074,14 @@ mod tests {
         )
         .is_err());
         assert!(request_intent_commitment(&key, &Frame::UploadEnd).is_err());
+        assert!(request_intent_commitment(
+            &key,
+            &Frame::TransferAck {
+                confirmed_bytes: 17,
+                durable_bytes: 16,
+            },
+        )
+        .is_err());
         assert!(request_intent_commitment(
             &key,
             &Frame::ShellInput {
@@ -1841,6 +2122,63 @@ mod tests {
             assert_ne!(baseline.as_ref(), commitment.as_ref());
         }
         assert!(request_intent_commitment(&key, &Frame::TunnelStop).is_err());
+
+        let download_with = |resume_offset, expected_size, expected_sha256: &str| Frame::Download {
+            transfer_id: TransferId::parse("00000000000000000000000000000002").unwrap(),
+            path: "/tmp/source".into(),
+            backend: TransferBackend::Native,
+            resume: TransferResumeMode::Auto,
+            resume_offset,
+            expected_size: Some(expected_size),
+            expected_sha256: Some(expected_sha256.repeat(32)),
+            idle_timeout_ms: 5_000,
+            deadline_ms: Some(10_000),
+        };
+        let download = download_with(4_096, 8_192, "11");
+        let download_commitment = request_intent_commitment(&key, &download).unwrap();
+        for changed in [
+            download_with(4_097, 8_192, "11"),
+            download_with(4_096, 8_193, "11"),
+            download_with(4_096, 8_192, "22"),
+        ] {
+            assert_ne!(
+                download_commitment.as_ref(),
+                request_intent_commitment(&key, &changed).unwrap().as_ref(),
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_progress_is_bounded_monotonic_shape_without_paths() {
+        let progress = TransferProgress {
+            schema_version: TRANSFER_PROGRESS_SCHEMA_VERSION,
+            event: "progress".into(),
+            transfer_id: TransferId::parse("00000000000000000000000000000001").unwrap(),
+            direction: TransferDirection::Push,
+            stage: TransferStage::Transferring,
+            total_bytes: 1024,
+            confirmed_bytes: 512,
+            durable_bytes: 0,
+            window_bps: 128.0,
+            average_bps: 64.0,
+            eta_ms: Some(4_000),
+            backend: TransferBackend::Sftp,
+            chunk_bytes: SFTP_SAFE_CHUNK_BYTES as u32,
+            window_bytes: SFTP_SAFE_CHUNK_BYTES as u32,
+            updated_unix_ms: 1,
+        };
+        progress.validate().unwrap();
+        let encoded = serde_json::to_string(&progress).unwrap();
+        assert!(!encoded.contains("/tmp"));
+        let mut invalid = progress.clone();
+        invalid.confirmed_bytes = invalid.total_bytes + 1;
+        assert!(invalid.validate().is_err());
+        let mut invalid = progress;
+        invalid.window_bps = f64::NAN;
+        assert!(invalid.validate().is_err());
+        invalid.window_bps = 0.0;
+        invalid.event = "x\nforged".into();
+        assert!(invalid.validate().is_err());
     }
 
     #[tokio::test]

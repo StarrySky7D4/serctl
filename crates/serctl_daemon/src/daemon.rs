@@ -4,12 +4,12 @@
 //! descriptor/secret, per-profile credential leases, and the unlock flow.
 use anyhow::{bail, ensure, Context, Result};
 use russh::ChannelMsg;
-use russh_sftp::protocol::OpenFlags;
 use serctl_core::daemon_runtime::{self, DaemonRuntimeDescriptor, DESCRIPTOR_SCHEMA_VERSION};
 use serctl_core::vault::{self, now_unix, Creds, LockInfo, ProfileCallKey};
 use serctl_protocol::v6::{
     frame_kind, ActivationSecret, InstanceId, V6RequestPrelude, V6ServerIo, IPC_PROTOCOL_VERSION_V6,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -23,11 +23,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 use serctl_core::ssh::{
     commit_remote_upload_no_replace_until, is_explicit_sftp_status, poll_remote_mutation_until,
-    protected_upload_file_attributes, temporary_remote_path, validate_remote_command,
-    validate_remote_path, validate_shell_dimensions, validate_upload_remote_path,
-    ExecSubmissionState, SshSession, MAX_TRANSFER_BYTES,
+    temporary_remote_path, validate_remote_command, validate_remote_path,
+    validate_shell_dimensions, validate_upload_remote_path, ExecSubmissionState, SshSession,
+    MAX_TRANSFER_BYTES,
 };
 use serctl_protocol as ipc;
+use serctl_transfer_protocol as native;
 
 /// Bound for the complete daemon setup (credential snapshot + runtime
 /// publication) once a start is requested. The CLI launcher mirrors this value
@@ -48,6 +49,345 @@ const MAX_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 const BUFFERED_HEAVY_OPERATION_LIMIT: usize = 8;
 const TUNNEL_CONTROL_LIMIT: usize = 8;
 const TUNNEL_COMPLETION_POLL: Duration = Duration::from_millis(100);
+const TRANSFER_RECORD_RETENTION: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Default)]
+struct TransferCancellation {
+    cancelled: AtomicBool,
+    changed: Notify,
+}
+
+impl TransferCancellation {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct TransferRecord {
+    profile: String,
+    progress: ipc::TransferProgress,
+    cancellation: Arc<TransferCancellation>,
+    finished_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct TransferRegistry {
+    records: StdMutex<HashMap<String, TransferRecord>>,
+}
+
+impl TransferRegistry {
+    fn prune_locked(records: &mut HashMap<String, TransferRecord>, now: Instant) {
+        records.retain(|_, record| {
+            record
+                .finished_at
+                .is_none_or(|finished| now.duration_since(finished) < TRANSFER_RECORD_RETENTION)
+        });
+    }
+
+    fn begin(
+        &self,
+        profile: &str,
+        progress: ipc::TransferProgress,
+    ) -> Result<Arc<TransferCancellation>> {
+        progress.validate()?;
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transfer registry lock is poisoned"))?;
+        Self::prune_locked(&mut records, Instant::now());
+        ensure!(
+            !records.contains_key(progress.transfer_id.as_str()),
+            "transfer id is already registered"
+        );
+        let cancellation = Arc::new(TransferCancellation::default());
+        records.insert(
+            progress.transfer_id.as_str().to_owned(),
+            TransferRecord {
+                profile: profile.to_owned(),
+                progress,
+                cancellation: Arc::clone(&cancellation),
+                finished_at: None,
+            },
+        );
+        Ok(cancellation)
+    }
+
+    fn update(&self, profile: &str, progress: ipc::TransferProgress) -> Result<()> {
+        progress.validate()?;
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transfer registry lock is poisoned"))?;
+        let record = records
+            .get_mut(progress.transfer_id.as_str())
+            .context("transfer is not registered")?;
+        ensure!(record.profile == profile, "transfer profile mismatch");
+        ensure!(
+            progress.confirmed_bytes >= record.progress.confirmed_bytes,
+            "transfer confirmation moved backwards"
+        );
+        record.progress = progress;
+        Ok(())
+    }
+
+    fn finish(&self, profile: &str, progress: ipc::TransferProgress) -> Result<()> {
+        self.update(profile, progress.clone())?;
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transfer registry lock is poisoned"))?;
+        let record = records
+            .get_mut(progress.transfer_id.as_str())
+            .context("transfer is not registered")?;
+        record.finished_at = Some(Instant::now());
+        Ok(())
+    }
+
+    fn snapshots(
+        &self,
+        profile: &str,
+        transfer_id: Option<&ipc::TransferId>,
+    ) -> Result<Vec<ipc::TransferProgress>> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transfer registry lock is poisoned"))?;
+        Self::prune_locked(&mut records, Instant::now());
+        let mut snapshots = records
+            .values()
+            .filter(|record| {
+                record.profile == profile
+                    && transfer_id
+                        .is_none_or(|id| id.as_str() == record.progress.transfer_id.as_str())
+            })
+            .map(|record| record.progress.clone())
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.transfer_id.as_str().cmp(right.transfer_id.as_str()));
+        Ok(snapshots)
+    }
+
+    fn cancel(&self, profile: &str, transfer_id: &ipc::TransferId) -> Result<()> {
+        let records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transfer registry lock is poisoned"))?;
+        let record = records
+            .get(transfer_id.as_str())
+            .context("transfer was not found for this profile")?;
+        ensure!(
+            record.profile == profile,
+            "transfer was not found for this profile"
+        );
+        ensure!(record.finished_at.is_none(), "transfer is no longer active");
+        record.cancellation.cancel();
+        Ok(())
+    }
+}
+
+fn resolved_sftp_backend(requested: ipc::TransferBackend) -> Result<ipc::TransferBackend> {
+    match requested {
+        ipc::TransferBackend::Auto => Ok(ipc::TransferBackend::SftpFallback),
+        ipc::TransferBackend::Sftp | ipc::TransferBackend::SftpFallback => {
+            Ok(ipc::TransferBackend::Sftp)
+        }
+        ipc::TransferBackend::Native => {
+            bail!("native transfer helper is unavailable; use --backend auto or sftp")
+        }
+    }
+}
+
+struct NativeTransferChannel {
+    stream: russh::ChannelStream<russh::client::Msg>,
+    chunk_bytes: u32,
+    window_bytes: u32,
+    resume: bool,
+}
+
+enum NegotiatedTransferBackend {
+    Native(Box<NativeTransferChannel>),
+    Sftp,
+}
+
+async fn open_native_transfer_channel(
+    session: &SshSession,
+    deadline: Instant,
+) -> Result<NativeTransferChannel> {
+    let mut stream = session.native_transfer_stream_until(deadline).await?;
+    let hello = tokio::time::timeout_at(deadline, native::read_frame(&mut stream))
+        .await
+        .map_err(|_| anyhow::anyhow!("native helper handshake exceeded its deadline"))??;
+    let Some(native::Frame::Control(native::Control::Hello {
+        version,
+        max_chunk,
+        max_window,
+        resume,
+        sha256,
+        fsync,
+        no_replace,
+    })) = hello
+    else {
+        bail!("native helper did not send a compatible hello")
+    };
+    ensure!(version == native::VERSION, "native helper version mismatch");
+    ensure!(
+        sha256 && fsync && no_replace,
+        "native helper lacks required integrity or commit features"
+    );
+    let chunk_bytes = max_chunk
+        .min(native::DEFAULT_CHUNK_BYTES)
+        // The same russh channel stall reproduced for the first native frame
+        // above 2 KiB that motivated the SFTP fallback cap. Keep the wire
+        // protocol capable of larger chunks, but negotiate only the largest
+        // complete-channel size for which ACK delivery is currently proven.
+        .min(ipc::SFTP_SAFE_CHUNK_BYTES as u32);
+    let window_bytes = max_window.min(native::MAX_WINDOW_BYTES);
+    ensure!(
+        chunk_bytes > 0,
+        "native helper advertised a zero chunk size"
+    );
+    ensure!(
+        window_bytes >= chunk_bytes,
+        "native helper window is smaller than one chunk"
+    );
+    native::write_control(
+        &mut stream,
+        &native::Control::Hello {
+            version: native::VERSION,
+            max_chunk: chunk_bytes,
+            max_window: window_bytes,
+            resume,
+            sha256: true,
+            fsync: true,
+            no_replace: true,
+        },
+    )
+    .await?;
+    Ok(NativeTransferChannel {
+        stream,
+        chunk_bytes,
+        window_bytes,
+        resume,
+    })
+}
+
+async fn negotiate_transfer_backend(
+    session: &SshSession,
+    requested: ipc::TransferBackend,
+    resume: ipc::TransferResumeMode,
+    deadline: Instant,
+) -> Result<(ipc::TransferBackend, NegotiatedTransferBackend)> {
+    if matches!(
+        requested,
+        ipc::TransferBackend::Auto | ipc::TransferBackend::Native
+    ) {
+        let probe_deadline = if requested == ipc::TransferBackend::Auto {
+            deadline.min(Instant::now() + Duration::from_secs(2))
+        } else {
+            deadline
+        };
+        match open_native_transfer_channel(session, probe_deadline).await {
+            Ok(channel) => {
+                if resume == ipc::TransferResumeMode::Auto && !channel.resume {
+                    bail!("native helper does not support resume=auto")
+                }
+                return Ok((
+                    ipc::TransferBackend::Native,
+                    NegotiatedTransferBackend::Native(Box::new(channel)),
+                ));
+            }
+            Err(error) if requested == ipc::TransferBackend::Auto => {
+                log::debug!("native transfer probe fell back to SFTP: {error:#}");
+            }
+            Err(error) => return Err(error).context("native transfer helper is unavailable"),
+        }
+    }
+    ensure!(
+        resume == ipc::TransferResumeMode::Never,
+        "resume=auto requires a compatible native transfer helper"
+    );
+    Ok((
+        resolved_sftp_backend(requested)?,
+        NegotiatedTransferBackend::Sftp,
+    ))
+}
+
+fn transfer_progress(
+    transfer_id: ipc::TransferId,
+    direction: ipc::TransferDirection,
+    stage: ipc::TransferStage,
+    total_bytes: u64,
+    confirmed_bytes: u64,
+    durable_bytes: u64,
+    backend: ipc::TransferBackend,
+) -> ipc::TransferProgress {
+    let (chunk_bytes, window_bytes) = match backend {
+        ipc::TransferBackend::Sftp | ipc::TransferBackend::SftpFallback => {
+            let chunk = ipc::SFTP_SAFE_CHUNK_BYTES as u32;
+            (chunk, chunk)
+        }
+        ipc::TransferBackend::Auto | ipc::TransferBackend::Native => (0, 0),
+    };
+    ipc::TransferProgress {
+        schema_version: ipc::TRANSFER_PROGRESS_SCHEMA_VERSION,
+        event: "progress".to_owned(),
+        transfer_id,
+        direction,
+        stage,
+        total_bytes,
+        confirmed_bytes,
+        durable_bytes,
+        window_bps: 0.0,
+        average_bps: 0.0,
+        eta_ms: None,
+        backend,
+        chunk_bytes,
+        window_bytes,
+        updated_unix_ms: now_unix_ms(),
+    }
+}
+
+fn terminal_transfer_progress(
+    mut progress: ipc::TransferProgress,
+    stage: ipc::TransferStage,
+    event: &str,
+) -> ipc::TransferProgress {
+    progress.stage = stage;
+    progress.event = event.to_owned();
+    progress.updated_unix_ms = now_unix_ms();
+    progress
+}
+
+fn finish_transfer_setup(
+    registry: &TransferRegistry,
+    profile: &str,
+    progress: ipc::TransferProgress,
+    stage: ipc::TransferStage,
+    event: &str,
+) -> Result<()> {
+    registry.finish(profile, terminal_transfer_progress(progress, stage, event))
+}
+
+fn is_transfer_stall_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("timeout") || message.contains("deadline")
+    })
+}
 
 fn terminal_safe_field(value: &str) -> String {
     value.escape_debug().to_string()
@@ -92,10 +432,20 @@ fn daemon_up_line(
 #[derive(Clone)]
 struct ConnInfo {
     profile: String,
+    profile_id: Option<[u8; 16]>,
     host: String,
     user: String,
     started: i64,
     token: Arc<Zeroizing<String>>,
+}
+
+impl ConnInfo {
+    fn transfer_owner_key(&self) -> String {
+        self.profile_id.as_ref().map_or_else(
+            || format!("legacy-name:{}", self.profile),
+            |profile_id| format!("profile-id:{}", hex::encode(profile_id)),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -105,6 +455,7 @@ struct HandlerContext {
     shutdown: watch::Sender<bool>,
     buffered_operation_slots: Arc<Semaphore>,
     tunnel_control_slots: Arc<Semaphore>,
+    transfers: Arc<TransferRegistry>,
     call_key: Arc<ProfileCallKey>,
     /// Hard upper bound for this root operation. Global-v6 handlers set it to
     /// the earliest credential/grant/request deadline; legacy v5 uses `None`.
@@ -801,6 +1152,7 @@ async fn run_after_startup_lock_reconciliation(
 
     let info = ConnInfo {
         profile: profile.to_string(),
+        profile_id: None,
         host,
         user,
         started: now_unix(),
@@ -811,6 +1163,7 @@ async fn run_after_startup_lock_reconciliation(
     let connection_slots = Arc::new(Semaphore::new(64));
     let buffered_operation_slots = Arc::new(Semaphore::new(BUFFERED_HEAVY_OPERATION_LIMIT));
     let tunnel_control_slots = Arc::new(Semaphore::new(TUNNEL_CONTROL_LIMIT));
+    let transfers = Arc::new(TransferRegistry::default());
     let mut handlers = JoinSet::new();
 
     let mut listener_error = None;
@@ -840,6 +1193,7 @@ async fn run_after_startup_lock_reconciliation(
                     shutdown: shutdown_tx.clone(),
                     buffered_operation_slots: Arc::clone(&buffered_operation_slots),
                     tunnel_control_slots: Arc::clone(&tunnel_control_slots),
+                    transfers: Arc::clone(&transfers),
                     call_key: Arc::clone(&call_key),
                     authorization_deadline: None,
                 };
@@ -927,7 +1281,11 @@ where
     let max_frame = match frame {
         ipc::Frame::ShellOut { .. } | ipc::Frame::ShellClosed => ipc::MAX_SHELL_FRAME,
         ipc::Frame::Ack
+        | ipc::Frame::TransferAck { .. }
         | ipc::Frame::TransferDone { .. }
+        | ipc::Frame::TransferDigest { .. }
+        | ipc::Frame::TransferProgress { .. }
+        | ipc::Frame::TransferStatusInfo { .. }
         | ipc::Frame::StatusInfo { .. }
         | ipc::Frame::TunnelReady { .. }
         | ipc::Frame::TunnelClosed
@@ -1037,11 +1395,64 @@ fn validate_request_frame(frame: &ipc::Frame) -> Result<()> {
             bail!("shell input exceeds {MAX_SHELL_INPUT_BYTES} bytes");
         }
         ipc::Frame::ListDir { path, .. } => validate_remote_path(path, true)?,
-        ipc::Frame::CreateDir { path, .. } | ipc::Frame::Download { path, .. } => {
-            validate_remote_path(path, false)?
+        ipc::Frame::CreateDir { path, .. } => validate_remote_path(path, false)?,
+        ipc::Frame::Download {
+            path,
+            resume,
+            resume_offset,
+            expected_size,
+            expected_sha256,
+            idle_timeout_ms,
+            deadline_ms,
+            ..
+        } => {
+            validate_remote_path(path, false)?;
+            validate_transfer_timeouts(*idle_timeout_ms, *deadline_ms)?;
+            match (resume, resume_offset, expected_size, expected_sha256) {
+                (ipc::TransferResumeMode::Never, 0, None, None) => {}
+                (ipc::TransferResumeMode::Auto, 0, None, None) => {}
+                (ipc::TransferResumeMode::Auto, offset, Some(size), Some(sha256))
+                    if *offset <= *size
+                        && sha256.len() == 64
+                        && sha256
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')) => {}
+                _ => bail!("download resume metadata is incomplete or inconsistent"),
+            }
         }
-        ipc::Frame::UploadBegin { path, size, .. } => {
+        ipc::Frame::UploadBegin {
+            path,
+            size,
+            sha256,
+            resume,
+            resume_token,
+            idle_timeout_ms,
+            deadline_ms,
+            ..
+        } => {
             validate_upload_remote_path(path)?;
+            ensure!(
+                sha256.len() == 64
+                    && sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "upload SHA-256 must be 64 lowercase hex characters"
+            );
+            validate_transfer_timeouts(*idle_timeout_ms, *deadline_ms)?;
+            match (resume, resume_token) {
+                (ipc::TransferResumeMode::Never, None) => {}
+                (ipc::TransferResumeMode::Auto, Some(token))
+                    if token.len() == 64
+                        && token
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')) => {}
+                (ipc::TransferResumeMode::Never, Some(_)) => {
+                    bail!("resume=never must not carry a resume token")
+                }
+                (ipc::TransferResumeMode::Auto, _) => {
+                    bail!("resume=auto requires a 64-character ownership token")
+                }
+            }
             if *size > MAX_TRANSFER_BYTES {
                 bail!(
                     "upload exceeds the {} byte safety limit",
@@ -1054,6 +1465,20 @@ fn validate_request_frame(frame: &ipc::Frame) -> Result<()> {
         }
         ipc::Frame::TunnelOpen { spec } => spec.validate()?,
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_transfer_timeouts(idle_timeout_ms: u64, deadline_ms: Option<u64>) -> Result<()> {
+    ensure!(
+        (1..=ipc::MAX_SFTP_TIMEOUT_MS).contains(&idle_timeout_ms),
+        "transfer idle timeout is outside the supported range"
+    );
+    if let Some(deadline_ms) = deadline_ms {
+        ensure!(
+            (1..=ipc::MAX_SFTP_TIMEOUT_MS).contains(&deadline_ms),
+            "transfer deadline is outside the supported range"
+        );
     }
     Ok(())
 }
@@ -1162,6 +1587,7 @@ where
         shutdown,
         buffered_operation_slots,
         tunnel_control_slots,
+        transfers,
         call_key,
         authorization_deadline,
     } = context;
@@ -1211,6 +1637,7 @@ where
         shutdown,
         buffered_operation_slots,
         tunnel_control_slots,
+        transfers,
         call_key,
         authorization_deadline,
     };
@@ -1234,11 +1661,19 @@ where
     W: AsyncWrite + Unpin,
 {
     let authorization_deadline = context.authorization_deadline;
+    let sessions = Arc::clone(&context.sessions);
     let operation = dispatch_root_request_inner(rd, wr, shutdown_rx, context, frame);
     match authorization_deadline {
         Some(deadline) => match tokio::time::timeout_at(deadline, operation).await {
             Ok(result) => result,
-            Err(_) => bail!("profile authorization lease expired"),
+            Err(_) => {
+                // A cancelled SFTP/SSH future can trip its transport slightly
+                // after this outer authorization timer fires. Invalidate now
+                // so a following request cannot race onto that ambiguous
+                // session before the bounded stream reports closure.
+                sessions.invalidate_current().await;
+                bail!("profile authorization lease expired")
+            }
         },
         None => operation.await,
     }
@@ -1261,9 +1696,11 @@ where
         shutdown,
         buffered_operation_slots,
         tunnel_control_slots,
+        transfers,
         call_key: _call_key,
         authorization_deadline: _,
     } = context;
+    let transfer_owner = info.transfer_owner_key();
     if let Err(error) = validate_request_frame(&frame) {
         frame.zeroize_sensitive();
         write_owned_frame_or_shutdown(
@@ -1613,6 +2050,42 @@ where
             )
             .await?;
         }
+        ipc::Frame::TransferStatus { transfer_id } => {
+            let snapshots = transfers.snapshots(&transfer_owner, transfer_id.as_ref())?;
+            write_owned_frame_or_shutdown(
+                &mut wr,
+                ipc::Frame::TransferStatusInfo {
+                    transfers: snapshots,
+                },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await?;
+        }
+        ipc::Frame::TransferCancel { transfer_id } => {
+            match transfers.cancel(&transfer_owner, &transfer_id) {
+                Ok(()) => {
+                    write_frame_or_shutdown(
+                        &mut wr,
+                        &ipc::Frame::Ack,
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                }
+            }
+        }
         ipc::Frame::ListDir { path, timeout_ms } => {
             let timeout = match validated_sftp_timeout(timeout_ms) {
                 Ok(timeout) => timeout,
@@ -1767,28 +2240,91 @@ where
                 }
             }
         }
-        ipc::Frame::Download { path, timeout_ms } => {
-            let timeout = match validated_sftp_timeout(timeout_ms) {
-                Ok(timeout) => timeout,
-                Err(error) => {
-                    write_owned_frame_or_shutdown(
-                        &mut wr,
-                        ipc::Frame::Error {
-                            msg: error.to_string(),
-                        },
-                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                        &mut shutdown_rx,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
+        ipc::Frame::Download {
+            transfer_id,
+            path,
+            backend,
+            resume,
+            resume_offset,
+            expected_size,
+            expected_sha256,
+            idle_timeout_ms,
+            deadline_ms,
+        } => {
+            let mut initial = transfer_progress(
+                transfer_id.clone(),
+                ipc::TransferDirection::Pull,
+                ipc::TransferStage::Negotiating,
+                0,
+                0,
+                0,
+                backend,
+            );
+            let cancellation = transfers.begin(&transfer_owner, initial.clone())?;
+            if let Err(error) = write_frame_or_shutdown(
+                &mut wr,
+                &ipc::Frame::TransferProgress {
+                    progress: initial.clone(),
+                },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await
+            {
+                finish_transfer_setup(
+                    &transfers,
+                    &transfer_owner,
+                    initial,
+                    ipc::TransferStage::Failed,
+                    "failed",
+                )?;
+                return Err(error);
+            }
+            let timeout =
+                match validated_sftp_timeout(deadline_ms.unwrap_or(ipc::MAX_SFTP_TIMEOUT_MS)) {
+                    Ok(timeout) => timeout,
+                    Err(error) => {
+                        finish_transfer_setup(
+                            &transfers,
+                            &transfer_owner,
+                            initial,
+                            ipc::TransferStage::Failed,
+                            "failed",
+                        )?;
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
             let deadline = Instant::now() + timeout;
             let session =
                 match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
                     Ok(Some(session)) => session,
-                    Ok(None) => return Ok(()),
+                    Ok(None) => {
+                        finish_transfer_setup(
+                            &transfers,
+                            &transfer_owner,
+                            initial,
+                            ipc::TransferStage::Cancelled,
+                            "cancelled",
+                        )?;
+                        return Ok(());
+                    }
                     Err(error) => {
+                        finish_transfer_setup(
+                            &transfers,
+                            &transfer_owner,
+                            initial,
+                            ipc::TransferStage::Failed,
+                            "failed",
+                        )?;
                         write_owned_frame_or_shutdown(
                             &mut wr,
                             ipc::Frame::Error {
@@ -1801,15 +2337,77 @@ where
                         return Ok(());
                     }
                 };
-            let result = match tokio::select! {
-                result = serve_download(&session, &mut wr, &path, timeout_ms, deadline) => Some(result),
-                _ = rd.read_u8() => None,
-                _ = shutdown_rx.changed() => None,
-            } {
-                Some(result) => result,
-                None => {
-                    session.invalidate().await;
+            let (actual_backend, negotiated) = match negotiate_transfer_backend(
+                &session,
+                backend,
+                resume,
+                deadline.min(Instant::now() + Duration::from_millis(idle_timeout_ms)),
+            )
+            .await
+            {
+                Ok(negotiated) => negotiated,
+                Err(error) => {
+                    finish_transfer_setup(
+                        &transfers,
+                        &transfer_owner,
+                        initial,
+                        ipc::TransferStage::Failed,
+                        "failed",
+                    )?;
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
                     return Ok(());
+                }
+            };
+            initial.backend = actual_backend;
+            match &negotiated {
+                NegotiatedTransferBackend::Native(channel) => {
+                    initial.chunk_bytes = channel.chunk_bytes;
+                    initial.window_bytes = channel.window_bytes;
+                }
+                NegotiatedTransferBackend::Sftp => {
+                    initial.chunk_bytes = ipc::SFTP_SAFE_CHUNK_BYTES as u32;
+                    initial.window_bytes = ipc::SFTP_SAFE_CHUNK_BYTES as u32;
+                }
+            }
+            initial.updated_unix_ms = now_unix_ms();
+            transfers.update(&transfer_owner, initial.clone())?;
+            write_frame_or_shutdown(
+                &mut wr,
+                &ipc::Frame::TransferProgress {
+                    progress: initial.clone(),
+                },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await?;
+            let request = DownloadServeRequest {
+                path: &path,
+                resume_offset,
+                expected_size,
+                expected_sha256: expected_sha256.as_deref(),
+                timeout_ms: idle_timeout_ms,
+                idle_timeout: Duration::from_millis(idle_timeout_ms),
+                deadline,
+                registry: &transfers,
+                profile: &transfer_owner,
+                progress: initial,
+                cancellation,
+            };
+            let result = match negotiated {
+                NegotiatedTransferBackend::Native(channel) => {
+                    serve_native_download(*channel, &mut rd, &mut wr, request, &mut shutdown_rx)
+                        .await
+                }
+                NegotiatedTransferBackend::Sftp => {
+                    serve_download(&session, &mut rd, &mut wr, request, &mut shutdown_rx).await
                 }
             };
             if let Err(error) = result {
@@ -1831,31 +2429,90 @@ where
             }
         }
         ipc::Frame::UploadBegin {
+            transfer_id,
             path,
             size,
-            timeout_ms,
+            sha256,
+            backend,
+            resume,
+            resume_token,
+            idle_timeout_ms,
+            deadline_ms,
         } => {
-            let timeout = match validated_sftp_timeout(timeout_ms) {
-                Ok(timeout) => timeout,
-                Err(error) => {
-                    write_owned_frame_or_shutdown(
-                        &mut wr,
-                        ipc::Frame::Error {
-                            msg: error.to_string(),
-                        },
-                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                        &mut shutdown_rx,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
+            let mut initial = transfer_progress(
+                transfer_id,
+                ipc::TransferDirection::Push,
+                ipc::TransferStage::Negotiating,
+                size,
+                0,
+                0,
+                backend,
+            );
+            let cancellation = transfers.begin(&transfer_owner, initial.clone())?;
+            if let Err(error) = write_frame_or_shutdown(
+                &mut wr,
+                &ipc::Frame::TransferProgress {
+                    progress: initial.clone(),
+                },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await
+            {
+                finish_transfer_setup(
+                    &transfers,
+                    &transfer_owner,
+                    initial,
+                    ipc::TransferStage::Failed,
+                    "failed",
+                )?;
+                return Err(error);
+            }
+            let timeout =
+                match validated_sftp_timeout(deadline_ms.unwrap_or(ipc::MAX_SFTP_TIMEOUT_MS)) {
+                    Ok(timeout) => timeout,
+                    Err(error) => {
+                        finish_transfer_setup(
+                            &transfers,
+                            &transfer_owner,
+                            initial,
+                            ipc::TransferStage::Failed,
+                            "failed",
+                        )?;
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
             let deadline = Instant::now() + timeout;
             let session =
                 match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
                     Ok(Some(session)) => session,
-                    Ok(None) => return Ok(()),
+                    Ok(None) => {
+                        finish_transfer_setup(
+                            &transfers,
+                            &transfer_owner,
+                            initial,
+                            ipc::TransferStage::Cancelled,
+                            "cancelled",
+                        )?;
+                        return Ok(());
+                    }
                     Err(error) => {
+                        finish_transfer_setup(
+                            &transfers,
+                            &transfer_owner,
+                            initial,
+                            ipc::TransferStage::Failed,
+                            "failed",
+                        )?;
                         write_owned_frame_or_shutdown(
                             &mut wr,
                             ipc::Frame::Error {
@@ -1868,19 +2525,79 @@ where
                         return Ok(());
                     }
                 };
-            let upload = serve_upload(
+            let (actual_backend, negotiated) = match negotiate_transfer_backend(
                 &session,
-                &mut rd,
+                backend,
+                resume,
+                deadline.min(Instant::now() + Duration::from_millis(idle_timeout_ms)),
+            )
+            .await
+            {
+                Ok(negotiated) => negotiated,
+                Err(error) => {
+                    finish_transfer_setup(
+                        &transfers,
+                        &transfer_owner,
+                        initial,
+                        ipc::TransferStage::Failed,
+                        "failed",
+                    )?;
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            initial.backend = actual_backend;
+            match &negotiated {
+                NegotiatedTransferBackend::Native(channel) => {
+                    initial.chunk_bytes = channel.chunk_bytes;
+                    initial.window_bytes = channel.window_bytes;
+                }
+                NegotiatedTransferBackend::Sftp => {
+                    initial.chunk_bytes = ipc::SFTP_SAFE_CHUNK_BYTES as u32;
+                    initial.window_bytes = ipc::SFTP_SAFE_CHUNK_BYTES as u32;
+                }
+            }
+            initial.updated_unix_ms = now_unix_ms();
+            transfers.update(&transfer_owner, initial.clone())?;
+            write_frame_or_shutdown(
                 &mut wr,
-                UploadRequest {
-                    path: &path,
-                    size,
-                    timeout_ms,
-                    deadline,
+                &ipc::Frame::TransferProgress {
+                    progress: initial.clone(),
                 },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
                 &mut shutdown_rx,
             )
-            .await;
+            .await?;
+            let request = UploadRequest {
+                path: &path,
+                size,
+                sha256: &sha256,
+                resume,
+                resume_token: resume_token.as_deref(),
+                timeout_ms: idle_timeout_ms,
+                idle_timeout: Duration::from_millis(idle_timeout_ms),
+                deadline,
+                registry: &transfers,
+                profile: &transfer_owner,
+                progress: initial,
+                cancellation,
+            };
+            let upload = match negotiated {
+                NegotiatedTransferBackend::Native(channel) => {
+                    serve_native_upload(*channel, &mut rd, &mut wr, request, &mut shutdown_rx).await
+                }
+                NegotiatedTransferBackend::Sftp => {
+                    serve_upload(&session, &mut rd, &mut wr, request, &mut shutdown_rx).await
+                }
+            };
             if let Err(error) = upload {
                 // See the download path above: never reuse an IPC stream
                 // after a response write may have stopped mid-frame.
@@ -2072,15 +2789,17 @@ impl Drop for IdleGuard {
     }
 }
 
-/// Operation kinds a grant may authorize. Interactive shells and control
-/// operations (unlock, shutdown, grant issuance) are never grantable.
+/// Operation kinds the current Agent JSONL gateway can actually consume.
+/// Keep issuance fail-closed until a corresponding AgentRequest handler exists;
+/// otherwise a syntactically valid Grant would advertise an unusable capability.
+/// Interactive shells and control operations (unlock, shutdown, grant issuance)
+/// are never grantable.
 const GRANTABLE_OPERATION_KINDS: &[&str] = &[
     "ssh.exec",
     "daemon.status",
     "sftp.list",
-    "sftp.read",
     "sftp.write",
-    "forward",
+    "transfer.write",
 ];
 
 const UNKNOWN_GRANT_ERROR: &str = "grant is not registered in this daemon instance; the daemon may have restarted, so reissue the grant";
@@ -2124,10 +2843,8 @@ impl GrantRegistry {
         );
         ensure!(!grants.contains_key(&grant.grant_id), "grant id collision");
         let idle_guard = self.idle.acquire();
-        grants.insert(
-            grant.grant_id,
-            Arc::new(GrantRecord::new(grant, now, idle_guard)),
-        );
+        let record = GrantRecord::new(grant, now, idle_guard)?;
+        grants.insert(record.grant.grant_id, Arc::new(record));
         Ok(())
     }
 
@@ -2161,13 +2878,17 @@ impl GrantRecord {
         grant: serctl_protocol::grant::OperationGrant,
         issued_at: Instant,
         idle_guard: IdleGuard,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let ttl = grant.policy_ttl()?;
+        let expires_at = issued_at
+            .checked_add(ttl)
+            .context("grant monotonic expiry overflow")?;
+        Ok(Self {
             remaining: AtomicUsize::new(grant.budget as usize),
             grant,
-            expires_at: issued_at + serctl_protocol::grant::GRANT_TTL,
+            expires_at,
             _idle_guard: idle_guard,
-        }
+        })
     }
 
     /// Validate expiry, requested deadline, scope, and proof of possession,
@@ -2265,6 +2986,7 @@ fn issue_grant(
         profile,
         operations,
         budget,
+        ttl_secs,
         holder_key,
     } = frame
     else {
@@ -2311,13 +3033,14 @@ fn issue_grant(
         .map_err(|_| anyhow::anyhow!("grant holder key must decode to 32 bytes"))?;
     let holder =
         VerifyingKey::from_bytes(&key_bytes).context("grant holder public key is invalid")?;
-    let grant = serctl_protocol::grant::OperationGrant::new(
+    let grant = serctl_protocol::grant::OperationGrant::new_with_ttl(
         profile.clone(),
         profile_id,
         unique,
         *budget,
         &holder,
         now_unix_ms(),
+        Duration::from_secs(u64::from(*ttl_secs)),
     )?;
     grants.insert(grant.clone())?;
     Ok(grant)
@@ -2433,6 +3156,7 @@ async fn unlock_profile(
     let sessions = Arc::new(SessionManager::new(creds.clone(), session));
     let conn_info = ConnInfo {
         profile: name.clone(),
+        profile_id: Some(profile_id),
         host: creds.host.clone(),
         user: creds.user.clone(),
         started: now_unix(),
@@ -2454,18 +3178,31 @@ async fn unlock_profile(
 /// Serve one authenticated v6 connection: the root request is the unlock, the
 /// catalog listing, a grant issuance, or a data-plane operation against a live
 /// credential lease (directly or through a grant).
-async fn handle_global_conn<S>(
-    io: V6ServerIo<S>,
-    prelude: V6RequestPrelude,
+struct GlobalHandlerContext {
     pool: Arc<ProfilePool>,
     grants: Arc<GrantRegistry>,
     shutdown_tx: watch::Sender<bool>,
     buffered_operation_slots: Arc<Semaphore>,
     tunnel_control_slots: Arc<Semaphore>,
+    transfers: Arc<TransferRegistry>,
+}
+
+async fn handle_global_conn<S>(
+    io: V6ServerIo<S>,
+    prelude: V6RequestPrelude,
+    context: GlobalHandlerContext,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let GlobalHandlerContext {
+        pool,
+        grants,
+        shutdown_tx,
+        buffered_operation_slots,
+        tunnel_control_slots,
+        transfers,
+    } = context;
     let (mut rd, mut wr) = tokio::io::split(io);
     let mut shutdown_rx = shutdown_tx.subscribe();
     let frame =
@@ -2551,6 +3288,7 @@ where
                     &mut wr,
                     &ipc::Frame::GrantIssued {
                         grant_id: grant.grant_id_hex(),
+                        issued_unix_ms: grant.issued_unix_ms,
                         expires_unix_ms: grant.expires_unix_ms,
                     },
                     Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
@@ -2718,6 +3456,7 @@ where
                 shutdown: shutdown_tx.clone(),
                 buffered_operation_slots,
                 tunnel_control_slots,
+                transfers,
                 call_key: entry.call_key.clone(),
                 authorization_deadline: Some(authorization_deadline),
             };
@@ -2784,6 +3523,7 @@ pub async fn run_global_with_idle_timeout(
     let idle = Arc::new(IdleTracker::default());
     let pool = Arc::new(ProfilePool::default());
     let grants = Arc::new(GrantRegistry::new(Arc::clone(&idle)));
+    let transfers = Arc::new(TransferRegistry::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut daemon_shutdown = shutdown_rx.clone();
     let connection_slots = Arc::new(Semaphore::new(GLOBAL_CONNECTION_LIMIT));
@@ -2831,6 +3571,7 @@ pub async fn run_global_with_idle_timeout(
                 let _ = handler_shutdown; // the global handler subscribes per connection
                 let pool = Arc::clone(&pool);
                 let grants = Arc::clone(&grants);
+                let transfers = Arc::clone(&transfers);
                 let secret = secret.clone();
                 let shutdown_tx = shutdown_tx.clone();
                 let buffered_operation_slots = Arc::clone(&buffered_operation_slots);
@@ -2850,15 +3591,14 @@ pub async fn run_global_with_idle_timeout(
                     {
                         Ok((session, prelude)) => {
                             let io = V6ServerIo::new(session);
-                            handle_global_conn(
-                                io,
-                                prelude,
+                            handle_global_conn(io, prelude, GlobalHandlerContext {
                                 pool,
                                 grants,
                                 shutdown_tx,
                                 buffered_operation_slots,
                                 tunnel_control_slots,
-                            )
+                                transfers,
+                            })
                             .await
                         }
                         Err(error) => {
@@ -3167,51 +3907,642 @@ fn zeroize_pending_shell_frames(receiver: &mut mpsc::Receiver<ZeroizingShellFram
     while receiver.try_recv().is_ok() {}
 }
 
-async fn serve_download<W>(
-    session: &SshSession,
-    writer: &mut W,
-    path: &str,
+struct DownloadServeRequest<'a> {
+    path: &'a str,
+    resume_offset: u64,
+    expected_size: Option<u64>,
+    expected_sha256: Option<&'a str>,
     timeout_ms: u64,
+    idle_timeout: Duration,
     deadline: Instant,
+    registry: &'a TransferRegistry,
+    profile: &'a str,
+    progress: ipc::TransferProgress,
+    cancellation: Arc<TransferCancellation>,
+}
+
+async fn read_native_transfer_frame<S>(
+    stream: &mut S,
+    cancellation: &TransferCancellation,
+    shutdown: &mut watch::Receiver<bool>,
+    deadline: Instant,
+    timeout_message: &'static str,
+) -> Result<native::Frame>
+where
+    S: AsyncRead + Unpin,
+{
+    tokio::select! {
+        result = tokio::time::timeout_at(deadline, native::read_frame(stream)) => {
+            result.map_err(|_| anyhow::anyhow!(timeout_message))??
+                .context("native transfer helper closed its protocol stream")
+        },
+        _ = cancellation.cancelled() => bail!("transfer cancelled"),
+        _ = shutdown.changed() => bail!("daemon shutting down during native transfer"),
+    }
+}
+
+async fn write_native_control_until<S>(
+    stream: &mut S,
+    control: &native::Control,
+    deadline: Instant,
+    timeout_message: &'static str,
 ) -> Result<()>
 where
+    S: AsyncWrite + Unpin,
+{
+    tokio::time::timeout_at(deadline, native::write_control(stream, control))
+        .await
+        .map_err(|_| anyhow::anyhow!(timeout_message))??;
+    Ok(())
+}
+
+async fn write_native_data_until<S>(
+    stream: &mut S,
+    data: &native::DataFrame,
+    deadline: Instant,
+    timeout_message: &'static str,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    tokio::time::timeout_at(deadline, native::write_data(stream, data))
+        .await
+        .map_err(|_| anyhow::anyhow!(timeout_message))??;
+    Ok(())
+}
+
+fn native_helper_error(code: &str, message: &str, outcome_unknown: bool) -> anyhow::Error {
+    if outcome_unknown {
+        anyhow::anyhow!("native helper error {code}: {message}; remote outcome is unknown")
+    } else {
+        anyhow::anyhow!("native helper error {code}: {message}")
+    }
+}
+
+async fn serve_native_download<R, W>(
+    channel: NativeTransferChannel,
+    reader: &mut R,
+    writer: &mut W,
+    request: DownloadServeRequest<'_>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let DownloadServeRequest {
+        path,
+        resume_offset,
+        expected_size,
+        expected_sha256,
+        timeout_ms,
+        idle_timeout,
+        deadline,
+        registry,
+        profile,
+        mut progress,
+        cancellation,
+    } = request;
+    let NativeTransferChannel {
+        mut stream,
+        chunk_bytes,
+        window_bytes,
+        ..
+    } = channel;
+    let transfer_id = native::parse_transfer_id(progress.transfer_id.as_str())?;
+    let mut progress_deadline = deadline.min(Instant::now() + idle_timeout);
     let operation = async {
-        let sftp = session.sftp_until(deadline).await?;
-        let mut file = sftp.open(path).await?;
-        let mut transferred = 0_u64;
-        let mut buffer = Zeroizing::new(vec![0_u8; 32 * 1024]);
-        loop {
-            let read = file.read(&mut buffer).await?;
-            if read == 0 {
-                file.shutdown().await?;
-                write_frame_until(
-                    writer,
-                    &ipc::Frame::TransferDone { bytes: transferred },
-                    deadline,
-                )
-                .await?;
-                return Ok(());
-            }
-            transferred = transferred
-                .checked_add(read as u64)
-                .ok_or_else(|| anyhow::anyhow!("download size overflow"))?;
-            if transferred > MAX_TRANSFER_BYTES {
-                bail!(
-                    "download exceeds the {} byte safety limit",
-                    MAX_TRANSFER_BYTES
+        write_native_control_until(
+            &mut stream,
+            &native::Control::BeginPull {
+                transfer_id: progress.transfer_id.as_str().to_owned(),
+                source: path.to_owned(),
+                offset: resume_offset,
+            },
+            progress_deadline,
+            "native download idle timeout elapsed",
+        )
+        .await?;
+        let (total, expected_sha256, start_offset) = match read_native_transfer_frame(
+            &mut stream,
+            &cancellation,
+            shutdown,
+            progress_deadline,
+            "native download idle timeout elapsed",
+        )
+        .await?
+        {
+            native::Frame::Control(native::Control::PullReady {
+                chunk,
+                window,
+                size,
+                sha256,
+                start_offset,
+            }) => {
+                ensure!(
+                    chunk > 0 && chunk <= chunk_bytes,
+                    "native helper exceeded the negotiated chunk size"
                 );
+                ensure!(
+                    window >= chunk && window <= window_bytes,
+                    "native helper exceeded the negotiated window"
+                );
+                ensure!(
+                    size <= MAX_TRANSFER_BYTES,
+                    "download exceeds the configured safety limit"
+                );
+                ensure!(
+                    start_offset == resume_offset,
+                    "native helper returned an unexpected resume offset"
+                );
+                if let Some(expected_size) = expected_size {
+                    ensure!(
+                        size == expected_size,
+                        "remote source size changed since the resume journal was written"
+                    );
+                }
+                if let Some(expected_sha256) = expected_sha256 {
+                    ensure!(
+                        sha256 == expected_sha256,
+                        "remote source SHA-256 changed since the resume journal was written"
+                    );
+                }
+                (size, sha256, start_offset)
             }
-            let frame = ZeroizingResponseFrame(ipc::Frame::FileChunk {
-                data: buffer[..read].to_vec(),
-            });
-            write_frame_until(writer, &frame.0, deadline).await?;
+            native::Frame::Control(native::Control::Error {
+                code,
+                message,
+                outcome_unknown,
+            }) => return Err(native_helper_error(&code, &message, outcome_unknown)),
+            _ => bail!("native helper did not accept the download request"),
+        };
+        ensure!(
+            expected_sha256.len() == 64
+                && expected_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "native helper returned an invalid SHA-256"
+        );
+        progress.total_bytes = total;
+        progress.confirmed_bytes = start_offset;
+        progress.durable_bytes = start_offset;
+        progress.stage = ipc::TransferStage::Transferring;
+        if start_offset > 0 {
+            progress.event = "resumed".to_owned();
         }
+        progress.updated_unix_ms = now_unix_ms();
+        registry.update(profile, progress.clone())?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        progress.event = "progress".to_owned();
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferDigest {
+                transfer_id: progress.transfer_id.clone(),
+                sha256: expected_sha256.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+
+        let mut received = start_offset;
+        let mut client_durable = start_offset;
+        let mut received_hasher = Sha256::new();
+        let mut last_progress_write = Instant::now();
+        loop {
+            match read_native_transfer_frame(
+                &mut stream,
+                &cancellation,
+                shutdown,
+                progress_deadline,
+                "native download idle timeout elapsed",
+            )
+            .await?
+            {
+                native::Frame::Data(data) => {
+                    ensure!(
+                        data.transfer_id == transfer_id,
+                        "native download transfer id mismatch"
+                    );
+                    ensure!(
+                        data.offset == received,
+                        "native download offset gap, replay, or reordering"
+                    );
+                    ensure!(
+                        data.payload.len() <= chunk_bytes as usize,
+                        "native download chunk exceeded the negotiated limit"
+                    );
+                    let next = received
+                        .checked_add(data.payload.len() as u64)
+                        .context("native download size overflow")?;
+                    ensure!(next <= total, "native download exceeded its declared size");
+                    received_hasher.update(&data.payload);
+                    write_frame_until(
+                        writer,
+                        &ipc::Frame::FileChunk { data: data.payload },
+                        progress_deadline,
+                    )
+                    .await?;
+                    match tokio::select! {
+                        result = tokio::time::timeout_at(
+                            progress_deadline,
+                            ipc::read_frame_limited(reader, ipc::MAX_CONTROL_FRAME),
+                        ) => result.map_err(|_| anyhow::anyhow!("native download idle timeout elapsed"))??,
+                        _ = cancellation.cancelled() => bail!("transfer cancelled"),
+                        _ = shutdown.changed() => bail!("daemon shutting down during native download"),
+                    } {
+                        Some(ipc::Frame::TransferAck {
+                            confirmed_bytes,
+                            durable_bytes,
+                        }) => {
+                            ensure!(
+                                confirmed_bytes == next,
+                                "client confirmed an unexpected native download offset"
+                            );
+                            ensure!(
+                                durable_bytes >= client_durable && durable_bytes <= confirmed_bytes,
+                                "client reported an invalid native download durable offset"
+                            );
+                            client_durable = durable_bytes;
+                        }
+                        Some(mut unexpected) => {
+                            unexpected.zeroize_sensitive();
+                            bail!("client did not acknowledge the native download chunk")
+                        }
+                        None => bail!("client disconnected during native download"),
+                    }
+                    received = next;
+                    write_native_control_until(
+                        &mut stream,
+                        &native::Control::Ack {
+                            confirmed_offset: received,
+                            durable_offset: client_durable,
+                            receiver_window: window_bytes,
+                        },
+                        progress_deadline,
+                        "native download idle timeout elapsed",
+                    )
+                    .await?;
+                    progress.confirmed_bytes = received;
+                    progress.durable_bytes = client_durable;
+                    progress.updated_unix_ms = now_unix_ms();
+                    registry.update(profile, progress.clone())?;
+                    progress_deadline = deadline.min(Instant::now() + idle_timeout);
+                    if last_progress_write.elapsed() >= Duration::from_millis(250) {
+                        write_frame_until(
+                            writer,
+                            &ipc::Frame::TransferProgress {
+                                progress: progress.clone(),
+                            },
+                            progress_deadline,
+                        )
+                        .await?;
+                        last_progress_write = Instant::now();
+                    }
+                }
+                native::Frame::Control(native::Control::Completed { size, sha256 }) => {
+                    ensure!(
+                        size == total && received == total,
+                        "native download size mismatch"
+                    );
+                    let suffix_sha256 = hex::encode(received_hasher.finalize());
+                    ensure!(
+                        sha256 == expected_sha256
+                            && (start_offset > 0 || suffix_sha256 == expected_sha256),
+                        "native download SHA-256 mismatch"
+                    );
+                    break;
+                }
+                native::Frame::Control(native::Control::Error {
+                    code,
+                    message,
+                    outcome_unknown,
+                }) => return Err(native_helper_error(&code, &message, outcome_unknown)),
+                _ => bail!("unexpected native download frame"),
+            }
+        }
+        progress.stage = ipc::TransferStage::Verifying;
+        progress.updated_unix_ms = now_unix_ms();
+        registry.update(profile, progress.clone())?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferDone { bytes: total },
+            progress_deadline,
+        )
+        .await?;
+        match tokio::select! {
+            result = tokio::time::timeout_at(
+                progress_deadline,
+                ipc::read_frame_limited(reader, ipc::MAX_CONTROL_FRAME),
+            ) => result.map_err(|_| anyhow::anyhow!("native download idle timeout elapsed"))??,
+            _ = cancellation.cancelled() => bail!("transfer cancelled"),
+            _ = shutdown.changed() => bail!("daemon shutting down during native download"),
+        } {
+            Some(ipc::Frame::Ack) => {}
+            Some(mut unexpected) => {
+                unexpected.zeroize_sensitive();
+                bail!("client did not confirm the native download commit")
+            }
+            None => bail!("client disconnected before confirming the native download commit"),
+        }
+        progress.durable_bytes = total;
+        progress = terminal_transfer_progress(
+            progress.clone(),
+            ipc::TransferStage::Completed,
+            "completed",
+        );
+        registry.finish(profile, progress.clone())?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        Ok(())
     };
     match tokio::time::timeout_at(deadline, operation).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
+            if !cancellation.is_cancelled() && is_transfer_stall_error(&error) {
+                progress.stage = ipc::TransferStage::Stalled;
+                progress.event = "stalled".to_owned();
+                progress.updated_unix_ms = now_unix_ms();
+                registry.update(profile, progress.clone())?;
+                let _ = write_frame_until(
+                    writer,
+                    &ipc::Frame::TransferProgress {
+                        progress: progress.clone(),
+                    },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                )
+                .await;
+            }
+            let (stage, event) = if cancellation.is_cancelled() {
+                (ipc::TransferStage::Cancelled, "cancelled")
+            } else {
+                (ipc::TransferStage::Failed, "failed")
+            };
+            progress = terminal_transfer_progress(progress, stage, event);
+            registry.finish(profile, progress)?;
+            Err(error)
+        }
+        Err(_) => {
+            progress.stage = ipc::TransferStage::Stalled;
+            progress.event = "stalled".to_owned();
+            progress.updated_unix_ms = now_unix_ms();
+            registry.update(profile, progress.clone())?;
+            let _ = write_frame_until(
+                writer,
+                &ipc::Frame::TransferProgress {
+                    progress: progress.clone(),
+                },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+            )
+            .await;
+            progress = terminal_transfer_progress(progress, ipc::TransferStage::Failed, "failed");
+            registry.finish(profile, progress)?;
+            bail!("native download exceeded its deadline of {timeout_ms} ms")
+        }
+    }
+}
+
+async fn serve_download<R, W>(
+    session: &SshSession,
+    reader: &mut R,
+    writer: &mut W,
+    request: DownloadServeRequest<'_>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let DownloadServeRequest {
+        path,
+        resume_offset: _,
+        expected_size: _,
+        expected_sha256: _,
+        timeout_ms,
+        idle_timeout,
+        deadline,
+        registry,
+        profile,
+        mut progress,
+        cancellation,
+    } = request;
+    let mut progress_deadline = deadline.min(Instant::now() + idle_timeout);
+    let operation = async {
+        let sftp = session.sftp_until(progress_deadline).await?;
+        let mut file = tokio::time::timeout_at(progress_deadline, sftp.open(path))
+            .await
+            .map_err(|_| anyhow::anyhow!("SFTP download idle timeout elapsed"))??;
+        let total = tokio::time::timeout_at(progress_deadline, file.metadata())
+            .await
+            .map_err(|_| anyhow::anyhow!("SFTP download idle timeout elapsed"))??
+            .len();
+        ensure!(
+            total <= MAX_TRANSFER_BYTES,
+            "download exceeds the {} byte safety limit",
+            MAX_TRANSFER_BYTES
+        );
+        progress.total_bytes = total;
+        progress.stage = ipc::TransferStage::Transferring;
+        progress.updated_unix_ms = now_unix_ms();
+        registry.update(profile, progress.clone())?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        let mut transferred = 0_u64;
+        let mut sent_hasher = Sha256::new();
+        let mut last_progress_write = Instant::now();
+        let mut buffer = Zeroizing::new(vec![0_u8; ipc::SFTP_SAFE_CHUNK_BYTES]);
+        loop {
+            let read = tokio::select! {
+                result = tokio::time::timeout_at(progress_deadline, file.read(&mut buffer)) => {
+                    result.map_err(|_| anyhow::anyhow!("SFTP download idle timeout elapsed"))??
+                },
+                _ = cancellation.cancelled() => bail!("transfer cancelled"),
+                _ = shutdown.changed() => bail!("daemon shutting down during download"),
+            };
+            if read == 0 {
+                tokio::time::timeout_at(progress_deadline, file.shutdown())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("SFTP download idle timeout elapsed"))??;
+                break;
+            }
+            let next = transferred
+                .checked_add(read as u64)
+                .ok_or_else(|| anyhow::anyhow!("download size overflow"))?;
+            if next > total || next > MAX_TRANSFER_BYTES {
+                bail!("remote source size changed during download or exceeded the safety limit");
+            }
+            let frame = ZeroizingResponseFrame(ipc::Frame::FileChunk {
+                data: buffer[..read].to_vec(),
+            });
+            sent_hasher.update(&buffer[..read]);
+            write_frame_until(writer, &frame.0, progress_deadline).await?;
+            let acknowledgement = tokio::select! {
+                result = tokio::time::timeout_at(
+                    progress_deadline,
+                    ipc::read_frame_limited(reader, ipc::MAX_CONTROL_FRAME),
+                ) => match result {
+                    Ok(result) => result?,
+                    Err(_) => bail!("SFTP download exceeded its deadline of {timeout_ms} ms"),
+                },
+                _ = cancellation.cancelled() => bail!("transfer cancelled"),
+                _ = shutdown.changed() => bail!("daemon shutting down during download"),
+            };
+            match acknowledgement {
+                Some(ipc::Frame::TransferAck {
+                    confirmed_bytes,
+                    durable_bytes,
+                }) => {
+                    ensure!(
+                        confirmed_bytes == next && durable_bytes <= confirmed_bytes,
+                        "client acknowledged an invalid downloaded offset"
+                    );
+                    progress.durable_bytes = durable_bytes;
+                }
+                Some(mut unexpected) => {
+                    unexpected.zeroize_sensitive();
+                    bail!("client did not acknowledge the downloaded chunk")
+                }
+                None => bail!("client disconnected during download"),
+            }
+            transferred = next;
+            progress.confirmed_bytes = transferred;
+            progress.updated_unix_ms = now_unix_ms();
+            registry.update(profile, progress.clone())?;
+            progress_deadline = deadline.min(Instant::now() + idle_timeout);
+            if last_progress_write.elapsed() >= Duration::from_millis(250) {
+                write_frame_until(
+                    writer,
+                    &ipc::Frame::TransferProgress {
+                        progress: progress.clone(),
+                    },
+                    progress_deadline,
+                )
+                .await?;
+                last_progress_write = Instant::now();
+            }
+        }
+        ensure!(
+            transferred == total,
+            "remote source size changed during download"
+        );
+        progress.stage = ipc::TransferStage::Verifying;
+        progress.updated_unix_ms = now_unix_ms();
+        registry.update(profile, progress.clone())?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferDigest {
+                transfer_id: progress.transfer_id.clone(),
+                sha256: hex::encode(sent_hasher.finalize()),
+            },
+            progress_deadline,
+        )
+        .await?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferDone { bytes: transferred },
+            progress_deadline,
+        )
+        .await?;
+        // The client sends this final Ack only after its protected temporary
+        // file has been verified and committed with no-overwrite semantics.
+        match tokio::select! {
+            result = tokio::time::timeout_at(
+                progress_deadline,
+                ipc::read_frame_limited(reader, ipc::MAX_CONTROL_FRAME),
+            ) => match result {
+                Ok(result) => result?,
+                Err(_) => bail!("SFTP download exceeded its deadline of {timeout_ms} ms"),
+            },
+            _ = cancellation.cancelled() => bail!("transfer cancelled"),
+            _ = shutdown.changed() => bail!("daemon shutting down during download"),
+        } {
+            Some(ipc::Frame::Ack) => {}
+            Some(mut unexpected) => {
+                unexpected.zeroize_sensitive();
+                bail!("client did not confirm the local no-overwrite commit")
+            }
+            None => bail!("client disconnected before confirming the local commit"),
+        }
+        progress.durable_bytes = total;
+        progress = terminal_transfer_progress(
+            progress.clone(),
+            ipc::TransferStage::Completed,
+            "completed",
+        );
+        registry.finish(profile, progress.clone())?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        Ok(())
+    };
+    match tokio::time::timeout_at(deadline, operation).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            if !cancellation.is_cancelled() && is_transfer_stall_error(&error) {
+                progress.stage = ipc::TransferStage::Stalled;
+                progress.event = "stalled".to_owned();
+                progress.updated_unix_ms = now_unix_ms();
+                registry.update(profile, progress.clone())?;
+                let _ = write_frame_until(
+                    writer,
+                    &ipc::Frame::TransferProgress {
+                        progress: progress.clone(),
+                    },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                )
+                .await;
+            }
+            let stage = if cancellation.is_cancelled() {
+                ipc::TransferStage::Cancelled
+            } else {
+                ipc::TransferStage::Failed
+            };
+            let event = if cancellation.is_cancelled() {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            progress = terminal_transfer_progress(progress, stage, event);
+            registry.finish(profile, progress)?;
             // A blocked/broken IPC consumer says nothing about the SSH/SFTP
             // protocol state. The current SFTP request has already completed
             // before its FileChunk is written, and dropping the file/session
@@ -3224,6 +4555,20 @@ where
             Err(error)
         }
         Err(_) => {
+            progress.stage = ipc::TransferStage::Stalled;
+            progress.event = "stalled".to_owned();
+            progress.updated_unix_ms = now_unix_ms();
+            registry.update(profile, progress.clone())?;
+            let _ = write_frame_until(
+                writer,
+                &ipc::Frame::TransferProgress {
+                    progress: progress.clone(),
+                },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+            )
+            .await;
+            progress = terminal_transfer_progress(progress, ipc::TransferStage::Failed, "failed");
+            registry.finish(profile, progress)?;
             session.invalidate().await;
             bail!("SFTP download exceeded its deadline of {timeout_ms} ms")
         }
@@ -3233,13 +4578,389 @@ where
 struct UploadRequest<'a> {
     path: &'a str,
     size: u64,
+    sha256: &'a str,
+    resume: ipc::TransferResumeMode,
+    resume_token: Option<&'a str>,
     timeout_ms: u64,
+    idle_timeout: Duration,
     deadline: Instant,
+    registry: &'a TransferRegistry,
+    profile: &'a str,
+    progress: ipc::TransferProgress,
+    cancellation: Arc<TransferCancellation>,
+}
+
+async fn serve_native_upload<R, W>(
+    channel: NativeTransferChannel,
+    reader: &mut R,
+    writer: &mut W,
+    request: UploadRequest<'_>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let UploadRequest {
+        path,
+        size,
+        sha256,
+        resume,
+        resume_token,
+        timeout_ms,
+        idle_timeout,
+        deadline,
+        registry,
+        profile,
+        mut progress,
+        cancellation,
+    } = request;
+    let NativeTransferChannel {
+        mut stream,
+        chunk_bytes,
+        window_bytes,
+        ..
+    } = channel;
+    let transfer_id = native::parse_transfer_id(progress.transfer_id.as_str())?;
+    let mut progress_deadline = deadline.min(Instant::now() + idle_timeout);
+    let mut commit_sent = false;
+    let operation = async {
+        validate_upload_remote_path(path)?;
+        ensure!(
+            size <= MAX_TRANSFER_BYTES,
+            "upload exceeds the configured safety limit"
+        );
+        let ephemeral_token;
+        let effective_resume_token = if let Some(token) = resume_token {
+            token
+        } else {
+            ephemeral_token = Zeroizing::new(format!(
+                "{}{}",
+                ipc::TransferId::random().as_str(),
+                ipc::TransferId::random().as_str()
+            ));
+            ephemeral_token.as_str()
+        };
+        let begin_push = Zeroizing::new(native::Control::BeginPush {
+            transfer_id: progress.transfer_id.as_str().to_owned(),
+            target: path.to_owned(),
+            size,
+            sha256: sha256.to_owned(),
+            resume_token: effective_resume_token.to_owned(),
+            resume: resume == ipc::TransferResumeMode::Auto,
+        });
+        write_native_control_until(
+            &mut stream,
+            &begin_push,
+            progress_deadline,
+            "native upload idle timeout elapsed",
+        )
+        .await?;
+        let (helper_chunk, helper_window, mut confirmed, mut durable) =
+            match read_native_transfer_frame(
+                &mut stream,
+                &cancellation,
+                shutdown,
+                progress_deadline,
+                "native upload idle timeout elapsed",
+            )
+            .await?
+            {
+                native::Frame::Control(native::Control::Ready {
+                    chunk,
+                    window,
+                    durable_offset,
+                }) => {
+                    ensure!(
+                        chunk > 0 && chunk <= chunk_bytes,
+                        "native helper exceeded the negotiated chunk size"
+                    );
+                    ensure!(
+                        window >= chunk && window <= window_bytes,
+                        "native helper exceeded the negotiated window"
+                    );
+                    ensure!(
+                        durable_offset <= size,
+                        "native helper returned a resume offset beyond the source size"
+                    );
+                    if resume == ipc::TransferResumeMode::Never {
+                        ensure!(
+                            durable_offset == 0,
+                            "native helper resumed a resume=never upload"
+                        );
+                    }
+                    (chunk, window, durable_offset, durable_offset)
+                }
+                native::Frame::Control(native::Control::Error {
+                    code,
+                    message,
+                    outcome_unknown,
+                }) => return Err(native_helper_error(&code, &message, outcome_unknown)),
+                _ => bail!("native helper did not accept the upload request"),
+            };
+        progress.chunk_bytes = helper_chunk;
+        progress.window_bytes = helper_window;
+        progress.stage = ipc::TransferStage::Transferring;
+        progress.confirmed_bytes = confirmed;
+        progress.durable_bytes = durable;
+        if confirmed > 0 {
+            progress.event = "resumed".to_owned();
+        }
+        progress.updated_unix_ms = now_unix_ms();
+        registry.update(profile, progress.clone())?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        progress.event = "progress".to_owned();
+        write_frame_until(writer, &ipc::Frame::Ack, progress_deadline).await?;
+        let mut last_progress_write = Instant::now();
+        loop {
+            let frame = tokio::select! {
+                result = tokio::time::timeout_at(
+                    progress_deadline,
+                    ipc::read_frame_limited(reader, ipc::MAX_UPLOAD_FRAME),
+                ) => result.map_err(|_| anyhow::anyhow!("native upload idle timeout elapsed"))??,
+                _ = shutdown.changed() => bail!("daemon shutting down during native upload"),
+                _ = cancellation.cancelled() => bail!("transfer cancelled"),
+            };
+            match frame {
+                Some(ipc::Frame::UploadChunk { data }) => {
+                    let mut data = Zeroizing::new(data);
+                    ensure!(
+                        !data.is_empty() && data.len() <= helper_chunk as usize,
+                        "native upload chunk exceeds the negotiated size"
+                    );
+                    let next = confirmed
+                        .checked_add(data.len() as u64)
+                        .context("native upload size overflow")?;
+                    ensure!(next <= size, "native upload exceeded its declared size");
+                    let native_data =
+                        native::DataFrame::new(transfer_id, confirmed, std::mem::take(&mut *data))?;
+                    write_native_data_until(
+                        &mut stream,
+                        &native_data,
+                        progress_deadline,
+                        "native upload idle timeout elapsed",
+                    )
+                    .await?;
+                    match read_native_transfer_frame(
+                        &mut stream,
+                        &cancellation,
+                        shutdown,
+                        progress_deadline,
+                        "native upload idle timeout elapsed",
+                    )
+                    .await?
+                    {
+                        native::Frame::Control(native::Control::Ack {
+                            confirmed_offset,
+                            durable_offset,
+                            receiver_window,
+                        }) => {
+                            ensure!(
+                                confirmed_offset == next,
+                                "native upload acknowledgement offset mismatch"
+                            );
+                            ensure!(
+                                durable_offset >= durable && durable_offset <= confirmed_offset,
+                                "native upload durable offset is invalid"
+                            );
+                            ensure!(
+                                receiver_window >= helper_chunk && receiver_window <= helper_window,
+                                "native helper returned an invalid receiver window"
+                            );
+                            confirmed = confirmed_offset;
+                            durable = durable_offset;
+                        }
+                        native::Frame::Control(native::Control::Error {
+                            code,
+                            message,
+                            outcome_unknown,
+                        }) => return Err(native_helper_error(&code, &message, outcome_unknown)),
+                        _ => bail!("native upload acknowledgement mismatch"),
+                    }
+                    progress.stage = ipc::TransferStage::Transferring;
+                    progress.confirmed_bytes = confirmed;
+                    progress.durable_bytes = durable;
+                    progress.updated_unix_ms = now_unix_ms();
+                    registry.update(profile, progress.clone())?;
+                    progress_deadline = deadline.min(Instant::now() + idle_timeout);
+                    if last_progress_write.elapsed() >= Duration::from_millis(250) {
+                        write_frame_until(
+                            writer,
+                            &ipc::Frame::TransferProgress {
+                                progress: progress.clone(),
+                            },
+                            progress_deadline,
+                        )
+                        .await?;
+                        last_progress_write = Instant::now();
+                    }
+                    write_frame_until(writer, &ipc::Frame::Ack, progress_deadline).await?;
+                }
+                Some(ipc::Frame::UploadEnd) => break,
+                Some(mut unexpected) => {
+                    unexpected.zeroize_sensitive();
+                    bail!("unexpected frame during native upload")
+                }
+                None => bail!("client disconnected during native upload"),
+            }
+        }
+        ensure!(confirmed == size, "native upload size mismatch");
+        progress.stage = ipc::TransferStage::Verifying;
+        progress.updated_unix_ms = now_unix_ms();
+        registry.update(profile, progress.clone())?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        commit_sent = true;
+        progress.stage = ipc::TransferStage::Committing;
+        progress.updated_unix_ms = now_unix_ms();
+        registry.update(profile, progress.clone())?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        write_native_control_until(
+            &mut stream,
+            &native::Control::Commit,
+            progress_deadline,
+            "native upload commit outcome unknown after timeout",
+        )
+        .await?;
+        match read_native_transfer_frame(
+            &mut stream,
+            &cancellation,
+            shutdown,
+            progress_deadline,
+            "native upload commit outcome unknown after timeout",
+        )
+        .await?
+        {
+            native::Frame::Control(native::Control::Completed {
+                size: completed_size,
+                sha256: completed_sha256,
+            }) => {
+                ensure!(
+                    completed_size == size && completed_sha256 == sha256,
+                    "native upload completion proof mismatch"
+                );
+            }
+            native::Frame::Control(native::Control::Error {
+                code,
+                message,
+                outcome_unknown,
+            }) => return Err(native_helper_error(&code, &message, outcome_unknown)),
+            _ => bail!("native helper did not confirm the upload commit"),
+        }
+        progress.confirmed_bytes = size;
+        progress.durable_bytes = size;
+        progress = terminal_transfer_progress(
+            progress.clone(),
+            ipc::TransferStage::Completed,
+            "completed",
+        );
+        registry.finish(profile, progress.clone())?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferDone { bytes: size },
+            progress_deadline,
+        )
+        .await?;
+        Ok(())
+    };
+    let result = tokio::time::timeout_at(deadline, operation).await;
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            if !cancellation.is_cancelled() && is_transfer_stall_error(&error) {
+                progress.stage = ipc::TransferStage::Stalled;
+                progress.event = "stalled".to_owned();
+                progress.updated_unix_ms = now_unix_ms();
+                registry.update(profile, progress.clone())?;
+                let _ = write_frame_until(
+                    writer,
+                    &ipc::Frame::TransferProgress {
+                        progress: progress.clone(),
+                    },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                )
+                .await;
+            }
+            let (stage, event) = if commit_sent {
+                (ipc::TransferStage::Failed, "outcome_unknown")
+            } else if cancellation.is_cancelled() {
+                (ipc::TransferStage::Cancelled, "cancelled")
+            } else {
+                (ipc::TransferStage::Failed, "failed")
+            };
+            progress = terminal_transfer_progress(progress, stage, event);
+            registry.finish(profile, progress)?;
+            if commit_sent {
+                Err(error).context(format!(
+                    "native upload commit outcome unknown; inspect {path} before retry"
+                ))
+            } else {
+                Err(error)
+            }
+        }
+        Err(_) => {
+            progress.stage = ipc::TransferStage::Stalled;
+            progress.event = "stalled".to_owned();
+            progress.updated_unix_ms = now_unix_ms();
+            registry.update(profile, progress.clone())?;
+            let _ = write_frame_until(
+                writer,
+                &ipc::Frame::TransferProgress {
+                    progress: progress.clone(),
+                },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+            )
+            .await;
+            progress = terminal_transfer_progress(
+                progress,
+                ipc::TransferStage::Failed,
+                if commit_sent {
+                    "outcome_unknown"
+                } else {
+                    "failed"
+                },
+            );
+            registry.finish(profile, progress)?;
+            if commit_sent {
+                bail!("native upload commit outcome unknown after its deadline of {timeout_ms} ms")
+            }
+            bail!("native upload exceeded its deadline of {timeout_ms} ms")
+        }
+    }
 }
 
 async fn upload_remote_step<R, F, T, S>(
     reader: &mut R,
     shutdown: &mut watch::Receiver<bool>,
+    cancellation: &TransferCancellation,
     deadline: Instant,
     uncertain: &AtomicBool,
     on_first_poll: S,
@@ -3270,6 +4991,10 @@ where
             uncertain.store(true, Ordering::Release);
             bail!("daemon shutting down during upload")
         },
+        _ = cancellation.cancelled() => {
+            uncertain.store(true, Ordering::Release);
+            bail!("transfer cancelled")
+        },
     }
 }
 
@@ -3287,11 +5012,20 @@ where
     let UploadRequest {
         path,
         size,
+        sha256,
+        resume: _,
+        resume_token: _,
         timeout_ms,
+        idle_timeout,
         deadline,
+        registry,
+        profile,
+        mut progress,
+        cancellation,
     } = request;
+    let mut progress_deadline = deadline.min(Instant::now() + idle_timeout);
     let sftp = match tokio::select! {
-        result = session.sftp_until(deadline) => Some(result),
+        result = session.sftp_until(progress_deadline) => Some(result),
         _ = reader.read_u8() => None,
         _ = shutdown.changed() => None,
     } {
@@ -3317,7 +5051,8 @@ where
         if upload_remote_step(
             reader,
             shutdown,
-            deadline,
+            &cancellation,
+            progress_deadline,
             &invalidate_after_cleanup,
             || {},
             async { Ok(sftp.try_exists(path).await?) },
@@ -3329,18 +5064,11 @@ where
         let opened = upload_remote_step(
             reader,
             shutdown,
-            deadline,
+            &cancellation,
+            progress_deadline,
             &invalidate_after_cleanup,
             || partial_may_exist = true,
-            async {
-                Ok(sftp
-                    .open_with_flags_and_attributes(
-                        &partial,
-                        OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
-                        protected_upload_file_attributes(),
-                    )
-                    .await?)
-            },
+            session.confirmed_sftp_upload_until(&partial, progress_deadline),
         )
         .await;
         let mut file = match opened {
@@ -3354,12 +5082,22 @@ where
                 return Err(error);
             }
         };
-        write_frame_until(writer, &ipc::Frame::Ack, deadline).await?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        write_frame_until(writer, &ipc::Frame::Ack, progress_deadline).await?;
         let mut transferred = 0_u64;
+        let mut received_hasher = Sha256::new();
+        let mut last_progress_write = Instant::now();
         loop {
             let frame = tokio::select! {
                 result = tokio::time::timeout_at(
-                    deadline,
+                    progress_deadline,
                     ipc::read_frame_limited(reader, ipc::MAX_UPLOAD_FRAME),
                 ) => match result {
                     Ok(result) => result?,
@@ -3371,6 +5109,10 @@ where
                 _ = shutdown.changed() => {
                     invalidate_after_cleanup.store(true, Ordering::Release);
                     bail!("daemon shutting down during upload")
+                },
+                _ = cancellation.cancelled() => {
+                    invalidate_after_cleanup.store(true, Ordering::Release);
+                    bail!("transfer cancelled")
                 },
             };
             match frame {
@@ -3391,19 +5133,38 @@ where
                     let write = upload_remote_step(
                         reader,
                         shutdown,
-                        deadline,
+                        &cancellation,
+                        progress_deadline,
                         &invalidate_after_cleanup,
                         || {},
-                        async {
-                            file.write_all(&data).await?;
-                            Ok(())
-                        },
+                        file.write_confirmed(&data),
                     )
                     .await;
+                    let confirmed = write?;
+                    ensure!(
+                        confirmed == next,
+                        "SFTP upload confirmation offset mismatch"
+                    );
+                    received_hasher.update(data.as_slice());
                     data.zeroize();
-                    write?;
                     transferred = next;
-                    write_frame_until(writer, &ipc::Frame::Ack, deadline).await?;
+                    progress.stage = ipc::TransferStage::Transferring;
+                    progress.confirmed_bytes = transferred;
+                    progress.updated_unix_ms = now_unix_ms();
+                    registry.update(profile, progress.clone())?;
+                    progress_deadline = deadline.min(Instant::now() + idle_timeout);
+                    if last_progress_write.elapsed() >= Duration::from_millis(250) {
+                        write_frame_until(
+                            writer,
+                            &ipc::Frame::TransferProgress {
+                                progress: progress.clone(),
+                            },
+                            progress_deadline,
+                        )
+                        .await?;
+                        last_progress_write = Instant::now();
+                    }
+                    write_frame_until(writer, &ipc::Frame::Ack, progress_deadline).await?;
                 }
                 Some(ipc::Frame::UploadEnd) => break,
                 Some(mut frame) => {
@@ -3419,35 +5180,92 @@ where
         if transferred != size {
             bail!("upload size mismatch: expected {size}, received {transferred}");
         }
-        upload_remote_step(
+        ensure!(
+            hex::encode(received_hasher.finalize()) == sha256,
+            "upload source changed after preflight hashing"
+        );
+        let closed_at = upload_remote_step(
             reader,
             shutdown,
-            deadline,
+            &cancellation,
+            progress_deadline,
             &invalidate_after_cleanup,
             || {},
-            async {
-                file.flush().await?;
-                Ok(())
-            },
+            file.close_confirmed(),
         )
         .await?;
-        upload_remote_step(
-            reader,
-            shutdown,
-            deadline,
-            &invalidate_after_cleanup,
-            || {},
-            async {
-                file.shutdown().await?;
-                Ok(())
-            },
-        )
-        .await?;
+        ensure!(
+            closed_at == transferred,
+            "SFTP upload close offset mismatch"
+        );
         drop(file);
+        progress.stage = ipc::TransferStage::Verifying;
+        progress.confirmed_bytes = transferred;
+        progress.updated_unix_ms = now_unix_ms();
+        registry.update(profile, progress.clone())?;
+        progress_deadline = deadline.min(Instant::now() + idle_timeout);
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
+        let mut verify_file = upload_remote_step(
+            reader,
+            shutdown,
+            &cancellation,
+            progress_deadline,
+            &invalidate_after_cleanup,
+            || {},
+            async { Ok(sftp.open(&partial).await?) },
+        )
+        .await?;
+        let mut remote_hasher = Sha256::new();
+        // Verification is read-only and has no queued-WRITE acknowledgement
+        // ambiguity. Use the bounded upload-frame payload cap to avoid one
+        // extra SFTP round trip per conservative upload chunk on
+        // higher-latency servers.
+        let mut verify_buffer = Zeroizing::new(vec![0_u8; MAX_UPLOAD_CHUNK_BYTES]);
+        let mut verified_bytes = 0_u64;
+        loop {
+            let read = upload_remote_step(
+                reader,
+                shutdown,
+                &cancellation,
+                progress_deadline,
+                &invalidate_after_cleanup,
+                || {},
+                async { Ok(verify_file.read(&mut verify_buffer).await?) },
+            )
+            .await?;
+            if read == 0 {
+                break;
+            }
+            remote_hasher.update(&verify_buffer[..read]);
+            verified_bytes = verified_bytes
+                .checked_add(read as u64)
+                .context("remote verification byte count overflow")?;
+            ensure!(
+                verified_bytes <= size,
+                "remote partial grew during verification"
+            );
+        }
+        verify_file.shutdown().await?;
+        ensure!(
+            verified_bytes == size,
+            "remote partial size changed during verification"
+        );
+        ensure!(
+            hex::encode(remote_hasher.finalize()) == sha256,
+            "remote partial SHA-256 mismatch"
+        );
         if upload_remote_step(
             reader,
             shutdown,
-            deadline,
+            &cancellation,
+            progress_deadline,
             &invalidate_after_cleanup,
             || {},
             async { Ok(sftp.try_exists(path).await?) },
@@ -3456,15 +5274,27 @@ where
         {
             bail!("remote destination was created during upload: {path}");
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= progress_deadline {
             invalidate_after_cleanup.store(true, Ordering::Release);
             bail!("SFTP upload exceeded its deadline of {timeout_ms} ms");
         }
         commit_started.store(true, Ordering::Release);
+        progress.stage = ipc::TransferStage::Committing;
+        progress.updated_unix_ms = now_unix_ms();
+        registry.update(profile, progress.clone())?;
+        write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            progress_deadline,
+        )
+        .await?;
         let commit = upload_remote_step(
             reader,
             shutdown,
-            deadline,
+            &cancellation,
+            progress_deadline,
             &invalidate_after_cleanup,
             || {},
             commit_remote_upload_no_replace_until(
@@ -3472,7 +5302,7 @@ where
                 &partial,
                 path,
                 &remote_committed,
-                deadline,
+                progress_deadline,
                 "SFTP upload exceeded its deadline",
             ),
         )
@@ -3501,6 +5331,44 @@ where
     drop(sftp);
     let committed = remote_committed.load(Ordering::Acquire);
     if committed {
+        progress.confirmed_bytes = size;
+        progress.durable_bytes = size;
+        progress = terminal_transfer_progress(progress, ipc::TransferStage::Completed, "completed");
+        registry.finish(profile, progress.clone())?;
+    } else if operation.is_err() {
+        if !cancellation.is_cancelled()
+            && operation
+                .as_ref()
+                .err()
+                .is_some_and(is_transfer_stall_error)
+        {
+            progress.stage = ipc::TransferStage::Stalled;
+            progress.event = "stalled".to_owned();
+            progress.updated_unix_ms = now_unix_ms();
+            registry.update(profile, progress.clone())?;
+            let _ = write_frame_until(
+                writer,
+                &ipc::Frame::TransferProgress {
+                    progress: progress.clone(),
+                },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+            )
+            .await;
+        }
+        let stage = if cancellation.is_cancelled() {
+            ipc::TransferStage::Cancelled
+        } else {
+            ipc::TransferStage::Failed
+        };
+        let event = if cancellation.is_cancelled() {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        progress = terminal_transfer_progress(progress, stage, event);
+        registry.finish(profile, progress.clone())?;
+    }
+    if committed {
         if let Err(error) = &operation {
             log::warn!(
                 "upload to {} committed before post-commit cleanup was interrupted: {}",
@@ -3517,14 +5385,26 @@ where
     // consume longer than the client's post-deadline reconciliation window
     // and falsely report an already committed upload as "outcome unknown".
     let committed_response = if committed {
-        Some(
-            write_frame_until(
-                writer,
-                &ipc::Frame::TransferDone { bytes: size },
-                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-            )
-            .await,
+        let response_deadline = Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT;
+        let progress_response = write_frame_until(
+            writer,
+            &ipc::Frame::TransferProgress {
+                progress: progress.clone(),
+            },
+            response_deadline,
         )
+        .await;
+        Some(match progress_response {
+            Ok(()) => {
+                write_frame_until(
+                    writer,
+                    &ipc::Frame::TransferDone { bytes: size },
+                    response_deadline,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        })
     } else {
         None
     };
@@ -3652,10 +5532,10 @@ mod tests {
         exec_outcome_unknown_wire_message, exec_request_rejected_wire_message, handoff_readiness,
         ipc, read_authenticated_request, read_shell_frame_pump, read_shell_frame_pump_inner,
         recover_invalid_startup_lock_read, status_info_frame, stop_tunnel_and_report,
-        terminal_safe_error, validate_request_frame, validated_exec_timeout,
+        terminal_safe_error, transfer_progress, validate_request_frame, validated_exec_timeout,
         validated_sftp_timeout, wait_for_tunnel_control_or_completion, write_all_until_or_shutdown,
-        write_frame_or_shutdown, ConnInfo, Creds, GrantRegistry, IdleTracker, TunnelControlWait,
-        MAX_UPLOAD_CHUNK_BYTES, UNKNOWN_GRANT_ERROR,
+        write_frame_or_shutdown, ConnInfo, Creds, GrantRegistry, IdleTracker, TransferRegistry,
+        TunnelControlWait, GRANTABLE_OPERATION_KINDS, MAX_UPLOAD_CHUNK_BYTES, UNKNOWN_GRANT_ERROR,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -3667,6 +5547,89 @@ mod tests {
     /// `vault::set_test_home` is process-global; the three global-daemon tests
     /// serialize on it for their whole lifetime.
     static TEST_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn grantable_operations_match_the_current_agent_gateway() {
+        assert_eq!(
+            GRANTABLE_OPERATION_KINDS,
+            &[
+                "ssh.exec",
+                "daemon.status",
+                "sftp.list",
+                "sftp.write",
+                "transfer.write",
+            ]
+        );
+    }
+
+    #[test]
+    fn transfer_registry_is_profile_isolated_and_monotonic() {
+        let registry = TransferRegistry::default();
+        let transfer_id = ipc::TransferId::parse("00000000000000000000000000000001").unwrap();
+        let initial = transfer_progress(
+            transfer_id.clone(),
+            ipc::TransferDirection::Push,
+            ipc::TransferStage::Negotiating,
+            100,
+            0,
+            0,
+            ipc::TransferBackend::Sftp,
+        );
+        let cancellation = registry.begin("alpha", initial.clone()).unwrap();
+        assert_eq!(registry.snapshots("alpha", None).unwrap().len(), 1);
+        assert!(registry.snapshots("beta", None).unwrap().is_empty());
+        assert!(registry.cancel("beta", &transfer_id).is_err());
+        registry.cancel("alpha", &transfer_id).unwrap();
+        assert!(cancellation.is_cancelled());
+
+        let mut advanced = initial.clone();
+        advanced.stage = ipc::TransferStage::Transferring;
+        advanced.confirmed_bytes = 50;
+        registry.update("alpha", advanced).unwrap();
+        let mut backwards = initial;
+        backwards.confirmed_bytes = 49;
+        assert!(registry.update("alpha", backwards).is_err());
+    }
+
+    #[test]
+    fn transfer_registry_owner_changes_when_a_profile_name_is_recreated() {
+        let old = ConnInfo {
+            profile: "same-name".into(),
+            profile_id: Some([0x11; 16]),
+            host: "old.example".into(),
+            user: "alice".into(),
+            started: 1,
+            token: Arc::new(zeroize::Zeroizing::new("old-token".into())),
+        };
+        let replacement = ConnInfo {
+            profile: "same-name".into(),
+            profile_id: Some([0x22; 16]),
+            host: "new.example".into(),
+            user: "alice".into(),
+            started: 2,
+            token: Arc::new(zeroize::Zeroizing::new("new-token".into())),
+        };
+        let old_owner = old.transfer_owner_key();
+        let replacement_owner = replacement.transfer_owner_key();
+        assert_ne!(old_owner, replacement_owner);
+
+        let registry = TransferRegistry::default();
+        let progress = transfer_progress(
+            ipc::TransferId::parse("00000000000000000000000000000002").unwrap(),
+            ipc::TransferDirection::Pull,
+            ipc::TransferStage::Completed,
+            1,
+            1,
+            1,
+            ipc::TransferBackend::Native,
+        );
+        registry.begin(&old_owner, progress.clone()).unwrap();
+        registry.finish(&old_owner, progress).unwrap();
+        assert!(registry
+            .snapshots(&replacement_owner, None)
+            .unwrap()
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn global_daemon_serves_catalog_rejects_bad_unlock_and_shuts_down() {
@@ -3909,21 +5872,22 @@ mod tests {
     }
 
     #[test]
-    fn unexpired_grant_holds_daemon_idle_guard_until_reaped() {
+    fn policy_max_grant_holds_daemon_idle_guard_until_its_own_expiry() {
         use ed25519_dalek::SigningKey;
-        use serctl_protocol::grant::{OperationGrant, GRANT_TTL};
+        use serctl_protocol::grant::{OperationGrant, GRANT_DEFAULT_TTL, GRANT_MAX_TTL};
         use serctl_protocol::v6::{V6RequestPrelude, IPC_PROTOCOL_VERSION_V6};
 
         let idle = Arc::new(IdleTracker::default());
         let grants = GrantRegistry::new(Arc::clone(&idle));
         let holder = SigningKey::from_bytes(&[7_u8; 32]);
-        let grant = OperationGrant::new(
+        let grant = OperationGrant::new_with_ttl(
             "grant-idle-test".into(),
             [9_u8; 16],
             vec!["daemon.status".into()],
             1,
             &holder.verifying_key(),
             super::now_unix_ms(),
+            GRANT_MAX_TTL,
         )
         .unwrap();
 
@@ -3952,7 +5916,15 @@ mod tests {
         let error = record
             .check_and_spend(
                 &expired_request,
-                Instant::now() + GRANT_TTL + Duration::from_millis(1),
+                Instant::now() + GRANT_DEFAULT_TTL + Duration::from_millis(1),
+                super::now_unix_ms(),
+            )
+            .unwrap_err();
+        assert_ne!(terminal_safe_error(&error), "grant has expired");
+        let error = record
+            .check_and_spend(
+                &expired_request,
+                Instant::now() + GRANT_MAX_TTL + Duration::from_millis(1),
                 super::now_unix_ms(),
             )
             .unwrap_err();
@@ -3960,7 +5932,7 @@ mod tests {
         assert!(!UNKNOWN_GRANT_ERROR.contains("expired"));
         drop(record);
 
-        grants.prune_expired(Instant::now() + GRANT_TTL + Duration::from_millis(1));
+        grants.prune_expired(Instant::now() + GRANT_MAX_TTL + Duration::from_millis(1));
         assert!(
             idle.is_idle(),
             "reaping the expired grant must release its idle guard"
@@ -4116,6 +6088,7 @@ mod tests {
         // retained password on behalf of its call-key-authorized caller.
         let info = ConnInfo {
             profile: "prod".into(),
+            profile_id: Some([0x11; 16]),
             host: "ssh.example".into(),
             user: "alice".into(),
             started: 123,
@@ -4201,6 +6174,14 @@ mod tests {
             }
         }
 
+        // Start this test runtime's blocking pool before arming the deliberately
+        // short deadline. Under a loaded workspace test run, aborting a queued
+        // (not-yet-started) spawn_blocking job is valid but does not exercise the
+        // late-owned-result cleanup path that this test is specifically about.
+        tokio::task::spawn_blocking(|| {})
+            .await
+            .expect("prewarm blocking worker");
+
         let started = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
         let published = Arc::new(AtomicBool::new(false));
@@ -4226,7 +6207,7 @@ mod tests {
         };
 
         let wait = tokio::spawn(await_owned_blocking_until(
-            Instant::now() + Duration::from_millis(25),
+            Instant::now() + Duration::from_millis(250),
             operation,
             "test publication",
         ));
@@ -4543,12 +6524,63 @@ mod tests {
         );
         assert!(
             validate_request_frame(&serctl_protocol::Frame::UploadBegin {
+                transfer_id: serctl_protocol::TransferId::random(),
                 path: "/tmp/x".into(),
                 size: serctl_core::ssh::MAX_TRANSFER_BYTES + 1,
-                timeout_ms: 1,
+                sha256: "00".repeat(32),
+                backend: serctl_protocol::TransferBackend::Sftp,
+                resume: serctl_protocol::TransferResumeMode::Never,
+                resume_token: None,
+                idle_timeout_ms: 1,
+                deadline_ms: Some(1),
             })
             .is_err()
         );
+
+        let download_with =
+            |resume, resume_offset, expected_size, expected_sha256: Option<String>| {
+                serctl_protocol::Frame::Download {
+                    transfer_id: serctl_protocol::TransferId::random(),
+                    path: "/tmp/x".into(),
+                    backend: serctl_protocol::TransferBackend::Native,
+                    resume,
+                    resume_offset,
+                    expected_size,
+                    expected_sha256,
+                    idle_timeout_ms: 1,
+                    deadline_ms: Some(1),
+                }
+            };
+        let valid_download = download_with(
+            serctl_protocol::TransferResumeMode::Auto,
+            5,
+            Some(10),
+            Some("ab".repeat(32)),
+        );
+        assert!(validate_request_frame(&valid_download).is_ok());
+        for invalid in [
+            download_with(serctl_protocol::TransferResumeMode::Auto, 5, Some(10), None),
+            download_with(
+                serctl_protocol::TransferResumeMode::Auto,
+                11,
+                Some(10),
+                Some("ab".repeat(32)),
+            ),
+            download_with(
+                serctl_protocol::TransferResumeMode::Auto,
+                5,
+                Some(10),
+                Some("AB".repeat(32)),
+            ),
+            download_with(
+                serctl_protocol::TransferResumeMode::Never,
+                5,
+                Some(10),
+                Some("ab".repeat(32)),
+            ),
+        ] {
+            assert!(validate_request_frame(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -4570,8 +6602,15 @@ mod tests {
         for invalid_path in [String::new(), "nul\0path".to_owned()] {
             assert!(serctl_core::ssh::validate_remote_path(&invalid_path, false).is_err());
             assert!(validate_request_frame(&serctl_protocol::Frame::Download {
+                transfer_id: serctl_protocol::TransferId::random(),
                 path: invalid_path,
-                timeout_ms: 1,
+                backend: serctl_protocol::TransferBackend::Sftp,
+                resume: serctl_protocol::TransferResumeMode::Never,
+                resume_offset: 0,
+                expected_size: None,
+                expected_sha256: None,
+                idle_timeout_ms: 1,
+                deadline_ms: Some(1),
             })
             .is_err());
         }

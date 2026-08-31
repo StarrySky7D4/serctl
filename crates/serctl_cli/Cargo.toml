@@ -11,8 +11,8 @@ name = "serctl_cli"
 path = "src/main.rs"
 
 [dependencies]
-serctl-core = { version = "0.2.0-test.1", path = "../serctl_core" }
-serctl-protocol = { version = "0.2.0-test.1", path = "../serctl_protocol" }
+serctl-core = { version = "0.3.0-beta.2", path = "../serctl_core" }
+serctl-protocol = { version = "0.3.0-beta.2", path = "../serctl_protocol" }
 tokio.workspace = true
 tokio-util.workspace = true
 russh.workspace = true
@@ -29,6 +29,7 @@ crossterm.workspace = true
 log.workspace = true
 env_logger.workspace = true
 hex.workspace = true
+sha2.workspace = true
 zeroize.workspace = true
 subtle.workspace = true
 eframe.workspace = true
@@ -41,5 +42,6 @@ windows-sys.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-serctl-core = { version = "0.2.0-test.1", path = "../serctl_core", features = ["test-support"] }
-serctl-daemon = { version = "0.2.0-test.1", path = "../serctl_daemon" }
+serctl-core = { version = "0.3.0-beta.2", path = "../serctl_core", features = ["test-support"] }
+serctl-daemon = { version = "0.3.0-beta.2", path = "../serctl_daemon" }
+serctl-transfer-protocol = { version = "0.3.0-beta.2", path = "../serctl_transfer_protocol" }
