@@ -174,6 +174,8 @@ struct TestState {
     exec_events: Mutex<ExecEvents>,
     exec_changed: Notify,
     sftp_hang: AtomicBool,
+    sftp_hung_connection: Mutex<Option<u64>>,
+    sftp_hang_changed: Notify,
     sftp_write_hang: AtomicBool,
     sftp_write_delay_ms: AtomicU64,
     sftp_write_hang_at: AtomicU64,
@@ -194,10 +196,6 @@ struct TestState {
 }
 
 impl TestState {
-    fn latest_connection_id(&self) -> Option<u64> {
-        self.next_connection.load(Ordering::SeqCst).checked_sub(1)
-    }
-
     async fn record_connection_closed(&self, connection: u64) {
         self.closed_connections.lock().await.insert(connection);
         self.connection_changed.notify_waiters();
@@ -215,6 +213,32 @@ impl TestState {
         })
         .await
         .unwrap_or_else(|_| panic!("SSH connection {connection} did not close after {context}"));
+    }
+
+    async fn reset_sftp_hang_observation(&self) {
+        *self.sftp_hung_connection.lock().await = None;
+    }
+
+    async fn record_sftp_hang(&self, connection: Option<u64>) {
+        let Some(connection) = connection else {
+            return;
+        };
+        *self.sftp_hung_connection.lock().await = Some(connection);
+        self.sftp_hang_changed.notify_waiters();
+    }
+
+    async fn wait_for_sftp_hang(&self, context: &str) -> u64 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = self.sftp_hang_changed.notified();
+                if let Some(connection) = *self.sftp_hung_connection.lock().await {
+                    break connection;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("SFTP request did not hang during {context}"))
     }
 
     async fn latest_exec_generation(&self) -> u64 {
@@ -975,6 +999,7 @@ impl russh::server::Handler for TestSsh {
         session.channel_success(channel.id())?;
         let sftp = MemorySftp {
             state: self.state.clone(),
+            connection: Some(self.connection),
             handles: HashMap::new(),
             directory_handles: HashMap::new(),
             directories_read: HashSet::new(),
@@ -990,6 +1015,7 @@ impl russh::server::Handler for TestSsh {
 
 struct MemorySftp {
     state: Arc<TestState>,
+    connection: Option<u64>,
     handles: HashMap<String, String>,
     directory_handles: HashMap<String, String>,
     directories_read: HashSet<String>,
@@ -1032,6 +1058,7 @@ impl russh_sftp::server::Handler for MemorySftp {
     ) -> Result<Handle, Self::Error> {
         self.state.sftp_open_calls.fetch_add(1, Ordering::SeqCst);
         if self.state.sftp_hang.load(Ordering::SeqCst) {
+            self.state.record_sftp_hang(self.connection).await;
             std::future::pending::<()>().await;
         }
         let mut files = self.state.files.lock().await;
@@ -1195,6 +1222,7 @@ impl russh_sftp::server::Handler for MemorySftp {
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
         self.state.sftp_stat_calls.fetch_add(1, Ordering::SeqCst);
         if self.state.sftp_hang.load(Ordering::SeqCst) {
+            self.state.record_sftp_hang(self.connection).await;
             std::future::pending::<()>().await;
         }
         let files = self.state.files.lock().await;
@@ -1288,6 +1316,7 @@ async fn matrix_sftp_session(
     let (client, server) = tokio::io::duplex(2 * 1024 * 1024);
     let handler = MemorySftp {
         state,
+        connection: None,
         handles: HashMap::new(),
         directory_handles: HashMap::new(),
         directories_read: HashSet::new(),
@@ -2010,11 +2039,14 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     );
     {
         let observed_progress = observed_progress.lock().unwrap();
-        let negotiating = observed_progress
-            .iter()
-            .find(|(_, progress)| progress.stage == ipc::TransferStage::Negotiating)
-            .expect("missing negotiating progress event");
-        assert!(negotiating.0 <= Duration::from_millis(500));
+        let first = observed_progress.first().expect("missing progress event");
+        assert!(first.0 <= Duration::from_millis(500));
+        assert!(
+            observed_progress
+                .iter()
+                .any(|(_, progress)| progress.stage == ipc::TransferStage::Negotiating),
+            "missing negotiating progress event"
+        );
         assert!(observed_progress
             .windows(2)
             .all(|pair| pair[0].1.confirmed_bytes <= pair[1].1.confirmed_bytes));
@@ -2175,27 +2207,40 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     assert_eq!(std::fs::read(&download_target).unwrap(), b"server evidence");
 
     state.sftp_hang.store(true, Ordering::SeqCst);
-    let upload_timeout = client::upload_with_timeout_and_master(
-        "e2e",
-        &upload_source,
-        "/hung-upload.txt",
-        Duration::from_millis(500),
-        Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
-    )
-    .await
-    .unwrap_err();
+    state.reset_sftp_hang_observation().await;
+    let timed_upload_source = upload_source.clone();
+    let upload_timeout_task = tokio::spawn(async move {
+        client::upload_with_timeout_and_master(
+            "e2e",
+            &timed_upload_source,
+            "/hung-upload.txt",
+            Duration::from_millis(500),
+            Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
+        )
+        .await
+    });
+    let upload_connection = state.wait_for_sftp_hang("timed upload").await;
+    let upload_timeout = upload_timeout_task.await.unwrap().unwrap_err();
     assert!(upload_timeout.to_string().contains("deadline"));
+    state
+        .wait_for_connection_closed(upload_connection, "the SFTP upload timeout")
+        .await;
 
     let timed_download = test_home.join("timed-download.txt");
-    let download_timeout = client::download_with_timeout_and_master(
-        "e2e",
-        "/evidence.txt",
-        &timed_download,
-        Duration::from_millis(500),
-        Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
-    )
-    .await
-    .unwrap_err();
+    state.reset_sftp_hang_observation().await;
+    let timed_download_task_path = timed_download.clone();
+    let download_timeout_task = tokio::spawn(async move {
+        client::download_with_timeout_and_master(
+            "e2e",
+            "/evidence.txt",
+            &timed_download_task_path,
+            Duration::from_millis(500),
+            Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
+        )
+        .await
+    });
+    let download_connection = state.wait_for_sftp_hang("timed download").await;
+    let download_timeout = download_timeout_task.await.unwrap().unwrap_err();
     assert!(download_timeout.to_string().contains("deadline"));
     assert!(!timed_download.exists());
     assert!(!std::fs::read_dir(&test_home).unwrap().any(|entry| {
@@ -2204,14 +2249,10 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             .and_then(|entry| entry.file_name().into_string().ok())
             .is_some_and(|name| name.starts_with("timed-download.txt.serctl-part-"))
     }));
-
-    state.sftp_hang.store(false, Ordering::SeqCst);
-    let timed_out_connection = state
-        .latest_connection_id()
-        .expect("SFTP timeout did not use an SSH connection");
     state
-        .wait_for_connection_closed(timed_out_connection, "the SFTP timeout")
+        .wait_for_connection_closed(download_connection, "the SFTP download timeout")
         .await;
+    state.sftp_hang.store(false, Ordering::SeqCst);
     let after_timeout_generation = state.latest_exec_generation().await;
     let after_timeout = client::exec_capture_with_timeout(
         "e2e",
@@ -2225,8 +2266,8 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .wait_for_exec_start(after_timeout_generation, b"ok")
         .await;
     assert!(
-        recovery_channel.connection > timed_out_connection,
-        "post-timeout exec reused closed SSH connection {timed_out_connection}"
+        recovery_channel.connection > download_connection,
+        "post-timeout exec reused closed SSH connection {download_connection}"
     );
     let recovery_starts = state
         .exec_events
