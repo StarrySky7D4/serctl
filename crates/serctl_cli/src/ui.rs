@@ -1289,6 +1289,7 @@ impl UiOperations {
         self.active.remove(&operation.id).is_some()
     }
 
+    #[cfg(any(windows, test))]
     fn update_activity(&mut self, operation_id: u64, activity: String) -> bool {
         let Some(current) = self.active.get_mut(&operation_id) else {
             return false;
