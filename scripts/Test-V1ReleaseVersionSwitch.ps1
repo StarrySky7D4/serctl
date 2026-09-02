@@ -68,7 +68,10 @@ function Invoke-GitFixture {
             $ErrorActionPreference = $savedPreference
         }
         if ($exitCode -ne 0) {
-            throw 'fixture git command failed'
+            throw (
+                "fixture git command failed: git $($Arguments -join ' '); " +
+                "output=$($output -join ' | ')"
+            )
         }
         return $output
     }
