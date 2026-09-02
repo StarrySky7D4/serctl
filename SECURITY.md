@@ -6,7 +6,7 @@ serctl handles encrypted SSH credentials and mediates remote side effects. Treat
 
 | Release line | Security support |
 | --- | --- |
-| `v1.0.0-beta` | Supported after its tagged acceptance workflow publishes the attested prerelease; fixes are delivered as a new immutable prerelease tag. |
+| `v1.0.0-beta.1` | Supported after its tagged acceptance workflow publishes the attested prerelease; fixes are delivered as a new immutable prerelease tag. |
 | `v0.3.0-beta.2` | Rollback predecessor during the v1 beta compatibility window; critical fixes only until the v1 beta line is superseded. |
 | Older test snapshots | Unsupported. They remain source-history evidence and must not receive moved or replacement tags. |
 

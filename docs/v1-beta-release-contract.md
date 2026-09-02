@@ -1,6 +1,6 @@
 # serctl v1 beta release and compatibility contract
 
-<!-- release-tag: v1.0.0-beta -->
+<!-- release-tag: v1.0.0-beta.1 -->
 
 Initial release tag: `v1.0.0-beta`; an immutable failed candidate is repaired
 only as a new canonical SemVer prerelease such as `v1.0.0-beta.1`.
@@ -23,7 +23,7 @@ Tag push builds, tests and attests a candidate, but it does not by itself author
 {
   "schema_version": 1,
   "accepted": true,
-  "tag": "v1.0.0-beta",
+  "tag": "v1.0.0-beta.1",
   "tag_object": "40 lowercase hexadecimal characters",
   "commit": "40 lowercase hexadecimal characters",
   "release_manifest_sha256": "64 uppercase hexadecimal characters",
@@ -39,7 +39,7 @@ The record must bind the exact remote annotated tag object, peeled commit, SHA-2
 ```json
 {
   "schema_version": 1,
-  "tag": "v1.0.0-beta",
+  "tag": "v1.0.0-beta.1",
   "tag_object": "40 lowercase hexadecimal characters",
   "commit": "40 lowercase hexadecimal characters",
   "release_manifest_sha256": "64 uppercase hexadecimal characters",
@@ -201,7 +201,7 @@ The exact-tag workflow configures no `actions/cache`, restore key or save-on-fai
 
 The tag build uses a fresh GitHub runner and the dedicated Cargo target directory `target/v1-beta-release`. Local `target/release` contents are never release inputs. In particular, the known local directory containing mixed v0.2/v7-era binaries is invalid evidence; the clean predecessor staging set under `target/staging-v0.3/release` remains historical evidence only and is not copied into v1 artifacts.
 
-Before a tag exists, `scripts/New-IsolatedCandidate.ps1 -Version 1.0.0-beta` may build a local matched set for controlled external acceptance preparation on Windows. It refuses a dirty checkout, a workspace-version mismatch, a noncanonical full `HEAD`, Git repository redirection, or an existing candidate identity. HEAD, clean status and the full tree object are read in a before/after bracket. The approved commit is checked out into a random detached worktree below `target/candidate-sources`; Cargo runs with the requested repository as its explicit working directory and the detached worktree `Cargo.toml` as its explicit manifest. Change monitors cover tracked files in both roots and reject a source mutation even if the original bytes are restored before Cargo exits. They watch the repository root non-recursively plus only top-level directories that contain tracked paths, so high-volume ignored `target` output cannot exhaust the watcher buffer; any monitored overflow still fails closed, and the final clean/tree rescan remains mandatory. Git, Cargo and any mode tool must resolve to absolute Application files outside the repository; wildcard and repository-shadow resolution is rejected, while path, file identity, size, SHA-256 and version are recorded and rechecked. Cargo writes only to a new private GUID directory below `target/candidate-builds`; candidate files are first copied with create-new handles into a separate private directory below `target/candidate-staging`. Version output, byte size and SHA-256 are then bound to the same pinned staging file object. The script records Windows volume/file identities and random owner tokens for private roots, holds non-delete-sharing handles on the candidate parents, rejects reparse points at every cleanup/publication boundary, and rechecks every staged object immediately before publication. The detached source and private Cargo tree must both be safely removed before the same-volume no-overwrite directory move publishes `target/candidates/v1.0.0-beta-<12-character-HEAD>`; after that move no fallible recursive cleanup remains. Neither `target/release` nor `target/staging-v0.3` is a source or destination.
+Before a tag exists, `scripts/New-IsolatedCandidate.ps1 -Version 1.0.0-beta.1` may build a local matched set for controlled external acceptance preparation on Windows. It refuses a dirty checkout, a workspace-version mismatch, a noncanonical full `HEAD`, Git repository redirection, or an existing candidate identity. HEAD, clean status and the full tree object are read in a before/after bracket. The approved commit is checked out into a random detached worktree below `target/candidate-sources`; Cargo runs with the requested repository as its explicit working directory and the detached worktree `Cargo.toml` as its explicit manifest. Change monitors cover tracked files in both roots and reject a source mutation even if the original bytes are restored before Cargo exits. They watch the repository root non-recursively plus only top-level directories that contain tracked paths, so high-volume ignored `target` output cannot exhaust the watcher buffer; any monitored overflow still fails closed, and the final clean/tree rescan remains mandatory. Git, Cargo and any mode tool must resolve to absolute Application files outside the repository; wildcard and repository-shadow resolution is rejected, while path, file identity, size, SHA-256 and version are recorded and rechecked. Cargo writes only to a new private GUID directory below `target/candidate-builds`; candidate files are first copied with create-new handles into a separate private directory below `target/candidate-staging`. Version output, byte size and SHA-256 are then bound to the same pinned staging file object. The script records Windows volume/file identities and random owner tokens for private roots, holds non-delete-sharing handles on the candidate parents, rejects reparse points at every cleanup/publication boundary, and rechecks every staged object immediately before publication. The detached source and private Cargo tree must both be safely removed before the same-volume no-overwrite directory move publishes `target/candidates/v1.0.0-beta.1-<12-character-HEAD>`; after that move no fallible recursive cleanup remains. Neither `target/release` nor `target/staging-v0.3` is a source or destination.
 
 This P1/P2 constructor intentionally fails closed on non-Windows hosts. PowerShell cannot provide a portable persistent directory identity and handle-relative no-replace move with one implementation; Linux and macOS require a separate native `openat`/`renameat`/`unlinkat` boundary before local candidate construction is enabled there. A future Unix implementation must call and then read back `GetUnixFileMode`, prove the permission bits are exactly 0755, and fail when that API is unavailable; merely running `chmod` is not acceptable evidence. This platform restriction does not change the cross-platform release build matrix.
 
