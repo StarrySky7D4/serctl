@@ -6,7 +6,7 @@ Target release: `v1.0.0-beta` (candidate, not accepted or published)
 
 Agent transfer/tunnel/connection-identity source readiness: `implemented-unreleased`
 
-This contract describes the candidate source tree. The current workspace/release marker remains `v0.3.0-beta.2` until the exact-tag acceptance gates pass. A handler is not a supported capability by itself: an Agent operation is available only when the request handler and the daemon's grantable-operation list both exist, their scope mapping is tested, and the exact tag passes end-to-end acceptance.
+This contract describes the candidate source tree. The current workspace/release marker is `v1.0.0-beta`; exact-tag acceptance gates still control support and publication. A handler is not a supported capability by itself: an Agent operation is available only when the request handler and the daemon's grantable-operation list both exist, their scope mapping is tested, and the exact tag passes end-to-end acceptance.
 
 ## 1. Transport and envelope
 

@@ -3813,7 +3813,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serctl-cli"
-version = "0.3.0-beta.2"
+version = "1.0.0-beta"
 dependencies = [
  "anyhow",
  "base64",
@@ -3846,7 +3846,7 @@ dependencies = [
 
 [[package]]
 name = "serctl-core"
-version = "0.3.0-beta.2"
+version = "1.0.0-beta"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -3877,7 +3877,7 @@ dependencies = [
 
 [[package]]
 name = "serctl-daemon"
-version = "0.3.0-beta.2"
+version = "1.0.0-beta"
 dependencies = [
  "anyhow",
  "base64",
@@ -3902,7 +3902,7 @@ dependencies = [
 
 [[package]]
 name = "serctl-jobs"
-version = "0.3.0-beta.2"
+version = "1.0.0-beta"
 dependencies = [
  "anyhow",
  "atomic-write-file",
@@ -3920,7 +3920,7 @@ dependencies = [
 
 [[package]]
 name = "serctl-policy"
-version = "0.3.0-beta.2"
+version = "1.0.0-beta"
 dependencies = [
  "hex",
  "serde",
@@ -3930,7 +3930,7 @@ dependencies = [
 
 [[package]]
 name = "serctl-protocol"
-version = "0.3.0-beta.2"
+version = "1.0.0-beta"
 dependencies = [
  "anyhow",
  "base64",
@@ -3952,7 +3952,7 @@ dependencies = [
 
 [[package]]
 name = "serctl-remote"
-version = "0.3.0-beta.2"
+version = "1.0.0-beta"
 dependencies = [
  "anyhow",
  "hex",
@@ -3966,7 +3966,7 @@ dependencies = [
 
 [[package]]
 name = "serctl-remote-protocol"
-version = "0.3.0-beta.2"
+version = "1.0.0-beta"
 dependencies = [
  "rand 0.8.7",
  "sha2 0.10.9",
@@ -3975,7 +3975,7 @@ dependencies = [
 
 [[package]]
 name = "serctl-transfer-protocol"
-version = "0.3.0-beta.2"
+version = "1.0.0-beta"
 dependencies = [
  "anyhow",
  "hex",
@@ -3988,7 +3988,7 @@ dependencies = [
 
 [[package]]
 name = "serctl-xfer"
-version = "0.3.0-beta.2"
+version = "1.0.0-beta"
 dependencies = [
  "anyhow",
  "atomic-write-file",

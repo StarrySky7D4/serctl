@@ -2,11 +2,11 @@
 
 `serctl` 是一个纯 Rust 的持久 SSH 控制工具，提供 Winit/Egui 桌面 UI 与完整 CLI。它复用 SSH 连接执行远端命令、浏览目录、执行可观察且可取消的文件传输、运行 Bash PTY，并支持本地（`-L`）、远程（`-R`）和动态 SOCKS5（`-D`）TCP 隧道。
 
-当前重写版标记为预发布测试版本 **v0.3.0-beta.2**；原 main 基线保存在远端 `V1` 分支。测试版本不应替代正式签名发行物。
-<!-- release-marker: v0.3.0-beta.2 -->
+当前重写版标记为预发布测试版本 **v1.0.0-beta**；原 main 基线保存在远端 `V1` 分支。测试版本不应替代正式签名发行物。
+<!-- release-marker: v1.0.0-beta -->
 
 > [!IMPORTANT]
-> 工作树中的 **v1.0.0-beta 候选尚未验收或发布**。候选 wire 已升级为 IPC v9，并定义 Agent JSONL `schema_version=1`、稳定 `error_code` 及 14 个互不替代的精确 scope；只有对应 Agent handler、daemon 可签发列表与映射测试同时存在，能力才算源码实现。`serctl-remote`、jobs、remote protocol 与 policy 仍是 source-only experimental / unshipped 代码，v1 beta 不构建交付、不发布、不支持，`job.*` 也不属于 Agent/OperationGrant 能力面。当前版本标记在 Cargo、lockfile、CHANGELOG、README、用户指南和架构页统一切换前仍保持 v0.3.0-beta.2；真实 SSH/native、跨平台和发布证据未齐前不得把候选写成已验收。候选契约见 [Agent JSONL 契约](docs/v1-beta-agent-jsonl.md)、[发布兼容契约](docs/v1-beta-release-contract.md)和[验收矩阵](docs/v1-beta-acceptance-matrix.md)。
+> 工作树中的 **v1.0.0-beta 候选尚未验收或发布**。候选 wire 已升级为 IPC v9，并定义 Agent JSONL `schema_version=1`、稳定 `error_code` 及 14 个互不替代的精确 scope；只有对应 Agent handler、daemon 可签发列表与映射测试同时存在，能力才算源码实现。`serctl-remote`、jobs、remote protocol 与 policy 仍是 source-only experimental / unshipped 代码，v1 beta 不构建交付、不发布、不支持，`job.*` 也不属于 Agent/OperationGrant 能力面。当前 workspace 与预发布标记已同步为 v1.0.0-beta；真实 SSH/native、跨平台和发布证据未齐前不得把候选写成已验收。候选契约见 [Agent JSONL 契约](docs/v1-beta-agent-jsonl.md)、[发布兼容契约](docs/v1-beta-release-contract.md)和[验收矩阵](docs/v1-beta-acceptance-matrix.md)。
 
 面向操作者的安装、首次配置、UI/CLI、备份恢复和故障处理流程见 [serctl 使用手册](docs/serctl-user-guide.md)；当前实现的安全边界见 [架构、安全与运维说明](docs/serctl-architecture-security.html)；尚未发布的策略、审计、作业、IPC codec 与高速数据面方案见 [目标架构与演进路线](docs/serctl-design-roadmap.md)；版本变化见 [更新日志](CHANGELOG.md)。
 
@@ -313,7 +313,7 @@ target\release\serctl-xfer.exe --version
 
 存储兼容是单向的：`audit_seed directionally incompatible`。v1 可以读取缺少审计字段的 beta-2 KeyPackage，但首次认证初始化写入非零 `audit_seed` 与 marker 后，严格的 v8 reader 会在 unknown field 处失败关闭；`unknown fields must not be dropped`，禁止宽松读取后用旧结构回写丢字段。此后 `binary-only rollback is forbidden`，必须恢复 `exact pre-upgrade vault backup`、匹配的恢复介质以及原 ACL/owner metadata，不能只替换旧二进制、只恢复 vault 或只恢复介质。
 
-当前正式版本标记仍冻结为 `v0.3.0-beta.2`；工作树中的 `v1.0.0-beta` 只是未发布候选。v1 的可发布来源只能是 exact tag 指向、已推送至 `origin/main` 且通过远端门禁的 clean commit；冻结前 dirty staging、旧标签后的中间提交或本地测试结果都不能替代该来源与仓库外交付记录。
+当前预发布版本标记为 `v1.0.0-beta`；该版本仍是未发布候选。v1 的可发布来源只能是 exact tag 指向、已推送至 `origin/main` 且通过远端门禁的 clean commit；冻结前 dirty staging、旧标签后的中间提交或本地测试结果都不能替代该来源与仓库外交付记录。
 
 ### Release 体积策略
 
