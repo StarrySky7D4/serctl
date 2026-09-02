@@ -437,7 +437,12 @@ Assert-TestCondition (
 Assert-TestCondition (
     Test-Path -LiteralPath $isolatedCandidateSelfTestScript -PathType Leaf
 ) 'isolated candidate builder self-test is missing'
-& $isolatedCandidateSelfTestScript
+if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+    & $isolatedCandidateSelfTestScript
+}
+else {
+    Write-Output 'Skipped Windows-only isolated candidate runtime self-test on non-Windows host.'
+}
 Assert-TestCondition (
     Test-Path -LiteralPath $externalRuntimeSupervisorScript -PathType Leaf
 ) 'external runtime process supervisor is missing'
@@ -802,6 +807,7 @@ foreach ($required in @(
     'Test-ReleaseAssetSnapshot.ps1',
     'Windows PowerShell 5.1 governance smoke',
     'shell: powershell',
+    './scripts/Test-IsolatedCandidateSelfTest.ps1',
     'runner: macos-15',
     'runner: macos-15-intel',
     'expected_arch: ARM64',
@@ -1508,6 +1514,7 @@ foreach ($required in @(
     'shell: powershell',
     './scripts/Test-V1BetaDocumentation.ps1',
     './scripts/Test-V1BetaLocalGate.ps1',
+    './scripts/Test-IsolatedCandidateSelfTest.ps1',
     'runner: macos-15',
     'runner: macos-15-intel',
     'expected_arch: ARM64',

@@ -186,6 +186,7 @@ jobs:
         run: |
           ./scripts/Test-V1BetaDocumentation.ps1
           ./scripts/Test-V1BetaLocalGate.ps1
+          ./scripts/Test-IsolatedCandidateSelfTest.ps1
 
       - name: Require the privileged Windows reparse-point rejection branch
         if: runner.os == 'Windows'
