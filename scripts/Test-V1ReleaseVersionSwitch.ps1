@@ -147,7 +147,9 @@ The v1.0.0-beta capability does not rewrite current v0.3.0-beta.2.
             -LiteralPath (Join-Path $script:SourceRoot $document) `
             -Destination (Join-Path $root $document)
     }
-    Write-Utf8 (Join-Path $root 'SECURITY.md') "| ``v1.0.0-beta`` | supported prerelease |`n"
+    Copy-Item `
+        -LiteralPath (Join-Path $script:SourceRoot 'SECURITY.md') `
+        -Destination (Join-Path $root 'SECURITY.md')
     Write-Utf8 (Join-Path $root 'scripts/Test-V1BetaDocumentation.ps1') "Set-StrictMode -Version Latest`n`$ErrorActionPreference = 'Stop'`nWrite-Output 'fixture docs PASS'`n"
     Copy-Item -LiteralPath (Join-Path $script:SourceRoot 'scripts/Set-V1ReleaseVersion.ps1') -Destination (Join-Path $root 'scripts/Set-V1ReleaseVersion.ps1')
     Copy-Item -LiteralPath (Join-Path $script:SourceRoot 'scripts/Verify-ReleaseConsistency.ps1') -Destination (Join-Path $root 'scripts/Verify-ReleaseConsistency.ps1')
@@ -250,6 +252,21 @@ function Get-MachineMarkerNeutralDocument {
     return [regex]::Replace($text, $pattern, "<!-- ${MarkerName}: __VERSION__ -->")
 }
 
+function Get-CurrentSecurityLineNeutralDocument {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $path = Join-Path $Root 'SECURITY.md'
+    $text = [IO.File]::ReadAllText($path, $script:Utf8NoBom)
+    $pattern = '(?m)^\| `v1\.0\.0-beta(?:\.[1-9][0-9]*)?` \| Supported after its tagged acceptance workflow publishes the attested prerelease; fixes are delivered as a new immutable prerelease tag\. \|$'
+    Assert-Test ([regex]::Matches($text, $pattern).Count -eq 1) (
+        'SECURITY does not contain exactly one current supported prerelease line'
+    )
+    return [regex]::Replace(
+        $text,
+        $pattern,
+        '| `__CURRENT_BETA__` | Supported after its tagged acceptance workflow publishes the attested prerelease; fixes are delivered as a new immutable prerelease tag. |'
+    )
+}
+
 function Get-TrackedHashes {
     param([Parameter(Mandatory = $true)][string]$Root)
     $result = @{}
@@ -289,6 +306,8 @@ try {
         $neutralGovernance[[string]$binding[0]] = Get-MachineMarkerNeutralDocument `
             $success ([string]$binding[0]) ([string]$binding[1])
     }
+    $neutralSecurity = Get-CurrentSecurityLineNeutralDocument $success
+    $rollbackPredecessorLine = '| `v0.3.0-beta.2` | Rollback predecessor during the v1 beta compatibility window; critical fixes only until the v1 beta line is superseded. |'
 
     $betaHistory = ([IO.File]::ReadAllText(
         (Join-Path $success 'CHANGELOG.md'), $Utf8NoBom
@@ -315,6 +334,13 @@ try {
                 [string]$neutralGovernance[[string]$binding[0]]
         ) "beta -> beta.1 modified historical prose in $($binding[0])"
     }
+    $betaOneSecurity = [IO.File]::ReadAllText(
+        (Join-Path $success 'SECURITY.md'), $Utf8NoBom
+    )
+    Assert-Test (
+        (Get-CurrentSecurityLineNeutralDocument $success) -ceq $neutralSecurity -and
+        $betaOneSecurity.Contains($rollbackPredecessorLine)
+    ) 'beta -> beta.1 modified SECURITY history or its rollback predecessor'
     Assert-Test (
         @(Invoke-GitFixture $success @('status', '--porcelain=v1', '--untracked-files=all')).Count -eq 10
     ) 'beta -> beta.1 did not leave the exact ten approved identity changes'
@@ -344,6 +370,13 @@ try {
                 [string]$neutralGovernance[[string]$binding[0]]
         ) "beta.N transition modified historical prose in $($binding[0])"
     }
+    $betaTwoSecurity = [IO.File]::ReadAllText(
+        (Join-Path $success 'SECURITY.md'), $Utf8NoBom
+    )
+    Assert-Test (
+        (Get-CurrentSecurityLineNeutralDocument $success) -ceq $neutralSecurity -and
+        $betaTwoSecurity.Contains($rollbackPredecessorLine)
+    ) 'beta.N transition modified SECURITY history or its rollback predecessor'
     Invoke-GitFixture $success @('add', '--all') | Out-Null
     Invoke-GitFixture $success @('commit', '-m', 'freeze beta two') | Out-Null
 

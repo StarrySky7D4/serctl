@@ -300,8 +300,7 @@ function New-TransformationPlan {
     foreach ($binding in @(
         @('docs/v1-beta-release-contract.md', "<!-- release-tag: $oldTag -->", "<!-- release-tag: $TargetTag -->", 'release contract machine marker'),
         @('docs/v1-beta-agent-jsonl.md', "<!-- target-release: $oldTag -->", "<!-- target-release: $TargetTag -->", 'Agent contract machine marker'),
-        @('docs/v1-beta-acceptance-matrix.md', "<!-- normative-release: $oldTag -->", "<!-- normative-release: $TargetTag -->", 'acceptance matrix machine marker'),
-        @('SECURITY.md', "| ``$oldTag`` |", "| ``$TargetTag`` |", 'security support table')
+        @('docs/v1-beta-acceptance-matrix.md', "<!-- normative-release: $oldTag -->", "<!-- normative-release: $TargetTag -->", 'acceptance matrix machine marker')
     )) {
         $relative = [string]$binding[0]
         $path = Join-Path $RepositoryRoot $relative
@@ -319,6 +318,26 @@ function New-TransformationPlan {
                 "$($binding[3]) is not bound exactly once to either the prior or target tag"
             )
         }
+    }
+    $securityPath = Join-Path $RepositoryRoot 'SECURITY.md'
+    $security = Read-Text $securityPath
+    $supportSuffix = ' | Supported after its tagged acceptance workflow publishes the attested prerelease; fixes are delivered as a new immutable prerelease tag. |'
+    $oldSupportLine = "| ``$oldTag``$supportSuffix"
+    $targetSupportLine = "| ``$TargetTag``$supportSuffix"
+    $oldSupportCount = ([regex]::Matches(
+        $security, [regex]::Escape($oldSupportLine)
+    )).Count
+    $targetSupportCount = ([regex]::Matches(
+        $security, [regex]::Escape($targetSupportLine)
+    )).Count
+    if ($oldSupportCount -eq 1 -and $targetSupportCount -eq 0) {
+        $plan['SECURITY.md'] = Replace-ExactLiteral `
+            $security $oldSupportLine $targetSupportLine 1 'current security support line'
+    }
+    else {
+        Assert-Condition (
+            $oldSupportCount -eq 0 -and $targetSupportCount -eq 1
+        ) 'current security support line is not bound exactly once to either the prior or target tag'
     }
 
     return $plan
