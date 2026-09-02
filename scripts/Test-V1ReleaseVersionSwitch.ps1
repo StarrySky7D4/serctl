@@ -13,6 +13,7 @@ $OwnerToken = [Guid]::NewGuid().ToString('N')
 $IdentityFiles = @(
     'Cargo.toml',
     'Cargo.lock',
+    'fuzz/Cargo.lock',
     'CHANGELOG.md',
     'README.md',
     'docs/serctl-user-guide.md',
@@ -536,6 +537,12 @@ try {
     $sourceStatus = @(Invoke-GitFixture $SourceRoot @('status', '--porcelain=v1', '--untracked-files=all'))
     Assert-Test ($sourceHead -match '^[0-9a-f]{40}$') 'source HEAD is not canonical'
     Assert-Test ($sourceStatus.Count -eq 0) 'source checkout must be clean'
+    $isShallow = ([string](Invoke-GitFixture $SourceRoot @(
+        'rev-parse', '--is-shallow-repository'
+    ))).Trim().ToLowerInvariant()
+    Assert-Test ($isShallow -ceq 'false') (
+        'full first-parent release history required; source checkout is shallow'
+    )
     $currentVersion = Get-WorkspaceVersion $SourceRoot
     $currentTag = "v$currentVersion"
     Assert-Test ([regex]::IsMatch(

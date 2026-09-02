@@ -130,6 +130,9 @@ function Get-V1BetaLocalGatePlan {
     $steps.Add((New-V1BetaCommandStep -Name 'locked-metadata' -File 'cargo' -Arguments @(
         'metadata', '--locked', '--format-version', '1'
     ) -SuppressStdout $true))
+    $steps.Add((New-V1BetaCommandStep -Name 'fuzz-locked-metadata' -File 'cargo' -Arguments @(
+        'metadata', '--manifest-path', 'fuzz/Cargo.toml', '--locked', '--format-version', '1'
+    ) -SuppressStdout $true))
     $steps.Add((New-V1BetaCommandStep -Name 'protocol-corpus-transfer' -File 'cargo' -Arguments @(
         'test', '--locked', '-p', 'serctl-transfer-protocol', '--lib'
     )))

@@ -42,6 +42,7 @@ $expectedNames = @(
     'git-diff-check',
     'rustfmt',
     'locked-metadata',
+    'fuzz-locked-metadata',
     'protocol-corpus-transfer',
     'protocol-corpus-remote',
     'protocol-corpus-policy',
@@ -64,6 +65,7 @@ $expectedCommandPrefixes = [ordered]@{
     'git-diff-check' = 'git diff --check'
     'rustfmt' = 'cargo fmt --all -- --check'
     'locked-metadata' = 'cargo metadata --locked --format-version 1'
+    'fuzz-locked-metadata' = 'cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1'
     'protocol-corpus-transfer' = 'cargo test --locked -p serctl-transfer-protocol --lib'
     'protocol-corpus-remote' = 'cargo test --locked -p serctl-remote-protocol --lib'
     'protocol-corpus-policy' = 'cargo test --locked -p serctl-policy --lib'

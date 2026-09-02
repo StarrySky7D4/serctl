@@ -14,6 +14,27 @@ function Assert-TestCondition {
     }
 }
 
+function Assert-QualityCheckoutHasFullHistory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $quality = [regex]::Match(
+        $Source,
+        '(?ms)^  quality:\r?\n(?<body>.*?)(?=^  [a-zA-Z0-9_-]+:\r?\n)'
+    )
+    Assert-TestCondition $quality.Success "$Description has no bounded quality job"
+    $normalized = [regex]::Replace($quality.Groups['body'].Value, '\s+', ' ').Trim()
+    $checkout = (
+        'uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 ' +
+        '# v7.0.1 with: fetch-depth: 0 persist-credentials: false'
+    )
+    Assert-TestCondition (
+        ([regex]::Matches($normalized, [regex]::Escape($checkout))).Count -eq 1
+    ) "$Description quality checkout must fetch full history exactly once without persisted credentials"
+}
+
 function Invoke-ExpectedFailure {
     param([Parameter(Mandatory = $true)][string]$Tag)
 
@@ -720,6 +741,7 @@ Invoke-ExpectedFailure 'v1.0.0-beta.01'
 Invoke-ExpectedFailure 'v9.9.9-beta'
 
 $workflow = Get-Content -LiteralPath $workflowPath -Raw -Encoding utf8
+Assert-QualityCheckoutHasFullHistory $workflow 'exact-tag release workflow'
 $nativeHelperSource = Get-Content `
     -LiteralPath $nativeHelperSourcePath `
     -Raw `
@@ -1480,6 +1502,7 @@ Assert-TestCondition (
 ) 'artifact download plan reparses the manifest after strict verification'
 
 $ciWorkflow = Get-Content -LiteralPath $ciWorkflowPath -Raw -Encoding utf8
+Assert-QualityCheckoutHasFullHistory $ciWorkflow 'ordinary CI workflow'
 foreach ($required in @(
     'Windows PowerShell 5.1 governance smoke',
     'shell: powershell',

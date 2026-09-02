@@ -272,6 +272,28 @@ function New-TransformationPlan {
     }
     $plan['Cargo.lock'] = $lock
 
+    $fuzzManifestPath = Join-Path $RepositoryRoot 'fuzz/Cargo.toml'
+    $fuzzManifest = Read-Text $fuzzManifestPath
+    $fuzzWorkspaceNames = @([regex]::Matches(
+        $fuzzManifest,
+        '(?m)^(?<name>serctl-[a-z0-9-]+)\s*=\s*\{[^\r\n]*\bpath\s*=',
+        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    ) | ForEach-Object { $_.Groups['name'].Value } | Sort-Object -Unique)
+    Assert-Condition ($fuzzWorkspaceNames.Count -gt 0) 'fuzz/Cargo.toml has no internal path dependencies'
+    foreach ($name in $fuzzWorkspaceNames) {
+        Assert-Condition ($WorkspaceNames -ccontains $name) "fuzz/Cargo.toml path-depends on non-workspace package $name"
+    }
+
+    $fuzzLockPath = Join-Path $RepositoryRoot 'fuzz/Cargo.lock'
+    $fuzzLock = Read-Text $fuzzLockPath
+    foreach ($name in $fuzzWorkspaceNames) {
+        $pattern = '(?ms)(^\[\[package\]\]\r?\n(?:(?!^\[\[package\]\]).)*?^name = "' +
+            [regex]::Escape($name) + '"\r?\n(?:(?!^\[\[package\]\]).)*?^version = ")' +
+            [regex]::Escape($OldVersion) + '("\s*$)'
+        $fuzzLock = Replace-ExactRegex $fuzzLock $pattern ('${1}' + $Version + '${2}') 1 "fuzz/Cargo.lock workspace package $name"
+    }
+    $plan['fuzz/Cargo.lock'] = $fuzzLock
+
     $changelogPath = Join-Path $RepositoryRoot 'CHANGELOG.md'
     $changelog = Read-Text $changelogPath
     $changelog = Replace-ExactLiteral $changelog "## $TargetTag - Unreleased" "## $TargetTag - $ReleaseDate" 1 'v1 Unreleased heading'
@@ -494,6 +516,7 @@ function Assert-PlanPostconditions {
     foreach ($name in $WorkspaceNames) {
         Assert-Condition ($Plan['Cargo.lock'].Contains("name = `"$name`"")) "Cargo.lock lost workspace package $name"
     }
+    Assert-Condition ($Plan.Contains('fuzz/Cargo.lock')) 'transformation plan omitted fuzz/Cargo.lock'
 }
 
 Assert-Condition (-not ($Apply -and $WhatIf)) '-Apply and -WhatIf are mutually exclusive'

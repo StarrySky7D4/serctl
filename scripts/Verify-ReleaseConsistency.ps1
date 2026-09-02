@@ -217,6 +217,27 @@ try {
         )
     }
 
+    $fuzzManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'fuzz/Cargo.toml') -Raw -Encoding utf8
+    $fuzzWorkspaceNames = @([regex]::Matches(
+        $fuzzManifest,
+        '(?m)^(?<name>serctl-[a-z0-9-]+)\s*=\s*\{[^\r\n]*\bpath\s*=',
+        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    ) | ForEach-Object { $_.Groups['name'].Value } | Sort-Object -Unique)
+    Assert-ReleaseCondition ($fuzzWorkspaceNames.Count -gt 0) 'fuzz/Cargo.toml has no internal path dependencies'
+    $fuzzLockPackages = @(Read-LockPackages (Join-Path $repositoryRoot 'fuzz/Cargo.lock'))
+    foreach ($name in $fuzzWorkspaceNames) {
+        Assert-ReleaseCondition ($workspaceNames.ContainsKey($name)) (
+            "fuzz/Cargo.toml path-depends on non-workspace package '$name'"
+        )
+        $nameMatches = @($fuzzLockPackages | Where-Object { $_.Name -ceq $name })
+        Assert-ReleaseCondition ($nameMatches.Count -eq 1) (
+            "fuzz/Cargo.lock must contain exactly one package named '$name'; found $($nameMatches.Count)"
+        )
+        Assert-ReleaseCondition ($nameMatches[0].Version -ceq $releaseVersion) (
+            "fuzz/Cargo.lock package '$name' has version '$($nameMatches[0].Version)', expected '$releaseVersion'"
+        )
+    }
+
     $escapedVersion = [regex]::Escape($releaseVersion)
     $architectureMarker = if ($releaseVersion -match '^1\.0\.0-beta(?:\.|$)') {
         @{
