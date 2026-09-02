@@ -1,0 +1,188 @@
+name: Parser fuzzing
+
+on:
+  # The tagged release workflow calls this exact file so publication cannot
+  # outrun the normative exact-tag parser-fuzz gate. Manual and scheduled runs
+  # remain available for development and retained periodic evidence.
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      tag_object:
+        required: true
+        type: string
+      commit:
+        required: true
+        type: string
+    outputs:
+      artifact_id:
+        value: ${{ jobs.evidence.outputs.artifact_id }}
+      artifact_digest:
+        value: ${{ jobs.evidence.outputs.artifact_digest }}
+      receipt_sha256:
+        value: ${{ jobs.evidence.outputs.receipt_sha256 }}
+  workflow_dispatch:
+  schedule:
+    - cron: "37 20 * * 3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parser-fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: transfer_protocol
+            # Header + the production 1 MiB chunk ceiling.
+            max_len: 1048644
+          - target: remote_protocol
+            # Header + the production 128 KiB frame ceiling.
+            max_len: 131092
+          - target: policy_json
+            # Include one byte beyond the production 64 KiB document ceiling.
+            max_len: 65537
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install a minimal nightly toolchain
+        run: rustup toolchain install nightly-2026-08-03 --profile minimal
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version '=0.13.2' --locked
+
+      - name: Verify the isolated fuzz dependency lock
+        run: >-
+          cargo +nightly-2026-08-03 metadata
+          --manifest-path fuzz/Cargo.toml
+          --locked
+          --format-version 1
+          > /dev/null
+
+      - name: Run bounded coverage-guided fuzzing
+        run: >-
+          cargo +nightly-2026-08-03 fuzz run ${{ matrix.target }} --
+          -max_total_time=180
+          -max_len=${{ matrix.max_len }}
+          -rss_limit_mb=2048
+          -timeout=10
+
+      - name: Validate failure artifact envelope
+        id: bound_failure_artifacts
+        if: failure()
+        shell: bash
+        env:
+          ARTIFACT_DIR: fuzz/artifacts/${{ matrix.target }}
+          MAX_ARTIFACT_BYTES: ${{ matrix.max_len }}
+        run: |
+          set -euo pipefail
+          if [[ ! -e "$ARTIFACT_DIR" ]]; then
+            exit 0
+          fi
+          [[ -d "$ARTIFACT_DIR" && ! -L "$ARTIFACT_DIR" ]]
+          if find "$ARTIFACT_DIR" -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q .; then
+            echo "refusing a non-regular fuzz artifact" >&2
+            exit 1
+          fi
+          count=0
+          while IFS= read -r -d '' artifact; do
+            count=$((count + 1))
+            [[ $count -le 4 ]]
+            [[ $(stat -c %s -- "$artifact") -le $MAX_ARTIFACT_BYTES ]]
+          done < <(find "$ARTIFACT_DIR" -mindepth 1 -maxdepth 1 -type f -print0)
+
+      - name: Upload bounded crash and timeout inputs
+        if: failure() && steps.bound_failure_artifacts.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: parser-fuzz-${{ matrix.target }}-failures
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  evidence:
+    name: Retain exact-tag fuzz success receipt
+    needs: fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      receipt_sha256: ${{ steps.hash.outputs.receipt_sha256 }}
+    steps:
+      - name: Check out the exact caller commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require exact reusable-workflow identity
+        shell: pwsh
+        env:
+          RECEIPT_TAG: ${{ inputs.tag }}
+          RECEIPT_TAG_OBJECT: ${{ inputs.tag_object }}
+          RECEIPT_COMMIT: ${{ inputs.commit }}
+        run: |
+          if ($env:GITHUB_EVENT_NAME -cne 'push' -or
+              $env:GITHUB_REF -cne "refs/tags/$env:RECEIPT_TAG" -or
+              $env:GITHUB_SHA -cne $env:RECEIPT_COMMIT) {
+            throw 'parser fuzz success receipt is not running for the exact tag commit'
+          }
+          if ((git rev-parse HEAD).Trim() -cne $env:RECEIPT_COMMIT) {
+            throw 'parser fuzz receipt checkout does not match the exact caller commit'
+          }
+
+      - name: Generate and verify create-new success receipt
+        shell: pwsh
+        env:
+          RECEIPT_TAG: ${{ inputs.tag }}
+          RECEIPT_TAG_OBJECT: ${{ inputs.tag_object }}
+          RECEIPT_COMMIT: ${{ inputs.commit }}
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP 'parser-fuzz-success.json'
+          ./scripts/New-ParserFuzzReceipt.ps1 `
+            -Path $receipt `
+            -Tag $env:RECEIPT_TAG `
+            -TagObject $env:RECEIPT_TAG_OBJECT `
+            -Commit $env:RECEIPT_COMMIT `
+            -Repository $env:GITHUB_REPOSITORY `
+            -RunId $env:GITHUB_RUN_ID `
+            -RunAttempt $env:GITHUB_RUN_ATTEMPT
+          ./scripts/Test-ParserFuzzReceipt.ps1 `
+            -Path $receipt `
+            -Tag $env:RECEIPT_TAG `
+            -TagObject $env:RECEIPT_TAG_OBJECT `
+            -Commit $env:RECEIPT_COMMIT `
+            -Repository $env:GITHUB_REPOSITORY `
+            -RunId $env:GITHUB_RUN_ID `
+            -RunAttempt $env:GITHUB_RUN_ATTEMPT
+
+      - name: Bind the retained receipt digest
+        id: hash
+        shell: pwsh
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP 'parser-fuzz-success.json'
+          $digest = (Get-FileHash -LiteralPath $receipt -Algorithm SHA256).Hash.ToLowerInvariant()
+          "receipt_sha256=$digest" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload retained exact-tag fuzz success receipt
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: parser-fuzz-success-${{ inputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/parser-fuzz-success.json
+          if-no-files-found: error
+          retention-days: 90

@@ -1,0 +1,21 @@
+[package]
+name = "serctl-jobs"
+description = "Crash-safe job journal and authenticated receipt core for serctl."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+atomic-write-file.workspace = true
+hex.workspace = true
+hmac.workspace = true
+libc.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serctl-remote-protocol.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true

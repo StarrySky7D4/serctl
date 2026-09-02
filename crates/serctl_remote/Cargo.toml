@@ -1,0 +1,21 @@
+[package]
+name = "serctl-remote"
+description = "Typed, policy-checked remote execution helper for serctl."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "serctl-remote"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+hex.workspace = true
+libc.workspace = true
+serctl-jobs.workspace = true
+serctl-policy.workspace = true
+serctl-remote-protocol.workspace = true
+sha2.workspace = true
+zeroize.workspace = true

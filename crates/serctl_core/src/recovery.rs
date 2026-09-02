@@ -36,7 +36,7 @@ const HKDF_INFO_DOMAIN: &[u8] = b"serctl/recovery/aead-key/v2\0";
 const MEDIA_CHECKSUM_DOMAIN: &[u8] = b"serctl/recovery/media-checksum/v1\0";
 
 /// The complete profile key package protected by both the profile passphrase
-/// and the recovery envelope in vault v4.  It is intentionally non-Debug and
+/// and the recovery envelope in vault storage v4/v5. It is intentionally non-Debug and
 /// wipes its key bytes on drop.
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +45,36 @@ pub struct KeyPackage {
     pub generation: u64,
     pub dek: [u8; 32],
     pub auth_seed: [u8; 32],
+    /// Stable audit-only seed. Legacy packages omit it; their first
+    /// authenticated audit upgrade derives and persists an independent,
+    /// DEK-keyed legacy migration seed before accepting normal audit use.
+    #[serde(default, skip_serializing_if = "is_zero_32")]
+    pub audit_seed: [u8; 32],
+    /// Authenticated migration marker for the profile's local audit ledger.
+    /// Once true it is never cleared: missing generation files therefore fail
+    /// closed instead of being mistaken for an unused empty chain.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub audit_initialized: bool,
+}
+
+impl KeyPackage {
+    /// Reject security-state combinations that a reader must never normalize
+    /// and write back. A nonzero seed with a false marker is valid during the
+    /// first authenticated audit initialization; the inverse is not.
+    pub(crate) fn validate_security_state(&self) -> Result<()> {
+        if self.audit_initialized && self.audit_seed == [0_u8; 32] {
+            bail!("initialized profile key package is missing its audit seed");
+        }
+        Ok(())
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero_32(value: &[u8; 32]) -> bool {
+    *value == [0_u8; 32]
 }
 
 /// Public vault-wide recovery configuration.  The private scalar input is
@@ -387,6 +417,7 @@ fn validate_profile_name(profile_name: &str) -> Result<()> {
 }
 
 fn serialize_key_package(package: &KeyPackage) -> Result<Zeroizing<Vec<u8>>> {
+    package.validate_security_state()?;
     let encoded =
         Zeroizing::new(serde_json::to_vec(package).context("serialize recovery key package")?);
     if encoded.is_empty() || encoded.len() > MAX_KEY_PACKAGE_BYTES {
@@ -401,6 +432,7 @@ fn parse_key_package(bytes: &[u8]) -> Result<KeyPackage> {
     }
     let package: KeyPackage =
         serde_json::from_slice(bytes).context("parse recovered key package")?;
+    package.validate_security_state()?;
     let canonical = serialize_key_package(&package)?;
     if canonical.len() != bytes.len() || !bool::from(canonical.as_slice().ct_eq(bytes)) {
         bail!("recovered key package is not canonically encoded");
@@ -557,13 +589,147 @@ mod tests {
 
     const PROFILE_ID: [u8; 16] = [0x42; 16];
 
+    /// Exact storage fields understood by the v0.3.0-beta.2 reader. Keeping
+    /// `deny_unknown_fields` here is deliberate: a predecessor must reject a
+    /// directionally upgraded package before any write callback can run.
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Beta2StrictKeyPackage {
+        profile_id: [u8; 16],
+        generation: u64,
+        dek: [u8; 32],
+        auth_seed: [u8; 32],
+    }
+
+    fn beta2_strict_read_then_write<F>(bytes: &[u8], mut write: F) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let package: Beta2StrictKeyPackage =
+            serde_json::from_slice(bytes).context("beta-2 strict reader rejected key package")?;
+        let encoded = Zeroizing::new(
+            serde_json::to_vec(&package).context("beta-2 strict writer encoded key package")?,
+        );
+        write(&encoded)
+    }
+
     fn package(generation: u64) -> KeyPackage {
         KeyPackage {
             profile_id: PROFILE_ID,
             generation,
             dek: [0x31; 32],
             auth_seed: [0xa7; 32],
+            audit_seed: [0xb8; 32],
+            audit_initialized: false,
         }
+    }
+
+    #[test]
+    fn pre_audit_key_packages_remain_canonical_and_default_uninitialized() {
+        #[derive(Serialize)]
+        struct LegacyKeyPackage {
+            profile_id: [u8; 16],
+            generation: u64,
+            dek: [u8; 32],
+            auth_seed: [u8; 32],
+        }
+        let legacy = LegacyKeyPackage {
+            profile_id: PROFILE_ID,
+            generation: 7,
+            dek: [0x31_u8; 32],
+            auth_seed: [0xa7_u8; 32],
+        };
+        let encoded = serde_json::to_vec(&legacy).unwrap();
+        let parsed = parse_key_package(&encoded).unwrap();
+        assert!(!parsed.audit_initialized);
+        assert_eq!(parsed.audit_seed, [0_u8; 32]);
+        assert_eq!(serialize_key_package(&parsed).unwrap().as_slice(), encoded);
+    }
+
+    #[test]
+    fn current_audit_fields_round_trip_without_normalization() {
+        let mut current = package(8);
+        current.audit_initialized = true;
+        let encoded = serialize_key_package(&current).unwrap();
+        let parsed = parse_key_package(&encoded).unwrap();
+        assert_eq!(parsed.audit_seed, current.audit_seed);
+        assert!(parsed.audit_initialized);
+        assert_eq!(
+            serialize_key_package(&parsed).unwrap().as_slice(),
+            encoded.as_slice()
+        );
+    }
+
+    #[test]
+    fn future_security_fields_and_impossible_audit_state_fail_closed() {
+        let current = package(8);
+        let mut value = serde_json::to_value(&current).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "future_security_seed".to_owned(),
+            serde_json::Value::Array(vec![serde_json::Value::from(0); 32]),
+        );
+        let future = serde_json::to_vec(&value).unwrap();
+        let before = future.clone();
+        let mut future_writer_calls = 0_usize;
+        let future_error = match parse_key_package(&future).and_then(|parsed| {
+            let encoded = serialize_key_package(&parsed)?;
+            future_writer_calls += 1;
+            drop(encoded);
+            Ok(parsed)
+        }) {
+            Ok(_) => panic!("future security field unexpectedly reached the writer"),
+            Err(error) => error,
+        };
+        assert!(format!("{future_error:#}").contains("unknown field"));
+        assert_eq!(future_writer_calls, 0);
+        assert_eq!(future, before);
+
+        let mut impossible = current;
+        impossible.audit_seed = [0_u8; 32];
+        impossible.audit_initialized = true;
+        let mut impossible_writer_calls = 0_usize;
+        let error = serialize_key_package(&impossible)
+            .map(|encoded| {
+                impossible_writer_calls += 1;
+                drop(encoded);
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("missing its audit seed"));
+        assert_eq!(impossible_writer_calls, 0);
+    }
+
+    #[test]
+    fn beta2_strict_reader_rejects_upgraded_audit_fields_without_writing_or_mutating_input() {
+        let mut upgraded = package(8);
+        upgraded.audit_initialized = true;
+        let fixture = serialize_key_package(&upgraded).unwrap().to_vec();
+        let before = fixture.clone();
+        let before_hash = Sha256::digest(&fixture);
+        let mut writer_calls = 0_usize;
+
+        let error = beta2_strict_read_then_write(&fixture, |_| {
+            writer_calls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("beta-2 strict reader rejected"));
+        assert!(format!("{error:#}").contains("unknown field `audit_seed`"));
+        assert_eq!(writer_calls, 0);
+        assert_eq!(fixture, before);
+        assert_eq!(Sha256::digest(&fixture), before_hash);
+    }
+
+    /// Single entrypoint used by the whole-bundle upgrade/rollback harness.
+    /// Keep this as an executable source fixture rather than a source marker:
+    /// the harness invokes this exact test under both supported PowerShells.
+    #[test]
+    fn whole_bundle_storage_direction_fixture() {
+        pre_audit_key_packages_remain_canonical_and_default_uninitialized();
+        current_audit_fields_round_trip_without_normalization();
+        recovery_envelope_preserves_initialized_audit_state();
+        future_security_fields_and_impossible_audit_state_fail_closed();
+        beta2_strict_reader_rejects_upgraded_audit_fields_without_writing_or_mutating_input();
     }
 
     fn setup(
@@ -595,6 +761,33 @@ mod tests {
         assert_eq!(opened.generation, 7);
         assert_eq!(opened.dek, [0x31; 32]);
         assert_eq!(opened.auth_seed, [0xa7; 32]);
+        assert_eq!(opened.audit_seed, [0xb8; 32]);
+        assert!(!opened.audit_initialized);
+    }
+
+    #[test]
+    fn recovery_envelope_preserves_initialized_audit_state() {
+        let (config, local, media) = generate_recovery().unwrap();
+        let mut current = package(9);
+        current.audit_initialized = true;
+        let envelope = seal_package(&config, "audited", &PROFILE_ID, 9, &current).unwrap();
+        let opened = open_package(
+            &config,
+            "audited",
+            &PROFILE_ID,
+            9,
+            &envelope,
+            &local,
+            &media,
+        )
+        .unwrap();
+
+        assert_eq!(opened.profile_id, current.profile_id);
+        assert_eq!(opened.generation, current.generation);
+        assert_eq!(opened.dek, current.dek);
+        assert_eq!(opened.auth_seed, current.auth_seed);
+        assert_eq!(opened.audit_seed, current.audit_seed);
+        assert!(opened.audit_initialized);
     }
 
     #[test]

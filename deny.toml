@@ -15,10 +15,65 @@ ignore = []
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
-skip-tree = [
-    { crate = "russh@0.62.5", reason = "russh pins ssh-key 0.7.0-rc.11 and its RustCrypto 0.11/RC generation; serctl keeps its audited stable credential and IPC crypto generation until that upstream stack stabilizes." },
-    { crate = "eframe@0.35.0", reason = "eframe intentionally combines platform backends whose Winit, clipboard, Wayland, macOS, windows-sys, and proc-macro dependencies advance on independent version lines." },
-    { crate = "atomic-write-file@0.3.0", reason = "atomic-write-file 0.3 pins rand 0.9 independently of serctl's stable rand 0.8 and russh's rand 0.10 generation." },
+skip = [
+    # russh 0.62.5/ssh-key 0.7 RC has moved to the RustCrypto 0.11/RC
+    # generation while serctl's credential and IPC primitives intentionally
+    # remain on the audited stable generation. Exact entries ensure any future
+    # additional duplicate still fails this gate.
+    { crate = "aead@0.6.1", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "argon2@0.6.0-rc.8", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "blake2@0.11.0-rc.6", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "block-buffer@0.12.1", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "chacha20@0.10.2", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "cipher@0.5.2", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "cpufeatures@0.3.0", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "crypto-common@0.2.2", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "curve25519-dalek@5.0.0", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "digest@0.11.3", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "ed25519@3.0.0", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "ed25519-dalek@3.0.0", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "generic-array@1.4.4", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "hkdf@0.13.0", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "hmac@0.13.0", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "inout@0.2.2", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "poly1305@0.9.1", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "sha2@0.11.0", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "sha3@0.11.0", reason = "russh ML-KEM dependency transition" },
+    { crate = "signature@3.0.0", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "syn@3.0.3", reason = "upstream proc-macro ecosystem transition" },
+    { crate = "universal-hash@0.6.1", reason = "russh RustCrypto 0.11 transition" },
+    { crate = "rand@0.10.2", reason = "russh rand 0.10 transition" },
+    { crate = "rand_core@0.10.1", reason = "russh rand 0.10 transition" },
+    { crate = "getrandom@0.4.3", reason = "russh rand 0.10 transition" },
+
+    # atomic-write-file 0.3 currently uses the rand 0.9 and nix 0.30 lines.
+    { crate = "rand@0.9.5", reason = "atomic-write-file 0.3 dependency generation" },
+    { crate = "rand_chacha@0.9.0", reason = "atomic-write-file 0.3 dependency generation" },
+    { crate = "rand_core@0.9.5", reason = "atomic-write-file 0.3 dependency generation" },
+    { crate = "getrandom@0.3.4", reason = "atomic-write-file 0.3 dependency generation" },
+    { crate = "nix@0.30.1", reason = "atomic-write-file 0.3 dependency generation" },
+
+    # eframe 0.35 intentionally combines platform backends that have not yet
+    # converged on one Wayland, macOS, rustix, or windows-sys generation.
+    { crate = "bitflags@1.3.2", reason = "eframe 0.35 platform backend generation" },
+    { crate = "block2@0.5.1", reason = "eframe 0.35 macOS backend generation" },
+    { crate = "calloop@0.13.0", reason = "eframe 0.35 Wayland backend generation" },
+    { crate = "calloop-wayland-source@0.3.0", reason = "eframe 0.35 Wayland backend generation" },
+    { crate = "hashbrown@0.14.5", reason = "russh-sftp and eframe dependency generations" },
+    { crate = "linux-raw-sys@0.4.15", reason = "eframe 0.35 rustix backend generation" },
+    { crate = "objc2@0.5.2", reason = "eframe 0.35 macOS backend generation" },
+    { crate = "objc2-app-kit@0.2.2", reason = "eframe 0.35 macOS backend generation" },
+    { crate = "objc2-foundation@0.2.2", reason = "eframe 0.35 macOS backend generation" },
+    { crate = "rustix@0.38.44", reason = "eframe 0.35 platform backend generation" },
+    { crate = "smithay-client-toolkit@0.19.2", reason = "eframe 0.35 Wayland backend generation" },
+    { crate = "thiserror@1.0.69", reason = "eframe 0.35 platform backend generation" },
+    { crate = "thiserror-impl@1.0.69", reason = "eframe 0.35 platform backend generation" },
+    { crate = "windows-sys@0.52.0", reason = "eframe 0.35 Windows backend generation" },
+    { crate = "windows-sys@0.59.0", reason = "rpassword and eframe platform dependency generation" },
+    { crate = "windows-sys@0.60.2", reason = "eframe 0.35 clipboard backend generation" },
+    { crate = "windows-targets@0.52.6", reason = "eframe 0.35 Windows backend generation" },
+    { crate = "windows_x86_64_gnu@0.52.6", reason = "eframe 0.35 Windows backend generation" },
+    { crate = "windows_x86_64_msvc@0.52.6", reason = "eframe 0.35 Windows backend generation" },
 ]
 
 [sources]

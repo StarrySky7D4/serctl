@@ -1,0 +1,12 @@
+[package]
+name = "serctl-remote-protocol"
+description = "Bounded binary protocol for the serctl remote helper."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rand.workspace = true
+sha2.workspace = true
+zeroize.workspace = true

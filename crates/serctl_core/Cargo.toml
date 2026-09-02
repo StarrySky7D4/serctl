@@ -12,7 +12,7 @@ repository.workspace = true
 test-support = []
 
 [dependencies]
-serctl-protocol = { version = "0.3.0-beta.2", path = "../serctl_protocol" }
+serctl-protocol.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 russh.workspace = true

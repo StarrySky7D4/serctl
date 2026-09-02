@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
@@ -35,6 +35,20 @@ pub const MAX_SHELL_DIMENSION: u32 = 10_000;
 const REMOTE_PARTIAL_SUFFIX_BYTES: usize = ".serctl-part-".len() + 32;
 const SSH_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
 const TRANSPORT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+const MIN_FIRST_KEX_WINDOW: Duration = Duration::from_secs(8);
+const MIN_RETRY_KEX_WINDOW: Duration = Duration::from_secs(8);
+const PRE_AUTH_RETRY_BACKOFF: Duration = Duration::from_millis(1500);
+// A peer that closes the transport before sending any SSH bytes can fail far
+// earlier than the conservative two-window budget below. Reuse the caller's
+// still-unspent absolute deadline for that one narrow case instead of turning
+// a prompt, clean EOF into a false "no reconnect" result. This shorter path is
+// never available after server bytes, an SSH_MSG_DISCONNECT, or incomplete
+// transport cleanup.
+const EARLY_EOF_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const MIN_EARLY_EOF_RETRY_WINDOW: Duration = Duration::from_millis(500);
+const RETRY_SCHEDULING_MARGIN: Duration = Duration::from_millis(500);
+const MIN_TOFU_PIN_WINDOW: Duration = Duration::from_secs(5);
+const MIN_PASSWORD_AUTH_WINDOW: Duration = Duration::from_secs(5);
 const CHANNEL_OPERATION_TIMEOUT: Duration = Duration::from_millis(350);
 const CHANNEL_SIGNAL_GRACE: Duration = Duration::from_millis(100);
 // Tunnel wire types and their loopback-only validation live in the protocol
@@ -55,6 +69,8 @@ const SOCKS5_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TUNNEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const TUNNEL_STOP_TIMEOUT: Duration = Duration::from_secs(4);
 const TUNNEL_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_SAFE_SERVER_IDENTIFICATION_BYTES: usize = 128;
+static NEXT_TRANSPORT_ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 const TUNNEL_LOOPBACK_HOST: &str = "127.0.0.1";
 
@@ -370,6 +386,38 @@ pub fn is_explicit_sftp_status(error: &anyhow::Error) -> bool {
         error.downcast_ref::<russh_sftp::client::error::Error>(),
         Some(russh_sftp::client::error::Error::Status(_))
     )
+}
+
+/// Whether a russh failure proves that the underlying SSH transport is no
+/// longer reusable. In particular, channel confirmation can report
+/// `Disconnect` before `Handle::is_closed()` observes the event-loop sender
+/// closing; callers must not put that handle back into a session pool.
+pub fn is_ssh_transport_terminal_error(error: &anyhow::Error) -> bool {
+    let Some(error) = error.downcast_ref::<russh::Error>() else {
+        return false;
+    };
+    match error {
+        russh::Error::Disconnect
+        | russh::Error::HUP
+        | russh::Error::ConnectionTimeout
+        | russh::Error::KeepaliveTimeout
+        | russh::Error::InactivityTimeout
+        | russh::Error::SendError
+        | russh::Error::PacketAuth
+        | russh::Error::DecryptionError
+        | russh::Error::Inconsistent
+        | russh::Error::StrictKeyExchangeViolation { .. } => true,
+        russh::Error::IO(error) => matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
 }
 
 async fn await_exec_request_queued_until<F, E>(
@@ -692,7 +740,40 @@ impl Drop for RemoteForwardRegistration {
 pub struct SshHandler {
     expect: Option<String>,
     seen: Arc<Mutex<Option<String>>>,
+    disconnect_detail: Arc<Mutex<Option<String>>>,
+    activity: Arc<SshTransportActivity>,
     remote_forwards: Arc<RemoteForwardRegistry>,
+}
+
+fn safe_ssh_failure_category(
+    error: anyhow::Error,
+    disconnect_detail: &Arc<Mutex<Option<String>>>,
+) -> (anyhow::Error, String) {
+    let category = disconnect_detail
+        .lock()
+        .ok()
+        .and_then(|detail| detail.clone())
+        .unwrap_or_else(|| match error.downcast_ref::<russh::Error>() {
+            Some(russh::Error::Disconnect) => "russh Disconnect".to_owned(),
+            Some(russh::Error::HUP) => "russh HUP".to_owned(),
+            Some(russh::Error::ConnectionTimeout) => "russh ConnectionTimeout".to_owned(),
+            Some(russh::Error::KeepaliveTimeout) => "russh KeepaliveTimeout".to_owned(),
+            Some(russh::Error::InactivityTimeout) => "russh InactivityTimeout".to_owned(),
+            Some(russh::Error::SendError) => "russh SendError".to_owned(),
+            Some(russh::Error::IO(error)) => format!("russh IO::{:?}", error.kind()),
+            Some(_) => "russh protocol error".to_owned(),
+            None => "local SSH transport error".to_owned(),
+        });
+    (error, category)
+}
+
+fn ssh_phase_failure(
+    phase: &'static str,
+    error: anyhow::Error,
+    disconnect_detail: &Arc<Mutex<Option<String>>>,
+) -> anyhow::Error {
+    let (error, category) = safe_ssh_failure_category(error, disconnect_detail);
+    error.context(format!("{phase} failed: {category}"))
 }
 
 fn require_server_fingerprint(observed: Option<String>) -> Result<String> {
@@ -711,6 +792,9 @@ impl client::Handler for SshHandler {
         &mut self,
         server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
+        self.activity
+            .host_key_observed
+            .store(true, Ordering::Release);
         let fp = server_public_key
             .fingerprint(ssh_key::HashAlg::Sha256)
             .to_string();
@@ -721,6 +805,26 @@ impl client::Handler for SshHandler {
             None => true,
         };
         Ok(accept)
+    }
+
+    fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send {
+        let result = match reason {
+            client::DisconnectReason::ReceivedDisconnect(info) => {
+                // The server's description and language fields are untrusted
+                // free text and may echo credential material. Retain only the
+                // bounded protocol enum; never propagate those strings.
+                let detail = format!("remote disconnect {:?}", info.reason_code);
+                if let Ok(mut recorded) = self.disconnect_detail.lock() {
+                    *recorded = Some(detail);
+                }
+                Ok(())
+            }
+            client::DisconnectReason::Error(error) => Err(error),
+        };
+        std::future::ready(result)
     }
 
     async fn server_channel_open_forwarded_tcpip(
@@ -855,11 +959,107 @@ impl client::Handler for SshHandler {
 
 pub struct SshSession {
     handle: client::Handle<SshHandler>,
+    connection_identity: SshConnectionIdentitySnapshot,
     invalidated: Arc<AtomicBool>,
     transport: TransportControl,
     remote_forwards: Arc<RemoteForwardRegistry>,
     remote_forward_setup: AsyncMutex<()>,
     tunnel_flow_permits: Arc<Semaphore>,
+}
+
+/// Authenticated, read-only identity facts for one SSH transport.
+///
+/// The snapshot deliberately excludes endpoint topology, usernames,
+/// authentication material, pre-identification text, and the raw peer banner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshConnectionIdentitySnapshot {
+    observed_host_key_sha256: String,
+    server_identification: String,
+    transport_attempt_id: String,
+}
+
+impl SshConnectionIdentitySnapshot {
+    fn new_authenticated(
+        authenticated: bool,
+        observed_host_key_sha256: Option<&str>,
+        expected_host_key_sha256: Option<&str>,
+        server_identification: Option<&str>,
+        transport_attempt_id: Option<&str>,
+    ) -> Result<Self> {
+        ensure!(
+            authenticated,
+            "SSH connection identity requires authentication"
+        );
+        let observed =
+            observed_host_key_sha256.context("SSH connection identity has no observed host key")?;
+        ensure!(
+            is_canonical_sha256_fingerprint(observed),
+            "SSH connection identity host key is not a canonical SHA256 fingerprint"
+        );
+        if let Some(expected) = expected_host_key_sha256 {
+            ensure!(
+                expected == observed,
+                "SSH connection identity host-key pin does not match"
+            );
+        }
+        let identification = server_identification
+            .and_then(|value| sanitize_server_identification(value.as_bytes()))
+            .context("SSH connection identity has no safe server identification")?;
+        let attempt_id = transport_attempt_id
+            .filter(|value| is_canonical_transport_attempt_id(value))
+            .context("SSH connection identity transport attempt id is invalid")?;
+        Ok(Self {
+            observed_host_key_sha256: observed.to_owned(),
+            server_identification: identification,
+            transport_attempt_id: attempt_id.to_owned(),
+        })
+    }
+
+    pub fn observed_host_key_sha256(&self) -> &str {
+        &self.observed_host_key_sha256
+    }
+
+    /// This getter exists to make the fail-closed invariant explicit: a
+    /// snapshot is constructible only after the accepted key matches the pin
+    /// (or the caller-authorized first-use key) and authentication succeeds.
+    pub fn pin_match(&self) -> bool {
+        true
+    }
+
+    pub fn server_identification(&self) -> &str {
+        &self.server_identification
+    }
+
+    pub fn transport_attempt_id(&self) -> &str {
+        &self.transport_attempt_id
+    }
+}
+
+fn is_canonical_sha256_fingerprint(value: &str) -> bool {
+    let Some(payload) = value.strip_prefix("SHA256:") else {
+        return false;
+    };
+    payload.len() == 43
+        && payload
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+}
+
+fn is_canonical_transport_attempt_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
+}
+
+fn new_transport_attempt_id() -> String {
+    let sequence = NEXT_TRANSPORT_ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut nonce = [0_u8; 8];
+    OsRng.fill_bytes(&mut nonce);
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&nonce);
+    bytes[8..].copy_from_slice(&sequence.to_be_bytes());
+    hex::encode_upper(bytes)
 }
 
 pub struct ExecResult {
@@ -878,12 +1078,491 @@ pub struct RunningCommand {
 struct TransportTrip {
     invalidated: Arc<AtomicBool>,
     cancel: CancellationToken,
+    shutdown: Option<Arc<std::net::TcpStream>>,
+    activity: Option<Arc<SshTransportActivity>>,
 }
 
 impl TransportTrip {
-    fn trip(&self) {
+    fn trip(&self) -> bool {
         self.invalidated.store(true, Ordering::Release);
+        if let Some(activity) = &self.activity {
+            activity
+                .local_shutdown_started
+                .store(true, Ordering::Release);
+        }
+        let io_stopped =
+            self.shutdown
+                .as_ref()
+                .is_some_and(|socket| match socket.shutdown(Shutdown::Both) {
+                    Ok(()) => true,
+                    Err(error) => matches!(
+                        error.kind(),
+                        io::ErrorKind::NotConnected
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                    ),
+                });
         self.cancel.cancel();
+        io_stopped
+    }
+}
+
+#[derive(Default)]
+struct SshTransportActivity {
+    rx_bytes: AtomicU64,
+    tx_bytes: AtomicU64,
+    server_identification_observed: AtomicBool,
+    server_identification: Mutex<Option<String>>,
+    host_key_observed: AtomicBool,
+    local_shutdown_started: AtomicBool,
+    peer_eof_before_local_shutdown: AtomicBool,
+}
+
+#[derive(Debug)]
+struct SshAttemptRecord {
+    // This record is attached to operator-visible errors. Deliberately omit
+    // the resolved peer SocketAddr: profile topology is not required to
+    // distinguish the transport phases below and must not leak through Agent
+    // or sanitized error paths. `tcp_connected` means only that one resolved
+    // endpoint completed TCP connect; it does not identify that endpoint or
+    // attribute later silence to sshd, a middlebox, or a server-side policy.
+    attempt: u8,
+    tcp_connected: bool,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    server_identification_observed: bool,
+    host_key_observed: bool,
+    peer_eof_before_local_shutdown: bool,
+    peer_disconnect_reason: Option<String>,
+    elapsed_ms: u64,
+    failure_elapsed_ms: u64,
+    cleanup_elapsed_ms: u64,
+    socket_shutdown_confirmed: bool,
+    stream_released: bool,
+    failure_category: SshFailureCategory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SshFailureCategory {
+    TerminalDisconnect,
+    TerminalHangup,
+    TerminalTimeout,
+    TerminalSend,
+    TerminalIoClose,
+    Io,
+    LocalDeadline,
+    Protocol,
+    HostKey,
+    LocalSetup,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SshPeerObservation {
+    TcpNotConnected,
+    TcpConnectedNoSshBytes,
+    ClientIdentificationSentServerSilent,
+    TransportClosedBeforeServerIdentification,
+    PeerBytesWithoutValidServerIdentification,
+    SshIdentificationObservedNoHostKey,
+    RemoteSshDisconnectBeforeHostKey,
+    HostKeyObserved,
+}
+
+impl fmt::Display for SshPeerObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TcpNotConnected => "tcp_not_connected",
+            Self::TcpConnectedNoSshBytes => "tcp_connected_no_ssh_bytes",
+            Self::ClientIdentificationSentServerSilent => {
+                "client_identification_sent_server_silent"
+            }
+            Self::TransportClosedBeforeServerIdentification => {
+                "transport_closed_before_server_identification"
+            }
+            Self::PeerBytesWithoutValidServerIdentification => {
+                "peer_bytes_without_valid_server_identification"
+            }
+            Self::SshIdentificationObservedNoHostKey => "ssh_identification_observed_no_host_key",
+            Self::RemoteSshDisconnectBeforeHostKey => "remote_ssh_disconnect_before_host_key",
+            Self::HostKeyObserved => "host_key_observed",
+        })
+    }
+}
+
+impl SshPeerObservation {
+    fn attribution(self) -> &'static str {
+        match self {
+            Self::TcpNotConnected => "connect_path_failure",
+            Self::TcpConnectedNoSshBytes => "no_ssh_traffic_observed",
+            Self::ClientIdentificationSentServerSilent => "undetermined_pre_identification_silence",
+            Self::TransportClosedBeforeServerIdentification => {
+                "undetermined_pre_identification_transport_close"
+            }
+            Self::PeerBytesWithoutValidServerIdentification => {
+                "non_ssh_or_pre_identification_policy_bytes"
+            }
+            Self::SshIdentificationObservedNoHostKey => "ssh_identification_reached",
+            Self::RemoteSshDisconnectBeforeHostKey => "ssh_disconnect_observed",
+            Self::HostKeyObserved => "ssh_host_key_reached",
+        }
+    }
+}
+
+fn ssh_pre_auth_transport_phase(server_identification_observed: bool) -> &'static str {
+    if server_identification_observed {
+        "SSH key exchange phase"
+    } else {
+        "SSH server identification phase"
+    }
+}
+
+impl fmt::Display for SshFailureCategory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TerminalDisconnect => "terminal_disconnect",
+            Self::TerminalHangup => "terminal_hangup",
+            Self::TerminalTimeout => "terminal_timeout",
+            Self::TerminalSend => "terminal_send",
+            Self::TerminalIoClose => "terminal_io_close",
+            Self::Io => "io",
+            Self::LocalDeadline => "local_deadline",
+            Self::Protocol => "protocol",
+            Self::HostKey => "host_key",
+            Self::LocalSetup => "local_setup",
+        })
+    }
+}
+
+impl fmt::Display for SshAttemptRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let peer_disconnect_reason = self.peer_disconnect_reason.as_deref().unwrap_or("none");
+        let peer_observation = self.peer_observation();
+        write!(
+            formatter,
+            "SSH attempt {}: peer_observation={} attribution={} tcp_connected={} rx_bytes={} tx_bytes={} server_identification_observed={} host_key_observed={} peer_eof_before_local_shutdown={} peer_disconnect_reason={} failure_elapsed_ms={} cleanup_elapsed_ms={} elapsed_ms={} socket_shutdown_confirmed={} stream_released={} failure={}",
+            self.attempt,
+            peer_observation,
+            peer_observation.attribution(),
+            self.tcp_connected,
+            self.rx_bytes,
+            self.tx_bytes,
+            self.server_identification_observed,
+            self.host_key_observed,
+            self.peer_eof_before_local_shutdown,
+            peer_disconnect_reason,
+            self.failure_elapsed_ms,
+            self.cleanup_elapsed_ms,
+            self.elapsed_ms,
+            self.socket_shutdown_confirmed,
+            self.stream_released,
+            self.failure_category
+        )
+    }
+}
+
+impl std::error::Error for SshAttemptRecord {}
+
+impl SshAttemptRecord {
+    fn peer_observation(&self) -> SshPeerObservation {
+        if !self.tcp_connected {
+            SshPeerObservation::TcpNotConnected
+        } else if self.host_key_observed {
+            SshPeerObservation::HostKeyObserved
+        } else if self.peer_disconnect_reason.is_some() {
+            SshPeerObservation::RemoteSshDisconnectBeforeHostKey
+        } else if self.rx_bytes == 0
+            && (self.peer_eof_before_local_shutdown
+                || self.failure_category == SshFailureCategory::TerminalIoClose)
+        {
+            SshPeerObservation::TransportClosedBeforeServerIdentification
+        } else if self.server_identification_observed {
+            SshPeerObservation::SshIdentificationObservedNoHostKey
+        } else if self.rx_bytes > 0 {
+            SshPeerObservation::PeerBytesWithoutValidServerIdentification
+        } else if self.tx_bytes > 0 {
+            SshPeerObservation::ClientIdentificationSentServerSilent
+        } else {
+            SshPeerObservation::TcpConnectedNoSshBytes
+        }
+    }
+
+    fn capture(
+        attempt: u8,
+        started: tokio::time::Instant,
+        tcp_connected: bool,
+        activity: &SshTransportActivity,
+        disconnect_detail: &Arc<Mutex<Option<String>>>,
+        cleanup: TransportCleanup,
+        failure_category: SshFailureCategory,
+    ) -> Self {
+        let elapsed = started.elapsed();
+        let failure_elapsed = elapsed.saturating_sub(cleanup.elapsed);
+        Self {
+            attempt,
+            tcp_connected,
+            rx_bytes: activity.rx_bytes.load(Ordering::Relaxed),
+            tx_bytes: activity.tx_bytes.load(Ordering::Relaxed),
+            server_identification_observed: activity
+                .server_identification_observed
+                .load(Ordering::Acquire),
+            host_key_observed: activity.host_key_observed.load(Ordering::Acquire),
+            peer_eof_before_local_shutdown: activity
+                .peer_eof_before_local_shutdown
+                .load(Ordering::Acquire),
+            peer_disconnect_reason: disconnect_detail
+                .lock()
+                .ok()
+                .and_then(|detail| detail.clone()),
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            failure_elapsed_ms: u64::try_from(failure_elapsed.as_millis()).unwrap_or(u64::MAX),
+            cleanup_elapsed_ms: u64::try_from(cleanup.elapsed.as_millis()).unwrap_or(u64::MAX),
+            socket_shutdown_confirmed: cleanup.socket_shutdown_confirmed,
+            stream_released: cleanup.stream_released,
+            failure_category,
+        }
+    }
+}
+
+fn classify_ssh_attempt_failure(error: &anyhow::Error) -> SshFailureCategory {
+    fn is_terminal_close(kind: io::ErrorKind) -> bool {
+        matches!(
+            kind,
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::UnexpectedEof
+        )
+    }
+
+    match error.downcast_ref::<russh::Error>() {
+        Some(russh::Error::Disconnect) => SshFailureCategory::TerminalDisconnect,
+        Some(russh::Error::HUP) => SshFailureCategory::TerminalHangup,
+        Some(
+            russh::Error::ConnectionTimeout
+            | russh::Error::KeepaliveTimeout
+            | russh::Error::InactivityTimeout,
+        ) => SshFailureCategory::TerminalTimeout,
+        Some(russh::Error::SendError) => SshFailureCategory::TerminalSend,
+        Some(russh::Error::IO(error)) if is_terminal_close(error.kind()) => {
+            SshFailureCategory::TerminalIoClose
+        }
+        Some(russh::Error::IO(_)) => SshFailureCategory::Io,
+        Some(russh::Error::UnknownKey) => SshFailureCategory::HostKey,
+        Some(_) => SshFailureCategory::Protocol,
+        None if error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| is_terminal_close(error.kind())) =>
+        {
+            SshFailureCategory::TerminalIoClose
+        }
+        None if error.downcast_ref::<io::Error>().is_some() => SshFailureCategory::Io,
+        None => SshFailureCategory::LocalSetup,
+    }
+}
+
+fn attach_ssh_attempt_record(error: anyhow::Error, record: SshAttemptRecord) -> anyhow::Error {
+    log::debug!("{record}");
+    error.context(record)
+}
+
+fn log_successful_ssh_attempt(
+    attempt: u8,
+    started: tokio::time::Instant,
+    activity: &SshTransportActivity,
+) {
+    log::debug!(
+        "SSH attempt {attempt}: tcp_connected=true rx_bytes={} tx_bytes={} server_identification_observed={} host_key_observed={} elapsed_ms={} socket_shutdown_confirmed=false stream_released=false outcome=key_exchange_complete",
+        activity.rx_bytes.load(Ordering::Relaxed),
+        activity.tx_bytes.load(Ordering::Relaxed),
+        activity
+            .server_identification_observed
+            .load(Ordering::Acquire),
+        activity.host_key_observed.load(Ordering::Acquire),
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    );
+}
+
+struct CountedSshStream {
+    socket: Option<tokio::net::TcpStream>,
+    activity: Arc<SshTransportActivity>,
+    identification: IdentificationTracker,
+    released: Option<oneshot::Sender<()>>,
+}
+
+struct IdentificationTracker {
+    line: Vec<u8>,
+    oversized: bool,
+}
+
+impl Default for IdentificationTracker {
+    fn default() -> Self {
+        Self {
+            line: Vec::with_capacity(255),
+            oversized: false,
+        }
+    }
+}
+
+fn sanitize_server_identification(line: &[u8]) -> Option<String> {
+    if line.is_empty() || line.len() > 253 || !line.iter().all(|byte| matches!(byte, 0x20..=0x7e)) {
+        return None;
+    }
+    let prefix_len = if line.starts_with(b"SSH-2.0-") {
+        b"SSH-2.0-".len()
+    } else if line.starts_with(b"SSH-1.99-") {
+        b"SSH-1.99-".len()
+    } else {
+        return None;
+    };
+    let software_end = line[prefix_len..]
+        .iter()
+        .position(|byte| *byte == b' ')
+        .map_or(line.len(), |offset| prefix_len + offset);
+    let software = line.get(prefix_len..software_end)?;
+    if software.is_empty()
+        || software.len() > MAX_SAFE_SERVER_IDENTIFICATION_BYTES.saturating_sub(prefix_len)
+        || !software.iter().all(|byte| matches!(byte, 0x21..=0x7e))
+    {
+        return None;
+    }
+    let retained = line.get(..software_end)?;
+    std::str::from_utf8(retained).ok().map(str::to_owned)
+}
+
+impl IdentificationTracker {
+    fn observe(&mut self, bytes: &[u8]) -> Option<String> {
+        for byte in bytes {
+            if *byte == b'\n' {
+                let observed = (!self.oversized && self.line.last() == Some(&b'\r'))
+                    .then(|| sanitize_server_identification(&self.line[..self.line.len() - 1]))
+                    .flatten();
+                *self = Self::default();
+                if observed.is_some() {
+                    return observed;
+                }
+                continue;
+            }
+            if self.line.len() < 254 {
+                self.line.push(*byte);
+            } else {
+                self.oversized = true;
+            }
+        }
+        None
+    }
+}
+
+impl CountedSshStream {
+    fn new(
+        socket: tokio::net::TcpStream,
+        activity: Arc<SshTransportActivity>,
+        released: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            socket: Some(socket),
+            activity,
+            identification: IdentificationTracker::default(),
+            released: Some(released),
+        }
+    }
+}
+
+impl AsyncRead for CountedSshStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let filled_before = buffer.filled().len();
+        let had_capacity = buffer.remaining() > 0;
+        let result = Pin::new(
+            self.socket
+                .as_mut()
+                .expect("counted SSH stream polled after socket release"),
+        )
+        .poll_read(context, buffer);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            let received = buffer.filled().len().saturating_sub(filled_before);
+            let received_bytes = &buffer.filled()[filled_before..];
+            if let Some(identification) = self.identification.observe(received_bytes) {
+                if let Ok(mut retained) = self.activity.server_identification.lock() {
+                    if retained.is_none() {
+                        *retained = Some(identification);
+                    }
+                    self.activity
+                        .server_identification_observed
+                        .store(true, Ordering::Release);
+                }
+            }
+            self.activity
+                .rx_bytes
+                .fetch_add(received as u64, Ordering::Relaxed);
+            if had_capacity
+                && received == 0
+                && !self.activity.local_shutdown_started.load(Ordering::Acquire)
+            {
+                self.activity
+                    .peer_eof_before_local_shutdown
+                    .store(true, Ordering::Release);
+            }
+        }
+        result
+    }
+}
+
+impl AsyncWrite for CountedSshStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(
+            self.socket
+                .as_mut()
+                .expect("counted SSH stream polled after socket release"),
+        )
+        .poll_write(context, buffer);
+        if let Poll::Ready(Ok(written)) = result {
+            self.activity
+                .tx_bytes
+                .fetch_add(written as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(
+            self.socket
+                .as_mut()
+                .expect("counted SSH stream polled after socket release"),
+        )
+        .poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(
+            self.socket
+                .as_mut()
+                .expect("counted SSH stream polled after socket release"),
+        )
+        .poll_shutdown(context)
+    }
+}
+
+impl Drop for CountedSshStream {
+    fn drop(&mut self) {
+        // `stream_released` is a retry authorization condition. Drop the
+        // transport's owned async socket before publishing the signal; Rust
+        // would otherwise drop fields only after this Drop body returns.
+        drop(self.socket.take());
+        if let Some(released) = self.released.take() {
+            let _ = released.send(());
+        }
     }
 }
 
@@ -919,20 +1598,45 @@ struct TransportControl {
     done: AsyncMutex<Option<oneshot::Receiver<()>>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TransportCleanup {
+    socket_shutdown_confirmed: bool,
+    stream_released: bool,
+    elapsed: Duration,
+}
+
+impl TransportCleanup {
+    const NO_LIVE_STREAM: Self = Self {
+        socket_shutdown_confirmed: false,
+        stream_released: true,
+        elapsed: Duration::ZERO,
+    };
+}
+
 impl TransportControl {
     fn trip(&self) -> TransportTrip {
         self.trip.clone()
     }
 
-    async fn stop_and_wait(&self) -> bool {
-        self.trip.trip();
+    async fn stop_and_wait(&self) -> TransportCleanup {
+        let started = tokio::time::Instant::now();
+        let socket_shutdown_confirmed = self.trip.trip();
         let Some(done) = self.done.lock().await.take() else {
-            return true;
+            return TransportCleanup {
+                socket_shutdown_confirmed,
+                stream_released: false,
+                elapsed: started.elapsed(),
+            };
         };
-        matches!(
+        let stream_released = matches!(
             tokio::time::timeout(TRANSPORT_CLEANUP_TIMEOUT, done).await,
             Ok(Ok(()))
-        )
+        );
+        TransportCleanup {
+            socket_shutdown_confirmed,
+            stream_released,
+            elapsed: started.elapsed(),
+        }
     }
 }
 
@@ -940,27 +1644,6 @@ impl Drop for TransportControl {
     fn drop(&mut self) {
         self.trip.trip();
     }
-}
-
-async fn run_transport_proxy(
-    mut socket: tokio::net::TcpStream,
-    mut proxy_stream: tokio::io::DuplexStream,
-    cancel: CancellationToken,
-    done: oneshot::Sender<()>,
-) {
-    tokio::select! {
-        result = tokio::io::copy_bidirectional(&mut socket, &mut proxy_stream) => {
-            if let Err(error) = result {
-                log::debug!("SSH transport proxy ended: {error}");
-            }
-        }
-        _ = cancel.cancelled() => {}
-    }
-    // Waking both halves is what makes cancelling a russh connect future
-    // deterministic even when its internal task is blocked in pre-auth KEX.
-    let _ = proxy_stream.shutdown().await;
-    let _ = socket.shutdown().await;
-    let _ = done.send(());
 }
 
 /// Validates each SFTP length prefix before exposing even its four-byte header
@@ -1272,7 +1955,11 @@ pub struct StagedSshSession {
     invalidated: Arc<AtomicBool>,
     transport: Option<TransportControl>,
     remote_forwards: Arc<RemoteForwardRegistry>,
+    disconnect_detail: Arc<Mutex<Option<String>>>,
     observed_fingerprint: String,
+    expected_fingerprint: Option<String>,
+    server_identification: String,
+    transport_attempt_id: String,
 }
 
 impl StagedSshSession {
@@ -1281,7 +1968,7 @@ impl StagedSshSession {
     }
 
     /// Close a pre-authentication transport and wait a bounded interval for
-    /// its proxy to release the underlying TCP socket.
+    /// russh to release the underlying TCP socket.
     pub async fn abort(mut self) {
         self.invalidated.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
@@ -1310,7 +1997,7 @@ impl StagedSshSession {
     ) -> Result<SshSession> {
         if deadline <= tokio::time::Instant::now() {
             self.abort().await;
-            bail!("SSH connection exceeded its deadline");
+            bail!("SSH password authentication phase exceeded its deadline");
         }
         let result = {
             let authentication = self
@@ -1336,6 +2023,19 @@ impl StagedSshSession {
         };
         match result {
             Ok(Some(Ok(client::AuthResult::Success))) => {
+                let connection_identity = match SshConnectionIdentitySnapshot::new_authenticated(
+                    true,
+                    Some(&self.observed_fingerprint),
+                    self.expected_fingerprint.as_deref(),
+                    Some(&self.server_identification),
+                    Some(&self.transport_attempt_id),
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        self.abort().await;
+                        return Err(error);
+                    }
+                };
                 let handle = self
                     .handle
                     .take()
@@ -1343,9 +2043,10 @@ impl StagedSshSession {
                 let transport = self
                     .transport
                     .take()
-                    .context("SSH transport proxy disappeared after authentication")?;
+                    .context("SSH transport control disappeared after authentication")?;
                 Ok(SshSession {
                     handle,
+                    connection_identity,
                     invalidated: self.invalidated.clone(),
                     transport,
                     remote_forwards: Arc::clone(&self.remote_forwards),
@@ -1354,23 +2055,223 @@ impl StagedSshSession {
                 })
             }
             Ok(Some(Ok(_))) => {
-                let error = anyhow::anyhow!("authentication failed for user '{user}'");
+                self.abort().await;
+                bail!("SSH password authentication rejected the stored SSH credential")
+            }
+            Ok(Some(Err(error))) => {
+                let error = ssh_phase_failure(
+                    "SSH password authentication phase",
+                    error.into(),
+                    &self.disconnect_detail,
+                );
                 self.abort().await;
                 Err(error)
             }
-            Ok(Some(Err(error))) => {
-                self.abort().await;
-                Err(error.into())
-            }
             Ok(None) | Err(_) => {
                 self.abort().await;
-                bail!("SSH connection exceeded its deadline")
+                bail!("SSH password authentication phase exceeded its deadline")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SshConnectBudget {
+    first_attempt_deadline: tokio::time::Instant,
+    retry_attempt_deadline: Option<tokio::time::Instant>,
+}
+
+fn ssh_connect_budget(
+    now: tokio::time::Instant,
+    total_deadline: tokio::time::Instant,
+    post_kex_window: Duration,
+) -> SshConnectBudget {
+    let minimum_retry_total = MIN_FIRST_KEX_WINDOW
+        + TRANSPORT_CLEANUP_TIMEOUT
+        + PRE_AUTH_RETRY_BACKOFF
+        + MIN_RETRY_KEX_WINDOW
+        + RETRY_SCHEDULING_MARGIN
+        + post_kex_window;
+    let retry_reserve = TRANSPORT_CLEANUP_TIMEOUT
+        + PRE_AUTH_RETRY_BACKOFF
+        + MIN_RETRY_KEX_WINDOW
+        + RETRY_SCHEDULING_MARGIN
+        + post_kex_window;
+    let retry_enabled = total_deadline
+        .checked_duration_since(now)
+        .is_some_and(|remaining| remaining >= minimum_retry_total);
+
+    if retry_enabled {
+        SshConnectBudget {
+            first_attempt_deadline: total_deadline
+                .checked_sub(retry_reserve)
+                .expect("validated retry reserve exceeded the total SSH deadline"),
+            retry_attempt_deadline: Some(
+                total_deadline
+                    .checked_sub(post_kex_window)
+                    .expect("validated post-KEX reserve exceeded the total SSH deadline"),
+            ),
+        }
+    } else {
+        let first_attempt_deadline = total_deadline
+            .checked_duration_since(now)
+            .filter(|remaining| *remaining >= MIN_FIRST_KEX_WINDOW + post_kex_window)
+            .and_then(|_| total_deadline.checked_sub(post_kex_window))
+            .unwrap_or(total_deadline);
+        SshConnectBudget {
+            first_attempt_deadline,
+            retry_attempt_deadline: None,
+        }
+    }
+}
+
+fn has_minimum_retry_window_after_backoff(
+    now: tokio::time::Instant,
+    retry_deadline: tokio::time::Instant,
+) -> bool {
+    retry_deadline
+        .checked_duration_since(now)
+        .is_some_and(|remaining| remaining >= PRE_AUTH_RETRY_BACKOFF + MIN_RETRY_KEX_WINDOW)
+}
+
+fn has_minimum_retry_window(
+    now: tokio::time::Instant,
+    retry_deadline: tokio::time::Instant,
+) -> bool {
+    retry_deadline
+        .checked_duration_since(now)
+        .is_some_and(|remaining| remaining >= MIN_RETRY_KEX_WINDOW)
+}
+
+fn has_early_eof_retry_window_after_backoff(
+    now: tokio::time::Instant,
+    retry_deadline: tokio::time::Instant,
+) -> bool {
+    retry_deadline
+        .checked_duration_since(now)
+        .is_some_and(|remaining| remaining >= EARLY_EOF_RETRY_BACKOFF + MIN_EARLY_EOF_RETRY_WINDOW)
+}
+
+fn has_early_eof_retry_window(
+    now: tokio::time::Instant,
+    retry_deadline: tokio::time::Instant,
+) -> bool {
+    retry_deadline
+        .checked_duration_since(now)
+        .is_some_and(|remaining| remaining >= MIN_EARLY_EOF_RETRY_WINDOW)
+}
+
+fn should_retry_pre_auth_failure(record: &SshAttemptRecord, error: &anyhow::Error) -> bool {
+    if record.host_key_observed
+        || record.rx_bytes > 0
+        || record.peer_disconnect_reason.is_some()
+        || !record.socket_shutdown_confirmed
+        || !record.stream_released
+    {
+        return false;
+    }
+    is_ssh_transport_terminal_error(error)
+        || record.failure_category == SshFailureCategory::LocalDeadline
+}
+
+/// Retry exactly one pre-authentication failure without minting a fresh time
+/// budget. The first attempt owns an explicit sub-deadline only when the
+/// caller supplied enough time for cleanup, a useful retry, and all post-KEX
+/// work (TOFU persistence when needed plus password authentication).
+async fn connect_key_exchange_with_one_reconnect_until<T, F, Fut>(
+    deadline: tokio::time::Instant,
+    post_kex_window: Duration,
+    mut attempt: F,
+) -> Result<(T, bool)>
+where
+    F: FnMut(u8, tokio::time::Instant) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let budget = ssh_connect_budget(tokio::time::Instant::now(), deadline, post_kex_window);
+    match attempt(1, budget.first_attempt_deadline).await {
+        Ok(staged) => Ok((staged, false)),
+        Err(first) => {
+            let Some(record) = first.downcast_ref::<SshAttemptRecord>() else {
+                return Err(first);
+            };
+            let retryable = should_retry_pre_auth_failure(record, &first);
+            if !retryable {
+                return Err(first);
+            }
+            let now = tokio::time::Instant::now();
+            let (
+                retry_deadline,
+                retry_backoff,
+                uses_reserved_retry_window,
+                retry_window_is_complete,
+            ) = if let Some(retry_deadline) = budget.retry_attempt_deadline {
+                (
+                    retry_deadline,
+                    PRE_AUTH_RETRY_BACKOFF,
+                    true,
+                    has_minimum_retry_window_after_backoff(now, retry_deadline),
+                )
+            } else if record.peer_eof_before_local_shutdown {
+                (
+                    deadline,
+                    EARLY_EOF_RETRY_BACKOFF,
+                    false,
+                    has_early_eof_retry_window_after_backoff(now, deadline),
+                )
+            } else {
+                return Err(first);
+            };
+            if !retry_window_is_complete {
+                return Err(first);
+            }
+            let first_category = record.failure_category;
+            let first_attempt = record.to_string();
+            tokio::time::sleep(retry_backoff).await;
+            let now = tokio::time::Instant::now();
+            let retry_window_remains = if uses_reserved_retry_window {
+                has_minimum_retry_window(now, retry_deadline)
+            } else {
+                has_early_eof_retry_window(now, retry_deadline)
+            };
+            if !retry_window_remains {
+                return Err(first);
+            }
+            match attempt(2, retry_deadline).await {
+                Ok(staged) => Ok((staged, true)),
+                Err(second) => {
+                    let (second_category, second_attempt, second_phase) =
+                        second.downcast_ref::<SshAttemptRecord>().map_or_else(
+                            || {
+                                (
+                                    "unclassified".to_owned(),
+                                    "unavailable".to_owned(),
+                                    "SSH pre-authentication transport phase",
+                                )
+                            },
+                            |record| {
+                                (
+                                    record.failure_category.to_string(),
+                                    record.to_string(),
+                                    ssh_pre_auth_transport_phase(
+                                        record.server_identification_observed,
+                                    ),
+                                )
+                            },
+                        );
+                    Err(second.context(format!(
+                        "{second_phase} failed after one pre-authentication reconnect; first_failure={first_category}; first_attempt=[{first_attempt}]; second_failure={second_category}; second_attempt=[{second_attempt}]"
+                    )))
+                }
             }
         }
     }
 }
 
 impl SshSession {
+    pub fn connection_identity(&self) -> &SshConnectionIdentitySnapshot {
+        &self.connection_identity
+    }
+
     /// Start the fixed native transfer helper without interpolating any
     /// user-controlled path or argument into the SSH exec command. Paths and
     /// transfer metadata are exchanged only through bounded protocol frames
@@ -1391,22 +2292,56 @@ impl SshSession {
     }
 
     /// Complete TCP connection, SSH key exchange, and host-key validation
-    /// without sending a password. The TCP stream is kept behind a
-    /// cancellation-aware proxy because russh spawns its session task before
-    /// key exchange completes. Cancelling the public `connect_stream` future
-    /// alone would otherwise detach that task forever when a peer sends its
-    /// banner and then stalls during KEX.
+    /// without sending a password. A transport-terminal failure before KEX
+    /// completes is safe to retry once because authentication has not started;
+    /// both attempts share the caller's original absolute deadline.
     pub async fn connect_key_exchange_until(
         creds: &Creds,
         expect: Option<String>,
         deadline: tokio::time::Instant,
     ) -> Result<StagedSshSession> {
+        let post_kex_window = MIN_PASSWORD_AUTH_WINDOW
+            + if expect.is_none() {
+                MIN_TOFU_PIN_WINDOW
+            } else {
+                Duration::ZERO
+            };
+        let (staged, _) = connect_key_exchange_with_one_reconnect_until(
+            deadline,
+            post_kex_window,
+            |attempt, attempt_deadline| {
+                Self::connect_key_exchange_once_until(
+                    creds,
+                    expect.clone(),
+                    attempt,
+                    attempt_deadline,
+                )
+            },
+        )
+        .await?;
+        Ok(staged)
+    }
+
+    /// One pre-authentication transport attempt. Russh owns the counted TCP
+    /// stream directly; a duplicated OS socket handle lets timeout cleanup
+    /// interrupt blocked I/O without inserting a userspace duplex proxy into
+    /// the key-exchange path.
+    async fn connect_key_exchange_once_until(
+        creds: &Creds,
+        expect: Option<String>,
+        attempt: u8,
+        deadline: tokio::time::Instant,
+    ) -> Result<StagedSshSession> {
+        let started = tokio::time::Instant::now();
+        let transport_attempt_id = new_transport_attempt_id();
         let seen = Arc::new(Mutex::new(None));
+        let disconnect_detail = Arc::new(Mutex::new(None));
+        let activity = Arc::new(SshTransportActivity::default());
         let remote_forwards = Arc::new(RemoteForwardRegistry::default());
         let cfg = client::Config {
             // This is a second line of defence for pre-authentication stalls.
-            // The external absolute deadline is enforced by the proxy below;
-            // this timeout also bounds a detached/upstream-internal wait.
+            // The external absolute deadline is enforced around connect_stream;
+            // this timeout also bounds an upstream-internal wait.
             inactivity_timeout: Some(SSH_INACTIVITY_TIMEOUT),
             keepalive_interval: Some(Duration::from_secs(30)),
             keepalive_max: 3,
@@ -1417,22 +2352,102 @@ impl SshSession {
         let handler = SshHandler {
             expect: expect.clone(),
             seen: seen.clone(),
+            disconnect_detail: Arc::clone(&disconnect_detail),
+            activity: Arc::clone(&activity),
             remote_forwards: Arc::clone(&remote_forwards),
         };
-        let socket = connect_ssh_tcp_until(creds.host.as_str(), creds.port, deadline).await?;
+        let socket = match connect_ssh_tcp_until(creds.host.as_str(), creds.port, deadline).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                let category = if tokio::time::Instant::now() >= deadline {
+                    SshFailureCategory::LocalDeadline
+                } else {
+                    classify_ssh_attempt_failure(&error)
+                };
+                let record = SshAttemptRecord::capture(
+                    attempt,
+                    started,
+                    false,
+                    &activity,
+                    &disconnect_detail,
+                    TransportCleanup::NO_LIVE_STREAM,
+                    category,
+                );
+                return Err(attach_ssh_attempt_record(
+                    error.context("SSH TCP connection phase failed"),
+                    record,
+                ));
+            }
+        };
         if cfg.nodelay {
             socket.set_nodelay(true).context("set SSH TCP_NODELAY")?;
         }
+
+        let socket = match socket.into_std() {
+            Ok(socket) => socket,
+            Err(error) => {
+                let record = SshAttemptRecord::capture(
+                    attempt,
+                    started,
+                    true,
+                    &activity,
+                    &disconnect_detail,
+                    TransportCleanup::NO_LIVE_STREAM,
+                    SshFailureCategory::LocalSetup,
+                );
+                return Err(attach_ssh_attempt_record(
+                    anyhow::Error::new(error).context("take ownership of SSH TCP socket"),
+                    record,
+                ));
+            }
+        };
+        let shutdown_socket = match socket.try_clone() {
+            Ok(shutdown_socket) => Arc::new(shutdown_socket),
+            Err(error) => {
+                let record = SshAttemptRecord::capture(
+                    attempt,
+                    started,
+                    true,
+                    &activity,
+                    &disconnect_detail,
+                    TransportCleanup::NO_LIVE_STREAM,
+                    SshFailureCategory::LocalSetup,
+                );
+                return Err(attach_ssh_attempt_record(
+                    anyhow::Error::new(error).context("duplicate SSH TCP shutdown handle"),
+                    record,
+                ));
+            }
+        };
+        let socket = match tokio::net::TcpStream::from_std(socket) {
+            Ok(socket) => socket,
+            Err(error) => {
+                let record = SshAttemptRecord::capture(
+                    attempt,
+                    started,
+                    true,
+                    &activity,
+                    &disconnect_detail,
+                    TransportCleanup::NO_LIVE_STREAM,
+                    SshFailureCategory::LocalSetup,
+                );
+                return Err(attach_ssh_attempt_record(
+                    anyhow::Error::new(error).context("restore asynchronous SSH TCP socket"),
+                    record,
+                ));
+            }
+        };
 
         let invalidated = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();
         let trip = TransportTrip {
             invalidated: invalidated.clone(),
-            cancel: cancel.clone(),
+            cancel,
+            shutdown: Some(shutdown_socket),
+            activity: Some(Arc::clone(&activity)),
         };
-        let (russh_stream, proxy_stream) = tokio::io::duplex(256 * 1024);
         let (done_tx, done_rx) = oneshot::channel();
-        tokio::spawn(run_transport_proxy(socket, proxy_stream, cancel, done_tx));
+        let russh_stream = CountedSshStream::new(socket, Arc::clone(&activity), done_tx);
         let transport = TransportControl {
             trip,
             done: AsyncMutex::new(Some(done_rx)),
@@ -1444,31 +2459,111 @@ impl SshSession {
         let handle = match tokio::time::timeout_at(deadline, operation).await {
             Ok(Ok(handle)) => handle,
             Ok(Err(error)) => {
-                let _ = transport.stop_and_wait().await;
-                return Err(error);
+                let category = classify_ssh_attempt_failure(&error);
+                let phase = ssh_pre_auth_transport_phase(
+                    activity
+                        .server_identification_observed
+                        .load(Ordering::Acquire),
+                );
+                let error = ssh_phase_failure(phase, error, &disconnect_detail);
+                let cleanup = transport.stop_and_wait().await;
+                let record = SshAttemptRecord::capture(
+                    attempt,
+                    started,
+                    true,
+                    &activity,
+                    &disconnect_detail,
+                    cleanup,
+                    category,
+                );
+                return Err(attach_ssh_attempt_record(error, record));
             }
             Err(_) => {
-                let _ = transport.stop_and_wait().await;
-                bail!("SSH connection exceeded its deadline");
+                let cleanup = transport.stop_and_wait().await;
+                let phase = ssh_pre_auth_transport_phase(
+                    activity
+                        .server_identification_observed
+                        .load(Ordering::Acquire),
+                );
+                let record = SshAttemptRecord::capture(
+                    attempt,
+                    started,
+                    true,
+                    &activity,
+                    &disconnect_detail,
+                    cleanup,
+                    SshFailureCategory::LocalDeadline,
+                );
+                return Err(attach_ssh_attempt_record(
+                    anyhow::anyhow!("{phase} exceeded its deadline"),
+                    record,
+                ));
             }
         };
         let observed_fingerprint = seen
             .lock()
             .map_err(|_| anyhow::anyhow!("server-key observation state was poisoned"))?
             .clone();
-        let fp = match require_server_fingerprint(observed_fingerprint) {
+        let fp = match require_server_fingerprint(observed_fingerprint)
+            .context("SSH host-key verification phase failed")
+        {
             Ok(fp) => fp,
             Err(error) => {
-                let _ = transport.stop_and_wait().await;
-                return Err(error);
+                let cleanup = transport.stop_and_wait().await;
+                let record = SshAttemptRecord::capture(
+                    attempt,
+                    started,
+                    true,
+                    &activity,
+                    &disconnect_detail,
+                    cleanup,
+                    SshFailureCategory::HostKey,
+                );
+                return Err(attach_ssh_attempt_record(error, record));
             }
         };
+        let verified_identity_material = (|| -> Result<(Option<String>, String)> {
+            if let Some(expected) = expect.as_deref() {
+                ensure!(expected == fp, "SSH host-key pin does not match");
+            }
+            let server_identification = activity
+                .server_identification
+                .lock()
+                .map_err(|_| anyhow::anyhow!("server-identification state was poisoned"))?
+                .clone()
+                .context("SSH completed without a safe server identification")?;
+            Ok((expect.clone(), server_identification))
+        })();
+        let (expected_fingerprint, server_identification) = match verified_identity_material {
+            Ok(material) => material,
+            Err(error) => {
+                let cleanup = transport.stop_and_wait().await;
+                let record = SshAttemptRecord::capture(
+                    attempt,
+                    started,
+                    true,
+                    &activity,
+                    &disconnect_detail,
+                    cleanup,
+                    SshFailureCategory::HostKey,
+                );
+                return Err(attach_ssh_attempt_record(
+                    error.context("SSH connection identity verification phase failed"),
+                    record,
+                ));
+            }
+        };
+        log_successful_ssh_attempt(attempt, started, &activity);
         Ok(StagedSshSession {
             handle: Some(handle),
             invalidated,
             transport: Some(transport),
             remote_forwards,
+            disconnect_detail,
             observed_fingerprint: fp,
+            expected_fingerprint,
+            server_identification,
+            transport_attempt_id,
         })
     }
 
@@ -1836,20 +2931,41 @@ impl SshSession {
     /// exposed separately so a daemon can react to IPC disconnects between
     /// channel creation and command startup and still close the channel.
     pub async fn open_exec_until(&self, deadline: tokio::time::Instant) -> Result<RunningCommand> {
-        match tokio::time::timeout_at(deadline, self.handle.channel_open_session()).await {
-            Ok(Ok(channel)) => Ok(RunningCommand {
-                channel,
-                transport: self.transport_trip(),
-                submission: ExecSubmissionState::BeforeRequest,
-            }),
-            Ok(Err(error)) => Err(error.into()),
-            Err(_) => {
-                // russh's channel-open future is not cancellation-safe: after
-                // its reply receiver is dropped the session can retain the
-                // corresponding channel. Discard the transport to release it.
-                self.invalidate().await;
-                Err(command_deadline_error())
+        ensure!(
+            deadline > tokio::time::Instant::now(),
+            "exec channel-open deadline expired"
+        );
+        let mut uncertain = TripTransportOnDrop::new(self.transport_trip());
+        let opened = poll_remote_mutation_until(
+            deadline,
+            self.handle.channel_open_session(),
+            || {},
+            || {},
+            "exec channel-open deadline expired",
+        )
+        .await;
+        match opened {
+            Ok(channel) => {
+                uncertain.disarm();
+                Ok(RunningCommand {
+                    channel,
+                    transport: self.transport_trip(),
+                    submission: ExecSubmissionState::BeforeRequest,
+                })
             }
+            Err(error)
+                if !is_ssh_transport_terminal_error(&error)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                // An explicit channel-open rejection is scoped to this
+                // channel. Keep the authenticated transport for later work.
+                uncertain.disarm();
+                Err(error)
+            }
+            // A transport-terminal result, deadline, or cancellation leaves
+            // the guard armed. Its synchronous Drop marks the session closed
+            // and shuts down the socket before a pool can reuse this handle.
+            Err(error) => Err(error),
         }
     }
 
@@ -2029,15 +3145,33 @@ impl SshSession {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<russh::Channel<russh::client::Msg>> {
-        let mut channel =
-            match tokio::time::timeout_at(deadline, self.handle.channel_open_session()).await {
-                Ok(Ok(channel)) => channel,
-                Ok(Err(error)) => return Err(error.into()),
-                Err(_) => {
-                    self.invalidate().await;
-                    bail!("SFTP channel setup exceeded its deadline");
-                }
-            };
+        ensure!(
+            deadline > tokio::time::Instant::now(),
+            "SFTP channel setup exceeded its deadline"
+        );
+        let mut uncertain = TripTransportOnDrop::new(self.transport_trip());
+        let opened = poll_remote_mutation_until(
+            deadline,
+            self.handle.channel_open_session(),
+            || {},
+            || {},
+            "SFTP channel setup exceeded its deadline",
+        )
+        .await;
+        let mut channel = match opened {
+            Ok(channel) => {
+                uncertain.disarm();
+                channel
+            }
+            Err(error)
+                if !is_ssh_transport_terminal_error(&error)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                uncertain.disarm();
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
 
         match tokio::time::timeout_at(deadline, channel.request_subsystem(true, "sftp")).await {
             Ok(Ok(())) => Ok(channel),
@@ -2835,6 +3969,8 @@ where
     let mut frame = serctl_protocol::Frame::DirList {
         path: canonical,
         entries,
+        operation_context_id: None,
+        revision: 0,
     };
     if let Err(error) =
         serctl_protocol::encoded_frame_len_limited(&frame, serctl_protocol::MAX_RESPONSE_FRAME)
@@ -2843,7 +3979,7 @@ where
         return Err(error).context("SFTP directory listing exceeds the IPC wire-size limit");
     }
     match frame {
-        serctl_protocol::Frame::DirList { path, entries } => Ok((path, entries)),
+        serctl_protocol::Frame::DirList { path, entries, .. } => Ok((path, entries)),
         _ => unreachable!(),
     }
 }
@@ -3253,20 +4389,26 @@ fn extend_command_output(target: &mut Vec<u8>, data: &[u8], other_len: usize) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        await_exec_request_queued_until, bridge_streams, commit_remote_upload_no_replace_with,
-        extend_command_output, is_explicit_sftp_status, literal_socket_addr,
-        poll_remote_mutation_until, protected_upload_file_attributes, push_directory_entry,
-        read_sftp_packet, read_sftp_packet_bounded, remote_forward_channel_is_loopback_only,
-        require_server_fingerprint, secure_client_algorithms, socks5_handshake, status_error,
-        temporary_remote_path, validate_remote_command, validate_remote_path,
-        validate_shell_dimensions, validate_upload_remote_path, write_sftp_packet,
-        BoundedSftpStream, CreateDirOutcomeUnknown, CreateDirSubmissionState, DirectoryBudget,
-        DirectoryLimits, ExecOutcomeUnknown, ExecSubmissionState, RemoteForwardRegistry,
-        SocksTarget, SshSession, TransportTrip, TunnelMode, TunnelSpec, ValidatedTunnelSpec,
-        DEFAULT_TUNNEL_CONNECTIONS, DIRECTORY_LIMITS, MAX_DIRECTORY_ENTRIES,
-        MAX_DIRECTORY_STRING_BYTES, MAX_REMOTE_COMMAND_BYTES, MAX_REMOTE_PATH_BYTES,
-        MAX_SFTP_PACKET_BYTES, MAX_SHELL_DIMENSION, MAX_TUNNEL_CONNECTIONS,
-        REMOTE_PARTIAL_SUFFIX_BYTES,
+        attach_ssh_attempt_record, await_exec_request_queued_until, bridge_streams,
+        commit_remote_upload_no_replace_with, connect_key_exchange_with_one_reconnect_until,
+        extend_command_output, has_minimum_retry_window, has_minimum_retry_window_after_backoff,
+        is_explicit_sftp_status, is_ssh_transport_terminal_error, literal_socket_addr,
+        new_transport_attempt_id, poll_remote_mutation_until, protected_upload_file_attributes,
+        push_directory_entry, read_sftp_packet, read_sftp_packet_bounded,
+        remote_forward_channel_is_loopback_only, require_server_fingerprint,
+        sanitize_server_identification, secure_client_algorithms, socks5_handshake,
+        ssh_connect_budget, status_error, temporary_remote_path, validate_remote_command,
+        validate_remote_path, validate_shell_dimensions, validate_upload_remote_path,
+        write_sftp_packet, BoundedSftpStream, CreateDirOutcomeUnknown, CreateDirSubmissionState,
+        DirectoryBudget, DirectoryLimits, ExecOutcomeUnknown, ExecSubmissionState,
+        IdentificationTracker, RemoteForwardRegistry, SocksTarget, SshAttemptRecord,
+        SshConnectionIdentitySnapshot, SshFailureCategory, SshSession, TransportTrip, TunnelMode,
+        TunnelSpec, ValidatedTunnelSpec, DEFAULT_TUNNEL_CONNECTIONS, DIRECTORY_LIMITS,
+        MAX_DIRECTORY_ENTRIES, MAX_DIRECTORY_STRING_BYTES, MAX_REMOTE_COMMAND_BYTES,
+        MAX_REMOTE_PATH_BYTES, MAX_SFTP_PACKET_BYTES, MAX_SHELL_DIMENSION, MAX_TUNNEL_CONNECTIONS,
+        MIN_FIRST_KEX_WINDOW, MIN_PASSWORD_AUTH_WINDOW, MIN_RETRY_KEX_WINDOW,
+        PRE_AUTH_RETRY_BACKOFF, REMOTE_PARTIAL_SUFFIX_BYTES, RETRY_SCHEDULING_MARGIN,
+        TRANSPORT_CLEANUP_TIMEOUT,
     };
     use crate::vault::Creds;
     use rand::{rngs::OsRng, RngCore as Rand08RngCore};
@@ -3307,16 +4449,44 @@ mod tests {
 
     impl ssh_key::rand_core::TryCryptoRng for CompatibleOsRng {}
 
+    fn raw_ssh_disconnect_packet(reason_code: u32, description: &[u8]) -> Vec<u8> {
+        // RFC 4253 section 11.1: SSH_MSG_DISCONNECT is legal before key
+        // exchange completes. Build the initial cleartext packet directly so
+        // this regression exercises russh's wire parser and our Handler
+        // callback instead of fabricating an SshAttemptRecord.
+        let mut payload = vec![1_u8]; // SSH_MSG_DISCONNECT
+        payload.extend_from_slice(&reason_code.to_be_bytes());
+        payload.extend_from_slice(&(description.len() as u32).to_be_bytes());
+        payload.extend_from_slice(description);
+        payload.extend_from_slice(&0_u32.to_be_bytes()); // empty language tag
+
+        let block_size = 8;
+        let mut padding_len = block_size - ((5 + payload.len()) % block_size);
+        if padding_len < 4 {
+            padding_len += block_size;
+        }
+        let packet_len = 1 + payload.len() + padding_len;
+        let mut packet = Vec::with_capacity(4 + packet_len);
+        packet.extend_from_slice(&(packet_len as u32).to_be_bytes());
+        packet.push(padding_len as u8);
+        packet.extend_from_slice(&payload);
+        packet.resize(4 + packet_len, 0);
+        packet
+    }
+
     #[derive(Clone)]
     struct MatrixSshServer {
         channels: Arc<TokioMutex<HashMap<ChannelId, Channel<Msg>>>>,
         observed: tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>,
+        authentications: Arc<AtomicUsize>,
+        executions: Arc<AtomicUsize>,
     }
 
     impl russh::server::Handler for MatrixSshServer {
         type Error = anyhow::Error;
 
         async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+            self.authentications.fetch_add(1, Ordering::AcqRel);
             Ok(if user == "matrix" && password == "matrix-password" {
                 Auth::Accept
             } else {
@@ -3344,6 +4514,7 @@ mod tests {
             command: &[u8],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            self.executions.fetch_add(1, Ordering::AcqRel);
             if command != b"serctl-xfer serve --stdio" {
                 session.channel_failure(channel)?;
                 return Ok(());
@@ -3453,12 +4624,18 @@ mod tests {
             .unwrap();
         let port = listener.local_addr().unwrap().port();
         let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let authentications = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let server_authentications = Arc::clone(&authentications);
+        let server_executions = Arc::clone(&executions);
         let server = tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let handler = MatrixSshServer {
                     channels: Arc::new(TokioMutex::new(HashMap::new())),
                     observed: observed_tx.clone(),
+                    authentications: Arc::clone(&server_authentications),
+                    executions: Arc::clone(&server_executions),
                 };
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
@@ -3481,6 +4658,16 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(observed_fingerprint, fingerprint);
+        let connection_identity = session.connection_identity();
+        assert_eq!(
+            connection_identity.observed_host_key_sha256(),
+            observed_fingerprint
+        );
+        assert!(connection_identity.pin_match());
+        assert!(connection_identity
+            .server_identification()
+            .starts_with("SSH-2.0-russh"));
+        assert_eq!(connection_identity.transport_attempt_id().len(), 32);
 
         for payload_len in [4, 8, 16, 32].map(|kib| kib * 1024) {
             let payload = (0..payload_len)
@@ -3567,8 +4754,673 @@ mod tests {
         }
 
         session.invalidate().await;
+        assert_eq!(authentications.load(Ordering::Acquire), 1);
+        assert_eq!(executions.load(Ordering::Acquire), 4);
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn stalled_first_kex_shutdown_without_stream_release_suppresses_retry() {
+        let mut rng = CompatibleOsRng(OsRng);
+        let key = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        let fingerprint = key
+            .public_key()
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
+        let config = Arc::new(russh::server::Config {
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![key],
+            ..Default::default()
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let authentications = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let server_connections = Arc::clone(&connections);
+        let server_authentications = Arc::clone(&authentications);
+        let server_executions = Arc::clone(&executions);
+        let (observed_tx, _observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            server_connections.fetch_add(1, Ordering::AcqRel);
+            first
+                .write_all(b"SSH-2.0-serctl-first-kex-stall\r\n")
+                .await
+                .unwrap();
+            first.flush().await.unwrap();
+            let mut discarded = Vec::new();
+            first.read_to_end(&mut discarded).await.unwrap();
+
+            // Accepting the retry only after EOF on the first socket proves
+            // cleanup completed before the second transport was created.
+            let (socket, _) = listener.accept().await.unwrap();
+            server_connections.fetch_add(1, Ordering::AcqRel);
+            let handler = MatrixSshServer {
+                channels: Arc::new(TokioMutex::new(HashMap::new())),
+                observed: observed_tx,
+                authentications: server_authentications,
+                executions: server_executions,
+            };
+            if let Err(error) = russh::server::run_stream(config, socket, handler).await {
+                eprintln!("retry matrix SSH transport failed: {error:#}");
+            }
+        });
+
+        let creds = Creds {
+            host: "127.0.0.1".into(),
+            port,
+            user: "matrix".into(),
+            password: "matrix-password".into(),
+            host_key: Some(fingerprint.clone()),
+        };
+        let total_budget = MIN_FIRST_KEX_WINDOW
+            + TRANSPORT_CLEANUP_TIMEOUT
+            + PRE_AUTH_RETRY_BACKOFF
+            + MIN_RETRY_KEX_WINDOW
+            + RETRY_SCHEDULING_MARGIN
+            + MIN_PASSWORD_AUTH_WINDOW
+            + Duration::from_secs(1);
+        let started = tokio::time::Instant::now();
+        let total_deadline = started + total_budget;
+        let error = match SshSession::connect_until(&creds, Some(fingerprint), total_deadline).await
+        {
+            Ok(_) => panic!("stalled first KEX unexpectedly retried before stream release"),
+            Err(error) => error,
+        };
+        let chain = format!("{error:#}");
+        assert!(chain.contains("SSH attempt 1:"));
+        assert!(chain.contains("socket_shutdown_confirmed=true stream_released=false"));
+        assert!(tokio::time::Instant::now() < total_deadline);
+        assert!(started.elapsed() >= MIN_FIRST_KEX_WINDOW);
+        assert_eq!(connections.load(Ordering::Acquire), 1);
+        assert_eq!(authentications.load(Ordering::Acquire), 0);
+        assert_eq!(executions.load(Ordering::Acquire), 0);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn silent_pre_identification_peer_is_reported_without_claiming_kex_progress() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (banner_seen_tx, banner_seen_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            for _ in 0..256 {
+                if peer.read_u8().await.unwrap() == b'\n' {
+                    banner_seen_tx.send(()).unwrap();
+                    let mut discarded = Vec::new();
+                    peer.read_to_end(&mut discarded).await.unwrap();
+                    return;
+                }
+            }
+            panic!("client SSH identification exceeded the test bound");
+        });
+        let creds = Creds {
+            host: "127.0.0.1".into(),
+            port,
+            user: "not-used".into(),
+            password: "not-used".into(),
+            host_key: Some("not-observed".into()),
+        };
+
+        let error = match SshSession::connect_key_exchange_once_until(
+            &creds,
+            creds.host_key.clone(),
+            1,
+            tokio::time::Instant::now() + Duration::from_millis(250),
+        )
+        .await
+        {
+            Ok(_) => panic!("silent pre-identification peer unexpectedly completed key exchange"),
+            Err(error) => error,
+        };
+        banner_seen_rx.await.unwrap();
+        let chain = format!("{error:#}");
+        assert!(chain.contains("peer_observation=client_identification_sent_server_silent"));
+        assert!(chain.contains("attribution=undetermined_pre_identification_silence"));
+        assert!(chain.contains("rx_bytes=0 tx_bytes=22"));
+        assert!(chain.contains("server_identification_observed=false"));
+        assert!(chain.contains("host_key_observed=false"));
+        assert!(chain.contains("peer_eof_before_local_shutdown=false"));
+        assert!(chain.contains("peer_disconnect_reason=none"));
+        assert!(chain.contains("failure=local_deadline"));
+        assert!(chain.contains("SSH server identification phase exceeded its deadline"));
+        assert!(!chain.contains("SSH key exchange phase exceeded its deadline"));
+        assert!(!chain.contains("server_bytes_received_before_host_key"));
+        assert!(!chain.contains("127.0.0.1"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_peer_close_then_silence_preserves_attempt_cleanup_and_diagnostics() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let mut client_identifications = Vec::new();
+            for connection in 1..=2 {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let mut identification = Vec::new();
+                for _ in 0..256 {
+                    let byte = peer.read_u8().await.unwrap();
+                    identification.push(byte);
+                    if byte == b'\n' {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    identification.last(),
+                    Some(&b'\n'),
+                    "connection {connection} did not send a complete SSH identification"
+                );
+                assert_eq!(
+                    identification.len(),
+                    22,
+                    "connection {connection} changed the counted client identification length"
+                );
+                assert!(
+                    identification.starts_with(b"SSH-2.0-russh_")
+                        && identification.ends_with(b"\r\n"),
+                    "connection {connection} sent an unexpected client identification"
+                );
+                client_identifications.push(identification);
+
+                if connection == 1 {
+                    peer.shutdown().await.unwrap();
+                } else {
+                    // Send no byte. EOF arrives only after the client's local
+                    // KEX deadline trips and releases the second transport.
+                    let mut discarded = Vec::new();
+                    peer.read_to_end(&mut discarded).await.unwrap();
+                }
+            }
+            client_identifications
+        });
+        let creds = Creds {
+            host: "127.0.0.1".into(),
+            port,
+            user: "not-used".into(),
+            password: "not-used".into(),
+            host_key: Some("not-observed".into()),
+        };
+        let total = MIN_FIRST_KEX_WINDOW
+            + TRANSPORT_CLEANUP_TIMEOUT
+            + PRE_AUTH_RETRY_BACKOFF
+            + MIN_RETRY_KEX_WINDOW
+            + RETRY_SCHEDULING_MARGIN
+            + MIN_PASSWORD_AUTH_WINDOW
+            + Duration::from_secs(1);
+        let total_deadline = tokio::time::Instant::now() + total;
+        let error = connect_key_exchange_with_one_reconnect_until::<(), _, _>(
+            total_deadline,
+            MIN_PASSWORD_AUTH_WINDOW,
+            {
+                let creds = creds.clone();
+                move |attempt, allocated_deadline| {
+                    let creds = creds.clone();
+                    async move {
+                        // Keep this deterministic regression short without
+                        // changing production budgets: the raw-peer attempt
+                        // still uses the real connect/KEX/cleanup path, while
+                        // its test-only cap is within the allocated deadline.
+                        let cap = if attempt == 1 {
+                            Duration::from_secs(1)
+                        } else {
+                            Duration::from_millis(250)
+                        };
+                        let attempt_deadline =
+                            std::cmp::min(allocated_deadline, tokio::time::Instant::now() + cap);
+                        SshSession::connect_key_exchange_once_until(
+                            &creds,
+                            creds.host_key.clone(),
+                            attempt,
+                            attempt_deadline,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let chain = format!("{error:#}");
+        let first_attempt = chain
+            .split("first_attempt=[")
+            .nth(1)
+            .and_then(|suffix| suffix.split("]; second_failure=").next())
+            .unwrap_or_else(|| panic!("combined diagnostic omitted the first attempt: {chain}"));
+        let second_attempt = chain
+            .split("second_attempt=[")
+            .nth(1)
+            .and_then(|suffix| suffix.split(']').next())
+            .unwrap_or_else(|| panic!("combined diagnostic omitted the second attempt: {chain}"));
+
+        assert!(first_attempt.contains("SSH attempt 1:"));
+        assert!(first_attempt
+            .contains("peer_observation=transport_closed_before_server_identification"));
+        assert!(first_attempt.contains("rx_bytes=0 tx_bytes=22"));
+        assert!(first_attempt.contains("server_identification_observed=false"));
+        assert!(first_attempt.contains("host_key_observed=false"));
+        assert!(first_attempt.contains("peer_eof_before_local_shutdown=true"));
+        assert!(first_attempt.contains("socket_shutdown_confirmed=true"));
+        assert!(first_attempt.contains("stream_released=true"));
+        assert!(
+            first_attempt.contains("failure=terminal_disconnect")
+                || first_attempt.contains("failure=terminal_io_close"),
+            "unexpected first-attempt category: {first_attempt}"
+        );
+
+        assert!(chain.contains("second_failure=local_deadline"));
+        assert!(second_attempt.contains("SSH attempt 2:"));
+        assert!(
+            second_attempt.contains("peer_observation=client_identification_sent_server_silent")
+        );
+        assert!(second_attempt.contains("rx_bytes=0 tx_bytes=22"));
+        assert!(second_attempt.contains("server_identification_observed=false"));
+        assert!(second_attempt.contains("host_key_observed=false"));
+        assert!(second_attempt.contains("peer_eof_before_local_shutdown=false"));
+        assert!(second_attempt.contains("socket_shutdown_confirmed=true"));
+        assert!(second_attempt.contains("stream_released=true"));
+        assert!(second_attempt.contains("failure=local_deadline"));
+        assert!(tokio::time::Instant::now() < total_deadline);
+
+        let identifications = server.await.unwrap();
+        assert_eq!(identifications.len(), 2);
+        assert_eq!(identifications[0], identifications[1]);
+    }
+
+    #[tokio::test]
+    async fn pre_identification_peer_close_is_not_reported_as_server_silence() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (peer, _) = listener.accept().await.unwrap();
+            drop(peer);
+        });
+        let creds = Creds {
+            host: "127.0.0.1".into(),
+            port,
+            user: "not-used".into(),
+            password: "not-used".into(),
+            host_key: Some("not-observed".into()),
+        };
+
+        let error = match SshSession::connect_key_exchange_once_until(
+            &creds,
+            creds.host_key.clone(),
+            1,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(_) => panic!("peer close unexpectedly completed key exchange"),
+            Err(error) => error,
+        };
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("peer_observation=transport_closed_before_server_identification"),
+            "unexpected peer-close diagnostic: {chain}"
+        );
+        assert!(chain.contains("attribution=undetermined_pre_identification_transport_close"));
+        assert!(chain.contains("rx_bytes=0"));
+        assert!(chain.contains("server_identification_observed=false"));
+        assert!(chain.contains("host_key_observed=false"));
+        assert!(!chain.contains("peer_observation=client_identification_sent_server_silent"));
+        assert!(
+            chain.contains("peer_eof_before_local_shutdown=true")
+                || chain.contains("failure=terminal_io_close"),
+            "transport close was not independently evidenced: {chain}"
+        );
+        assert!(chain.contains("SSH server identification phase failed"));
+        assert!(!chain.contains("SSH key exchange phase failed"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ssh_identification_then_transport_close_is_not_reported_as_missing_banner() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            peer.write_all(b"SSH-2.0-serctl-raw-close\r\n")
+                .await
+                .unwrap();
+            peer.shutdown().await.unwrap();
+        });
+        let creds = Creds {
+            host: "127.0.0.1".into(),
+            port,
+            user: "not-used".into(),
+            password: "not-used".into(),
+            host_key: Some("not-observed".into()),
+        };
+
+        let error = match SshSession::connect_key_exchange_once_until(
+            &creds,
+            creds.host_key.clone(),
+            1,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(_) => {
+                panic!("peer close after SSH identification unexpectedly completed key exchange")
+            }
+            Err(error) => error,
+        };
+        let chain = format!("{error:#}");
+        assert!(chain.contains("peer_observation=ssh_identification_observed_no_host_key"));
+        assert!(chain.contains("attribution=ssh_identification_reached"));
+        assert!(chain.contains("server_identification_observed=true"));
+        assert!(chain.contains("host_key_observed=false"));
+        assert!(
+            chain.contains("peer_eof_before_local_shutdown=true")
+                || chain.contains("failure=terminal_io_close"),
+            "transport close after identification was not independently evidenced: {chain}"
+        );
+        assert!(!chain.contains("peer_observation=transport_closed_before_server_identification"));
+        assert!(!chain.contains("peer_observation=client_identification_sent_server_silent"));
+        assert!(chain.contains("SSH key exchange phase failed"));
+        assert!(!chain.contains("SSH server identification phase failed"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ssh_identification_then_silence_is_reported_as_no_host_key_progress() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            peer.write_all(b"SSH-2.0-serctl-raw-stall\r\n")
+                .await
+                .unwrap();
+            peer.flush().await.unwrap();
+            let mut discarded = Vec::new();
+            peer.read_to_end(&mut discarded).await.unwrap();
+        });
+        let creds = Creds {
+            host: "127.0.0.1".into(),
+            port,
+            user: "not-used".into(),
+            password: "not-used".into(),
+            host_key: Some("not-observed".into()),
+        };
+
+        let error = match SshSession::connect_key_exchange_once_until(
+            &creds,
+            creds.host_key.clone(),
+            1,
+            tokio::time::Instant::now() + Duration::from_millis(250),
+        )
+        .await
+        {
+            Ok(_) => {
+                panic!("silent peer after SSH identification unexpectedly completed key exchange")
+            }
+            Err(error) => error,
+        };
+        let chain = format!("{error:#}");
+        assert!(chain.contains("peer_observation=ssh_identification_observed_no_host_key"));
+        assert!(chain.contains("attribution=ssh_identification_reached"));
+        assert!(chain.contains("server_identification_observed=true"));
+        assert!(chain.contains("host_key_observed=false"));
+        assert!(chain.contains("peer_eof_before_local_shutdown=false"));
+        assert!(chain.contains("failure=local_deadline"));
+        assert!(!chain.contains("peer_observation=client_identification_sent_server_silent"));
+        assert!(chain.contains("SSH key exchange phase exceeded its deadline"));
+        assert!(!chain.contains("SSH server identification phase exceeded its deadline"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_identification_policy_bytes_are_not_reported_as_ssh_kex_progress() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            peer.write_all(b"Access temporarily unavailable\r\n")
+                .await
+                .unwrap();
+            peer.shutdown().await.unwrap();
+        });
+        let creds = Creds {
+            host: "127.0.0.1".into(),
+            port,
+            user: "not-used".into(),
+            password: "not-used".into(),
+            host_key: Some("not-observed".into()),
+        };
+
+        let error = match SshSession::connect_key_exchange_once_until(
+            &creds,
+            creds.host_key.clone(),
+            1,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(_) => panic!("policy text unexpectedly completed key exchange"),
+            Err(error) => error,
+        };
+        let chain = format!("{error:#}");
+        assert!(chain.contains("peer_observation=peer_bytes_without_valid_server_identification"));
+        assert!(chain.contains("attribution=non_ssh_or_pre_identification_policy_bytes"));
+        assert!(chain.contains("server_identification_observed=false"));
+        assert!(chain.contains("host_key_observed=false"));
+        assert!(!chain.contains("Access temporarily unavailable"));
+        assert!(chain.contains("SSH server identification phase failed"));
+        assert!(!chain.contains("SSH key exchange phase failed"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn standard_pre_auth_disconnect_is_sanitized_and_not_retried() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut client_identification = Vec::new();
+            for _ in 0..256 {
+                let byte = peer.read_u8().await.unwrap();
+                client_identification.push(byte);
+                if byte == b'\n' {
+                    break;
+                }
+            }
+            assert!(client_identification.ends_with(b"\r\n"));
+            peer.write_all(b"SSH-2.0-serctl-policy-test\r\n")
+                .await
+                .unwrap();
+            // RFC 4253 reason 12 is too many connections. The description is
+            // deliberately sensitive-looking peer-controlled text and must
+            // never survive in the serctl diagnostic chain.
+            peer.write_all(&raw_ssh_disconnect_packet(
+                12,
+                b"secret-user blocked from 192.0.2.1",
+            ))
+            .await
+            .unwrap();
+            peer.shutdown().await.unwrap();
+
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_ok()
+        });
+        let creds = Creds {
+            host: "127.0.0.1".into(),
+            port,
+            user: "not-used".into(),
+            password: "not-used".into(),
+            host_key: Some("not-observed".into()),
+        };
+        let total = MIN_FIRST_KEX_WINDOW
+            + TRANSPORT_CLEANUP_TIMEOUT
+            + PRE_AUTH_RETRY_BACKOFF
+            + MIN_RETRY_KEX_WINDOW
+            + RETRY_SCHEDULING_MARGIN
+            + MIN_PASSWORD_AUTH_WINDOW
+            + Duration::from_secs(1);
+
+        let error = match SshSession::connect_key_exchange_until(
+            &creds,
+            creds.host_key.clone(),
+            tokio::time::Instant::now() + total,
+        )
+        .await
+        {
+            Ok(_) => {
+                panic!("standard pre-authentication disconnect unexpectedly reached host-key KEX")
+            }
+            Err(error) => error,
+        };
+        let chain = format!("{error:#}");
+        assert!(chain.contains("peer_observation=remote_ssh_disconnect_before_host_key"));
+        assert!(chain.contains("attribution=ssh_disconnect_observed"));
+        assert!(chain.contains("server_identification_observed=true"));
+        assert!(chain.contains("host_key_observed=false"));
+        assert!(chain.contains("peer_disconnect_reason=remote disconnect TooManyConnections"));
+        assert!(!chain.contains("secret-user"));
+        assert!(!chain.contains("192.0.2.1"));
+        assert!(!chain.contains("failed after one pre-authentication reconnect"));
+        assert!(chain.contains("SSH key exchange phase failed"));
+        assert!(!chain.contains("SSH server identification phase failed"));
+        assert!(
+            !server.await.unwrap(),
+            "explicit SSH disconnect was retried"
+        );
+    }
+
+    #[test]
+    fn identification_tracker_distinguishes_policy_text_and_chunked_ssh_id() {
+        let mut policy = IdentificationTracker::default();
+        assert!(policy.observe(b"Not allowed at this time\r\n").is_none());
+        assert!(policy.observe(b"SSH").is_none());
+        assert_eq!(
+            policy.observe(b"-2.0-test\r\nignored"),
+            Some("SSH-2.0-test".to_owned())
+        );
+
+        let mut pre_banner = IdentificationTracker::default();
+        assert!(pre_banner.observe(b"notice\r\nSSH-2.0-test").is_none());
+        assert_eq!(pre_banner.observe(b"\r\n"), Some("SSH-2.0-test".to_owned()));
+
+        let mut invalid = IdentificationTracker::default();
+        assert!(invalid.observe(b"SSH-\r\n").is_none());
+        assert!(invalid.observe(b"SSH-2.0-\r\n").is_none());
+        assert!(invalid.observe(b"SSH-2.0-test\n").is_none());
+        assert_eq!(
+            invalid.observe(b"SSH-1.99-compat\r\n"),
+            Some("SSH-1.99-compat".to_owned())
+        );
+
+        let mut oversized = IdentificationTracker::default();
+        let mut invalid = b"SSH-".to_vec();
+        invalid.extend(std::iter::repeat_n(b'x', 252));
+        invalid.push(b'\n');
+        assert!(oversized.observe(&invalid).is_none());
+    }
+
+    #[test]
+    fn server_identification_snapshot_is_bounded_and_strictly_sanitized() {
+        assert_eq!(
+            sanitize_server_identification(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.11"),
+            Some("SSH-2.0-OpenSSH_9.6p1".to_owned())
+        );
+        assert_eq!(
+            sanitize_server_identification(b"SSH-2.0-dropbear_2024.85"),
+            Some("SSH-2.0-dropbear_2024.85".to_owned())
+        );
+        assert!(sanitize_server_identification(b"SSH-2.0-OpenSSH_9.6p1\0secret").is_none());
+        assert!(sanitize_server_identification(b"SSH-2.0-OpenSSH_9.6p1 comment\x1b").is_none());
+        let oversized = format!("SSH-2.0-{}", "x".repeat(121));
+        assert!(sanitize_server_identification(oversized.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn authenticated_connection_identity_is_read_only_and_fail_closed() {
+        let fingerprint = format!("SHA256:{}", "A".repeat(43));
+        let attempt = new_transport_attempt_id();
+        assert!(SshConnectionIdentitySnapshot::new_authenticated(
+            false,
+            Some(&fingerprint),
+            Some(&fingerprint),
+            Some("SSH-2.0-OpenSSH_9.6p1"),
+            Some(&attempt),
+        )
+        .is_err());
+        assert!(SshConnectionIdentitySnapshot::new_authenticated(
+            true,
+            None,
+            Some(&fingerprint),
+            Some("SSH-2.0-OpenSSH_9.6p1"),
+            Some(&attempt),
+        )
+        .is_err());
+        assert!(SshConnectionIdentitySnapshot::new_authenticated(
+            true,
+            Some(&fingerprint),
+            Some(&format!("SHA256:{}", "B".repeat(43))),
+            Some("SSH-2.0-OpenSSH_9.6p1"),
+            Some(&attempt),
+        )
+        .is_err());
+        assert!(SshConnectionIdentitySnapshot::new_authenticated(
+            true,
+            Some(&fingerprint),
+            Some(&fingerprint),
+            Some("SSH-2.0-OpenSSH_9.6p1\nraw"),
+            Some(&attempt),
+        )
+        .is_err());
+
+        let snapshot = SshConnectionIdentitySnapshot::new_authenticated(
+            true,
+            Some(&fingerprint),
+            Some(&fingerprint),
+            Some("SSH-2.0-OpenSSH_9.6p1 Ubuntu"),
+            Some(&attempt),
+        )
+        .unwrap();
+        assert_eq!(snapshot.observed_host_key_sha256(), fingerprint);
+        assert!(snapshot.pin_match());
+        assert_eq!(snapshot.server_identification(), "SSH-2.0-OpenSSH_9.6p1");
+        assert_eq!(snapshot.transport_attempt_id(), attempt);
+    }
+
+    #[test]
+    fn reconnect_transport_attempt_identity_changes_without_reuse() {
+        let first_attempt = new_transport_attempt_id();
+        let reconnect_attempt = new_transport_attempt_id();
+        assert_ne!(first_attempt, reconnect_attempt);
+        assert_eq!(first_attempt.len(), 32);
+        assert_eq!(reconnect_attempt.len(), 32);
+        assert!(first_attempt
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F')));
+        assert!(reconnect_attempt
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F')));
     }
 
     #[test]
@@ -4007,6 +5859,39 @@ mod tests {
         assert!(is_explicit_sftp_status(&status));
     }
 
+    #[test]
+    fn ssh_transport_terminal_classification_excludes_channel_policy_and_local_deadlines() {
+        for error in [
+            russh::Error::Disconnect,
+            russh::Error::HUP,
+            russh::Error::SendError,
+            russh::Error::ConnectionTimeout,
+            russh::Error::KeepaliveTimeout,
+            russh::Error::InactivityTimeout,
+        ] {
+            let error: anyhow::Error = error.into();
+            assert!(is_ssh_transport_terminal_error(&error));
+        }
+
+        let contextual_disconnect =
+            anyhow::Error::from(russh::Error::Disconnect).context("SSH key exchange phase failed");
+        assert!(
+            is_ssh_transport_terminal_error(&contextual_disconnect),
+            "phase context must not hide the transport-terminal russh cause"
+        );
+
+        let rejected: anyhow::Error =
+            russh::Error::ChannelOpenFailure(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .into();
+        assert!(!is_ssh_transport_terminal_error(&rejected));
+        assert!(!is_ssh_transport_terminal_error(&anyhow::anyhow!(
+            "exec channel-open deadline expired"
+        )));
+        assert!(!is_ssh_transport_terminal_error(&anyhow::anyhow!(
+            "caller supplied operation timeout"
+        )));
+    }
+
     #[tokio::test]
     async fn expired_remote_mutation_is_not_polled_or_marked_submitted() {
         let polled = Arc::new(AtomicBool::new(false));
@@ -4089,6 +5974,21 @@ mod tests {
             .key
             .iter()
             .any(|algorithm| matches!(algorithm, ssh_key::Algorithm::Rsa { hash: None })));
+    }
+
+    #[test]
+    fn client_algorithm_policy_keeps_a_modern_openssh_baseline() {
+        let algorithms = secure_client_algorithms();
+
+        assert!(algorithms.kex.contains(&russh::kex::CURVE25519));
+        assert!(algorithms.key.contains(&ssh_key::Algorithm::Ed25519));
+        assert!(algorithms
+            .cipher
+            .contains(&russh::cipher::CHACHA20_POLY1305));
+        assert!(algorithms.cipher.contains(&russh::cipher::AES_256_CTR));
+        assert!(algorithms.mac.contains(&russh::mac::HMAC_SHA256_ETM));
+        assert!(algorithms.mac.contains(&russh::mac::HMAC_SHA256));
+        assert!(algorithms.compression.contains(&russh::compression::NONE));
     }
 
     #[tokio::test]
@@ -4234,6 +6134,8 @@ mod tests {
         let trip = TransportTrip {
             invalidated: invalidated.clone(),
             cancel: cancel.clone(),
+            shutdown: None,
+            activity: None,
         };
         let (mut writer, reader) = tokio::io::duplex(16);
         let mut guarded = BoundedSftpStream::new(reader, trip);
@@ -4256,6 +6158,8 @@ mod tests {
         let trip = TransportTrip {
             invalidated: Arc::new(AtomicBool::new(false)),
             cancel: CancellationToken::new(),
+            shutdown: None,
+            activity: None,
         };
         let (_writer, reader) = tokio::io::duplex(16);
         let mut guarded = BoundedSftpStream::new(reader, trip);
@@ -4285,6 +6189,8 @@ mod tests {
         let trip = TransportTrip {
             invalidated: invalidated.clone(),
             cancel: cancel.clone(),
+            shutdown: None,
+            activity: None,
         };
         let (client_io, mut server_io) = tokio::io::duplex(1024);
         let server = tokio::spawn(async move {
@@ -4326,6 +6232,8 @@ mod tests {
         let trip = TransportTrip {
             invalidated,
             cancel: CancellationToken::new(),
+            shutdown: None,
+            activity: None,
         };
         let (mut writer, reader) = tokio::io::duplex(32);
         let mut guarded = BoundedSftpStream::new(reader, trip);
@@ -4340,7 +6248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_kex_deadlines_close_every_proxy_connection() {
+    async fn repeated_kex_deadlines_close_every_transport_connection() {
         const ATTEMPTS: usize = 100;
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -4388,10 +6296,375 @@ mod tests {
             // absorbs scheduling jitter when the whole suite runs in parallel.
             tokio::time::timeout(Duration::from_secs(10), closed_rx.recv())
                 .await
-                .expect("proxy connection was not closed")
+                .expect("transport connection was not closed")
                 .expect("server close channel ended early");
         }
         server.await.unwrap();
+    }
+
+    #[test]
+    fn reconnect_budget_reserves_two_kex_windows_cleanup_and_authentication() {
+        let now = tokio::time::Instant::now();
+        let minimum_retry_total = MIN_FIRST_KEX_WINDOW
+            + TRANSPORT_CLEANUP_TIMEOUT
+            + PRE_AUTH_RETRY_BACKOFF
+            + MIN_RETRY_KEX_WINDOW
+            + RETRY_SCHEDULING_MARGIN
+            + MIN_PASSWORD_AUTH_WINDOW;
+        let total_deadline = now + minimum_retry_total;
+        let budget = ssh_connect_budget(now, total_deadline, MIN_PASSWORD_AUTH_WINDOW);
+
+        assert_eq!(budget.first_attempt_deadline, now + MIN_FIRST_KEX_WINDOW);
+        assert_eq!(
+            budget.retry_attempt_deadline,
+            Some(total_deadline - MIN_PASSWORD_AUTH_WINDOW)
+        );
+
+        let insufficient_deadline = total_deadline - Duration::from_nanos(1);
+        let insufficient = ssh_connect_budget(now, insufficient_deadline, MIN_PASSWORD_AUTH_WINDOW);
+        assert_eq!(insufficient.retry_attempt_deadline, None);
+        assert_eq!(
+            insufficient.first_attempt_deadline,
+            insufficient_deadline - MIN_PASSWORD_AUTH_WINDOW
+        );
+
+        let short_deadline = now + MIN_FIRST_KEX_WINDOW;
+        let short = ssh_connect_budget(now, short_deadline, MIN_PASSWORD_AUTH_WINDOW);
+        assert_eq!(short.retry_attempt_deadline, None);
+        assert_eq!(short.first_attempt_deadline, short_deadline);
+
+        let retry_deadline = now + PRE_AUTH_RETRY_BACKOFF + MIN_RETRY_KEX_WINDOW;
+        assert!(has_minimum_retry_window_after_backoff(now, retry_deadline));
+        assert!(!has_minimum_retry_window_after_backoff(
+            now + Duration::from_nanos(1),
+            retry_deadline
+        ));
+        assert!(has_minimum_retry_window(
+            now + PRE_AUTH_RETRY_BACKOFF,
+            retry_deadline
+        ));
+        assert!(!has_minimum_retry_window(
+            now + PRE_AUTH_RETRY_BACKOFF + Duration::from_nanos(1),
+            retry_deadline
+        ));
+    }
+
+    #[tokio::test]
+    async fn insufficient_budget_returns_first_terminal_failure_without_reconnect() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let connections = Arc::new(AtomicUsize::new(0));
+
+        let error = connect_key_exchange_with_one_reconnect_until::<(), _, _>(
+            deadline,
+            MIN_PASSWORD_AUTH_WINDOW,
+            {
+                let connections = Arc::clone(&connections);
+                move |attempt, _attempt_deadline| {
+                    connections.fetch_add(1, Ordering::AcqRel);
+                    async move {
+                        let record = SshAttemptRecord {
+                            attempt,
+                            tcp_connected: true,
+                            rx_bytes: 0,
+                            tx_bytes: 0,
+                            server_identification_observed: false,
+                            host_key_observed: false,
+                            peer_eof_before_local_shutdown: true,
+                            peer_disconnect_reason: None,
+                            elapsed_ms: 1,
+                            failure_elapsed_ms: 1,
+                            cleanup_elapsed_ms: 0,
+                            socket_shutdown_confirmed: true,
+                            stream_released: true,
+                            failure_category: SshFailureCategory::TerminalDisconnect,
+                        };
+                        Err(attach_ssh_attempt_record(
+                            anyhow::Error::new(russh::Error::Disconnect),
+                            record,
+                        ))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(connections.load(Ordering::Acquire), 1);
+        assert!(!format!("{error:#}").contains("failed after one pre-authentication reconnect"));
+    }
+
+    #[tokio::test]
+    async fn short_deadline_reuses_remaining_budget_after_clean_early_transport_eof() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let connections = Arc::new(AtomicUsize::new(0));
+
+        let result =
+            connect_key_exchange_with_one_reconnect_until(deadline, MIN_PASSWORD_AUTH_WINDOW, {
+                let connections = Arc::clone(&connections);
+                move |attempt, attempt_deadline| {
+                    connections.fetch_add(1, Ordering::AcqRel);
+                    async move {
+                        assert_eq!(attempt_deadline, deadline);
+                        if attempt == 1 {
+                            let record = SshAttemptRecord {
+                                attempt,
+                                tcp_connected: true,
+                                rx_bytes: 0,
+                                tx_bytes: 22,
+                                server_identification_observed: false,
+                                host_key_observed: false,
+                                peer_eof_before_local_shutdown: true,
+                                peer_disconnect_reason: None,
+                                elapsed_ms: 1,
+                                failure_elapsed_ms: 1,
+                                cleanup_elapsed_ms: 0,
+                                socket_shutdown_confirmed: true,
+                                stream_released: true,
+                                failure_category: SshFailureCategory::TerminalDisconnect,
+                            };
+                            Err(attach_ssh_attempt_record(
+                                anyhow::Error::new(russh::Error::Disconnect),
+                                record,
+                            ))
+                        } else {
+                            Ok(11_u8)
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, (11, true));
+        assert_eq!(connections.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn sufficient_budget_reconnects_once_after_complete_terminal_cleanup() {
+        let total = MIN_FIRST_KEX_WINDOW
+            + TRANSPORT_CLEANUP_TIMEOUT
+            + PRE_AUTH_RETRY_BACKOFF
+            + MIN_RETRY_KEX_WINDOW
+            + RETRY_SCHEDULING_MARGIN
+            + MIN_PASSWORD_AUTH_WINDOW
+            + Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + total;
+        let connections = Arc::new(AtomicUsize::new(0));
+
+        let result =
+            connect_key_exchange_with_one_reconnect_until(deadline, MIN_PASSWORD_AUTH_WINDOW, {
+                let connections = Arc::clone(&connections);
+                move |attempt, attempt_deadline| {
+                    connections.fetch_add(1, Ordering::AcqRel);
+                    async move {
+                        assert!(attempt_deadline < deadline);
+                        if attempt == 1 {
+                            let record = SshAttemptRecord {
+                                attempt,
+                                tcp_connected: true,
+                                rx_bytes: 0,
+                                tx_bytes: 32,
+                                server_identification_observed: false,
+                                host_key_observed: false,
+                                peer_eof_before_local_shutdown: true,
+                                peer_disconnect_reason: None,
+                                elapsed_ms: 1,
+                                failure_elapsed_ms: 1,
+                                cleanup_elapsed_ms: 0,
+                                socket_shutdown_confirmed: true,
+                                stream_released: true,
+                                failure_category: SshFailureCategory::TerminalDisconnect,
+                            };
+                            Err(attach_ssh_attempt_record(
+                                anyhow::Error::new(russh::Error::Disconnect),
+                                record,
+                            ))
+                        } else {
+                            Ok(7_u8)
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, (7, true));
+        assert_eq!(connections.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn reconnect_failure_labels_both_attempts_without_first_failure_mismatch() {
+        let total = MIN_FIRST_KEX_WINDOW
+            + TRANSPORT_CLEANUP_TIMEOUT
+            + PRE_AUTH_RETRY_BACKOFF
+            + MIN_RETRY_KEX_WINDOW
+            + RETRY_SCHEDULING_MARGIN
+            + MIN_PASSWORD_AUTH_WINDOW
+            + Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + total;
+
+        let error = connect_key_exchange_with_one_reconnect_until::<(), _, _>(
+            deadline,
+            MIN_PASSWORD_AUTH_WINDOW,
+            move |attempt, _attempt_deadline| async move {
+                let (failure_category, source) = if attempt == 1 {
+                    (
+                        SshFailureCategory::TerminalDisconnect,
+                        anyhow::Error::new(russh::Error::Disconnect),
+                    )
+                } else {
+                    (
+                        SshFailureCategory::LocalDeadline,
+                        anyhow::anyhow!("SSH server identification phase exceeded its deadline"),
+                    )
+                };
+                let record = SshAttemptRecord {
+                    attempt,
+                    tcp_connected: true,
+                    rx_bytes: 0,
+                    tx_bytes: 22,
+                    server_identification_observed: false,
+                    host_key_observed: false,
+                    peer_eof_before_local_shutdown: attempt == 1,
+                    peer_disconnect_reason: None,
+                    elapsed_ms: 1,
+                    failure_elapsed_ms: 1,
+                    cleanup_elapsed_ms: 0,
+                    socket_shutdown_confirmed: true,
+                    stream_released: true,
+                    failure_category,
+                };
+                Err(attach_ssh_attempt_record(source, record))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let chain = format!("{error:#}");
+        assert!(chain.contains(
+            "SSH server identification phase failed after one pre-authentication reconnect"
+        ));
+        assert!(
+            !chain.contains("SSH key exchange phase failed after one pre-authentication reconnect")
+        );
+        assert!(chain.contains("first_failure=terminal_disconnect; first_attempt=[SSH attempt 1:"));
+        assert!(chain.contains("second_failure=local_deadline; second_attempt=[SSH attempt 2:"));
+        assert!(chain.contains(
+            "first_attempt=[SSH attempt 1: peer_observation=transport_closed_before_server_identification"
+        ));
+        assert!(chain.contains(
+            "second_attempt=[SSH attempt 2: peer_observation=client_identification_sent_server_silent"
+        ));
+        assert!(!chain.contains("first_failure=terminal_disconnect: SSH attempt 2:"));
+        assert!(!chain.contains("first_attempt=[SSH attempt 2:"));
+        assert!(!chain.contains("second_attempt=[SSH attempt 1:"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_transport_cleanup_suppresses_reconnect() {
+        for (socket_shutdown_confirmed, stream_released) in [(false, true), (true, false)] {
+            let total = MIN_FIRST_KEX_WINDOW
+                + TRANSPORT_CLEANUP_TIMEOUT
+                + PRE_AUTH_RETRY_BACKOFF
+                + MIN_RETRY_KEX_WINDOW
+                + RETRY_SCHEDULING_MARGIN
+                + MIN_PASSWORD_AUTH_WINDOW;
+            let deadline = tokio::time::Instant::now() + total;
+            let connections = Arc::new(AtomicUsize::new(0));
+
+            let error = connect_key_exchange_with_one_reconnect_until::<(), _, _>(
+                deadline,
+                MIN_PASSWORD_AUTH_WINDOW,
+                {
+                    let connections = Arc::clone(&connections);
+                    move |attempt, _attempt_deadline| {
+                        connections.fetch_add(1, Ordering::AcqRel);
+                        async move {
+                            let record = SshAttemptRecord {
+                                attempt,
+                                tcp_connected: true,
+                                rx_bytes: 0,
+                                tx_bytes: 22,
+                                server_identification_observed: false,
+                                host_key_observed: false,
+                                peer_eof_before_local_shutdown: true,
+                                peer_disconnect_reason: None,
+                                elapsed_ms: 1,
+                                failure_elapsed_ms: 1,
+                                cleanup_elapsed_ms: 0,
+                                socket_shutdown_confirmed,
+                                stream_released,
+                                failure_category: SshFailureCategory::TerminalDisconnect,
+                            };
+                            Err(attach_ssh_attempt_record(
+                                anyhow::Error::new(russh::Error::Disconnect),
+                                record,
+                            ))
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(connections.load(Ordering::Acquire), 1);
+            assert!(!format!("{error:#}").contains("failed after one pre-authentication reconnect"));
+        }
+    }
+
+    #[tokio::test]
+    async fn server_bytes_or_explicit_disconnect_reason_suppress_pre_auth_reconnect() {
+        for (rx_bytes, peer_disconnect_reason) in [
+            (32_u64, None),
+            (
+                0_u64,
+                Some("remote disconnect TooManyConnections".to_owned()),
+            ),
+        ] {
+            // Keep the deadline below the conservative two-window budget so
+            // this also proves the early-EOF fallback remains unavailable
+            // after any server bytes or an explicit SSH_MSG_DISCONNECT.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let connections = Arc::new(AtomicUsize::new(0));
+            let error = connect_key_exchange_with_one_reconnect_until::<(), _, _>(
+                deadline,
+                MIN_PASSWORD_AUTH_WINDOW,
+                {
+                    let connections = Arc::clone(&connections);
+                    move |attempt, _attempt_deadline| {
+                        connections.fetch_add(1, Ordering::AcqRel);
+                        let peer_disconnect_reason = peer_disconnect_reason.clone();
+                        async move {
+                            let record = SshAttemptRecord {
+                                attempt,
+                                tcp_connected: true,
+                                rx_bytes,
+                                tx_bytes: 22,
+                                server_identification_observed: false,
+                                host_key_observed: false,
+                                peer_eof_before_local_shutdown: true,
+                                peer_disconnect_reason,
+                                elapsed_ms: 1,
+                                failure_elapsed_ms: 1,
+                                cleanup_elapsed_ms: 0,
+                                socket_shutdown_confirmed: true,
+                                stream_released: true,
+                                failure_category: SshFailureCategory::TerminalDisconnect,
+                            };
+                            Err(attach_ssh_attempt_record(
+                                anyhow::Error::new(russh::Error::Disconnect),
+                                record,
+                            ))
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(connections.load(Ordering::Acquire), 1);
+            assert!(!format!("{error:#}").contains("failed after one pre-authentication reconnect"));
+        }
     }
 
     #[test]
@@ -4460,6 +6733,8 @@ mod tests {
         let frame = serctl_protocol::Frame::DirList {
             path: "/".into(),
             entries,
+            operation_context_id: None,
+            revision: 0,
         };
         let encoded =
             serctl_protocol::encoded_frame_len_limited(&frame, serctl_protocol::MAX_RESPONSE_FRAME)

@@ -1,0 +1,13 @@
+[package]
+name = "serctl-policy"
+description = "Canonical deny-only policy compiler and typed-intent evaluator for serctl."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

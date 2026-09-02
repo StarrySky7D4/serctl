@@ -11,7 +11,18 @@ use std::path::Path;
 /// return the stable handle. A missing path is the only condition mapped to
 /// `None`.
 pub fn open_existing_protected_file(path: &Path) -> Result<Option<File>> {
-    match open_protected_file(path, false) {
+    open_existing_protected_file_with_access(path, false)
+}
+
+/// Open an existing protected regular file with read/write access but never
+/// create a missing path. Audit append/recovery uses this to keep existence a
+/// fail-closed precondition instead of accidentally synthesizing a new file.
+pub fn open_existing_protected_file_for_update(path: &Path) -> Result<Option<File>> {
+    open_existing_protected_file_with_access(path, true)
+}
+
+fn open_existing_protected_file_with_access(path: &Path, write: bool) -> Result<Option<File>> {
+    match open_protected_file(path, false, write) {
         Ok(file) => Ok(Some(file)),
         Err(error)
             if error
@@ -27,7 +38,7 @@ pub fn open_existing_protected_file(path: &Path) -> Result<Option<File>> {
 /// Open or create a security-sensitive regular file and harden the exact
 /// object represented by the returned handle.
 pub fn open_or_create_protected_file(path: &Path) -> Result<File> {
-    open_protected_file(path, true)
+    open_protected_file(path, true, true)
 }
 
 /// Atomically create a new security-sensitive regular file and return a
@@ -35,6 +46,73 @@ pub fn open_or_create_protected_file(path: &Path) -> Result<File> {
 /// is created; an existing path is never opened or modified.
 pub fn create_new_protected_file(path: &Path) -> Result<File> {
     create_new_protected_file_with_validation(path, validate_new_protected_file)
+}
+
+/// Durably commit a newly-created protected file's directory entry before a
+/// separate authenticated state file is allowed to claim that it exists.
+#[cfg(unix)]
+pub fn sync_parent_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+        .with_context(|| format!("open protected parent directory {}", parent.display()))?;
+    harden_open_directory(&directory)?;
+    directory
+        .sync_all()
+        .with_context(|| format!("sync protected parent directory {}", parent.display()))
+}
+
+#[cfg(windows)]
+pub fn sync_parent_directory(path: &Path) -> Result<()> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+    };
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(parent)
+        .with_context(|| format!("open protected parent directory {}", parent.display()))?;
+    let metadata = directory
+        .metadata()
+        .context("inspect protected parent directory handle")?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        bail!("protected parent is not a non-reparse directory");
+    }
+    verify_current_user_owns_handle(directory.as_raw_handle() as _)?;
+    verify_protected_dacl_on_handle(
+        directory.as_raw_handle() as _,
+        PROTECTED_DIRECTORY_SDDL,
+        "protected parent directory",
+    )?;
+    directory
+        .sync_all()
+        .with_context(|| format!("sync protected parent directory {}", parent.display()))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn sync_parent_directory(_path: &Path) -> Result<()> {
+    bail!("durable protected directory synchronization is unsupported on this platform")
 }
 
 /// Replace a security-sensitive file atomically and durably. On Unix,
@@ -318,13 +396,13 @@ pub fn open_regular_file_for_read(_path: &Path) -> Result<File> {
 }
 
 #[cfg(unix)]
-fn open_protected_file(path: &Path, create: bool) -> Result<File> {
+fn open_protected_file(path: &Path, create: bool, write: bool) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut options = OpenOptions::new();
     options
         .read(true)
-        .write(create)
+        .write(write)
         .create(create)
         .truncate(false)
         .mode(0o600)
@@ -337,7 +415,7 @@ fn open_protected_file(path: &Path, create: bool) -> Result<File> {
 }
 
 #[cfg(windows)]
-fn open_protected_file(path: &Path, create: bool) -> Result<File> {
+fn open_protected_file(path: &Path, create: bool, write: bool) -> Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -347,12 +425,12 @@ fn open_protected_file(path: &Path, create: bool) -> Result<File> {
 
     let mut options = OpenOptions::new();
     let mut access = GENERIC_READ | READ_CONTROL | WRITE_DAC;
-    if create {
+    if write {
         access |= GENERIC_WRITE;
     }
     options
         .read(true)
-        .write(create)
+        .write(write)
         .create(create)
         .truncate(false)
         .access_mode(access)
@@ -366,7 +444,7 @@ fn open_protected_file(path: &Path, create: bool) -> Result<File> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_protected_file(_path: &Path, _create: bool) -> Result<File> {
+fn open_protected_file(_path: &Path, _create: bool, _write: bool) -> Result<File> {
     bail!("secure file opening is unsupported on this platform")
 }
 
@@ -747,7 +825,7 @@ pub fn harden_directory(path: &Path) -> Result<()> {
 
 #[cfg(all(windows, test))]
 pub fn harden_file(path: &Path) -> Result<()> {
-    drop(open_protected_file(path, false)?);
+    drop(open_protected_file(path, false, false)?);
     Ok(())
 }
 
@@ -1525,6 +1603,9 @@ mod tests {
     fn protected_open_rejects_file_reparse_points_when_creation_is_available() {
         use std::os::windows::fs::{symlink_dir, symlink_file};
 
+        let require_reparse_branch = std::env::var_os("SERCTL_REQUIRE_WINDOWS_REPARSE_TEST")
+            .is_some_and(|value| value == "1");
+
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1549,6 +1630,10 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::PermissionDenied
                     || error.raw_os_error() == Some(1314) =>
             {
+                assert!(
+                    !require_reparse_branch,
+                    "required file-reparse test privilege is unavailable: {error}"
+                );
                 // Windows symlink creation needs Developer Mode or the
                 // SeCreateSymbolicLink privilege. The production rejection
                 // still compiles and is exercised on capable CI workers.
@@ -1571,6 +1656,10 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::PermissionDenied
                     || error.raw_os_error() == Some(1314) =>
             {
+                assert!(
+                    !require_reparse_branch,
+                    "required directory-reparse test privilege is unavailable: {error}"
+                );
                 eprintln!("skipping directory-reparse branch: symlink privilege unavailable");
             }
             Err(error) => panic!("create test directory symlink: {error}"),

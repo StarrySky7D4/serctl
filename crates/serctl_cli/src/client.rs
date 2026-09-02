@@ -52,7 +52,7 @@ const TUNNEL_CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 // Leave scheduling margin before aborting the client worker.
 const GUI_TUNNEL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(7);
 const GUI_TUNNEL_ABORT_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
-const MAX_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_UPLOAD_CHUNK_BYTES: usize = ipc::NATIVE_IPC_CHUNK_BYTES;
 const MAX_SHELL_INPUT_BYTES: usize = 64 * 1024;
 const LOCAL_PARTIAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCAL_PARTIAL_CLEANUP_JOIN_MARGIN: Duration = Duration::from_millis(100);
@@ -61,7 +61,32 @@ const LOCAL_COMMIT_RECONCILE_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_COMMIT_RECONCILE_TIMEOUT: Duration = Duration::from_millis(2250);
 const MAX_AGENT_GRANT_BYTES: usize = 64 * 1024;
 const MAX_AGENT_REQUEST_LINE_BYTES: usize = 1024 * 1024;
+pub const AGENT_SCHEMA_VERSION: u16 = 1;
+pub const AGENT_ERROR_INVALID_REQUEST: &str = "agent.invalid_request";
+pub const AGENT_ERROR_SCHEMA_UNSUPPORTED: &str = "agent.schema_unsupported";
+pub const AGENT_ERROR_SCOPE_DENIED: &str = "agent.scope_denied";
+pub const AGENT_ERROR_OPERATION_FAILED: &str = "agent.operation_failed";
+#[cfg(test)]
+pub const AGENT_ERROR_CODES: [&str; 4] = [
+    AGENT_ERROR_INVALID_REQUEST,
+    AGENT_ERROR_OPERATION_FAILED,
+    AGENT_ERROR_SCHEMA_UNSUPPORTED,
+    AGENT_ERROR_SCOPE_DENIED,
+];
+const AGENT_STATUS_OPERATION: &str = "daemon.status";
+const AGENT_EXEC_OPERATION: &str = "ssh.exec";
+const AGENT_LIST_OPERATION: &str = "sftp.list";
+const AGENT_CREATE_DIR_OPERATION: &str = "sftp.write";
+const AGENT_TRANSFER_READ_OPERATION: &str = "transfer.read";
 const AGENT_TRANSFER_WRITE_OPERATION: &str = "transfer.write";
+const AGENT_TRANSFER_STATUS_OPERATION: &str = "transfer.status";
+const AGENT_TRANSFER_CANCEL_OPERATION: &str = "transfer.cancel";
+const AGENT_FORWARD_LOCAL_OPEN_OPERATION: &str = "forward.local/open";
+const AGENT_FORWARD_REMOTE_OPEN_OPERATION: &str = "forward.remote/open";
+const AGENT_FORWARD_DYNAMIC_OPEN_OPERATION: &str = "forward.dynamic/open";
+const AGENT_FORWARD_STATUS_OPERATION: &str = "forward.status";
+const AGENT_FORWARD_CANCEL_OPERATION: &str = "forward.cancel";
+const AGENT_CONNECTION_IDENTITY_OPERATION: &str = "ssh.connection-identity";
 const DOWNLOAD_DURABLE_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 const TRANSFER_JOURNAL_SCHEMA: u8 = 1;
 const MAX_TRANSFER_JOURNAL_BYTES: u64 = 64 * 1024;
@@ -71,6 +96,7 @@ pub type TransferProgressSink = Arc<dyn Fn(ipc::TransferProgress) + Send + Sync 
 #[derive(Clone)]
 pub struct TransferOptions {
     pub backend: ipc::TransferBackend,
+    pub expected_helper_identity: Option<ipc::ExpectedNativeHelperIdentity>,
     pub resume: ipc::TransferResumeMode,
     pub idle_timeout: Duration,
     pub deadline: Option<Duration>,
@@ -81,6 +107,7 @@ impl TransferOptions {
     fn legacy(timeout: Duration) -> Self {
         Self {
             backend: ipc::TransferBackend::Sftp,
+            expected_helper_identity: None,
             resume: ipc::TransferResumeMode::Never,
             idle_timeout: timeout,
             deadline: Some(timeout),
@@ -603,6 +630,52 @@ struct TransferRateTracker {
     observations: VecDeque<(StdInstant, u64)>,
 }
 
+const PUBLIC_TRANSFER_PROGRESS_EVENTS: [&str; 9] = [
+    "accepted",
+    "preflight",
+    "hash",
+    "progress",
+    "resumed",
+    "stalled",
+    "completed",
+    "failed",
+    "cancelled",
+];
+
+/// Validate the final progress shape immediately before it can reach a CLI,
+/// UI, or Agent output sink. The wire-level length/control checks are not a
+/// confidentiality boundary: an otherwise valid event string could contain a
+/// local absolute path or credential. Keep the public vocabulary closed and
+/// clear an unexpected value before returning a value-independent error.
+fn validate_public_transfer_progress(progress: &mut ipc::TransferProgress) -> Result<()> {
+    if let Err(error) = progress.validate() {
+        progress.event.zeroize();
+        return Err(error);
+    }
+    let event_is_public = PUBLIC_TRANSFER_PROGRESS_EVENTS
+        .iter()
+        .any(|event| *event == progress.event);
+    if !event_is_public {
+        progress.event.zeroize();
+        bail!("transfer progress event is outside the public vocabulary");
+    }
+    Ok(())
+}
+
+fn validate_transfer_status_snapshots(
+    transfers: &mut [ipc::TransferProgress],
+    expected_transfer_id: Option<&ipc::TransferId>,
+) -> Result<()> {
+    for progress in transfers {
+        validate_public_transfer_progress(progress)?;
+        ensure!(
+            expected_transfer_id.is_none_or(|expected| expected == &progress.transfer_id),
+            "daemon returned a transfer outside the requested status scope"
+        );
+    }
+    Ok(())
+}
+
 impl TransferRateTracker {
     fn new(now: StdInstant) -> Self {
         let mut observations = VecDeque::new();
@@ -621,7 +694,7 @@ impl TransferRateTracker {
         mut progress: ipc::TransferProgress,
         now: StdInstant,
     ) -> Result<ipc::TransferProgress> {
-        progress.validate()?;
+        validate_public_transfer_progress(&mut progress)?;
         if progress.event == "resumed" {
             self.started = now;
             self.last_advanced = now;
@@ -679,7 +752,7 @@ impl TransferRateTracker {
         } else {
             None
         };
-        progress.validate()?;
+        validate_public_transfer_progress(&mut progress)?;
         Ok(progress)
     }
 }
@@ -800,6 +873,8 @@ pub struct CommandOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub code: Option<i32>,
+    pub operation_context_id: Option<ipc::OperationContextId>,
+    pub revision: u64,
 }
 
 #[derive(Debug)]
@@ -1097,18 +1172,6 @@ async fn catalog_profile_until(
         .with_context(|| format!("profile '{profile}' does not exist"))
 }
 
-async fn catalog_profile_id_until(
-    access: &DaemonAccess,
-    profile: &str,
-    deadline: tokio::time::Instant,
-) -> Result<[u8; 16]> {
-    let found = catalog_profile_until(access, profile, deadline).await?;
-    let bytes = hex::decode(&found.profile_id).context("catalog carries an invalid profile id")?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow!("catalog profile id must decode to 16 bytes"))
-}
-
 /// Unlock one profile against the daemon, unless this process already holds a
 /// mirror of the credential lease for this exact daemon instance.
 async fn ensure_profile_unlocked(
@@ -1325,6 +1388,7 @@ fn now_unix_ms() -> u64 {
 /// seed. The seed never reaches the daemon; only the public key is bound into
 /// the grant.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentGrantFile {
     pub grant: serctl_protocol::grant::OperationGrant,
     /// Base64 32-byte Ed25519 signing-key seed.
@@ -1348,8 +1412,22 @@ pub fn load_agent_grant(
         bytes.len() <= MAX_AGENT_GRANT_BYTES,
         "agent grant file exceeds its 64 KiB safety limit"
     );
+    decode_agent_grant(&bytes)
+}
+
+fn load_agent_grant_from_inherited_handle(
+    identifier: &str,
+) -> Result<(serctl_protocol::grant::OperationGrant, SigningKey)> {
+    let bytes =
+        crate::inherited_io::read_bounded(identifier, MAX_AGENT_GRANT_BYTES, "agent grant")?;
+    decode_agent_grant(&bytes)
+}
+
+fn decode_agent_grant(
+    bytes: &[u8],
+) -> Result<(serctl_protocol::grant::OperationGrant, SigningKey)> {
     let mut file: AgentGrantFile =
-        serde_json::from_slice(&bytes).context("parse agent grant file")?;
+        serde_json::from_slice(bytes).context("parse agent grant file")?;
     let agent_key = Zeroizing::new(std::mem::take(&mut file.agent_key));
     let decoded = Zeroizing::new(
         B64.decode(agent_key.as_bytes())
@@ -1406,6 +1484,91 @@ pub async fn issue_grant_with_ttl_until(
     ttl: Duration,
     output: &Path,
 ) -> Result<serctl_protocol::grant::OperationGrant> {
+    issue_grant_with_ttl_to_output_until(
+        profile,
+        master,
+        operations,
+        budget,
+        ttl,
+        GrantOutput::Path(output),
+    )
+    .await
+}
+
+/// Issue a grant and write it to a caller-created, already-open protected
+/// regular file. Ownership of `output` is consumed and the object is never
+/// resolved through a path.
+pub async fn issue_grant_with_ttl_to_file_until(
+    profile: &str,
+    master: &str,
+    operations: Vec<String>,
+    budget: u32,
+    ttl: Duration,
+    output: std::fs::File,
+) -> Result<serctl_protocol::grant::OperationGrant> {
+    issue_grant_with_ttl_to_output_until(
+        profile,
+        master,
+        operations,
+        budget,
+        ttl,
+        GrantOutput::Inherited(output),
+    )
+    .await
+}
+
+enum GrantOutput<'a> {
+    Path(&'a Path),
+    Inherited(std::fs::File),
+}
+
+/// Complete the strict, read-only profile authentication before allowing the
+/// caller to activate a daemon. Keeping this ordering in one helper makes the
+/// security boundary deterministic and directly testable: an incompatible
+/// KeyPackage, invalid audit state, wrong passphrase, or missing profile can
+/// never reach the activation callback.
+async fn preflight_then_activate_daemon<P, A, AFut, T>(
+    preflight: P,
+    activate: A,
+) -> Result<(vault::ProfileIdentity, T)>
+where
+    P: Future<Output = Result<vault::ProfileIdentity>>,
+    A: FnOnce() -> AFut,
+    AFut: Future<Output = Result<T>>,
+{
+    let identity = preflight.await?;
+    let activated = activate().await?;
+    Ok((identity, activated))
+}
+
+/// Authenticate the exact stored profile with the production vault parser on
+/// a blocking worker, without invoking any vault mutator. The owned
+/// passphrase copy is zeroized when that worker completes, including error
+/// paths. Argon2 cannot be safely preempted once running, so timeout aborts the
+/// join handle while the worker retains and eventually wipes its own copy.
+async fn preflight_grant_profile_until(
+    profile: &str,
+    master: &str,
+    deadline: tokio::time::Instant,
+) -> Result<vault::ProfileIdentity> {
+    let profile = profile.to_owned();
+    let master = Zeroizing::new(master.to_owned());
+    join_blocking_until(
+        tokio::task::spawn_blocking(move || vault::verify_profile_identity(&profile, &master)),
+        deadline,
+        "grant profile read-only preflight",
+    )
+    .await
+}
+
+async fn issue_grant_with_ttl_to_output_until(
+    profile: &str,
+    master: &str,
+    operations: Vec<String>,
+    budget: u32,
+    ttl: Duration,
+    output: GrantOutput<'_>,
+) -> Result<serctl_protocol::grant::OperationGrant> {
     ensure!(
         (serctl_protocol::grant::GRANT_MIN_TTL..=serctl_protocol::grant::GRANT_MAX_TTL)
             .contains(&ttl)
@@ -1416,6 +1579,25 @@ pub async fn issue_grant_with_ttl_until(
         serctl_protocol::grant::GRANT_MAX_TTL.as_secs() / 60
     );
     let ttl_secs = u32::try_from(ttl.as_secs()).context("grant TTL exceeds the wire range")?;
+
+    // The local strict-schema authentication must finish before even resolving
+    // or launching a daemon. Give the subsequent IPC exchange a fresh bounded
+    // budget: the daemon must authenticate independently because credentials
+    // are deliberately never transferred from this process outside its AEAD
+    // unlock request.
+    let preflight_deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
+    let (expected_identity, (access, deadline)) = preflight_then_activate_daemon(
+        preflight_grant_profile_until(profile, master, preflight_deadline),
+        || async {
+            let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
+            Ok((ensure_daemon_until(deadline).await?, deadline))
+        },
+    )
+    .await?;
+    let catalog = catalog_profile_until(&access, profile, deadline).await?;
+    validate_expected_catalog_identity(&catalog, Some(expected_identity))?;
+    let profile_id = wire_profile_id(&catalog)?;
+
     let signing = SigningKey::generate(&mut OsRng);
     let holder_key = B64.encode(signing.verifying_key().to_bytes());
     let request = ipc::Frame::IssueGrant {
@@ -1425,9 +1607,6 @@ pub async fn issue_grant_with_ttl_until(
         ttl_secs,
         holder_key,
     };
-    let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
-    let access = ensure_daemon_until(deadline).await?;
-    let profile_id = catalog_profile_id_until(&access, profile, deadline).await?;
     let call_key = ensure_profile_unlocked(&access, profile, master, profile_id, deadline).await?;
     let mut prelude = v6_prelude(
         &request,
@@ -1449,12 +1628,18 @@ pub async fn issue_grant_with_ttl_until(
     })
     .await
     .map_err(|_| anyhow!("grant issuance exceeded its deadline"))??;
-    let (grant_id, issued_unix_ms, expires_unix_ms) = match reply {
+    let (grant_id, profile_generation, issued_unix_ms, expires_unix_ms) = match reply {
         ipc::Frame::GrantIssued {
             grant_id,
+            profile_generation,
             issued_unix_ms,
             expires_unix_ms,
-        } => (grant_id, issued_unix_ms, expires_unix_ms),
+        } => (
+            grant_id,
+            profile_generation,
+            issued_unix_ms,
+            expires_unix_ms,
+        ),
         ipc::Frame::Error { msg } => bail!("{msg}"),
         mut other => {
             other.zeroize_sensitive();
@@ -1469,6 +1654,7 @@ pub async fn issue_grant_with_ttl_until(
         grant_id: grant_id_bytes,
         profile_name: profile.to_owned(),
         profile_id,
+        profile_generation,
         operations,
         budget,
         issued_unix_ms,
@@ -1485,8 +1671,11 @@ pub async fn issue_grant_with_ttl_until(
     };
     let encoded = Zeroizing::new(serde_json::to_vec(&file).context("serialize agent grant file")?);
     file.agent_key.zeroize();
-    write_agent_grant_file(output, &encoded)
-        .with_context(|| format!("write agent grant file {}", output.display()))?;
+    match output {
+        GrantOutput::Path(path) => write_agent_grant_file(path, &encoded)
+            .with_context(|| format!("write agent grant file {}", path.display()))?,
+        GrantOutput::Inherited(file) => crate::inherited_io::write_all_durable(file, &encoded)?,
+    }
     Ok(grant)
 }
 
@@ -1535,30 +1724,96 @@ async fn connect_grant_request_until(
     connect_v6_until(&access, prelude, handshake_deadline).await
 }
 
+/// Variant for operations whose absolute deadline is part of the signed root
+/// intent (managed tunnels). Scope checks must happen before this function: it
+/// may read the runtime descriptor and connect to the daemon.
+async fn connect_grant_request_at_deadline(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    request: &ipc::Frame,
+    deadline_unix_ms: u64,
+) -> Result<(DaemonConnection, tokio::time::Instant)> {
+    let now = now_unix_ms();
+    ensure!(now > 0, "system clock is unavailable");
+    ensure!(deadline_unix_ms > now, "operation deadline has expired");
+    ensure!(
+        deadline_unix_ms < grant.expires_unix_ms,
+        "operation would exceed the grant expiry"
+    );
+    let remaining_ms = deadline_unix_ms - now;
+    ensure!(
+        remaining_ms <= ipc::MAX_EXEC_TIMEOUT_MS,
+        "operation deadline is outside the supported range"
+    );
+    let operation_deadline = tokio::time::Instant::now() + Duration::from_millis(remaining_ms);
+    let handshake_deadline =
+        operation_deadline.min(tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT);
+    let access = ensure_daemon_until(handshake_deadline).await?;
+    let mut prelude = v6_prelude(
+        request,
+        None,
+        Some(grant.profile_name.clone()),
+        handshake_deadline,
+    )?;
+    prelude.grant_id = Some(grant.grant_id);
+    prelude.requested_deadline_unix_ms = deadline_unix_ms;
+    prelude.pop_signature = Some(serctl_protocol::grant::sign_prelude_pop(signing, &prelude)?);
+    let daemon = connect_v6_until(&access, prelude, handshake_deadline).await?;
+    Ok((daemon, operation_deadline))
+}
+
 /// One request line of the agent stdio protocol.
 #[derive(Deserialize)]
-#[serde(tag = "op", rename_all = "kebab-case")]
+#[serde(transparent)]
+struct DeferredPort(serde_json::Value);
+
+impl DeferredPort {
+    fn parse(self, label: &str) -> Result<u16> {
+        let value = self
+            .0
+            .as_u64()
+            .with_context(|| format!("{label} must be an unsigned integer"))?;
+        u16::try_from(value).with_context(|| format!("{label} exceeds the u16 range"))
+    }
+}
+
+struct DeferredTunnelOpen {
+    mode: ipc::TunnelMode,
+    bind_port: DeferredPort,
+    target_port: Option<DeferredPort>,
+    max_connections: Option<DeferredPort>,
+    deadline_unix_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 enum AgentRequest {
     Exec {
+        schema_version: u16,
         request_id: u64,
         cmd: String,
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
     ListDir {
+        schema_version: u16,
         request_id: u64,
         path: String,
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
     CreateDir {
+        schema_version: u16,
         request_id: u64,
         path: String,
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
     TransferPush {
+        schema_version: u16,
         request_id: u64,
+        #[serde(default)]
+        transfer_id: Option<ipc::TransferId>,
         local: PathBuf,
         remote: String,
         #[serde(default)]
@@ -1569,72 +1824,351 @@ enum AgentRequest {
         idle_timeout_ms: Option<u64>,
         #[serde(default)]
         deadline_ms: Option<u64>,
+        #[serde(default)]
+        expected_helper_identity: Option<ipc::ExpectedNativeHelperIdentity>,
+    },
+    TransferPull {
+        schema_version: u16,
+        request_id: u64,
+        #[serde(default)]
+        transfer_id: Option<ipc::TransferId>,
+        remote: String,
+        local: PathBuf,
+        #[serde(default)]
+        backend: Option<ipc::TransferBackend>,
+        #[serde(default)]
+        resume: Option<ipc::TransferResumeMode>,
+        #[serde(default)]
+        idle_timeout_ms: Option<u64>,
+        #[serde(default)]
+        deadline_ms: Option<u64>,
+        #[serde(default)]
+        expected_helper_identity: Option<ipc::ExpectedNativeHelperIdentity>,
+    },
+    TransferStatus {
+        schema_version: u16,
+        request_id: u64,
+        #[serde(default)]
+        transfer_id: Option<ipc::TransferId>,
+        #[serde(default)]
+        operation_context_id: Option<ipc::OperationContextId>,
+    },
+    TransferCancel {
+        schema_version: u16,
+        request_id: u64,
+        transfer_id: ipc::TransferId,
+        operation_context_id: ipc::OperationContextId,
+    },
+    ForwardLocalOpen {
+        schema_version: u16,
+        request_id: u64,
+        bind_port: DeferredPort,
+        target_port: DeferredPort,
+        #[serde(default)]
+        max_connections: Option<DeferredPort>,
+        deadline_unix_ms: u64,
+    },
+    ForwardRemoteOpen {
+        schema_version: u16,
+        request_id: u64,
+        bind_port: DeferredPort,
+        target_port: DeferredPort,
+        #[serde(default)]
+        max_connections: Option<DeferredPort>,
+        deadline_unix_ms: u64,
+    },
+    ForwardDynamicOpen {
+        schema_version: u16,
+        request_id: u64,
+        bind_port: DeferredPort,
+        #[serde(default)]
+        max_connections: Option<DeferredPort>,
+        deadline_unix_ms: u64,
+    },
+    ForwardStatus {
+        schema_version: u16,
+        request_id: u64,
+        #[serde(default)]
+        tunnel_id: Option<ipc::TunnelId>,
+        #[serde(default)]
+        operation_context_id: Option<ipc::OperationContextId>,
+        deadline_unix_ms: u64,
+    },
+    ForwardCancel {
+        schema_version: u16,
+        request_id: u64,
+        tunnel_id: ipc::TunnelId,
+        operation_context_id: ipc::OperationContextId,
+        deadline_unix_ms: u64,
+    },
+    SshConnectionIdentity {
+        schema_version: u16,
+        request_id: u64,
     },
     Status {
+        schema_version: u16,
         request_id: u64,
     },
 }
 
-#[derive(Debug)]
-struct AgentTransferWriteScopeRequired;
+impl AgentRequest {
+    fn schema_version(&self) -> u16 {
+        match self {
+            Self::Exec { schema_version, .. }
+            | Self::ListDir { schema_version, .. }
+            | Self::CreateDir { schema_version, .. }
+            | Self::TransferPush { schema_version, .. }
+            | Self::TransferPull { schema_version, .. }
+            | Self::TransferStatus { schema_version, .. }
+            | Self::TransferCancel { schema_version, .. }
+            | Self::ForwardLocalOpen { schema_version, .. }
+            | Self::ForwardRemoteOpen { schema_version, .. }
+            | Self::ForwardDynamicOpen { schema_version, .. }
+            | Self::ForwardStatus { schema_version, .. }
+            | Self::ForwardCancel { schema_version, .. }
+            | Self::SshConnectionIdentity { schema_version, .. }
+            | Self::Status { schema_version, .. } => *schema_version,
+        }
+    }
 
-impl std::fmt::Display for AgentTransferWriteScopeRequired {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("grant does not authorize transfer.write")
+    fn request_id(&self) -> u64 {
+        match self {
+            Self::Exec { request_id, .. }
+            | Self::ListDir { request_id, .. }
+            | Self::CreateDir { request_id, .. }
+            | Self::TransferPush { request_id, .. }
+            | Self::TransferPull { request_id, .. }
+            | Self::TransferStatus { request_id, .. }
+            | Self::TransferCancel { request_id, .. }
+            | Self::ForwardLocalOpen { request_id, .. }
+            | Self::ForwardRemoteOpen { request_id, .. }
+            | Self::ForwardDynamicOpen { request_id, .. }
+            | Self::ForwardStatus { request_id, .. }
+            | Self::ForwardCancel { request_id, .. }
+            | Self::SshConnectionIdentity { request_id, .. }
+            | Self::Status { request_id, .. } => *request_id,
+        }
+    }
+
+    fn operation_kind(&self) -> &'static str {
+        match self {
+            Self::Exec { .. } => AGENT_EXEC_OPERATION,
+            Self::ListDir { .. } => AGENT_LIST_OPERATION,
+            Self::CreateDir { .. } => AGENT_CREATE_DIR_OPERATION,
+            Self::TransferPush { .. } => AGENT_TRANSFER_WRITE_OPERATION,
+            Self::TransferPull { .. } => AGENT_TRANSFER_READ_OPERATION,
+            Self::TransferStatus { .. } => AGENT_TRANSFER_STATUS_OPERATION,
+            Self::TransferCancel { .. } => AGENT_TRANSFER_CANCEL_OPERATION,
+            Self::ForwardLocalOpen { .. } => AGENT_FORWARD_LOCAL_OPEN_OPERATION,
+            Self::ForwardRemoteOpen { .. } => AGENT_FORWARD_REMOTE_OPEN_OPERATION,
+            Self::ForwardDynamicOpen { .. } => AGENT_FORWARD_DYNAMIC_OPEN_OPERATION,
+            Self::ForwardStatus { .. } => AGENT_FORWARD_STATUS_OPERATION,
+            Self::ForwardCancel { .. } => AGENT_FORWARD_CANCEL_OPERATION,
+            Self::SshConnectionIdentity { .. } => AGENT_CONNECTION_IDENTITY_OPERATION,
+            Self::Status { .. } => AGENT_STATUS_OPERATION,
+        }
     }
 }
 
-impl std::error::Error for AgentTransferWriteScopeRequired {}
+#[derive(Debug)]
+struct AgentOperationScopeRequired(&'static str);
 
-fn require_agent_transfer_write_scope(
+impl std::fmt::Display for AgentOperationScopeRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "grant does not authorize {}", self.0)
+    }
+}
+
+impl std::error::Error for AgentOperationScopeRequired {}
+
+fn require_agent_operation_scope(
     grant: &serctl_protocol::grant::OperationGrant,
+    operation_kind: &'static str,
 ) -> Result<()> {
     if grant
         .operations
         .iter()
-        .any(|operation| operation == AGENT_TRANSFER_WRITE_OPERATION)
+        .any(|operation| operation == operation_kind)
     {
         Ok(())
     } else {
-        Err(AgentTransferWriteScopeRequired.into())
+        Err(AgentOperationScopeRequired(operation_kind).into())
+    }
+}
+
+fn require_agent_transfer_write_scope(
+    grant: &serctl_protocol::grant::OperationGrant,
+) -> Result<()> {
+    require_agent_operation_scope(grant, AGENT_TRANSFER_WRITE_OPERATION)
+}
+
+fn require_agent_transfer_read_scope(grant: &serctl_protocol::grant::OperationGrant) -> Result<()> {
+    require_agent_operation_scope(grant, AGENT_TRANSFER_READ_OPERATION)
+}
+
+fn require_agent_transfer_status_scope(
+    grant: &serctl_protocol::grant::OperationGrant,
+) -> Result<()> {
+    require_agent_operation_scope(grant, AGENT_TRANSFER_STATUS_OPERATION)
+}
+
+fn require_agent_transfer_cancel_scope(
+    grant: &serctl_protocol::grant::OperationGrant,
+) -> Result<()> {
+    require_agent_operation_scope(grant, AGENT_TRANSFER_CANCEL_OPERATION)
+}
+
+fn validate_agent_expected_helper(
+    backend: ipc::TransferBackend,
+    expected: Option<&ipc::ExpectedNativeHelperIdentity>,
+) -> Result<()> {
+    if let Some(expected) = expected {
+        expected.validate()?;
+    }
+    match (backend, expected) {
+        (ipc::TransferBackend::Native, None) => {
+            bail!("backend=native requires an exact expected Linux helper identity")
+        }
+        (ipc::TransferBackend::Sftp | ipc::TransferBackend::SftpFallback, Some(_)) => {
+            bail!("an expected native helper identity is invalid for an explicit SFTP backend")
+        }
+        _ => Ok(()),
     }
 }
 
 /// Agent JSON must not echo local paths, protected state locations, or lower
 /// error-chain values that could eventually carry credentials. Scope rejection
 /// is a stable, non-secret diagnostic; all other detail remains local only.
-fn agent_visible_transfer_error(error: anyhow::Error) -> anyhow::Error {
-    if error.is::<AgentTransferWriteScopeRequired>() {
+fn agent_visible_transfer_push_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<AgentOperationScopeRequired>() {
         error
     } else {
         anyhow!("transfer-push failed (local diagnostic detail withheld)")
     }
 }
 
+fn agent_visible_transfer_pull_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<AgentOperationScopeRequired>() {
+        error
+    } else {
+        anyhow!("transfer-pull failed (local diagnostic detail withheld)")
+    }
+}
+
+fn agent_visible_transfer_status_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<AgentOperationScopeRequired>() {
+        error
+    } else if error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("outcome unknown")
+        || error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("disconnected")
+    {
+        anyhow!("transfer outcome unknown: daemon instance or IPC connection changed")
+    } else {
+        anyhow!("transfer-status failed (diagnostic detail withheld)")
+    }
+}
+
+fn agent_visible_transfer_cancel_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<AgentOperationScopeRequired>() {
+        error
+    } else if error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("outcome unknown")
+        || error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("disconnected")
+    {
+        anyhow!("transfer outcome unknown: daemon instance or IPC connection changed")
+    } else {
+        anyhow!("transfer-cancel failed (diagnostic detail withheld)")
+    }
+}
+
+fn agent_visible_operation_error(operation: &'static str, error: anyhow::Error) -> anyhow::Error {
+    if error.is::<AgentOperationScopeRequired>() {
+        error
+    } else {
+        anyhow!("{operation} failed (diagnostic detail withheld)")
+    }
+}
+
 /// One result line of the agent stdio protocol: the visible relay record.
 #[derive(Serialize)]
 struct AgentResultLine {
+    schema_version: u16,
     request_id: u64,
     ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<serde_json::Value>,
 }
 
+impl AgentResultLine {
+    fn success(request_id: u64, data: serde_json::Value) -> Self {
+        Self {
+            schema_version: AGENT_SCHEMA_VERSION,
+            request_id,
+            ok: true,
+            error_code: None,
+            error: None,
+            data: Some(data),
+        }
+    }
+
+    fn failure(request_id: u64, error_code: &'static str, error: impl Into<String>) -> Self {
+        Self {
+            schema_version: AGENT_SCHEMA_VERSION,
+            request_id,
+            ok: false,
+            error_code: Some(error_code),
+            error: Some(error.into()),
+            data: None,
+        }
+    }
+}
+
 /// The agent stdio gateway: JSONL requests on stdin, JSONL relay results on
 /// stdout. Every relayed operation is authorized by the grant's budget and
 /// scope and proven by its proof-of-possession signature.
 pub async fn agent_stdio_loop(grant_path: &Path) -> Result<()> {
-    agent_stdio_loop_with(tokio::io::stdin(), tokio::io::stdout(), grant_path).await
+    let credentials = load_agent_grant(grant_path)?;
+    agent_stdio_loop_with_credentials(tokio::io::stdin(), tokio::io::stdout(), credentials).await
 }
 
+pub async fn agent_stdio_loop_from_inherited_handle(identifier: &str) -> Result<()> {
+    let credentials = load_agent_grant_from_inherited_handle(identifier)?;
+    agent_stdio_loop_with_credentials(tokio::io::stdin(), tokio::io::stdout(), credentials).await
+}
+
+#[cfg(test)]
 async fn agent_stdio_loop_with<R, W>(reader: R, writer: W, grant_path: &Path) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let (grant, signing) = load_agent_grant(grant_path)?;
+    let credentials = load_agent_grant(grant_path)?;
+    agent_stdio_loop_with_credentials(reader, writer, credentials).await
+}
+
+async fn agent_stdio_loop_with_credentials<R, W>(
+    reader: R,
+    writer: W,
+    (grant, signing): (serctl_protocol::grant::OperationGrant, SigningKey),
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut lines = tokio::io::BufReader::new(reader);
     let mut stdout = writer;
     while let Some(line) = read_bounded_agent_line(&mut lines).await? {
@@ -1642,12 +2176,11 @@ where
             continue;
         }
         let result = match serde_json::from_slice::<AgentRequest>(&line) {
-            Err(error) => AgentResultLine {
-                request_id: 0,
-                ok: false,
-                error: Some(format!("invalid request: {error}")),
-                data: None,
-            },
+            Err(_) => AgentResultLine::failure(
+                0,
+                AGENT_ERROR_INVALID_REQUEST,
+                "invalid request (diagnostic detail withheld)",
+            ),
             Ok(request) => dispatch_agent_request(&grant, &signing, request).await,
         };
         let mut encoded = serde_json::to_vec(&result).context("serialize agent result line")?;
@@ -1673,8 +2206,12 @@ where
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(available.len(), |index| index + 1);
+        // The extra transport byte is reserved only for an LF terminator. An
+        // EOF-terminated line has no terminator to remove, so permitting the
+        // same `MAX + 1` total there would admit a one-byte oversized payload.
+        let transport_limit = MAX_AGENT_REQUEST_LINE_BYTES + usize::from(newline.is_some());
         ensure!(
-            line.len().saturating_add(consumed) <= MAX_AGENT_REQUEST_LINE_BYTES + 1,
+            line.len().saturating_add(consumed) <= transport_limit,
             "agent request line exceeds its 1 MiB safety limit"
         );
         line.extend_from_slice(&available[..consumed]);
@@ -1694,11 +2231,39 @@ async fn dispatch_agent_request(
     signing: &SigningKey,
     request: AgentRequest,
 ) -> AgentResultLine {
+    let request_id = request.request_id();
+    if request.schema_version() != AGENT_SCHEMA_VERSION {
+        return AgentResultLine::failure(
+            request_id,
+            AGENT_ERROR_SCHEMA_UNSUPPORTED,
+            format!(
+                "unsupported agent schema version {}; expected {}",
+                request.schema_version(),
+                AGENT_SCHEMA_VERSION
+            ),
+        );
+    }
+    let current_unix_ms = now_unix_ms();
+    if current_unix_ms == 0 || grant.is_expired(current_unix_ms) {
+        return AgentResultLine::failure(
+            request_id,
+            AGENT_ERROR_OPERATION_FAILED,
+            "grant is expired or unavailable",
+        );
+    }
+    if let Err(error) = require_agent_operation_scope(grant, request.operation_kind()) {
+        return AgentResultLine::failure(
+            request_id,
+            AGENT_ERROR_SCOPE_DENIED,
+            format!("{error:#}"),
+        );
+    }
     let (request_id, outcome) = match request {
         AgentRequest::Exec {
             request_id,
             cmd,
             timeout_ms,
+            ..
         } => (
             request_id,
             agent_exec_until(
@@ -1707,12 +2272,14 @@ async fn dispatch_agent_request(
                 &cmd,
                 timeout_ms.unwrap_or(ipc::DEFAULT_EXEC_TIMEOUT_MS),
             )
-            .await,
+            .await
+            .map_err(|error| agent_visible_operation_error("exec", error)),
         ),
         AgentRequest::ListDir {
             request_id,
             path,
             timeout_ms,
+            ..
         } => (
             request_id,
             agent_list_until(
@@ -1721,12 +2288,14 @@ async fn dispatch_agent_request(
                 &path,
                 timeout_ms.unwrap_or(ipc::DEFAULT_SFTP_TIMEOUT_MS),
             )
-            .await,
+            .await
+            .map_err(|error| agent_visible_operation_error("list-dir", error)),
         ),
         AgentRequest::CreateDir {
             request_id,
             path,
             timeout_ms,
+            ..
         } => (
             request_id,
             agent_create_dir_until(
@@ -1735,24 +2304,30 @@ async fn dispatch_agent_request(
                 &path,
                 timeout_ms.unwrap_or(ipc::DEFAULT_SFTP_TIMEOUT_MS),
             )
-            .await,
+            .await
+            .map_err(|error| agent_visible_operation_error("create-dir", error)),
         ),
         AgentRequest::TransferPush {
             request_id,
+            transfer_id,
             local,
             remote,
             backend,
             resume,
             idle_timeout_ms,
             deadline_ms,
+            expected_helper_identity,
+            ..
         } => {
             let outcome = agent_transfer_push_until(
                 grant,
                 signing,
+                transfer_id,
                 &local,
                 &remote,
                 TransferOptions {
                     backend: backend.unwrap_or(ipc::TransferBackend::Auto),
+                    expected_helper_identity,
                     resume: resume.unwrap_or(ipc::TransferResumeMode::Never),
                     idle_timeout: Duration::from_millis(
                         idle_timeout_ms.unwrap_or(ipc::DEFAULT_TRANSFER_IDLE_TIMEOUT_MS),
@@ -1762,27 +2337,282 @@ async fn dispatch_agent_request(
                 },
             )
             .await
-            .map_err(agent_visible_transfer_error);
+            .map_err(agent_visible_transfer_push_error);
             (request_id, outcome)
         }
-        AgentRequest::Status { request_id } => {
-            (request_id, agent_status_until(grant, signing).await)
+        AgentRequest::TransferPull {
+            request_id,
+            transfer_id,
+            remote,
+            local,
+            backend,
+            resume,
+            idle_timeout_ms,
+            deadline_ms,
+            expected_helper_identity,
+            ..
+        } => {
+            let outcome = agent_transfer_pull_until(
+                grant,
+                signing,
+                transfer_id,
+                &remote,
+                &local,
+                TransferOptions {
+                    backend: backend.unwrap_or(ipc::TransferBackend::Auto),
+                    expected_helper_identity,
+                    resume: resume.unwrap_or(ipc::TransferResumeMode::Never),
+                    idle_timeout: Duration::from_millis(
+                        idle_timeout_ms.unwrap_or(ipc::DEFAULT_TRANSFER_IDLE_TIMEOUT_MS),
+                    ),
+                    deadline: deadline_ms.map(Duration::from_millis),
+                    progress: None,
+                },
+            )
+            .await
+            .map_err(agent_visible_transfer_pull_error);
+            (request_id, outcome)
         }
+        AgentRequest::TransferStatus {
+            request_id,
+            transfer_id,
+            operation_context_id,
+            ..
+        } => (
+            request_id,
+            agent_transfer_status_until(grant, signing, transfer_id, operation_context_id)
+                .await
+                .map_err(agent_visible_transfer_status_error),
+        ),
+        AgentRequest::TransferCancel {
+            request_id,
+            transfer_id,
+            operation_context_id,
+            ..
+        } => (
+            request_id,
+            agent_transfer_cancel_until(grant, signing, transfer_id, operation_context_id)
+                .await
+                .map_err(agent_visible_transfer_cancel_error),
+        ),
+        AgentRequest::ForwardLocalOpen {
+            request_id,
+            bind_port,
+            target_port,
+            max_connections,
+            deadline_unix_ms,
+            ..
+        } => (
+            request_id,
+            agent_forward_open_deferred_until(
+                grant,
+                signing,
+                AGENT_FORWARD_LOCAL_OPEN_OPERATION,
+                DeferredTunnelOpen {
+                    mode: ipc::TunnelMode::Local,
+                    bind_port,
+                    target_port: Some(target_port),
+                    max_connections,
+                    deadline_unix_ms,
+                },
+            )
+            .await
+            .map_err(|error| agent_visible_operation_error("forward-local-open", error)),
+        ),
+        AgentRequest::ForwardRemoteOpen {
+            request_id,
+            bind_port,
+            target_port,
+            max_connections,
+            deadline_unix_ms,
+            ..
+        } => (
+            request_id,
+            agent_forward_open_deferred_until(
+                grant,
+                signing,
+                AGENT_FORWARD_REMOTE_OPEN_OPERATION,
+                DeferredTunnelOpen {
+                    mode: ipc::TunnelMode::Remote,
+                    bind_port,
+                    target_port: Some(target_port),
+                    max_connections,
+                    deadline_unix_ms,
+                },
+            )
+            .await
+            .map_err(|error| agent_visible_operation_error("forward-remote-open", error)),
+        ),
+        AgentRequest::ForwardDynamicOpen {
+            request_id,
+            bind_port,
+            max_connections,
+            deadline_unix_ms,
+            ..
+        } => (
+            request_id,
+            agent_forward_open_deferred_until(
+                grant,
+                signing,
+                AGENT_FORWARD_DYNAMIC_OPEN_OPERATION,
+                DeferredTunnelOpen {
+                    mode: ipc::TunnelMode::Dynamic,
+                    bind_port,
+                    target_port: None,
+                    max_connections,
+                    deadline_unix_ms,
+                },
+            )
+            .await
+            .map_err(|error| agent_visible_operation_error("forward-dynamic-open", error)),
+        ),
+        AgentRequest::ForwardStatus {
+            request_id,
+            tunnel_id,
+            operation_context_id,
+            deadline_unix_ms,
+            ..
+        } => (
+            request_id,
+            agent_forward_status_until(
+                grant,
+                signing,
+                tunnel_id,
+                operation_context_id,
+                deadline_unix_ms,
+            )
+            .await
+            .map_err(|error| agent_visible_operation_error("forward-status", error)),
+        ),
+        AgentRequest::ForwardCancel {
+            request_id,
+            tunnel_id,
+            operation_context_id,
+            deadline_unix_ms,
+            ..
+        } => (
+            request_id,
+            agent_forward_cancel_until(
+                grant,
+                signing,
+                tunnel_id,
+                operation_context_id,
+                deadline_unix_ms,
+            )
+            .await
+            .map_err(|error| agent_visible_operation_error("forward-cancel", error)),
+        ),
+        AgentRequest::SshConnectionIdentity { request_id, .. } => (
+            request_id,
+            agent_connection_identity_until(grant, signing)
+                .await
+                .map_err(|error| agent_visible_operation_error("ssh-connection-identity", error)),
+        ),
+        AgentRequest::Status { request_id, .. } => (
+            request_id,
+            agent_status_until(grant, signing)
+                .await
+                .map_err(|error| agent_visible_operation_error("status", error)),
+        ),
     };
     match outcome {
-        Ok(data) => AgentResultLine {
-            request_id,
-            ok: true,
-            error: None,
-            data: Some(data),
-        },
-        Err(error) => AgentResultLine {
-            request_id,
-            ok: false,
-            error: Some(format!("{error:#}")),
-            data: None,
-        },
+        Ok(data) => AgentResultLine::success(request_id, data),
+        Err(error) => {
+            let error_code = if error.is::<AgentOperationScopeRequired>() {
+                AGENT_ERROR_SCOPE_DENIED
+            } else {
+                AGENT_ERROR_OPERATION_FAILED
+            };
+            AgentResultLine::failure(request_id, error_code, format!("{error:#}"))
+        }
     }
+}
+
+async fn agent_connection_identity_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+) -> Result<serde_json::Value> {
+    // Keep this check before constructing the root request, reading the
+    // runtime descriptor, or opening an IPC connection. Direct callers retain
+    // the same scope-first boundary as the JSONL dispatcher.
+    require_agent_operation_scope(grant, AGENT_CONNECTION_IDENTITY_OPERATION)?;
+    let request = ipc::Frame::ConnectionIdentity {
+        profile_id: grant.profile_id,
+        profile_generation: grant.profile_generation,
+    };
+    ensure!(
+        serctl_protocol::v6::frame_kind(&request) == AGENT_CONNECTION_IDENTITY_OPERATION,
+        "internal SSH connection-identity operation mismatch"
+    );
+    let timeout = CONTROL_EXCHANGE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let daemon = connect_grant_request_until(grant, signing, &request, timeout).await?;
+    let mut stream = daemon.stream;
+    let reply = tokio::time::timeout_at(deadline, async {
+        ipc::write_frame_limited(&mut stream, &request, ipc::MAX_CONTROL_FRAME).await?;
+        ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME)
+            .await?
+            .context("daemon disconnected during SSH connection-identity exchange")
+    })
+    .await
+    .map_err(|_| anyhow!("SSH connection-identity exchange exceeded its deadline"))??;
+    match reply {
+        ipc::Frame::ConnectionIdentityInfo { identity } => {
+            validate_agent_connection_identity(grant, &identity)?;
+            Ok(agent_connection_identity_value(&identity))
+        }
+        ipc::Frame::Error { msg } => bail!("{msg}"),
+        mut other => {
+            other.zeroize_sensitive();
+            bail!("daemon returned an unexpected SSH connection-identity response")
+        }
+    }
+}
+
+fn validate_agent_connection_identity(
+    grant: &serctl_protocol::grant::OperationGrant,
+    identity: &ipc::SshConnectionIdentity,
+) -> Result<()> {
+    identity.validate()?;
+    ensure!(
+        identity.profile_id == grant.profile_id
+            && identity.profile_generation == grant.profile_generation,
+        "daemon returned SSH connection identity outside the grant profile scope"
+    );
+    validate_agent_operation_context(
+        identity.operation_context_id.as_ref(),
+        identity.revision,
+        "SSH connection",
+    )?;
+    Ok(())
+}
+
+fn validate_agent_operation_context(
+    operation_context_id: Option<&ipc::OperationContextId>,
+    revision: u64,
+    operation: &str,
+) -> Result<()> {
+    ensure!(
+        operation_context_id.is_some() && revision > 0,
+        "daemon omitted the accepted {operation} operation context"
+    );
+    Ok(())
+}
+
+fn agent_connection_identity_value(identity: &ipc::SshConnectionIdentity) -> serde_json::Value {
+    // This is a closed projection of the protocol's already-bounded identity.
+    // It intentionally has no endpoint, username, path, pre-banner, raw
+    // banner, or credential field.
+    serde_json::json!({
+        "profile_id": hex::encode(identity.profile_id),
+        "profile_generation": identity.profile_generation,
+        "observed_host_key_sha256": identity.observed_host_key_sha256,
+        "pin_match": identity.pin_match,
+        "server_identification": identity.server_identification,
+        "transport_attempt_id": identity.transport_attempt_id,
+        "operation_context_id": identity.operation_context_id,
+        "revision": identity.revision,
+    })
 }
 
 pub(crate) async fn agent_exec_until(
@@ -1791,6 +2621,7 @@ pub(crate) async fn agent_exec_until(
     cmd: &str,
     timeout_ms: u64,
 ) -> Result<serde_json::Value> {
+    require_agent_operation_scope(grant, AGENT_EXEC_OPERATION)?;
     validate_remote_command(cmd)?;
     ensure!(
         (1..=ipc::MAX_EXEC_TIMEOUT_MS).contains(&timeout_ms),
@@ -1812,10 +2643,17 @@ pub(crate) async fn agent_exec_until(
         Err(_) => bail!("remote command exceeded its deadline of {timeout_ms} ms"),
     }
     .map_err(|error| classify_daemon_exec_read_error(submission, error))?;
+    validate_agent_operation_context(
+        output.operation_context_id.as_ref(),
+        output.revision,
+        "exec",
+    )?;
     Ok(serde_json::json!({
         "stdout": B64.encode(&output.stdout),
         "stderr": B64.encode(&output.stderr),
         "code": output.code,
+        "operation_context_id": output.operation_context_id,
+        "revision": output.revision,
     }))
 }
 
@@ -1825,6 +2663,7 @@ pub(crate) async fn agent_list_until(
     path: &str,
     timeout_ms: u64,
 ) -> Result<serde_json::Value> {
+    require_agent_operation_scope(grant, AGENT_LIST_OPERATION)?;
     validate_remote_path(path, false)?;
     ensure!(
         (1..=ipc::MAX_SFTP_TIMEOUT_MS).contains(&timeout_ms),
@@ -1847,8 +2686,19 @@ pub(crate) async fn agent_list_until(
     .await
     .map_err(|_| anyhow!("SFTP directory listing exceeded its deadline of {timeout_ms} ms"))??;
     match reply {
-        ipc::Frame::DirList { path, entries } => {
-            Ok(serde_json::json!({ "path": path, "entries": entries }))
+        ipc::Frame::DirList {
+            path,
+            entries,
+            operation_context_id,
+            revision,
+        } => {
+            validate_agent_operation_context(operation_context_id.as_ref(), revision, "directory")?;
+            Ok(serde_json::json!({
+                "path": path,
+                "entries": entries,
+                "operation_context_id": operation_context_id,
+                "revision": revision,
+            }))
         }
         ipc::Frame::Error { msg } => bail!("{msg}"),
         mut other => {
@@ -1864,6 +2714,7 @@ async fn agent_create_dir_until(
     path: &str,
     timeout_ms: u64,
 ) -> Result<serde_json::Value> {
+    require_agent_operation_scope(grant, AGENT_CREATE_DIR_OPERATION)?;
     validate_remote_path(path, false)?;
     ensure!(
         (1..=ipc::MAX_SFTP_TIMEOUT_MS).contains(&timeout_ms),
@@ -1886,7 +2737,21 @@ async fn agent_create_dir_until(
     .await
     .map_err(|_| anyhow!("SFTP create-directory exceeded its deadline of {timeout_ms} ms"))??;
     match reply {
-        ipc::Frame::Ack => Ok(serde_json::json!({ "created": path })),
+        ipc::Frame::CreateDirAccepted {
+            operation_context_id,
+            revision,
+        } => {
+            validate_agent_operation_context(
+                operation_context_id.as_ref(),
+                revision,
+                "create-directory",
+            )?;
+            Ok(serde_json::json!({
+                "created": path,
+                "operation_context_id": operation_context_id,
+                "revision": revision,
+            }))
+        }
         ipc::Frame::Error { msg } => bail!("{msg}"),
         mut other => {
             other.zeroize_sensitive();
@@ -1898,6 +2763,7 @@ async fn agent_create_dir_until(
 pub(crate) async fn agent_transfer_push_until(
     grant: &serctl_protocol::grant::OperationGrant,
     signing: &SigningKey,
+    requested_transfer_id: Option<ipc::TransferId>,
     local: &Path,
     remote: &str,
     options: TransferOptions,
@@ -1906,6 +2772,7 @@ pub(crate) async fn agent_transfer_push_until(
     // The daemon repeats the authoritative check against the signed root
     // prelude; this local check is a fail-fast confidentiality boundary.
     require_agent_transfer_write_scope(grant)?;
+    validate_agent_expected_helper(options.backend, options.expected_helper_identity.as_ref())?;
     validate_upload_remote_path(remote)?;
     let idle_timeout_ms = validated_sftp_timeout_ms(options.idle_timeout)?;
     let deadline_ms = options
@@ -1919,12 +2786,15 @@ pub(crate) async fn agent_transfer_push_until(
     let (mut source, size) =
         open_local_upload_source(local, deadline, &cancellation, idle_timeout_ms).await?;
     let sha256 = hash_stable_upload_source(&mut source, size, deadline, &cancellation).await?;
-    let candidate_transfer_id = ipc::TransferId::random();
+    let candidate_transfer_id = requested_transfer_id
+        .clone()
+        .unwrap_or_else(ipc::TransferId::random);
     let resume_journal = if options.resume == ipc::TransferResumeMode::Auto {
         let access = ensure_daemon_until(deadline).await?;
         let catalog = catalog_profile_until(&access, &grant.profile_name, deadline).await?;
         ensure!(
-            wire_profile_id(&catalog)? == grant.profile_id,
+            wire_profile_id(&catalog)? == grant.profile_id
+                && catalog.generation == grant.profile_generation,
             "grant profile was replaced before transfer resume preparation"
         );
         Some(prepare_upload_resume_journal(
@@ -1942,6 +2812,12 @@ pub(crate) async fn agent_transfer_push_until(
         Some(journal) => journal.transfer_id()?,
         None => candidate_transfer_id,
     };
+    ensure!(
+        requested_transfer_id
+            .as_ref()
+            .is_none_or(|requested| requested == &transfer_id),
+        "requested transfer id does not match the protected resume journal"
+    );
     let resume_token = resume_journal
         .as_ref()
         .map(|journal| journal.resume_token())
@@ -1954,6 +2830,7 @@ pub(crate) async fn agent_transfer_push_until(
         backend,
         resume: options.resume,
         resume_token: resume_token.as_ref().map(|token| token.to_string()),
+        expected_helper_identity: options.expected_helper_identity.clone().map(Box::new),
         idle_timeout_ms,
         deadline_ms,
     });
@@ -1970,6 +2847,8 @@ pub(crate) async fn agent_transfer_push_until(
                 progress.backend,
                 progress.chunk_bytes,
                 progress.window_bytes,
+                progress.operation_context_id.clone(),
+                progress.revision,
             ));
         }
     });
@@ -1988,12 +2867,19 @@ pub(crate) async fn agent_transfer_push_until(
     if let Some(journal) = resume_journal {
         journal.remove()?;
     }
-    let (actual_backend, chunk_bytes, window_bytes) = diagnostics
+    let (actual_backend, chunk_bytes, window_bytes, operation_context_id, revision) = diagnostics
         .lock()
         .map_err(|_| anyhow!("transfer diagnostic lock is poisoned"))?
-        .unwrap_or((backend, 0, 0));
+        .clone()
+        .unwrap_or((backend, 0, 0, None, 0));
+    ensure!(
+        operation_context_id.is_some() && revision > 0,
+        "daemon omitted the accepted operation context"
+    );
     Ok(serde_json::json!({
         "transfer_id": transfer_id.as_str(),
+        "operation_context_id": operation_context_id,
+        "revision": revision,
         "bytes": bytes,
         "backend_requested": backend,
         "backend": actual_backend,
@@ -2002,10 +2888,493 @@ pub(crate) async fn agent_transfer_push_until(
     }))
 }
 
+fn agent_pull_local_target_commitment(
+    grant: &serctl_protocol::grant::OperationGrant,
+    local: &Path,
+) -> Result<String> {
+    const DOMAIN: &[u8] = b"serctl/agent/transfer-pull/local-target/v1\0";
+    let encoded = local.as_os_str().as_encoded_bytes();
+    let encoded_len = u64::try_from(encoded.len()).context("local target path is oversized")?;
+    let mut digest = Sha256::new();
+    digest.update(DOMAIN);
+    digest.update(grant.profile_id);
+    digest.update(grant.profile_generation.to_be_bytes());
+    digest.update(encoded_len.to_be_bytes());
+    digest.update(encoded);
+    Ok(hex::encode(digest.finalize()))
+}
+
+pub(crate) async fn agent_transfer_pull_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    requested_transfer_id: Option<ipc::TransferId>,
+    remote: &str,
+    local: &Path,
+    options: TransferOptions,
+) -> Result<serde_json::Value> {
+    // This check deliberately precedes remote-path validation, local-path
+    // commitment, destination existence checks, journal access, and daemon
+    // descriptor discovery. A mismatched grant therefore cannot be used as a
+    // local filesystem or path-validation oracle.
+    require_agent_transfer_read_scope(grant)?;
+    validate_agent_expected_helper(options.backend, options.expected_helper_identity.as_ref())?;
+    validate_remote_path(remote, false)?;
+    let local = std::path::absolute(local).context("resolve local transfer target identity")?;
+    let local_target_sha256 = agent_pull_local_target_commitment(grant, &local)?;
+    let idle_timeout_ms = validated_sftp_timeout_ms(options.idle_timeout)?;
+    let deadline_ms = options
+        .deadline
+        .map(validated_sftp_timeout_ms)
+        .transpose()?;
+    let operation_timeout = options.request_bound();
+    let deadline = tokio::time::Instant::now() + operation_timeout;
+    ensure!(
+        !tokio::time::timeout_at(deadline, tokio::fs::try_exists(&local))
+            .await
+            .map_err(|_| anyhow!("transfer download exceeded its request bound"))??,
+        "local destination already exists"
+    );
+
+    let backend = options.backend;
+    let candidate_transfer_id = requested_transfer_id
+        .clone()
+        .unwrap_or_else(ipc::TransferId::random);
+    let (transfer_id, resume_offset, expected_size, expected_sha256, resume_journal) =
+        if options.resume == ipc::TransferResumeMode::Auto {
+            let access = ensure_daemon_until(deadline).await?;
+            let catalog = catalog_profile_until(&access, &grant.profile_name, deadline).await?;
+            ensure!(
+                wire_profile_id(&catalog)? == grant.profile_id
+                    && catalog.generation == grant.profile_generation,
+                "grant profile was replaced before transfer resume preparation"
+            );
+            let journal = prepare_download_resume_journal(
+                &catalog,
+                remote,
+                &local,
+                backend,
+                &candidate_transfer_id,
+            )?;
+            let snapshot = journal.snapshot()?;
+            (
+                snapshot.transfer_id,
+                snapshot.durable_offset,
+                snapshot.expected_size,
+                snapshot.expected_sha256,
+                Some(journal),
+            )
+        } else {
+            (candidate_transfer_id, 0, None, None, None)
+        };
+    ensure!(
+        requested_transfer_id
+            .as_ref()
+            .is_none_or(|requested| requested == &transfer_id),
+        "requested transfer id does not match the protected resume journal"
+    );
+    let root = ZeroizingRequestFrame(ipc::Frame::Download {
+        transfer_id: transfer_id.clone(),
+        path: remote.to_owned(),
+        local_target_sha256: Some(local_target_sha256),
+        backend,
+        resume: options.resume,
+        resume_offset,
+        expected_size,
+        expected_sha256,
+        expected_helper_identity: options.expected_helper_identity.clone().map(Box::new),
+        idle_timeout_ms,
+        deadline_ms,
+    });
+    ensure!(
+        serctl_protocol::v6::frame_kind(&root.0) == AGENT_TRANSFER_READ_OPERATION,
+        "internal transfer-pull root operation mismatch"
+    );
+    let daemon = connect_grant_request_until(grant, signing, &root.0, operation_timeout).await?;
+    let diagnostics = Arc::new(StdMutex::new(None));
+    let diagnostics_sink = Arc::clone(&diagnostics);
+    let progress_sink: TransferProgressSink = Arc::new(move |progress| {
+        if let Ok(mut current) = diagnostics_sink.lock() {
+            *current = Some((
+                progress.backend,
+                progress.chunk_bytes,
+                progress.window_bytes,
+                progress.operation_context_id.clone(),
+                progress.revision,
+            ));
+        }
+    });
+    let bytes = download_file_inner(DownloadRequest {
+        local: &local,
+        daemon,
+        root_request: root,
+        timeout_ms: idle_timeout_ms,
+        deadline,
+        cancellation: CancellationToken::new(),
+        progress_sink: Some(progress_sink),
+        resume_journal,
+    })
+    .await?;
+    let (actual_backend, chunk_bytes, window_bytes, operation_context_id, revision) = diagnostics
+        .lock()
+        .map_err(|_| anyhow!("transfer diagnostic lock is poisoned"))?
+        .clone()
+        .unwrap_or((backend, 0, 0, None, 0));
+    ensure!(
+        operation_context_id.is_some() && revision > 0,
+        "daemon omitted the accepted operation context"
+    );
+    Ok(serde_json::json!({
+        "transfer_id": transfer_id.as_str(),
+        "operation_context_id": operation_context_id,
+        "revision": revision,
+        "bytes": bytes,
+        "backend_requested": backend,
+        "backend": actual_backend,
+        "chunk_bytes": chunk_bytes,
+        "window_bytes": window_bytes,
+    }))
+}
+
+pub(crate) async fn agent_transfer_status_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    transfer_id: Option<ipc::TransferId>,
+    operation_context_id: Option<ipc::OperationContextId>,
+) -> Result<serde_json::Value> {
+    require_agent_transfer_status_scope(grant)?;
+    let request = ipc::Frame::TransferStatus {
+        transfer_id: transfer_id.clone(),
+        operation_context_id,
+    };
+    ensure!(
+        serctl_protocol::v6::frame_kind(&request) == AGENT_TRANSFER_STATUS_OPERATION,
+        "internal transfer-status operation mismatch"
+    );
+    let timeout = CONTROL_EXCHANGE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let daemon = connect_grant_request_until(grant, signing, &request, timeout).await?;
+    let mut stream = daemon.stream;
+    let reply = tokio::time::timeout_at(deadline, async {
+        ipc::write_frame_limited(&mut stream, &request, ipc::MAX_CONTROL_FRAME).await?;
+        ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME)
+            .await?
+            .context("daemon disconnected during transfer-status exchange")
+    })
+    .await
+    .map_err(|_| anyhow!("transfer-status exchange exceeded its deadline"))??;
+    match reply {
+        ipc::Frame::TransferStatusInfo { mut transfers } => {
+            validate_transfer_status_snapshots(&mut transfers, transfer_id.as_ref())?;
+            ensure!(
+                transfers.iter().all(|progress| {
+                    progress.operation_context_id.is_some() && progress.revision > 0
+                }),
+                "daemon returned an unbound Grant transfer snapshot"
+            );
+            Ok(serde_json::json!({ "transfers": transfers }))
+        }
+        ipc::Frame::Error { msg } => bail!("{msg}"),
+        mut other => {
+            other.zeroize_sensitive();
+            bail!("daemon returned an unexpected transfer-status response")
+        }
+    }
+}
+
+pub(crate) async fn agent_transfer_cancel_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    transfer_id: ipc::TransferId,
+    operation_context_id: ipc::OperationContextId,
+) -> Result<serde_json::Value> {
+    require_agent_transfer_cancel_scope(grant)?;
+    let transfer_id_text = transfer_id.as_str().to_owned();
+    let request = ipc::Frame::TransferCancel {
+        transfer_id,
+        operation_context_id: Some(operation_context_id),
+    };
+    ensure!(
+        serctl_protocol::v6::frame_kind(&request) == AGENT_TRANSFER_CANCEL_OPERATION,
+        "internal transfer-cancel operation mismatch"
+    );
+    let timeout = CONTROL_EXCHANGE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let daemon = connect_grant_request_until(grant, signing, &request, timeout).await?;
+    let mut stream = daemon.stream;
+    let reply = tokio::time::timeout_at(deadline, async {
+        ipc::write_frame_limited(&mut stream, &request, ipc::MAX_CONTROL_FRAME).await?;
+        ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME)
+            .await?
+            .context("daemon disconnected during transfer-cancel exchange")
+    })
+    .await
+    .map_err(|_| anyhow!("transfer-cancel exchange exceeded its deadline"))??;
+    match reply {
+        ipc::Frame::TransferCancelAccepted { mut progress } => {
+            validate_public_transfer_progress(&mut progress)?;
+            ensure!(
+                progress.transfer_id.as_str() == transfer_id_text,
+                "daemon returned cancellation for a different transfer"
+            );
+            Ok(serde_json::json!({
+                "transfer_id": transfer_id_text,
+                "operation_context_id": progress.operation_context_id,
+                "revision": progress.revision,
+                "cancel_requested": true,
+            }))
+        }
+        ipc::Frame::Error { msg } => bail!("{msg}"),
+        mut other => {
+            other.zeroize_sensitive();
+            bail!("daemon returned an unexpected transfer-cancel response")
+        }
+    }
+}
+
+async fn agent_forward_open_deferred_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    operation_kind: &'static str,
+    deferred: DeferredTunnelOpen,
+) -> Result<serde_json::Value> {
+    // This duplicate check is intentional: direct test/library callers retain
+    // the same scope-first boundary as the JSONL dispatcher. No port value is
+    // interpreted and no daemon state is read before it succeeds.
+    require_agent_operation_scope(grant, operation_kind)?;
+    let bind_port = deferred.bind_port.parse("bind_port")?;
+    let target_port = deferred
+        .target_port
+        .map(|port| port.parse("target_port"))
+        .transpose()?
+        .unwrap_or(0);
+    let max_connections = deferred
+        .max_connections
+        .map(|limit| limit.parse("max_connections"))
+        .transpose()?
+        .unwrap_or(ipc::DEFAULT_TUNNEL_CONNECTIONS as u16);
+    let spec = ipc::TunnelSpec {
+        mode: deferred.mode,
+        bind_port,
+        target_port,
+        max_connections,
+    };
+    agent_forward_open_until(
+        grant,
+        signing,
+        operation_kind,
+        spec,
+        deferred.deadline_unix_ms,
+    )
+    .await
+}
+
+async fn agent_forward_open_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    operation_kind: &'static str,
+    spec: ipc::TunnelSpec,
+    deadline_unix_ms: u64,
+) -> Result<serde_json::Value> {
+    require_agent_operation_scope(grant, operation_kind)?;
+    spec.validate()?;
+    let requested_mode = spec.mode();
+    let request = ipc::Frame::ManagedTunnelOpen {
+        spec,
+        deadline_unix_ms,
+    };
+    ensure!(
+        serctl_protocol::v6::frame_kind(&request) == operation_kind,
+        "internal managed-tunnel open operation mismatch"
+    );
+    let (daemon, operation_deadline) =
+        connect_grant_request_at_deadline(grant, signing, &request, deadline_unix_ms).await?;
+    let exchange_deadline =
+        operation_deadline.min(tokio::time::Instant::now() + IPC_TUNNEL_SETUP_TIMEOUT);
+    let mut stream = daemon.stream;
+    let reply = tokio::time::timeout_at(exchange_deadline, async {
+        ipc::write_frame_limited(&mut stream, &request, ipc::MAX_CONTROL_FRAME).await?;
+        ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME)
+            .await?
+            .context("daemon disconnected during managed-tunnel open exchange")
+    })
+    .await
+    .map_err(|_| anyhow!("managed-tunnel open exchange exceeded its deadline"))??;
+    match reply {
+        ipc::Frame::ManagedTunnelOpened { status } => {
+            validate_agent_tunnel_status(grant, &status, None)?;
+            ensure!(
+                status.mode == requested_mode
+                    && status.stage == ipc::TunnelStage::Ready
+                    && status.deadline_unix_ms == deadline_unix_ms,
+                "daemon returned a tunnel outside the requested open scope"
+            );
+            Ok(agent_tunnel_status_value(&status))
+        }
+        ipc::Frame::Error { msg } => bail!("{msg}"),
+        mut other => {
+            other.zeroize_sensitive();
+            bail!("daemon returned an unexpected managed-tunnel open response")
+        }
+    }
+}
+
+fn validate_agent_tunnel_status(
+    grant: &serctl_protocol::grant::OperationGrant,
+    status: &ipc::TunnelStatus,
+    expected_id: Option<&ipc::TunnelId>,
+) -> Result<()> {
+    status.validate()?;
+    ensure!(
+        status.operation_context_id.is_some() && status.revision > 0,
+        "daemon omitted the managed tunnel operation context"
+    );
+    ensure!(
+        status.profile_id == hex::encode(grant.profile_id)
+            && status.profile_generation == grant.profile_generation,
+        "daemon returned a tunnel outside the grant profile scope"
+    );
+    if let Some(expected_id) = expected_id {
+        ensure!(
+            status.tunnel_id == *expected_id,
+            "daemon returned a tunnel outside the requested id scope"
+        );
+    }
+    Ok(())
+}
+
+fn agent_tunnel_status_value(status: &ipc::TunnelStatus) -> serde_json::Value {
+    // Deliberately omit profile identity and all remote-side fields. The only
+    // address emitted by this stable Agent record is the enforced loopback
+    // listener address returned by the daemon.
+    serde_json::json!({
+        "tunnel_id": status.tunnel_id.as_str(),
+        "mode": status.mode,
+        "stage": status.stage,
+        "bind_host": status.bind_host,
+        "bind_port": status.bind_port,
+        "deadline_unix_ms": status.deadline_unix_ms,
+        "operation_context_id": status.operation_context_id,
+        "revision": status.revision,
+    })
+}
+
+async fn agent_forward_status_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    tunnel_id: Option<ipc::TunnelId>,
+    operation_context_id: Option<ipc::OperationContextId>,
+    deadline_unix_ms: u64,
+) -> Result<serde_json::Value> {
+    require_agent_operation_scope(grant, AGENT_FORWARD_STATUS_OPERATION)?;
+    ensure!(
+        operation_context_id.is_none() || tunnel_id.is_some(),
+        "managed tunnel operation context requires an exact tunnel id"
+    );
+    let request = ipc::Frame::ManagedTunnelStatus {
+        tunnel_id: tunnel_id.clone(),
+        operation_context_id: operation_context_id.clone(),
+    };
+    let (daemon, operation_deadline) =
+        connect_grant_request_at_deadline(grant, signing, &request, deadline_unix_ms).await?;
+    let exchange_deadline =
+        operation_deadline.min(tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT);
+    let mut stream = daemon.stream;
+    let reply = tokio::time::timeout_at(exchange_deadline, async {
+        ipc::write_frame_limited(&mut stream, &request, ipc::MAX_CONTROL_FRAME).await?;
+        ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME)
+            .await?
+            .context("daemon disconnected during managed-tunnel status exchange")
+    })
+    .await
+    .map_err(|_| anyhow!("managed-tunnel status exchange exceeded its deadline"))??;
+    match reply {
+        ipc::Frame::ManagedTunnelStatusInfo { tunnels } => {
+            let mut seen = std::collections::HashSet::new();
+            let mut output = Vec::with_capacity(tunnels.len());
+            for status in tunnels {
+                validate_agent_tunnel_status(grant, &status, tunnel_id.as_ref())?;
+                if let Some(expected) = operation_context_id.as_ref() {
+                    ensure!(
+                        status.operation_context_id.as_ref() == Some(expected),
+                        "daemon substituted the managed tunnel operation context"
+                    );
+                }
+                ensure!(
+                    seen.insert(status.tunnel_id.as_str().to_owned()),
+                    "daemon returned a duplicate tunnel status"
+                );
+                output.push(agent_tunnel_status_value(&status));
+            }
+            if tunnel_id.is_some() {
+                ensure!(
+                    output.len() == 1,
+                    "daemon did not return exactly one requested tunnel"
+                );
+            }
+            Ok(serde_json::json!({ "tunnels": output }))
+        }
+        ipc::Frame::Error { msg } => bail!("{msg}"),
+        mut other => {
+            other.zeroize_sensitive();
+            bail!("daemon returned an unexpected managed-tunnel status response")
+        }
+    }
+}
+
+async fn agent_forward_cancel_until(
+    grant: &serctl_protocol::grant::OperationGrant,
+    signing: &SigningKey,
+    tunnel_id: ipc::TunnelId,
+    operation_context_id: ipc::OperationContextId,
+    deadline_unix_ms: u64,
+) -> Result<serde_json::Value> {
+    require_agent_operation_scope(grant, AGENT_FORWARD_CANCEL_OPERATION)?;
+    let request = ipc::Frame::ManagedTunnelCancel {
+        tunnel_id: tunnel_id.clone(),
+        operation_context_id: Some(operation_context_id.clone()),
+    };
+    let (daemon, operation_deadline) =
+        connect_grant_request_at_deadline(grant, signing, &request, deadline_unix_ms).await?;
+    let exchange_deadline =
+        operation_deadline.min(tokio::time::Instant::now() + GUI_TUNNEL_CLEANUP_TIMEOUT);
+    let mut stream = daemon.stream;
+    let reply = tokio::time::timeout_at(exchange_deadline, async {
+        ipc::write_frame_limited(&mut stream, &request, ipc::MAX_CONTROL_FRAME).await?;
+        ipc::read_frame_limited(&mut stream, ipc::MAX_CONTROL_FRAME)
+            .await?
+            .context("daemon disconnected during managed-tunnel cancel exchange")
+    })
+    .await
+    .map_err(|_| anyhow!("managed-tunnel cancel exchange exceeded its deadline"))??;
+    match reply {
+        ipc::Frame::ManagedTunnelTerminal { status } => {
+            validate_agent_tunnel_status(grant, &status, Some(&tunnel_id))?;
+            ensure!(
+                status.operation_context_id.as_ref() == Some(&operation_context_id),
+                "daemon substituted the managed tunnel operation context"
+            );
+            ensure!(
+                matches!(
+                    status.stage,
+                    ipc::TunnelStage::Closed | ipc::TunnelStage::Unknown
+                ),
+                "daemon returned a non-terminal tunnel cancellation status"
+            );
+            Ok(agent_tunnel_status_value(&status))
+        }
+        ipc::Frame::Error { msg } => bail!("{msg}"),
+        mut other => {
+            other.zeroize_sensitive();
+            bail!("daemon returned an unexpected managed-tunnel cancel response")
+        }
+    }
+}
+
 pub(crate) async fn agent_status_until(
     grant: &serctl_protocol::grant::OperationGrant,
     signing: &SigningKey,
 ) -> Result<serde_json::Value> {
+    require_agent_operation_scope(grant, AGENT_STATUS_OPERATION)?;
     let request = ipc::Frame::Status;
     let timeout = CONTROL_EXCHANGE_TIMEOUT;
     let deadline = tokio::time::Instant::now() + timeout;
@@ -2025,12 +3394,23 @@ pub(crate) async fn agent_status_until(
             host,
             user,
             started_unix,
-        } => Ok(serde_json::json!({
-            "profile": profile,
-            "host": host,
-            "user": user,
-            "started_unix": started_unix,
-        })),
+            operation_context_id,
+            revision,
+        } => {
+            validate_agent_operation_context(
+                operation_context_id.as_ref(),
+                revision,
+                "daemon-status",
+            )?;
+            Ok(serde_json::json!({
+                "profile": profile,
+                "host": host,
+                "user": user,
+                "started_unix": started_unix,
+                "operation_context_id": operation_context_id,
+                "revision": revision,
+            }))
+        }
         ipc::Frame::Error { msg } => bail!("{msg}"),
         mut other => {
             other.zeroize_sensitive();
@@ -2398,13 +3778,19 @@ async fn read_exec_response<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<C
                 data.zeroize();
                 extend?;
             }
-            Some(ipc::Frame::ExecExit { code }) => {
+            Some(ipc::Frame::ExecExit {
+                code,
+                operation_context_id,
+                revision,
+            }) => {
                 let code =
                     code.ok_or_else(|| anyhow!("remote command completed without an exit status"))?;
                 return Ok(CommandOutput {
                     stdout: std::mem::take(&mut *stdout),
                     stderr: std::mem::take(&mut *stderr),
                     code: Some(code),
+                    operation_context_id,
+                    revision,
                 });
             }
             Some(ipc::Frame::Error { msg }) => {
@@ -2446,7 +3832,10 @@ pub async fn transfer_status(
 ) -> Result<Vec<ipc::TransferProgress>> {
     let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
     let access = ensure_daemon_until(deadline).await?;
-    let request = ipc::Frame::TransferStatus { transfer_id };
+    let request = ipc::Frame::TransferStatus {
+        transfer_id: transfer_id.clone(),
+        operation_context_id: None,
+    };
     let daemon =
         connect_authorized_request_until(&access, profile, master, &request, deadline).await?;
     let mut stream = daemon.stream;
@@ -2457,7 +3846,10 @@ pub async fn transfer_status(
     )
     .await
     {
-        Ok(Ok(Some(ipc::Frame::TransferStatusInfo { transfers }))) => Ok(transfers),
+        Ok(Ok(Some(ipc::Frame::TransferStatusInfo { mut transfers }))) => {
+            validate_transfer_status_snapshots(&mut transfers, transfer_id.as_ref())?;
+            Ok(transfers)
+        }
         Ok(Ok(Some(ipc::Frame::Error { msg }))) => bail!(msg),
         Ok(Ok(Some(mut unexpected))) => {
             unexpected.zeroize_sensitive();
@@ -2476,7 +3868,10 @@ pub async fn transfer_cancel(
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + CONTROL_EXCHANGE_TIMEOUT;
     let access = ensure_daemon_until(deadline).await?;
-    let request = ipc::Frame::TransferCancel { transfer_id };
+    let request = ipc::Frame::TransferCancel {
+        transfer_id,
+        operation_context_id: None,
+    };
     let daemon =
         connect_authorized_request_until(&access, profile, master, &request, deadline).await?;
     let mut stream = daemon.stream;
@@ -2487,7 +3882,10 @@ pub async fn transfer_cancel(
     )
     .await
     {
-        Ok(Ok(Some(ipc::Frame::Ack))) => Ok(()),
+        Ok(Ok(Some(ipc::Frame::TransferCancelAccepted { mut progress }))) => {
+            validate_public_transfer_progress(&mut progress)?;
+            Ok(())
+        }
         Ok(Ok(Some(ipc::Frame::Error { msg }))) => bail!(msg),
         Ok(Ok(Some(mut unexpected))) => {
             unexpected.zeroize_sensitive();
@@ -2546,6 +3944,7 @@ async fn daemon_status_at_optional_generation(
                 host,
                 user,
                 started_unix,
+                ..
             }) => Ok(Some(DaemonStatus {
                 profile,
                 host,
@@ -2880,7 +4279,7 @@ async fn list_dir_inner(
     let operation = async {
         ipc::write_frame_limited(&mut stream, &request.0, ipc::MAX_REQUEST_FRAME).await?;
         match ipc::read_frame_limited(&mut stream, ipc::MAX_RESPONSE_FRAME).await? {
-            Some(ipc::Frame::DirList { path, entries }) => Ok((path, entries)),
+            Some(ipc::Frame::DirList { path, entries, .. }) => Ok((path, entries)),
             Some(ipc::Frame::Error { msg }) => bail!(msg),
             Some(mut frame) => {
                 frame.zeroize_sensitive();
@@ -3211,6 +4610,8 @@ async fn upload_file_with_timeout_inner(
         schema_version: ipc::TRANSFER_PROGRESS_SCHEMA_VERSION,
         event: event.to_owned(),
         transfer_id: candidate_transfer_id.clone(),
+        operation_context_id: None,
+        revision: 0,
         direction: ipc::TransferDirection::Push,
         stage,
         total_bytes: size,
@@ -3252,6 +4653,7 @@ async fn upload_file_with_timeout_inner(
                 backend: options.backend,
                 resume: options.resume,
                 resume_token: Some(resume_token.to_string()),
+                expected_helper_identity: options.expected_helper_identity.clone().map(Box::new),
                 idle_timeout_ms,
                 deadline_ms,
             });
@@ -3274,6 +4676,7 @@ async fn upload_file_with_timeout_inner(
                 backend: options.backend,
                 resume: options.resume,
                 resume_token: None,
+                expected_helper_identity: options.expected_helper_identity.clone().map(Box::new),
                 idle_timeout_ms,
                 deadline_ms,
             });
@@ -4031,11 +5434,13 @@ async fn download_file_worker(
         let root = ZeroizingRequestFrame(ipc::Frame::Download {
             transfer_id: snapshot.transfer_id,
             path: remote.to_owned(),
+            local_target_sha256: None,
             backend: options.backend,
             resume: options.resume,
             resume_offset: snapshot.durable_offset,
             expected_size: snapshot.expected_size,
             expected_sha256: snapshot.expected_sha256,
+            expected_helper_identity: options.expected_helper_identity.clone().map(Box::new),
             idle_timeout_ms,
             deadline_ms,
         });
@@ -4048,11 +5453,13 @@ async fn download_file_worker(
         let root = ZeroizingRequestFrame(ipc::Frame::Download {
             transfer_id: candidate_transfer_id,
             path: remote.to_owned(),
+            local_target_sha256: None,
             backend: options.backend,
             resume: options.resume,
             resume_offset: 0,
             expected_size: None,
             expected_sha256: None,
+            expected_helper_identity: options.expected_helper_identity.clone().map(Box::new),
             idle_timeout_ms,
             deadline_ms,
         });
@@ -5701,7 +7108,11 @@ fn key_to_bytes(ev: &Event) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_stdio_loop_with, agent_transfer_push_until,
+        agent_connection_identity_until, agent_connection_identity_value, agent_create_dir_until,
+        agent_exec_until, agent_forward_cancel_until, agent_forward_status_until, agent_list_until,
+        agent_pull_local_target_commitment, agent_status_until, agent_stdio_loop_with,
+        agent_transfer_cancel_until, agent_transfer_pull_until, agent_transfer_push_until,
+        agent_transfer_status_until, agent_tunnel_status_value,
         await_daemon_upload_commit_response_with_grace, await_owned_upload_worker,
         classify_daemon_exec_read_error, commit_local_no_replace_with_hook,
         commit_local_no_replace_with_hook_and_link, complete_shell_input_write_until,
@@ -5710,21 +7121,33 @@ mod tests {
         download_file_with_timeout_owned, elapsed_nonnegative_seconds, enter_raw_mode_with,
         exec_capture_with_timeout_inner, finalize_local_download, join_blocking_until,
         key_to_bytes, list_dir_inner, load_agent_grant, open_local_upload_source,
-        open_local_upload_source_with, prepare_download_resume_journal_in,
-        prepare_upload_resume_journal_in, read_daemon_create_dir_response_until,
+        open_local_upload_source_with, preflight_then_activate_daemon,
+        prepare_download_resume_journal_in, prepare_upload_resume_journal_in,
+        read_bounded_agent_line, read_daemon_create_dir_response_until,
         read_daemon_tunnel_ready_until, read_exec_response, read_shell_frame_pump,
         read_shell_frame_pump_inner, reconcile_shutdown_exchange, run_gui_ipc_shell,
         run_gui_ipc_tunnel, run_local_partial_cleanup_with, send_gui_shell_output_or_cancel,
         shutdown_daemon_exchange, spawn_stdin_pump_with, start_ipc_shell_until,
         terminal_safe_error, terminal_safe_field, upload_file_with_timeout_inner,
-        validate_shell_input, validated_sftp_timeout_ms, verify_owned_file_identities_until_with,
-        wait_for_daemon_absent_until, wait_for_published_daemon_until, write_command_output_to,
+        validate_agent_connection_identity, validate_agent_operation_context,
+        validate_agent_tunnel_status, validate_public_transfer_progress, validate_shell_input,
+        validate_transfer_status_snapshots, validated_sftp_timeout_ms,
+        verify_owned_file_identities_until_with, wait_for_daemon_absent_until,
+        wait_for_published_daemon_until, write_command_output_to,
         write_daemon_create_dir_request_until, write_daemon_exec_request_until,
-        write_shutdown_request_until, AgentGrantFile, AgentRequest,
-        AgentTransferWriteScopeRequired, CommandOutput, DaemonAccess, DaemonStatus,
+        write_shutdown_request_until, AgentGrantFile, AgentOperationScopeRequired, AgentRequest,
+        AgentResultLine, CommandOutput, DaemonAccess, DaemonStatus, DeferredPort,
         OwnedPendingProfileAuthorization, PendingProfileAuthorization, ShellEvent, TransferOptions,
         TransferRateTracker, TunnelEvent, UnclaimedLocalPartial, UploadCommitOutcomeUnknown,
-        AGENT_TRANSFER_WRITE_OPERATION, DAEMON_LOCK_RELEASE_TIMEOUT, MAX_SHELL_INPUT_BYTES,
+        AGENT_CONNECTION_IDENTITY_OPERATION, AGENT_CREATE_DIR_OPERATION,
+        AGENT_ERROR_OPERATION_FAILED, AGENT_ERROR_SCOPE_DENIED, AGENT_EXEC_OPERATION,
+        AGENT_FORWARD_CANCEL_OPERATION, AGENT_FORWARD_DYNAMIC_OPEN_OPERATION,
+        AGENT_FORWARD_LOCAL_OPEN_OPERATION, AGENT_FORWARD_REMOTE_OPEN_OPERATION,
+        AGENT_FORWARD_STATUS_OPERATION, AGENT_LIST_OPERATION, AGENT_STATUS_OPERATION,
+        AGENT_TRANSFER_CANCEL_OPERATION, AGENT_TRANSFER_READ_OPERATION,
+        AGENT_TRANSFER_STATUS_OPERATION, AGENT_TRANSFER_WRITE_OPERATION,
+        DAEMON_LOCK_RELEASE_TIMEOUT, MAX_AGENT_REQUEST_LINE_BYTES, MAX_SHELL_INPUT_BYTES,
+        PUBLIC_TRANSFER_PROGRESS_EVENTS,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use ed25519_dalek::SigningKey;
@@ -5758,6 +7181,8 @@ mod tests {
             schema_version: ipc::TRANSFER_PROGRESS_SCHEMA_VERSION,
             event: "progress".into(),
             transfer_id: ipc::TransferId::parse("00000000000000000000000000000001").unwrap(),
+            operation_context_id: None,
+            revision: 0,
             direction: ipc::TransferDirection::Push,
             stage: ipc::TransferStage::Transferring,
             total_bytes: 10 * 1024 * 1024,
@@ -5771,6 +7196,75 @@ mod tests {
             window_bytes: ipc::SFTP_SAFE_CHUNK_BYTES as u32,
             updated_unix_ms: 1,
         }
+    }
+
+    #[test]
+    fn public_progress_rejects_absolute_path_and_secret_events_before_output() {
+        let canaries = [
+            r"C:\Users\Canary\PROFILE_PASSWORD_DO_NOT_LEAK",
+            "/home/canary/.serctl/PROFILE_PASSWORD_DO_NOT_LEAK",
+        ];
+        for canary in canaries {
+            let mut progress = test_transfer_progress(0);
+            progress.event = canary.to_owned();
+            assert!(
+                progress.validate().is_ok(),
+                "fixture must demonstrate the weaker wire-level boundary"
+            );
+
+            let error = validate_public_transfer_progress(&mut progress).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "transfer progress event is outside the public vocabulary"
+            );
+            assert!(!error.to_string().contains(canary));
+            assert!(progress.event.is_empty(), "rejected event was not cleared");
+        }
+    }
+
+    #[test]
+    fn public_progress_vocabulary_covers_local_daemon_and_terminal_events() {
+        for event in PUBLIC_TRANSFER_PROGRESS_EVENTS {
+            let mut progress = test_transfer_progress(0);
+            progress.event = event.to_owned();
+            validate_public_transfer_progress(&mut progress).unwrap();
+            assert_eq!(progress.event, event);
+        }
+    }
+
+    #[test]
+    fn public_progress_stream_rejects_canary_before_reaching_sink() {
+        let canary = "/home/canary/.serctl/SSH_PASSWORD_DO_NOT_LEAK";
+        let mut progress = test_transfer_progress(0);
+        progress.event = canary.to_owned();
+        let start = Instant::now();
+        let error = TransferRateTracker::new(start)
+            .enrich(progress, start)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "transfer progress event is outside the public vocabulary"
+        );
+        assert!(!error.to_string().contains(canary));
+    }
+
+    #[test]
+    fn public_progress_status_snapshots_fail_closed_before_serializing_canary_event() {
+        let canary = r"C:\Users\Canary\SSH_PASSWORD_DO_NOT_LEAK";
+        let mut progress = test_transfer_progress(0);
+        progress.event = canary.to_owned();
+        let transfer_id = progress.transfer_id.clone();
+        let mut transfers = vec![progress];
+
+        let error =
+            validate_transfer_status_snapshots(&mut transfers, Some(&transfer_id)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "transfer progress event is outside the public vocabulary"
+        );
+        assert!(!error.to_string().contains(canary));
+        assert!(transfers[0].event.is_empty());
     }
 
     #[test]
@@ -6430,6 +7924,8 @@ mod tests {
             stdout: b"short stdout".to_vec(),
             stderr: b"short stderr".to_vec(),
             code: Some(0),
+            operation_context_id: None,
+            revision: 0,
         };
         let mut stdout = FlushTrackingWriter::default();
         let mut stderr = FlushTrackingWriter::default();
@@ -6659,6 +8155,63 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn grant_profile_preflight_failures_never_reach_daemon_activation() {
+        for failure in [
+            "unknown field `audit_seed`",
+            "unknown field `future_security_seed`",
+            "initialized profile key package is missing its audit seed",
+        ] {
+            let activations = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&activations);
+            let result = preflight_then_activate_daemon(
+                std::future::ready(Err::<serctl_core::vault::ProfileIdentity, _>(
+                    anyhow::anyhow!(failure),
+                )),
+                move || async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert!(format!("{result:#}").contains(failure));
+            assert_eq!(
+                activations.load(Ordering::SeqCst),
+                0,
+                "strict-schema preflight failure reached the daemon launcher"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn grant_profile_preflight_precedes_daemon_activation() {
+        let sequence = Arc::new(AtomicUsize::new(0));
+        let preflight_sequence = Arc::clone(&sequence);
+        let activation_sequence = Arc::clone(&sequence);
+        let identity = serctl_core::vault::ProfileIdentity {
+            profile_id: [0x5a; 16],
+            generation: 7,
+        };
+
+        let (observed_identity, ()) = preflight_then_activate_daemon(
+            async move {
+                assert_eq!(preflight_sequence.fetch_add(1, Ordering::SeqCst), 0);
+                Ok(identity)
+            },
+            move || async move {
+                assert_eq!(activation_sequence.fetch_add(1, Ordering::SeqCst), 1);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(observed_identity, identity);
+        assert_eq!(sequence.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn absent_daemon_waits_for_the_runtime_state_to_clear() {
         let exited = Arc::new(AtomicBool::new(false));
         let probe_started = Arc::new(Notify::new());
@@ -6726,11 +8279,606 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn agent_basic_operations_reject_scope_before_validation_or_daemon_access() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
+            vec![AGENT_TRANSFER_WRITE_OPERATION.into()],
+            4,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+
+        let exec = agent_exec_until(&grant, &signing, "", 1_000)
+            .await
+            .unwrap_err();
+        assert!(exec.is::<AgentOperationScopeRequired>());
+        assert_eq!(exec.to_string(), "grant does not authorize ssh.exec");
+
+        let list = agent_list_until(&grant, &signing, "bad\0path", 1_000)
+            .await
+            .unwrap_err();
+        assert!(list.is::<AgentOperationScopeRequired>());
+        assert_eq!(list.to_string(), "grant does not authorize sftp.list");
+
+        let create = agent_create_dir_until(&grant, &signing, "bad\0path", 1_000)
+            .await
+            .unwrap_err();
+        assert!(create.is::<AgentOperationScopeRequired>());
+        assert_eq!(create.to_string(), "grant does not authorize sftp.write");
+
+        let status = agent_status_until(&grant, &signing).await.unwrap_err();
+        assert!(status.is::<AgentOperationScopeRequired>());
+        assert_eq!(status.to_string(), "grant does not authorize daemon.status");
+
+        let identity = agent_connection_identity_until(&grant, &signing)
+            .await
+            .unwrap_err();
+        assert!(identity.is::<AgentOperationScopeRequired>());
+        assert_eq!(
+            identity.to_string(),
+            "grant does not authorize ssh.connection-identity"
+        );
+
+        let result = dispatch_agent_request(
+            &grant,
+            &signing,
+            AgentRequest::Status {
+                schema_version: super::AGENT_SCHEMA_VERSION,
+                request_id: 79,
+            },
+        )
+        .await;
+        assert!(!result.ok);
+        assert_eq!(result.error_code, Some("agent.scope_denied"));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("grant does not authorize daemon.status")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn all_agent_operations_return_typed_scope_denial_before_specific_work() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
+            vec!["not.agent.operation".into()],
+            14,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let transfer_id = ipc::TransferId::parse("00000000000000000000000000000001").unwrap();
+        let requests = vec![
+            (
+                AgentRequest::Exec {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 101,
+                    cmd: String::new(),
+                    timeout_ms: Some(0),
+                },
+                AGENT_EXEC_OPERATION,
+            ),
+            (
+                AgentRequest::ListDir {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 102,
+                    path: "invalid\0path".into(),
+                    timeout_ms: Some(0),
+                },
+                AGENT_LIST_OPERATION,
+            ),
+            (
+                AgentRequest::CreateDir {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 103,
+                    path: "invalid\0path".into(),
+                    timeout_ms: Some(0),
+                },
+                AGENT_CREATE_DIR_OPERATION,
+            ),
+            (
+                AgentRequest::TransferPush {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 104,
+                    transfer_id: None,
+                    local: PathBuf::from("must-not-be-opened"),
+                    remote: "invalid\0path".into(),
+                    backend: Some(ipc::TransferBackend::Sftp),
+                    resume: Some(ipc::TransferResumeMode::Never),
+                    idle_timeout_ms: Some(0),
+                    deadline_ms: Some(0),
+                    expected_helper_identity: None,
+                },
+                AGENT_TRANSFER_WRITE_OPERATION,
+            ),
+            (
+                AgentRequest::TransferPull {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 114,
+                    transfer_id: None,
+                    remote: "invalid\0path".into(),
+                    local: PathBuf::from("must-not-be-created"),
+                    backend: Some(ipc::TransferBackend::Sftp),
+                    resume: Some(ipc::TransferResumeMode::Never),
+                    idle_timeout_ms: Some(0),
+                    deadline_ms: Some(0),
+                    expected_helper_identity: None,
+                },
+                AGENT_TRANSFER_READ_OPERATION,
+            ),
+            (
+                AgentRequest::TransferStatus {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 105,
+                    transfer_id: Some(transfer_id.clone()),
+                    operation_context_id: None,
+                },
+                AGENT_TRANSFER_STATUS_OPERATION,
+            ),
+            (
+                AgentRequest::TransferCancel {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 106,
+                    transfer_id,
+                    operation_context_id: ipc::OperationContextId::parse(&"ab".repeat(32)).unwrap(),
+                },
+                AGENT_TRANSFER_CANCEL_OPERATION,
+            ),
+            (
+                AgentRequest::ForwardLocalOpen {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 107,
+                    bind_port: DeferredPort(serde_json::json!("not-a-port")),
+                    target_port: DeferredPort(serde_json::json!({"secret": "must-not-parse"})),
+                    max_connections: None,
+                    deadline_unix_ms: 0,
+                },
+                AGENT_FORWARD_LOCAL_OPEN_OPERATION,
+            ),
+            (
+                AgentRequest::ForwardRemoteOpen {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 108,
+                    bind_port: DeferredPort(serde_json::Value::Null),
+                    target_port: DeferredPort(serde_json::json!(-1)),
+                    max_connections: None,
+                    deadline_unix_ms: 0,
+                },
+                AGENT_FORWARD_REMOTE_OPEN_OPERATION,
+            ),
+            (
+                AgentRequest::ForwardDynamicOpen {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 109,
+                    bind_port: DeferredPort(serde_json::json!([])),
+                    max_connections: Some(DeferredPort(serde_json::json!(0))),
+                    deadline_unix_ms: 0,
+                },
+                AGENT_FORWARD_DYNAMIC_OPEN_OPERATION,
+            ),
+            (
+                AgentRequest::ForwardStatus {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 110,
+                    tunnel_id: None,
+                    operation_context_id: None,
+                    deadline_unix_ms: 0,
+                },
+                AGENT_FORWARD_STATUS_OPERATION,
+            ),
+            (
+                AgentRequest::ForwardCancel {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 111,
+                    tunnel_id: ipc::TunnelId::parse("00000000000000000000000000000003").unwrap(),
+                    operation_context_id: ipc::OperationContextId::parse(&"ab".repeat(32)).unwrap(),
+                    deadline_unix_ms: 0,
+                },
+                AGENT_FORWARD_CANCEL_OPERATION,
+            ),
+            (
+                AgentRequest::SshConnectionIdentity {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 112,
+                },
+                AGENT_CONNECTION_IDENTITY_OPERATION,
+            ),
+            (
+                AgentRequest::Status {
+                    schema_version: super::AGENT_SCHEMA_VERSION,
+                    request_id: 113,
+                },
+                AGENT_STATUS_OPERATION,
+            ),
+        ];
+
+        for (request, required_operation) in requests {
+            let request_id = request.request_id();
+            assert_eq!(request.operation_kind(), required_operation);
+            let result = dispatch_agent_request(&grant, &signing, request).await;
+            assert_eq!(result.schema_version, super::AGENT_SCHEMA_VERSION);
+            assert_eq!(result.request_id, request_id);
+            assert!(!result.ok);
+            assert_eq!(result.error_code, Some(AGENT_ERROR_SCOPE_DENIED));
+            assert_eq!(
+                result.error.as_deref(),
+                Some(format!("grant does not authorize {required_operation}").as_str())
+            );
+            assert!(result.data.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_identity_agent_schema_is_closed_and_scope_precedes_daemon_access() {
+        let request: AgentRequest = serde_json::from_slice(
+            br#"{"schema_version":1,"op":"ssh-connection-identity","request_id":301}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            request.operation_kind(),
+            AGENT_CONNECTION_IDENTITY_OPERATION
+        );
+        assert!(serde_json::from_slice::<AgentRequest>(
+            br#"{"schema_version":1,"op":"ssh-connection-identity","request_id":301,"host":"secret.example","password":"DO_NOT_PARSE"}"#
+        )
+        .is_err());
+
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([0x21_u8; 16], 7),
+            vec![AGENT_STATUS_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let result = dispatch_agent_request(&grant, &signing, request).await;
+        assert_eq!(result.error_code, Some(AGENT_ERROR_SCOPE_DENIED));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("grant does not authorize ssh.connection-identity")
+        );
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("secret.example"));
+        assert!(!encoded.contains("DO_NOT_PARSE"));
+        assert!(!encoded.contains("password"));
+    }
+
+    #[test]
+    fn connection_identity_agent_output_is_bounded_and_profile_bound() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([0x21_u8; 16], 7),
+            vec![AGENT_CONNECTION_IDENTITY_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let identity = ipc::SshConnectionIdentity {
+            profile_id: grant.profile_id,
+            profile_generation: grant.profile_generation,
+            observed_host_key_sha256: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            pin_match: true,
+            server_identification: "SSH-2.0-OpenSSH_9.9".into(),
+            transport_attempt_id: "00112233445566778899AABBCCDDEEFF".into(),
+            operation_context_id: Some(ipc::OperationContextId::parse(&"ab".repeat(32)).unwrap()),
+            revision: 1,
+        };
+        validate_agent_connection_identity(&grant, &identity).unwrap();
+        let output = agent_connection_identity_value(&identity);
+        let object = output.as_object().unwrap();
+        let keys = object
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "observed_host_key_sha256",
+                "operation_context_id",
+                "pin_match",
+                "profile_generation",
+                "profile_id",
+                "server_identification",
+                "transport_attempt_id",
+                "revision",
+            ])
+        );
+        assert_eq!(object["profile_id"], hex::encode(grant.profile_id));
+        assert_eq!(
+            object["profile_generation"],
+            serde_json::json!(grant.profile_generation)
+        );
+        assert_eq!(object["operation_context_id"], "ab".repeat(32));
+        assert_eq!(object["revision"], 1);
+        let encoded = serde_json::to_string(&output).unwrap();
+        for forbidden in [
+            "host\"",
+            "user\"",
+            "path\"",
+            "raw_banner",
+            "pre_banner",
+            "password",
+            "credential",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+
+        let mut cross_profile = identity.clone();
+        cross_profile.profile_id = [0x22_u8; 16];
+        assert!(validate_agent_connection_identity(&grant, &cross_profile).is_err());
+        let mut stale = identity.clone();
+        stale.profile_generation -= 1;
+        assert!(validate_agent_connection_identity(&grant, &stale).is_err());
+        let mut pin_mismatch = identity;
+        pin_mismatch.pin_match = false;
+        assert!(validate_agent_connection_identity(&grant, &pin_mismatch).is_err());
+
+        assert!(validate_agent_operation_context(None, 0, "exec").is_err());
+        let context = ipc::OperationContextId::parse(&"cd".repeat(32)).unwrap();
+        assert!(validate_agent_operation_context(Some(&context), 0, "directory").is_err());
+        validate_agent_operation_context(Some(&context), 1, "directory").unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_tunnel_agent_schema_is_closed_and_scope_precedes_port_parsing() {
+        for request in [
+            br#"{"schema_version":1,"op":"forward-local-open","request_id":1,"bind_port":0,"target_port":22,"deadline_unix_ms":1900000000000}"#.as_slice(),
+            br#"{"schema_version":1,"op":"forward-remote-open","request_id":2,"bind_port":8022,"target_port":22,"max_connections":4,"deadline_unix_ms":1900000000000}"#.as_slice(),
+            br#"{"schema_version":1,"op":"forward-dynamic-open","request_id":3,"bind_port":1080,"deadline_unix_ms":1900000000000}"#.as_slice(),
+            br#"{"schema_version":1,"op":"forward-status","request_id":4,"deadline_unix_ms":1900000000000}"#.as_slice(),
+            br#"{"schema_version":1,"op":"forward-cancel","request_id":5,"tunnel_id":"00112233445566778899aabbccddeeff","operation_context_id":"abababababababababababababababababababababababababababababababab","deadline_unix_ms":1900000000000}"#.as_slice(),
+        ] {
+            serde_json::from_slice::<AgentRequest>(request).unwrap();
+        }
+        assert!(serde_json::from_slice::<AgentRequest>(
+            br#"{"schema_version":1,"op":"forward-status","request_id":4,"deadline_unix_ms":1900000000000,"unexpected":true}"#
+        )
+        .is_err());
+        assert!(serde_json::from_slice::<AgentRequest>(
+            br#"{"schema_version":1,"op":"forward-cancel","request_id":5,"tunnel_id":"00112233445566778899aabbccddeeff"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_slice::<AgentRequest>(
+            br#"{"schema_version":1,"op":"forward-cancel","request_id":5,"tunnel_id":"00112233445566778899aabbccddeeff","deadline_unix_ms":1900000000000}"#
+        )
+        .is_err());
+
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
+            vec![AGENT_FORWARD_STATUS_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        // The hostile port values deserialize only as opaque JSON. Because
+        // this grant lacks local-open scope, dispatch must deny without ever
+        // interpreting them or attempting daemon discovery.
+        let hostile: AgentRequest = serde_json::from_slice(
+            br#"{"schema_version":1,"op":"forward-local-open","request_id":9,"bind_port":{"password":"DO_NOT_PARSE"},"target_port":[22],"max_connections":-1,"deadline_unix_ms":0}"#,
+        )
+        .unwrap();
+        let result = dispatch_agent_request(&grant, &signing, hostile).await;
+        assert_eq!(result.error_code, Some(AGENT_ERROR_SCOPE_DENIED));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("grant does not authorize forward.local/open")
+        );
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("DO_NOT_PARSE"));
+        assert!(!encoded.contains("password"));
+    }
+
+    #[test]
+    fn managed_tunnel_agent_output_binds_profile_generation_and_redacts_remote_fields() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([0x21_u8; 16], 7),
+            vec![AGENT_FORWARD_STATUS_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let status = ipc::TunnelStatus {
+            schema_version: ipc::TUNNEL_STATUS_SCHEMA_VERSION,
+            tunnel_id: ipc::TunnelId::parse("00112233445566778899aabbccddeeff").unwrap(),
+            profile_id: hex::encode(grant.profile_id),
+            profile_generation: grant.profile_generation,
+            mode: ipc::TunnelMode::Local,
+            bind_host: "127.0.0.1".into(),
+            bind_port: 45123,
+            target_host: Some("127.0.0.1".into()),
+            target_port: 22,
+            deadline_unix_ms: 1_900_000_000_000,
+            stage: ipc::TunnelStage::Ready,
+            updated_unix_ms: 1_800_000_000_000,
+            operation_context_id: Some(ipc::OperationContextId::parse(&"ab".repeat(32)).unwrap()),
+            revision: 1,
+        };
+        validate_agent_tunnel_status(&grant, &status, Some(&status.tunnel_id)).unwrap();
+        let output = agent_tunnel_status_value(&status);
+        let encoded = serde_json::to_string(&output).unwrap();
+        assert!(encoded.contains("127.0.0.1"));
+        assert!(!encoded.contains(&status.profile_id));
+        assert!(!encoded.contains("target_host"));
+        assert!(!encoded.contains("target_port"));
+        assert!(encoded.contains(&"ab".repeat(32)));
+        assert_eq!(output["revision"], 1);
+
+        let mut cross_profile = status.clone();
+        cross_profile.profile_id = hex::encode([0x22_u8; 16]);
+        assert!(validate_agent_tunnel_status(&grant, &cross_profile, None).is_err());
+        let mut stale = status.clone();
+        stale.profile_generation -= 1;
+        assert!(validate_agent_tunnel_status(&grant, &stale, None).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_tunnel_status_and_cancel_require_independent_exact_scopes() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
+            vec![AGENT_FORWARD_LOCAL_OPEN_OPERATION.into()],
+            2,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let tunnel_id = ipc::TunnelId::parse("00112233445566778899aabbccddeeff").unwrap();
+        let operation_context_id = ipc::OperationContextId::parse(&"ab".repeat(32)).unwrap();
+        let status_error = agent_forward_status_until(&grant, &signing, None, None, u64::MAX)
+            .await
+            .unwrap_err();
+        assert!(status_error.is::<AgentOperationScopeRequired>());
+        let cancel_error =
+            agent_forward_cancel_until(&grant, &signing, tunnel_id, operation_context_id, u64::MAX)
+                .await
+                .unwrap_err();
+        assert!(cancel_error.is::<AgentOperationScopeRequired>());
+    }
+
+    #[test]
+    fn agent_result_ndjson_matches_the_v1_golden_fixture() {
+        let results = [
+            AgentResultLine::success(1, serde_json::json!({ "status": "ready" })),
+            AgentResultLine::failure(
+                2,
+                super::AGENT_ERROR_INVALID_REQUEST,
+                "invalid request (diagnostic detail withheld)",
+            ),
+            AgentResultLine::failure(
+                3,
+                super::AGENT_ERROR_SCHEMA_UNSUPPORTED,
+                "unsupported agent schema version",
+            ),
+            AgentResultLine::failure(
+                4,
+                super::AGENT_ERROR_SCOPE_DENIED,
+                "grant does not authorize ssh.exec",
+            ),
+            AgentResultLine::failure(
+                5,
+                super::AGENT_ERROR_OPERATION_FAILED,
+                "exec failed (diagnostic detail withheld)",
+            ),
+            AgentResultLine::success(
+                6,
+                serde_json::json!({
+                    "tunnel_id": "00112233445566778899aabbccddeeff",
+                    "mode": "local",
+                    "stage": "ready",
+                    "bind_host": "127.0.0.1",
+                    "bind_port": 45123,
+                    "deadline_unix_ms": 1_900_000_000_000_u64,
+                }),
+            ),
+            AgentResultLine::success(
+                7,
+                serde_json::json!({
+                    "profile_id": "21212121212121212121212121212121",
+                    "profile_generation": 7,
+                    "observed_host_key_sha256": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "pin_match": true,
+                    "server_identification": "SSH-2.0-OpenSSH_9.9",
+                    "transport_attempt_id": "00112233445566778899AABBCCDDEEFF",
+                    "operation_context_id": "abababababababababababababababababababababababababababababababab",
+                    "revision": 1,
+                }),
+            ),
+            AgentResultLine::success(
+                8,
+                serde_json::json!({
+                    "transfer_id": "00112233445566778899aabbccddeeff",
+                    "bytes": 3_400_000_u64,
+                    "backend_requested": "auto",
+                    "backend": "sftp_fallback",
+                    "chunk_bytes": 2048,
+                    "window_bytes": 2048,
+                    "operation_context_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+                    "revision": 4,
+                }),
+            ),
+        ];
+        let mut actual = String::new();
+        for result in results {
+            actual.push_str(&serde_json::to_string(&result).unwrap());
+            actual.push('\n');
+        }
+
+        assert_eq!(
+            actual.replace("\r\n", "\n"),
+            include_str!("../tests/fixtures/agent-result-v1.jsonl").replace("\r\n", "\n")
+        );
+        assert_eq!(actual.lines().count(), 8);
+        assert!(!actual.contains('\u{1b}'));
+        for line in actual.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["schema_version"], super::AGENT_SCHEMA_VERSION);
+            assert!(value["ok"].is_boolean());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_rechecks_grant_expiry_before_request_local_io_or_daemon_access() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let now = super::now_unix_ms();
+        let grant = serctl_protocol::grant::OperationGrant::new_with_ttl(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
+            vec![AGENT_TRANSFER_WRITE_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            now - u64::try_from(serctl_protocol::grant::GRANT_MIN_TTL.as_millis()).unwrap() - 1,
+            serctl_protocol::grant::GRANT_MIN_TTL,
+        )
+        .unwrap();
+        let result = dispatch_agent_request(
+            &grant,
+            &signing,
+            AgentRequest::TransferPush {
+                schema_version: super::AGENT_SCHEMA_VERSION,
+                request_id: 80,
+                transfer_id: None,
+                local: std::env::temp_dir()
+                    .join("serctl-expired-grant-must-not-open")
+                    .join("credential-material.bin"),
+                remote: "/tmp/expired-grant-test".into(),
+                backend: Some(ipc::TransferBackend::Sftp),
+                resume: Some(ipc::TransferResumeMode::Never),
+                idle_timeout_ms: Some(1_000),
+                deadline_ms: Some(2_000),
+                expected_helper_identity: None,
+            },
+        )
+        .await;
+        assert!(!result.ok);
+        assert_eq!(result.error_code, Some(AGENT_ERROR_OPERATION_FAILED));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("grant is expired or unavailable")
+        );
+        assert!(result.data.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn agent_transfer_push_requires_exact_transfer_write_scope_before_local_io() {
         let signing = SigningKey::generate(&mut OsRng);
         let grant = serctl_protocol::grant::OperationGrant::new(
             "prod".into(),
-            [2_u8; 16],
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
             vec!["sftp.write".into(), "ssh.exec".into()],
             2,
             &signing.verifying_key(),
@@ -6743,10 +8891,12 @@ mod tests {
         let error = agent_transfer_push_until(
             &grant,
             &signing,
+            None,
             &local,
             "/tmp/agent-scope-test",
             TransferOptions {
                 backend: ipc::TransferBackend::Sftp,
+                expected_helper_identity: None,
                 resume: ipc::TransferResumeMode::Never,
                 idle_timeout: Duration::from_secs(1),
                 deadline: Some(Duration::from_secs(2)),
@@ -6755,7 +8905,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.is::<AgentTransferWriteScopeRequired>());
+        assert!(error.is::<AgentOperationScopeRequired>());
         assert_eq!(error.to_string(), "grant does not authorize transfer.write");
         assert!(!error.to_string().contains(local.to_string_lossy().as_ref()));
 
@@ -6767,6 +8917,7 @@ mod tests {
             backend: ipc::TransferBackend::Sftp,
             resume: ipc::TransferResumeMode::Never,
             resume_token: None,
+            expected_helper_identity: None,
             idle_timeout_ms: 1_000,
             deadline_ms: Some(2_000),
         };
@@ -6779,11 +8930,176 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn agent_transfer_pull_requires_exact_scope_before_paths_or_daemon_access() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 7),
+            vec![
+                AGENT_TRANSFER_WRITE_OPERATION.into(),
+                AGENT_LIST_OPERATION.into(),
+            ],
+            2,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let local = std::env::temp_dir()
+            .join("serctl-agent-pull-scope-must-not-create")
+            .join("credential-material.bin");
+        let error = agent_transfer_pull_until(
+            &grant,
+            &signing,
+            None,
+            "invalid\0remote",
+            &local,
+            TransferOptions {
+                backend: ipc::TransferBackend::Sftp,
+                expected_helper_identity: None,
+                resume: ipc::TransferResumeMode::Never,
+                idle_timeout: Duration::ZERO,
+                deadline: Some(Duration::ZERO),
+                progress: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<AgentOperationScopeRequired>());
+        assert_eq!(error.to_string(), "grant does not authorize transfer.read");
+        assert!(!local.exists());
+
+        let read_grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 7),
+            vec![AGENT_TRANSFER_READ_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let commitment = agent_pull_local_target_commitment(&read_grant, &local).unwrap();
+        assert_eq!(commitment.len(), 64);
+        let root = ipc::Frame::Download {
+            transfer_id: ipc::TransferId::parse("00112233445566778899aabbccddeeff").unwrap(),
+            path: "/srv/evidence.bin".into(),
+            local_target_sha256: Some(commitment),
+            backend: ipc::TransferBackend::Sftp,
+            resume: ipc::TransferResumeMode::Never,
+            resume_offset: 0,
+            expected_size: None,
+            expected_sha256: None,
+            expected_helper_identity: None,
+            idle_timeout_ms: 1_000,
+            deadline_ms: Some(2_000),
+        };
+        assert_eq!(
+            serctl_protocol::v6::frame_kind(&root),
+            AGENT_TRANSFER_READ_OPERATION
+        );
+    }
+
+    #[test]
+    fn agent_transfer_pull_local_commitment_binds_profile_generation_and_target() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = |profile_id, generation| {
+            serctl_protocol::grant::OperationGrant::new(
+                "prod".into(),
+                serctl_protocol::grant::GrantProfileIdentity::new(profile_id, generation),
+                vec![AGENT_TRANSFER_READ_OPERATION.into()],
+                1,
+                &signing.verifying_key(),
+                super::now_unix_ms(),
+            )
+            .unwrap()
+        };
+        let local = PathBuf::from("evidence.bin");
+        let baseline = agent_pull_local_target_commitment(&grant([2_u8; 16], 7), &local).unwrap();
+        assert_ne!(
+            baseline,
+            agent_pull_local_target_commitment(&grant([3_u8; 16], 7), &local).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            agent_pull_local_target_commitment(&grant([2_u8; 16], 8), &local).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            agent_pull_local_target_commitment(&grant([2_u8; 16], 7), &PathBuf::from("other.bin"))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_transfer_status_requires_exact_scope_before_daemon_access() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
+            vec![AGENT_TRANSFER_WRITE_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let transfer_id = ipc::TransferId::parse("00000000000000000000000000000001").unwrap();
+        let error = agent_transfer_status_until(&grant, &signing, Some(transfer_id), None)
+            .await
+            .unwrap_err();
+        assert!(error.is::<AgentOperationScopeRequired>());
+        assert_eq!(
+            error.to_string(),
+            "grant does not authorize transfer.status"
+        );
+
+        let root = ipc::Frame::TransferStatus {
+            transfer_id: None,
+            operation_context_id: None,
+        };
+        assert_eq!(
+            serctl_protocol::v6::frame_kind(&root),
+            AGENT_TRANSFER_STATUS_OPERATION
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_transfer_cancel_requires_exact_scope_before_daemon_access() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
+            vec![AGENT_TRANSFER_STATUS_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let transfer_id = ipc::TransferId::parse("00000000000000000000000000000002").unwrap();
+        let context = ipc::OperationContextId::parse(&"ab".repeat(32)).unwrap();
+        let error = agent_transfer_cancel_until(&grant, &signing, transfer_id, context)
+            .await
+            .unwrap_err();
+        assert!(error.is::<AgentOperationScopeRequired>());
+        assert_eq!(
+            error.to_string(),
+            "grant does not authorize transfer.cancel"
+        );
+
+        let root = ipc::Frame::TransferCancel {
+            transfer_id: ipc::TransferId::parse("00000000000000000000000000000002").unwrap(),
+            operation_context_id: Some(ipc::OperationContextId::parse(&"ab".repeat(32)).unwrap()),
+        };
+        assert_eq!(
+            serctl_protocol::v6::frame_kind(&root),
+            AGENT_TRANSFER_CANCEL_OPERATION
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn agent_transfer_push_json_error_withholds_local_path_and_credentials() {
         let signing = SigningKey::generate(&mut OsRng);
         let grant = serctl_protocol::grant::OperationGrant::new(
             "prod".into(),
-            [2_u8; 16],
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
             vec![AGENT_TRANSFER_WRITE_OPERATION.into()],
             1,
             &signing.verifying_key(),
@@ -6801,13 +9117,16 @@ mod tests {
             &grant,
             &signing,
             AgentRequest::TransferPush {
+                schema_version: super::AGENT_SCHEMA_VERSION,
                 request_id: 77,
+                transfer_id: None,
                 local: local.clone(),
                 remote: "/tmp/agent-redaction-test".into(),
                 backend: Some(ipc::TransferBackend::Sftp),
                 resume: Some(ipc::TransferResumeMode::Never),
                 idle_timeout_ms: Some(1_000),
                 deadline_ms: Some(2_000),
+                expected_helper_identity: None,
             },
         )
         .await;
@@ -6823,6 +9142,95 @@ mod tests {
         assert!(!encoded.contains(local.to_string_lossy().as_ref()));
         assert!(!encoded.contains(marker));
         assert!(!encoded.contains("missing-source.bin"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_transfer_pull_json_error_withholds_paths_and_unknown_details() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
+            vec![AGENT_TRANSFER_READ_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let marker = "PROFILE_PASSWORD_DO_NOT_LEAK";
+        let local = std::env::temp_dir().join(format!("pull-{marker}.bin"));
+        let result = dispatch_agent_request(
+            &grant,
+            &signing,
+            AgentRequest::TransferPull {
+                schema_version: super::AGENT_SCHEMA_VERSION,
+                request_id: 177,
+                transfer_id: None,
+                remote: format!("/tmp/{marker}\0"),
+                local: local.clone(),
+                backend: Some(ipc::TransferBackend::Sftp),
+                resume: Some(ipc::TransferResumeMode::Never),
+                idle_timeout_ms: Some(1_000),
+                deadline_ms: Some(2_000),
+                expected_helper_identity: None,
+            },
+        )
+        .await;
+        assert!(!result.ok);
+        assert_eq!(result.error_code, Some(AGENT_ERROR_OPERATION_FAILED));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("transfer-pull failed (local diagnostic detail withheld)")
+        );
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains(marker));
+        assert!(!encoded.contains("/tmp/"));
+        assert!(!encoded.contains(local.to_string_lossy().as_ref()));
+        assert!(!local.exists());
+
+        for lower in [
+            anyhow::anyhow!("download cancelled at {marker}"),
+            anyhow::anyhow!("download commit outcome unknown at {marker}"),
+        ] {
+            assert_eq!(
+                super::agent_visible_transfer_pull_error(lower).to_string(),
+                "transfer-pull failed (local diagnostic detail withheld)"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_basic_operation_errors_withhold_request_and_lower_error_chain() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
+            vec![AGENT_LIST_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let marker = "PROFILE_PASSWORD_DO_NOT_LEAK";
+        let result = dispatch_agent_request(
+            &grant,
+            &signing,
+            AgentRequest::ListDir {
+                schema_version: super::AGENT_SCHEMA_VERSION,
+                request_id: 78,
+                path: format!("/tmp/{marker}\0"),
+                timeout_ms: Some(1_000),
+            },
+        )
+        .await;
+        assert!(!result.ok);
+        assert_eq!(result.error_code, Some("agent.operation_failed"));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("list-dir failed (diagnostic detail withheld)")
+        );
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains(marker));
+        assert!(!encoded.contains("/tmp/"));
     }
 
     #[test]
@@ -6842,7 +9250,7 @@ mod tests {
         let other = SigningKey::from_bytes(&[8_u8; 32]);
         let grant = serctl_protocol::grant::OperationGrant::new(
             "prod".into(),
-            [2_u8; 16],
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
             vec![AGENT_TRANSFER_WRITE_OPERATION.into()],
             1,
             &other.verifying_key(),
@@ -6866,6 +9274,52 @@ mod tests {
     }
 
     #[test]
+    fn load_agent_grant_rejects_unknown_envelope_fields_without_leaking_key() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "serctl-agent-grant-unknown-envelope-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let signing = SigningKey::from_bytes(&[31_u8; 32]);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
+            vec![AGENT_TRANSFER_WRITE_OPERATION.into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let encoded_key = B64.encode(signing.to_bytes());
+        let mut encoded = serde_json::to_value(AgentGrantFile {
+            grant,
+            agent_key: encoded_key.clone(),
+        })
+        .unwrap();
+        let marker = "UNKNOWN_AUTHORITY_MUST_NOT_BE_IGNORED_OR_LEAKED";
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .insert("zz_future_authority".into(), marker.into());
+        let path = base.join("agent-grant.json");
+        super::write_agent_grant_file(&path, &serde_json::to_vec(&encoded).unwrap()).unwrap();
+
+        let error = load_agent_grant(&path).unwrap_err();
+        let message = error.to_string();
+        assert_eq!(message, "parse agent grant file");
+        assert!(!message.contains(&encoded_key));
+        assert!(!message.contains(marker));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn load_agent_grant_rejects_expired_grant_before_request_processing() {
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
@@ -6883,7 +9337,7 @@ mod tests {
         let issued_unix_ms = super::now_unix_ms().checked_sub(ttl_ms + 1_000).unwrap();
         let grant = serctl_protocol::grant::OperationGrant::new(
             "prod".into(),
-            [2_u8; 16],
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
             vec![AGENT_TRANSFER_WRITE_OPERATION.into()],
             1,
             &signing.verifying_key(),
@@ -6905,6 +9359,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn agent_line_bound_reserves_the_extra_byte_only_for_lf() {
+        async fn read(input: &[u8]) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+            let mut reader = tokio::io::BufReader::with_capacity(17, input);
+            read_bounded_agent_line(&mut reader).await
+        }
+
+        let exact_payload = vec![b'x'; MAX_AGENT_REQUEST_LINE_BYTES];
+        let exact_eof = read(&exact_payload)
+            .await
+            .unwrap()
+            .expect("exact-size EOF line");
+        assert_eq!(exact_eof.len(), MAX_AGENT_REQUEST_LINE_BYTES);
+
+        let mut exact_lf = exact_payload.clone();
+        exact_lf.push(b'\n');
+        let exact_lf = read(&exact_lf).await.unwrap().expect("exact-size LF line");
+        assert_eq!(exact_lf.len(), MAX_AGENT_REQUEST_LINE_BYTES);
+
+        let oversized_eof = vec![b'x'; MAX_AGENT_REQUEST_LINE_BYTES + 1];
+        let error = read(&oversized_eof).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "agent request line exceeds its 1 MiB safety limit"
+        );
+
+        let mut oversized_lf = oversized_eof;
+        oversized_lf.push(b'\n');
+        let error = read(&oversized_lf).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "agent request line exceeds its 1 MiB safety limit"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn agent_stdio_gateway_reports_invalid_request_lines_without_a_daemon() {
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
@@ -6923,6 +9412,7 @@ mod tests {
             grant_id: [1_u8; 16],
             profile_name: "prod".into(),
             profile_id: [2_u8; 16],
+            profile_generation: 1,
             operations: vec!["ssh.exec".into()],
             budget: 1,
             issued_unix_ms,
@@ -6946,8 +9436,10 @@ mod tests {
             .await
             .unwrap();
         let line: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+        assert_eq!(line["schema_version"], super::AGENT_SCHEMA_VERSION);
         assert_eq!(line["request_id"], 0);
         assert_eq!(line["ok"], false);
+        assert_eq!(line["error_code"], "agent.invalid_request");
         assert!(line["error"]
             .as_str()
             .is_some_and(|error| error.contains("invalid request")));
@@ -6957,15 +9449,138 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_schema_and_unknown_fields_fail_closed_before_daemon_access() {
+        assert!(
+            serde_json::from_slice::<AgentRequest>(br#"{"op":"status","request_id":1}"#).is_err()
+        );
+        assert!(serde_json::from_slice::<AgentRequest>(
+            br#"{"schema_version":1,"op":"status","request_id":1,"unexpected":true}"#
+        )
+        .is_err());
+        assert!(serde_json::from_slice::<AgentRequest>(
+            br#"{"schema_version":1,"op":"future-op","request_id":1}"#
+        )
+        .is_err());
+        assert!(serde_json::from_slice::<AgentRequest>(
+            br#"{"schema_version":1,"op":"transfer-cancel","request_id":1,"transfer_id":"short"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_slice::<AgentRequest>(
+            br#"{"schema_version":1,"op":"transfer-status","request_id":1,"transfer_id":null,"unexpected":true}"#
+        )
+        .is_err());
+
+        let request: AgentRequest =
+            serde_json::from_slice(br#"{"schema_version":2,"op":"status","request_id":41}"#)
+                .unwrap();
+        let signing = SigningKey::from_bytes(&[17_u8; 32]);
+        let grant = serctl_protocol::grant::OperationGrant::new(
+            "prod".into(),
+            serctl_protocol::grant::GrantProfileIdentity::new([2_u8; 16], 1),
+            vec!["daemon.status".into()],
+            1,
+            &signing.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let result = dispatch_agent_request(&grant, &signing, request).await;
+        assert_eq!(result.schema_version, super::AGENT_SCHEMA_VERSION);
+        assert_eq!(result.request_id, 41);
+        assert!(!result.ok);
+        assert_eq!(result.error_code, Some("agent.schema_unsupported"));
+        assert!(result.data.is_none());
+    }
+
+    #[test]
+    fn agent_transfer_control_schema_parses_canonical_requests() {
+        let status: AgentRequest = serde_json::from_slice(
+            br#"{"schema_version":1,"op":"transfer-status","request_id":7,"transfer_id":"0123456789abcdef0123456789abcdef"}"#,
+        )
+        .unwrap();
+        assert_eq!(status.schema_version(), super::AGENT_SCHEMA_VERSION);
+        assert_eq!(status.request_id(), 7);
+        assert!(matches!(
+            status,
+            AgentRequest::TransferStatus {
+                transfer_id: Some(ref id),
+                ..
+            } if id.as_str() == "0123456789abcdef0123456789abcdef"
+        ));
+
+        let cancel: AgentRequest = serde_json::from_slice(
+            br#"{"schema_version":1,"op":"transfer-cancel","request_id":8,"transfer_id":"fedcba9876543210fedcba9876543210","operation_context_id":"abababababababababababababababababababababababababababababababab"}"#,
+        )
+        .unwrap();
+        assert_eq!(cancel.request_id(), 8);
+        assert!(matches!(
+            cancel,
+            AgentRequest::TransferCancel { ref transfer_id, ref operation_context_id, .. }
+                if transfer_id.as_str() == "fedcba9876543210fedcba9876543210"
+                    && operation_context_id.as_str() == "abababababababababababababababababababababababababababababababab"
+        ));
+        assert!(serde_json::from_slice::<AgentRequest>(
+            br#"{"schema_version":1,"op":"transfer-cancel","request_id":8,"transfer_id":"fedcba9876543210fedcba9876543210"}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn agent_transfer_pull_schema_is_closed_and_canonical() {
+        let request: AgentRequest = serde_json::from_slice(
+            br#"{"schema_version":1,"op":"transfer-pull","request_id":9,"transfer_id":"0123456789abcdef0123456789abcdef","remote":"/srv/evidence.bin","local":"evidence.bin","backend":"native","resume":"never","idle_timeout_ms":1000,"deadline_ms":2000,"expected_helper_identity":{"name":"serctl-xfer","binary_size":123,"sha256":"abababababababababababababababababababababababababababababababab","version":"serctl-xfer 1.0.0-beta (git 0123456789ab; transfer protocol v1)"}}"#,
+        )
+        .unwrap();
+        assert_eq!(request.operation_kind(), AGENT_TRANSFER_READ_OPERATION);
+        assert!(matches!(
+            request,
+            AgentRequest::TransferPull {
+                request_id: 9,
+                transfer_id: Some(ref transfer_id),
+                ref remote,
+                ref local,
+                expected_helper_identity: Some(ref expected),
+                ..
+            } if transfer_id.as_str() == "0123456789abcdef0123456789abcdef"
+                && remote == "/srv/evidence.bin" && local == &PathBuf::from("evidence.bin")
+                && expected.name == "serctl-xfer" && expected.binary_size == 123
+        ));
+        for invalid in [
+            br#"{"schema_version":1,"op":"transfer-pull","request_id":9,"remote":"/srv/evidence.bin"}"#.as_slice(),
+            br#"{"schema_version":1,"op":"transfer-pull","request_id":9,"remote":"/srv/evidence.bin","local":"evidence.bin","unexpected":true}"#.as_slice(),
+            br#"{"schema_version":1,"op":"transfer-pull","request_id":9,"remote":"/srv/evidence.bin","local":"evidence.bin","backend":"future"}"#.as_slice(),
+            br#"{"schema_version":1,"op":"transfer-pull","request_id":9,"remote":"/srv/evidence.bin","local":"evidence.bin","expected_helper_identity":{"name":"serctl-xfer","binary_size":"123","sha256":"abababababababababababababababababababababababababababababababab","version":"serctl-xfer 1.0.0-beta (git 0123456789ab; transfer protocol v1)"}}"#.as_slice(),
+            br#"{"schema_version":1,"op":"transfer-pull","request_id":9,"remote":"/srv/evidence.bin","local":"evidence.bin","expected_helper_identity":{"name":"serctl-xfer","binary_size":123,"sha256":"abababababababababababababababababababababababababababababababab","version":"serctl-xfer 1.0.0-beta (git 0123456789ab; transfer protocol v1)","future":true}}"#.as_slice(),
+        ] {
+            assert!(serde_json::from_slice::<AgentRequest>(invalid).is_err());
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocking_runtime_lock_poll_cannot_extend_its_absolute_deadline() {
+        let worker_started = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
+        let spawned_worker_started = Arc::clone(&worker_started);
         let worker_completed = Arc::clone(&completed);
         let task = tokio::task::spawn_blocking(move || {
+            spawned_worker_started.store(true, Ordering::Release);
             std::thread::sleep(std::time::Duration::from_millis(200));
             worker_completed.store(true, Ordering::Release);
             Ok::<_, anyhow::Error>(())
         });
+
+        // Establish that the blocking operation is already active before the
+        // product deadline begins. Under a saturated blocking pool, aborting a
+        // still-queued spawn_blocking task is allowed to prevent it from ever
+        // starting; waiting for `completed` in that case would test scheduler
+        // availability rather than the absolute-deadline invariant.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !worker_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking deadline fixture did not start");
         let started = std::time::Instant::now();
         let error = join_blocking_until(
             task,
@@ -7058,11 +9673,37 @@ mod tests {
     #[tokio::test]
     async fn exec_requires_a_concrete_exit_status() {
         let (mut writer, mut reader) = tokio::io::duplex(1024);
-        ipc::write_frame(&mut writer, &Frame::ExecExit { code: None })
-            .await
-            .unwrap();
+        ipc::write_frame(
+            &mut writer,
+            &Frame::ExecExit {
+                code: None,
+                operation_context_id: None,
+                revision: 0,
+            },
+        )
+        .await
+        .unwrap();
         let error = read_exec_response(&mut reader).await.unwrap_err();
         assert!(error.to_string().contains("without an exit status"));
+    }
+
+    #[tokio::test]
+    async fn exec_result_preserves_daemon_operation_context_and_revision() {
+        let (mut writer, mut reader) = tokio::io::duplex(2048);
+        let context = ipc::OperationContextId::parse(&"ab".repeat(32)).unwrap();
+        ipc::write_frame(
+            &mut writer,
+            &Frame::ExecExit {
+                code: Some(0),
+                operation_context_id: Some(context.clone()),
+                revision: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let output = read_exec_response(&mut reader).await.unwrap();
+        assert_eq!(output.operation_context_id.as_ref(), Some(&context));
+        assert_eq!(output.revision, 1);
     }
 
     #[tokio::test]

@@ -28,8 +28,23 @@ use zeroize::Zeroizing;
 
 const E2E_PROFILE_PASSPHRASE: &str = "daemon-profile-passphrase";
 const TOFU_PROFILE_PASSPHRASE: &str = "tofu-profile-passphrase";
+const AUTH_DISCONNECT_PROFILE_PASSPHRASE: &str = "auth-disconnect-profile-passphrase";
+const KEX_PERSISTENT_PROFILE_PASSPHRASE: &str = "kex-persistent-profile-passphrase";
 const DIRECT_PROFILE_PASSPHRASE: &str = "direct-profile-passphrase";
 const E2E_ADMINISTRATOR_PASSPHRASE: &str = "e2e-administrator-passphrase";
+
+// Both end-to-end tests redirect the process-global test vault home. Keep
+// them serialized while still allowing their mock SSH and daemon tasks to run
+// concurrently inside each test.
+static E2E_TEST_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+const GRANT_SUBPROCESS_TEST_NAME: &str = "e2e_tests::operation_grant_lifecycle_subprocess_helper";
+const GRANT_SUBPROCESS_ROLE_ENV: &str = "SERCTL_TEST_GRANT_SUBPROCESS_ROLE";
+const GRANT_SUBPROCESS_HOME_ENV: &str = "SERCTL_TEST_GRANT_SUBPROCESS_HOME";
+const GRANT_SUBPROCESS_PROFILE: &str = "grant-subprocess-e2e";
+const GRANT_SUBPROCESS_PASSPHRASE: &str = "grant-subprocess-profile-passphrase";
+const GRANT_SUBPROCESS_FILE: &str = "agent-grant.json";
+const GRANT_SUBPROCESS_MARKER: &str = "issued-marker.json";
 
 struct E2eTestHome {
     path: PathBuf,
@@ -141,6 +156,11 @@ struct RemoteForwardRegistration {
     stopped: tokio::sync::oneshot::Receiver<std::net::SocketAddr>,
 }
 
+struct PendingChannelOpen {
+    channel: Channel<Msg>,
+    reply: ChannelOpenHandle,
+}
+
 #[derive(Default)]
 struct ExecEvents {
     generation: u64,
@@ -171,6 +191,13 @@ struct TestState {
     closed_connections: Mutex<HashSet<u64>>,
     connection_changed: Notify,
     password_auth_attempts: AtomicU64,
+    pre_kex_disconnects_remaining: AtomicU64,
+    disconnect_next_password_auth: AtomicBool,
+    disconnect_next_channel_open: AtomicBool,
+    disconnect_two_channel_opens: AtomicBool,
+    pending_channel_open: Mutex<Option<PendingChannelOpen>>,
+    reject_next_channel_open: AtomicBool,
+    hang_next_channel_open: AtomicBool,
     exec_events: Mutex<ExecEvents>,
     exec_changed: Notify,
     sftp_hang: AtomicBool,
@@ -184,6 +211,17 @@ struct TestState {
     sftp_stat_calls: AtomicU64,
     sftp_wire_read_bytes: AtomicU64,
     sftp_large_dir: AtomicBool,
+    native_negotiated_chunk: AtomicU64,
+    native_negotiated_window: AtomicU64,
+    native_push_frames: AtomicU64,
+    native_push_max_chunk: AtomicU64,
+    native_pull_frames: AtomicU64,
+    native_pull_max_chunk: AtomicU64,
+    native_push_ack_gate: AtomicBool,
+    native_push_data_received: Notify,
+    native_push_ack_released: Notify,
+    native_helpers_finished: AtomicU64,
+    native_helper_finished: Notify,
     upload_partial_events: Mutex<UploadPartialEvents>,
     upload_partial_changed: Notify,
     upload_partial_remove_delay: AtomicBool,
@@ -196,6 +234,44 @@ struct TestState {
 }
 
 impl TestState {
+    async fn wait_for_native_push_frames(&self, minimum: u64) -> bool {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let changed = self.native_push_data_received.notified();
+                if self.native_push_frames.load(Ordering::SeqCst) >= minimum {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    async fn wait_for_native_push_ack_release(&self) {
+        while self.native_push_ack_gate.load(Ordering::SeqCst) {
+            let released = self.native_push_ack_released.notified();
+            if !self.native_push_ack_gate.load(Ordering::SeqCst) {
+                break;
+            }
+            released.await;
+        }
+    }
+
+    async fn wait_for_native_helpers_finished(&self, minimum: u64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = self.native_helper_finished.notified();
+                if self.native_helpers_finished.load(Ordering::SeqCst) >= minimum {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{minimum} native helper session(s) did not finish"));
+    }
+
     async fn record_connection_closed(&self, connection: u64) {
         self.closed_connections.lock().await.insert(connection);
         self.connection_changed.notify_waiters();
@@ -522,6 +598,28 @@ struct TestSsh {
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
 }
 
+/// Read the complete client identification and then close before sending any
+/// server byte. Russh classifies this pre-banner EOF as `Disconnect`; it is
+/// safe to retry because no host key or password has crossed the transport.
+async fn close_before_server_identification(mut socket: TcpStream) {
+    let client_banner = async {
+        for _ in 0..256 {
+            if socket.read_u8().await? == b'\n' {
+                return Ok::<(), std::io::Error>(());
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "client SSH banner exceeded test bound",
+        ))
+    };
+    tokio::time::timeout(Duration::from_secs(1), client_banner)
+        .await
+        .expect("client did not send its SSH banner")
+        .unwrap();
+    let _ = socket.shutdown().await;
+}
+
 struct ObservedSftpStream<S> {
     inner: S,
     state: Arc<TestState>,
@@ -572,9 +670,10 @@ async fn run_test_native_helper<S>(mut stream: S, state: Arc<TestState>) -> anyh
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    native::write_control(
+    let expected_identity = test_native_expected_identity();
+    native::write_handshake_control(
         &mut stream,
-        &native::Control::Hello {
+        &native::Control::HelperHello {
             version: native::VERSION,
             max_chunk: native::DEFAULT_CHUNK_BYTES,
             max_window: native::MAX_WINDOW_BYTES,
@@ -582,7 +681,14 @@ where
             sha256: true,
             fsync: true,
             no_replace: true,
+            identity: native::HelperRuntimeIdentity {
+                name: expected_identity.name,
+                binary_size: expected_identity.binary_size,
+                sha256: expected_identity.sha256,
+                version: expected_identity.version,
+            },
         },
+        native::HandshakePeer::Helper,
     )
     .await?;
     let (chunk, window) = match native::read_frame(&mut stream).await? {
@@ -601,6 +707,12 @@ where
         _ => anyhow::bail!("test native client did not complete the handshake"),
     };
     anyhow::ensure!(chunk > 0 && window >= chunk, "invalid native limits");
+    state
+        .native_negotiated_chunk
+        .store(chunk as u64, Ordering::SeqCst);
+    state
+        .native_negotiated_window
+        .store(window as u64, Ordering::SeqCst);
     match native::read_frame(&mut stream).await? {
         Some(native::Frame::Control(native::Control::BeginPush {
             transfer_id,
@@ -632,8 +744,14 @@ where
                                 && data.offset == payload.len() as u64,
                             "native push offset mismatch"
                         );
+                        state.native_push_frames.fetch_add(1, Ordering::SeqCst);
+                        state
+                            .native_push_max_chunk
+                            .fetch_max(data.payload.len() as u64, Ordering::SeqCst);
+                        state.native_push_data_received.notify_waiters();
                         payload.extend_from_slice(&data.payload);
                         anyhow::ensure!(payload.len() as u64 <= size, "native push overflow");
+                        state.wait_for_native_push_ack_release().await;
                         native::write_control(
                             &mut stream,
                             &native::Control::Ack {
@@ -702,6 +820,10 @@ where
                     confirmed,
                     payload[confirmed as usize..end].to_vec(),
                 )?;
+                state.native_pull_frames.fetch_add(1, Ordering::SeqCst);
+                state
+                    .native_pull_max_chunk
+                    .fetch_max(data.payload.len() as u64, Ordering::SeqCst);
                 native::write_data(&mut stream, &data).await?;
                 match native::read_frame(&mut stream).await? {
                     Some(native::Frame::Control(native::Control::Ack {
@@ -727,6 +849,15 @@ where
         _ => anyhow::bail!("unexpected native transfer root"),
     }
     Ok(())
+}
+
+fn test_native_expected_identity() -> ipc::ExpectedNativeHelperIdentity {
+    ipc::ExpectedNativeHelperIdentity {
+        name: "serctl-xfer".to_owned(),
+        binary_size: 123,
+        sha256: "ab".repeat(32),
+        version: "serctl-xfer 1.0.0-beta (git 0123456789ab; transfer protocol v1)".to_owned(),
+    }
 }
 
 async fn run_test_remote_forward_listener(
@@ -783,6 +914,13 @@ impl russh::server::Handler for TestSsh {
         self.state
             .password_auth_attempts
             .fetch_add(1, Ordering::SeqCst);
+        if self
+            .state
+            .disconnect_next_password_auth
+            .swap(false, Ordering::SeqCst)
+        {
+            anyhow::bail!("injected password-auth transport disconnect");
+        }
         Ok(if user == "tester" && password == "password" {
             Auth::Accept
         } else {
@@ -797,8 +935,70 @@ impl russh::server::Handler for TestSsh {
         &mut self,
         channel: Channel<Msg>,
         reply: ChannelOpenHandle,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self
+            .state
+            .disconnect_two_channel_opens
+            .load(Ordering::SeqCst)
+        {
+            let mut pending = self.state.pending_channel_open.lock().await;
+            if pending.is_none() {
+                *pending = Some(PendingChannelOpen { channel, reply });
+                return Ok(());
+            }
+            self.state
+                .disconnect_two_channel_opens
+                .store(false, Ordering::SeqCst);
+            let first = pending
+                .take()
+                .expect("first stale channel-open disappeared");
+            session.disconnect(
+                Disconnect::ByApplication,
+                "test disconnect with two pending channel confirmations",
+                "en-US",
+            )?;
+            drop(first.reply);
+            drop(first.channel);
+            drop(reply);
+            drop(channel);
+            return Ok(());
+        }
+        if self
+            .state
+            .reject_next_channel_open
+            .swap(false, Ordering::SeqCst)
+        {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            drop(channel);
+            return Ok(());
+        }
+        if self
+            .state
+            .hang_next_channel_open
+            .swap(false, Ordering::SeqCst)
+        {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(reply);
+            drop(channel);
+            return Ok(());
+        }
+        if self
+            .state
+            .disconnect_next_channel_open
+            .swap(false, Ordering::SeqCst)
+        {
+            session.disconnect(
+                Disconnect::ByApplication,
+                "test disconnect before channel confirmation",
+                "en-US",
+            )?;
+            drop(reply);
+            drop(channel);
+            return Ok(());
+        }
         self.channels.lock().await.insert(channel.id(), channel);
         reply.accept().await;
         Ok(())
@@ -920,9 +1120,13 @@ impl russh::server::Handler for TestSsh {
                     .ok_or_else(|| anyhow::anyhow!("native exec channel was not registered"))?;
                 let state = Arc::clone(&self.state);
                 tokio::spawn(async move {
-                    if let Err(error) = run_test_native_helper(channel.into_stream(), state).await {
+                    if let Err(error) =
+                        run_test_native_helper(channel.into_stream(), Arc::clone(&state)).await
+                    {
                         eprintln!("test native helper failed: {error:#}");
                     }
+                    state.native_helpers_finished.fetch_add(1, Ordering::SeqCst);
+                    state.native_helper_finished.notify_waiters();
                 });
             }
             b"ok" => {
@@ -1502,6 +1706,7 @@ async fn assert_socks5_echo(bind_host: &str, bind_port: u16, target_port: u16) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
+    let _test_home_lock = E2E_TEST_HOME_LOCK.lock().await;
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -1546,6 +1751,17 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         loop {
             let (socket, _) = ssh_listener.accept().await.unwrap();
             let connection = ssh_state.next_connection.fetch_add(1, Ordering::SeqCst);
+            if ssh_state
+                .pre_kex_disconnects_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                close_before_server_identification(socket).await;
+                ssh_state.record_connection_closed(connection).await;
+                continue;
+            }
             let handler = TestSsh {
                 state: ssh_state.clone(),
                 connection,
@@ -1654,6 +1870,34 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         administrator_passphrase,
     )
     .unwrap();
+    let auth_disconnect_profile = "auth-disconnect";
+    vault::create_profile(
+        auth_disconnect_profile,
+        &vault::Creds {
+            host: "127.0.0.1".into(),
+            port: ssh_port,
+            user: "tester".into(),
+            password: "password".into(),
+            host_key: Some(fingerprint.clone()),
+        },
+        AUTH_DISCONNECT_PROFILE_PASSPHRASE,
+        administrator_passphrase,
+    )
+    .unwrap();
+    let kex_persistent_profile = "kex-persistent";
+    vault::create_profile(
+        kex_persistent_profile,
+        &vault::Creds {
+            host: "127.0.0.1".into(),
+            port: ssh_port,
+            user: "tester".into(),
+            password: "password".into(),
+            host_key: Some(fingerprint.clone()),
+        },
+        KEX_PERSISTENT_PROFILE_PASSPHRASE,
+        administrator_passphrase,
+    )
+    .unwrap();
 
     let daemon_instance = ipc::v6::InstanceId::random();
     let daemon_secret = ipc::v6::ActivationSecret::random();
@@ -1736,6 +1980,125 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             "wrong-profile-passphrase broker unlock",
         )
         .await;
+
+    // A TCP EOF after the client identification but before any server byte is
+    // an initial-connect failure that is safe to retry: no password has been
+    // sent. The second transport succeeds under the same absolute deadline.
+    let transient_connections = state.next_connection.load(Ordering::SeqCst);
+    let transient_auth = state.password_auth_attempts.load(Ordering::SeqCst);
+    let transient_exec = state.latest_exec_generation().await;
+    state
+        .pre_kex_disconnects_remaining
+        .store(1, Ordering::SeqCst);
+    let transient_output = client::exec_capture_with_timeout(
+        tofu_profile,
+        "ok",
+        Some(tofu_passphrase),
+        Duration::from_secs(3),
+    )
+    .await
+    .expect("pre-authentication KEX disconnect did not reconnect once");
+    assert_eq!(transient_output.stdout, b"evidence\n");
+    assert_eq!(
+        state.next_connection.load(Ordering::SeqCst),
+        transient_connections + 2,
+        "one transient pre-KEX disconnect must use exactly two transports"
+    );
+    assert_eq!(
+        state.password_auth_attempts.load(Ordering::SeqCst),
+        transient_auth + 1,
+        "the failed pre-KEX transport must not receive a password"
+    );
+    assert_eq!(
+        state.latest_exec_generation().await,
+        transient_exec + 1,
+        "the successful retry must submit the command exactly once"
+    );
+
+    // A persistent pre-KEX failure gets the same single retry budget and then
+    // returns a phase-specific error. There must be no third connection, auth,
+    // or exec side effect.
+    let persistent_connections = state.next_connection.load(Ordering::SeqCst);
+    let persistent_auth = state.password_auth_attempts.load(Ordering::SeqCst);
+    let persistent_exec = state.latest_exec_generation().await;
+    state
+        .pre_kex_disconnects_remaining
+        .store(2, Ordering::SeqCst);
+    let persistent_error = client::exec_capture_with_timeout(
+        kex_persistent_profile,
+        "ok",
+        Some(KEX_PERSISTENT_PROFILE_PASSPHRASE),
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err();
+    let persistent_chain = format!("{persistent_error:#}");
+    assert!(
+        persistent_chain.contains(
+            "SSH server identification phase failed after one pre-authentication reconnect",
+        ) && (persistent_chain.contains("failure=terminal_disconnect")
+            || persistent_chain.contains("failure=io")),
+        "persistent pre-KEX error lost its phase/category: {}",
+        persistent_chain.escape_debug()
+    );
+    assert!(
+        persistent_chain.contains("first_attempt=[SSH attempt 1:")
+            && persistent_chain.contains("SSH attempt 2:"),
+        "persistent pre-KEX error did not keep both attempt numbers: {}",
+        persistent_chain.escape_debug()
+    );
+    assert!(
+        !persistent_chain.contains("pre-kex retry probe"),
+        "remote disconnect free text escaped into the client diagnostic"
+    );
+    assert_eq!(
+        state.next_connection.load(Ordering::SeqCst),
+        persistent_connections + 2,
+        "persistent pre-KEX failure exceeded its one-reconnect budget"
+    );
+    assert_eq!(
+        state.password_auth_attempts.load(Ordering::SeqCst),
+        persistent_auth,
+        "persistent pre-KEX failure unexpectedly sent a password"
+    );
+    assert_eq!(state.latest_exec_generation().await, persistent_exec);
+
+    // Once password authentication starts, disconnect is not replay-safe: it
+    // receives context but no reconnect. This profile has never entered the
+    // pool, proving the raw error is from initial unlock rather than SessionManager.
+    let auth_disconnect_connections = state.next_connection.load(Ordering::SeqCst);
+    let auth_disconnect_attempts = state.password_auth_attempts.load(Ordering::SeqCst);
+    let auth_disconnect_exec = state.latest_exec_generation().await;
+    state
+        .disconnect_next_password_auth
+        .store(true, Ordering::SeqCst);
+    let auth_disconnect = client::exec_capture_with_timeout(
+        auth_disconnect_profile,
+        "ok",
+        Some(AUTH_DISCONNECT_PROFILE_PASSPHRASE),
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err();
+    let auth_disconnect_chain = format!("{auth_disconnect:#}");
+    assert!(
+        auth_disconnect_chain.contains("SSH password authentication phase failed")
+            || auth_disconnect_chain
+                .contains("SSH password authentication rejected the stored SSH credential"),
+        "authentication failure lost its bounded phase/result: {}",
+        auth_disconnect_chain.escape_debug()
+    );
+    assert_eq!(
+        state.next_connection.load(Ordering::SeqCst),
+        auth_disconnect_connections + 1,
+        "password-authentication disconnect must not reconnect"
+    );
+    assert_eq!(
+        state.password_auth_attempts.load(Ordering::SeqCst),
+        auth_disconnect_attempts + 1,
+        "password-authentication disconnect must not replay authentication"
+    );
+    assert_eq!(state.latest_exec_generation().await, auth_disconnect_exec);
 
     // Unlock through the broker: the pool's credential lease is what blocks
     // vault mutations while a profile is live and unlocked.
@@ -1876,6 +2239,125 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     assert_eq!(output.stdout, b"evidence\n");
     assert_eq!(output.code, Some(0));
 
+    // A transport can close after SessionManager observes `is_closed=false`
+    // but before russh confirms the first session channel. This is the exact
+    // pre-submission boundary where retry is safe: no exec request has left
+    // the daemon yet. The same client request must invalidate the stale Arc,
+    // reconnect once under its original deadline, and then succeed.
+    let auth_before_channel_race = state.password_auth_attempts.load(Ordering::SeqCst);
+    state
+        .disconnect_next_channel_open
+        .store(true, Ordering::SeqCst);
+    let recovered = client::exec_capture_with_timeout(
+        "e2e",
+        "ok",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("exec did not reconnect after pre-submission channel-open disconnect");
+    assert_eq!(recovered.stdout, b"evidence\n");
+    assert_eq!(recovered.code, Some(0));
+    assert_eq!(
+        state.password_auth_attempts.load(Ordering::SeqCst),
+        auth_before_channel_race + 1,
+        "one channel-open disconnect must create exactly one replacement SSH session"
+    );
+
+    // Two requests can observe the same stale session before its close flag is
+    // published. Both retry safely, while SessionManager's reconnect mutex must
+    // still authenticate only one replacement transport.
+    let auth_before_concurrent_race = state.password_auth_attempts.load(Ordering::SeqCst);
+    state
+        .disconnect_two_channel_opens
+        .store(true, Ordering::SeqCst);
+    let first = client::exec_capture_with_timeout(
+        "e2e",
+        "ok",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(2),
+    );
+    let second = client::exec_capture_with_timeout(
+        "e2e",
+        "ok",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(2),
+    );
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(first.unwrap().stdout, b"evidence\n");
+    assert_eq!(second.unwrap().stdout, b"evidence\n");
+    assert_eq!(
+        state.password_auth_attempts.load(Ordering::SeqCst),
+        auth_before_concurrent_race + 1,
+        "concurrent stale-session failures must share one reconnect"
+    );
+    assert!(state.pending_channel_open.lock().await.is_none());
+
+    // An explicit per-channel rejection is not evidence of a dead transport.
+    // It must be returned as-is without reconnecting or retrying the request.
+    let auth_before_channel_rejection = state.password_auth_attempts.load(Ordering::SeqCst);
+    state.reject_next_channel_open.store(true, Ordering::SeqCst);
+    let rejected = client::exec_capture_with_timeout(
+        "e2e",
+        "ok",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        rejected.to_string().contains("AdministrativelyProhibited"),
+        "unexpected channel-open rejection: {rejected:#}"
+    );
+    assert_eq!(
+        state.password_auth_attempts.load(Ordering::SeqCst),
+        auth_before_channel_rejection,
+        "an explicit channel rejection must not reconnect"
+    );
+    let reused_after_rejection = client::exec_capture_with_timeout(
+        "e2e",
+        "ok",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("explicit channel rejection poisoned a reusable transport");
+    assert_eq!(reused_after_rejection.stdout, b"evidence\n");
+    assert_eq!(
+        state.password_auth_attempts.load(Ordering::SeqCst),
+        auth_before_channel_rejection,
+        "a later request should reuse the explicitly rejecting transport"
+    );
+
+    // A local channel-open deadline is not a transport-terminal russh result:
+    // it must return promptly without a same-request reconnect. The production
+    // retry path passes the original absolute Instant rather than deriving a
+    // new duration; the authentication count makes accidental retry visible.
+    let auth_before_channel_deadline = state.password_auth_attempts.load(Ordering::SeqCst);
+    state.hang_next_channel_open.store(true, Ordering::SeqCst);
+    let channel_deadline_started = tokio::time::Instant::now();
+    let deadline_error = client::exec_capture_with_timeout(
+        "e2e",
+        "ok",
+        Some(E2E_PROFILE_PASSPHRASE),
+        Duration::from_millis(150),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        deadline_error.to_string().contains("deadline"),
+        "unexpected channel-open deadline error: {deadline_error:#}"
+    );
+    assert!(
+        channel_deadline_started.elapsed() < Duration::from_secs(1),
+        "channel-open deadline did not return promptly"
+    );
+    assert_eq!(
+        state.password_auth_attempts.load(Ordering::SeqCst),
+        auth_before_channel_deadline,
+        "a local channel-open deadline must not trigger same-request reconnect"
+    );
+
     let overflow_after = state.latest_exec_generation().await;
     let overflow_task = tokio::spawn(async {
         client::exec_capture_with_timeout(
@@ -1898,6 +2380,8 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         .wait_for_cancel(overflow_channel, "output-limit failure")
         .await;
 
+    let submitted_disconnect_after = state.latest_exec_generation().await;
+    let auth_before_submitted_disconnect = state.password_auth_attempts.load(Ordering::SeqCst);
     let disconnected = client::exec_capture_with_timeout(
         "e2e",
         "disconnect",
@@ -1912,6 +2396,16 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             && disconnected
                 .to_string()
                 .contains("inspect remote side effects before retry")
+    );
+    assert_eq!(
+        state.latest_exec_generation().await,
+        submitted_disconnect_after + 1,
+        "a submitted exec must never be replayed in the same request"
+    );
+    assert_eq!(
+        state.password_auth_attempts.load(Ordering::SeqCst),
+        auth_before_submitted_disconnect,
+        "post-submission disconnect must return OutcomeUnknown without same-request reconnect"
     );
     let reconnected = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -2013,6 +2507,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         "/fixed-snapshot.bin",
         client::TransferOptions {
             backend: ipc::TransferBackend::Sftp,
+            expected_helper_identity: None,
             resume: ipc::TransferResumeMode::Never,
             idle_timeout: Duration::from_secs(30),
             deadline: Some(Duration::from_secs(120)),
@@ -2067,37 +2562,116 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     // Exercise the M3 backend over the same real SSH transport. The server
     // accepts only the fixed helper command and then speaks the bounded raw
     // transfer protocol on that channel; paths never enter the exec string.
+    let native_observed_progress = Arc::new(StdMutex::new(Vec::new()));
+    let native_observed_sink = Arc::clone(&native_observed_progress);
+    let native_progress: client::TransferProgressSink = Arc::new(move |progress| {
+        native_observed_sink.lock().unwrap().push(progress);
+    });
     let native_options = client::TransferOptions {
         backend: ipc::TransferBackend::Native,
+        expected_helper_identity: Some(test_native_expected_identity()),
         resume: ipc::TransferResumeMode::Never,
         idle_timeout: Duration::from_secs(30),
         deadline: Some(Duration::from_secs(120)),
-        progress: None,
+        progress: Some(native_progress),
     };
-    assert_eq!(
+    let native_push_frames_before = state.native_push_frames.load(Ordering::SeqCst);
+    let native_helpers_before = state.native_helpers_finished.load(Ordering::SeqCst);
+    state.native_push_ack_gate.store(true, Ordering::SeqCst);
+    let native_source = fixed_source.clone();
+    let native_push_options = native_options.clone();
+    let native_push = tokio::spawn(async move {
         client::transfer_push_with_master_cancellable(
             "e2e-large",
-            &fixed_source,
+            &native_source,
             "/native-fixed-snapshot.bin",
-            native_options.clone(),
+            native_push_options,
             Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
             tokio_util::sync::CancellationToken::new(),
         )
         .await
-        .unwrap(),
+    });
+    let native_received = state
+        .wait_for_native_push_frames(native_push_frames_before + 1)
+        .await;
+    assert!(
+        native_received,
+        "native helper did not receive its first push frame; negotiated chunk/window={}/{}, client_finished={}, progress={:?}",
+        state.native_negotiated_chunk.load(Ordering::SeqCst),
+        state.native_negotiated_window.load(Ordering::SeqCst),
+        native_push.is_finished(),
+        native_observed_progress.lock().unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !native_push.is_finished(),
+        "native upload advanced before the helper acknowledged its first frame"
+    );
+    {
+        let observed = native_observed_progress.lock().unwrap();
+        assert!(!observed.is_empty(), "native upload emitted no progress");
+        assert!(
+            observed
+                .iter()
+                .all(|progress| progress.confirmed_bytes == 0),
+            "native confirmed bytes advanced before the helper ACK: {observed:?}"
+        );
+    }
+    state.native_push_ack_gate.store(false, Ordering::SeqCst);
+    state.native_push_ack_released.notify_waiters();
+    assert_eq!(
+        native_push
+            .await
+            .expect("native upload worker panicked")
+            .unwrap(),
         fixed_snapshot.len() as u64
     );
+    state
+        .wait_for_native_helpers_finished(native_helpers_before + 1)
+        .await;
     assert_eq!(
         state.files.lock().await.get("/native-fixed-snapshot.bin"),
         Some(&fixed_snapshot)
     );
+    let expected_native_frames = fixed_snapshot.len().div_ceil(ipc::NATIVE_IPC_CHUNK_BYTES) as u64;
+    assert_eq!(
+        state.native_push_frames.load(Ordering::SeqCst) - native_push_frames_before,
+        expected_native_frames
+    );
+    assert_eq!(
+        state.native_push_max_chunk.load(Ordering::SeqCst),
+        ipc::NATIVE_IPC_CHUNK_BYTES as u64
+    );
+    assert_eq!(
+        state.native_negotiated_chunk.load(Ordering::SeqCst),
+        ipc::NATIVE_IPC_CHUNK_BYTES as u64
+    );
+    assert_eq!(
+        state.native_negotiated_window.load(Ordering::SeqCst),
+        native::MAX_WINDOW_BYTES as u64
+    );
+    {
+        let observed = native_observed_progress.lock().unwrap();
+        assert!(observed
+            .windows(2)
+            .all(|pair| pair[0].confirmed_bytes <= pair[1].confirmed_bytes));
+        let completed = observed.last().expect("missing native completion progress");
+        assert_eq!(completed.stage, ipc::TransferStage::Completed);
+        assert_eq!(completed.confirmed_bytes, fixed_snapshot.len() as u64);
+        assert_eq!(completed.durable_bytes, fixed_snapshot.len() as u64);
+        assert_eq!(completed.chunk_bytes, ipc::NATIVE_IPC_CHUNK_BYTES as u32);
+        assert_eq!(completed.window_bytes, ipc::NATIVE_IPC_CHUNK_BYTES as u32);
+    }
     let native_download = test_home.join("native-fixed-snapshot-download.bin");
+    let native_pull_frames_before = state.native_pull_frames.load(Ordering::SeqCst);
+    let mut native_pull_options = native_options.clone();
+    native_pull_options.progress = None;
     assert_eq!(
         client::transfer_pull_with_master_cancellable(
             "e2e-large",
             "/native-fixed-snapshot.bin",
             &native_download,
-            native_options,
+            native_pull_options,
             Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
             tokio_util::sync::CancellationToken::new(),
         )
@@ -2106,6 +2680,159 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         fixed_snapshot.len() as u64
     );
     assert_eq!(std::fs::read(native_download).unwrap(), fixed_snapshot);
+    assert_eq!(
+        state.native_pull_frames.load(Ordering::SeqCst) - native_pull_frames_before,
+        expected_native_frames
+    );
+    assert_eq!(
+        state.native_pull_max_chunk.load(Ordering::SeqCst),
+        ipc::NATIVE_IPC_CHUNK_BYTES as u64
+    );
+
+    // Native no-replace remains fail-closed even when the source is identical.
+    // The already committed bytes must remain untouched.
+    let duplicate_helpers_before = state.native_helpers_finished.load(Ordering::SeqCst);
+    let mut native_no_progress = native_options.clone();
+    native_no_progress.progress = None;
+    let duplicate_error = client::transfer_push_with_master_cancellable(
+        "e2e-large",
+        &fixed_source,
+        "/native-fixed-snapshot.bin",
+        native_no_progress.clone(),
+        Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        duplicate_error.to_string().contains("native")
+            || duplicate_error.to_string().contains("helper")
+            || duplicate_error.to_string().contains("disconnected"),
+        "unexpected native no-replace error: {duplicate_error:#}"
+    );
+    state
+        .wait_for_native_helpers_finished(duplicate_helpers_before + 1)
+        .await;
+    assert_eq!(
+        state.files.lock().await.get("/native-fixed-snapshot.bin"),
+        Some(&fixed_snapshot)
+    );
+
+    // Withhold the first helper ACK. Confirmed progress must remain at zero,
+    // the daemon must report a stall at the idle boundary, and no mock target
+    // may become visible because Commit was never reached.
+    let idle_progress = Arc::new(StdMutex::new(Vec::new()));
+    let idle_sink = Arc::clone(&idle_progress);
+    let idle_progress_sink: client::TransferProgressSink =
+        Arc::new(move |progress| idle_sink.lock().unwrap().push(progress));
+    let idle_frames_before = state.native_push_frames.load(Ordering::SeqCst);
+    let idle_helpers_before = state.native_helpers_finished.load(Ordering::SeqCst);
+    state.native_push_ack_gate.store(true, Ordering::SeqCst);
+    let idle_source = fixed_source.clone();
+    let idle_upload = tokio::spawn(async move {
+        client::transfer_push_with_master_cancellable(
+            "e2e-large",
+            &idle_source,
+            "/native-idle-timeout.bin",
+            client::TransferOptions {
+                backend: ipc::TransferBackend::Native,
+                expected_helper_identity: Some(test_native_expected_identity()),
+                resume: ipc::TransferResumeMode::Never,
+                idle_timeout: Duration::from_millis(100),
+                deadline: Some(Duration::from_secs(3)),
+                progress: Some(idle_progress_sink),
+            },
+            Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    });
+    assert!(
+        state
+            .wait_for_native_push_frames(idle_frames_before + 1)
+            .await,
+        "native idle test helper did not receive a push frame"
+    );
+    let idle_error = tokio::time::timeout(Duration::from_secs(3), idle_upload)
+        .await
+        .expect("native idle timeout did not terminate the client")
+        .expect("native idle upload worker panicked")
+        .unwrap_err();
+    state.native_push_ack_gate.store(false, Ordering::SeqCst);
+    state.native_push_ack_released.notify_waiters();
+    state
+        .wait_for_native_helpers_finished(idle_helpers_before + 1)
+        .await;
+    assert!(
+        idle_error.to_string().contains("idle timeout"),
+        "unexpected native idle error: {idle_error:#}"
+    );
+    assert!(idle_progress
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|progress| progress.stage == ipc::TransferStage::Stalled));
+    assert!(!state
+        .files
+        .lock()
+        .await
+        .contains_key("/native-idle-timeout.bin"));
+
+    // Cancellation while the helper ACK is withheld closes the local request
+    // without claiming confirmation or exposing a destination.
+    let cancel_frames_before = state.native_push_frames.load(Ordering::SeqCst);
+    let cancel_helpers_before = state.native_helpers_finished.load(Ordering::SeqCst);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    state.native_push_ack_gate.store(true, Ordering::SeqCst);
+    let cancel_source = fixed_source.clone();
+    let cancel_token = cancellation.clone();
+    let cancelled_upload = tokio::spawn(async move {
+        client::transfer_push_with_master_cancellable(
+            "e2e-large",
+            &cancel_source,
+            "/native-cancelled.bin",
+            client::TransferOptions {
+                backend: ipc::TransferBackend::Native,
+                expected_helper_identity: Some(test_native_expected_identity()),
+                resume: ipc::TransferResumeMode::Never,
+                idle_timeout: Duration::from_secs(30),
+                deadline: Some(Duration::from_secs(3)),
+                progress: None,
+            },
+            Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
+            cancel_token,
+        )
+        .await
+    });
+    assert!(
+        state
+            .wait_for_native_push_frames(cancel_frames_before + 1)
+            .await,
+        "native cancellation test helper did not receive a push frame"
+    );
+    cancellation.cancel();
+    // Let the helper answer only after cancellation is observable. This lets
+    // the daemon leave its helper read and notice the now-closed IPC request;
+    // no helper ACK was available when the client chose cancellation.
+    state.native_push_ack_gate.store(false, Ordering::SeqCst);
+    state.native_push_ack_released.notify_waiters();
+    let cancel_error = tokio::time::timeout(Duration::from_secs(5), cancelled_upload)
+        .await
+        .expect("native cancellation did not terminate the client")
+        .expect("native cancellation worker panicked")
+        .unwrap_err();
+    state
+        .wait_for_native_helpers_finished(cancel_helpers_before + 1)
+        .await;
+    assert!(
+        cancel_error.to_string().contains("cancelled"),
+        "unexpected native cancellation error: {cancel_error:#}"
+    );
+    assert!(!state
+        .files
+        .lock()
+        .await
+        .contains_key("/native-cancelled.bin"));
 
     // The hardlink is the durable commit point. If unlinking the owned
     // temporary name then stalls until the request deadline, the daemon must
@@ -2600,11 +3327,44 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
             .await
             .is_ok()
     );
+    let grant_audit_path = serctl_core::daemon_runtime::grant_audit_path().unwrap();
+    // The compatibility JSONL is intentionally non-authoritative and is
+    // appended after the terminal response. Wait until all three accepted
+    // relays for this grant are visible before taking the negative baseline;
+    // otherwise the third append can race the locally denied fourth request.
+    let grant_id = loaded_grant.grant_id_hex();
+    let audit_before_budget_denial = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let audit = std::fs::read_to_string(&grant_audit_path).unwrap();
+            let accepted = audit
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|entry| {
+                    entry.get("grant_id").and_then(serde_json::Value::as_str)
+                        == Some(grant_id.as_str())
+                        && entry.get("outcome").and_then(serde_json::Value::as_str)
+                            == Some("accepted")
+                })
+                .count();
+            if accepted >= 3 {
+                break audit;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("three accepted compatibility-audit records were not appended");
     let exec_events_before_budget = state.latest_exec_generation().await;
     let exhausted = client::agent_exec_until(&loaded_grant, &signing, "ok", 3_000)
         .await
         .unwrap_err();
     assert!(exhausted.to_string().contains("grant budget exhausted"));
+    let audit_after_budget_denial = std::fs::read_to_string(&grant_audit_path).unwrap();
+    assert_eq!(
+        audit_after_budget_denial.lines().collect::<Vec<_>>(),
+        audit_before_budget_denial.lines().collect::<Vec<_>>(),
+        "a locally budget-denied request must not synthesize a daemon audit record"
+    );
     state
         .assert_no_exec_start(
             exec_events_before_budget,
@@ -2625,12 +3385,27 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     .await
     .unwrap();
     let (list_grant, list_signing) = client::load_agent_grant(&list_grant_path).unwrap();
+    let audit_before_scope_denial = std::fs::read_to_string(&grant_audit_path).unwrap();
+    let exec_events_before_scope_denial = state.latest_exec_generation().await;
     let scope_error = client::agent_exec_until(&list_grant, &list_signing, "ok", 3_000)
         .await
         .unwrap_err();
-    assert!(scope_error
-        .to_string()
-        .contains("does not authorize this operation kind"));
+    let scope_error = scope_error.to_string();
+    eprintln!("agent scope-denial evidence: {scope_error}");
+    assert!(scope_error.contains("grant does not authorize"));
+    let audit_after_scope_denial = std::fs::read_to_string(&grant_audit_path).unwrap();
+    assert_eq!(
+        audit_after_scope_denial.lines().collect::<Vec<_>>(),
+        audit_before_scope_denial.lines().collect::<Vec<_>>(),
+        "a locally scope-denied request must not synthesize a daemon audit record"
+    );
+    state
+        .assert_no_exec_start(
+            exec_events_before_scope_denial,
+            b"ok",
+            "locally scope-denied agent exec",
+        )
+        .await;
     let listing = client::agent_list_until(&list_grant, &list_signing, "/", 3_000)
         .await
         .unwrap();
@@ -2655,10 +3430,12 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
     let transfer_value = client::agent_transfer_push_until(
         &transfer_grant,
         &transfer_signing,
+        None,
         &upload_source,
         "/agent-transfer-evidence.txt",
         client::TransferOptions {
             backend: ipc::TransferBackend::Sftp,
+            expected_helper_identity: None,
             resume: ipc::TransferResumeMode::Never,
             idle_timeout: Duration::from_millis(3_000),
             deadline: Some(Duration::from_millis(5_000)),
@@ -2687,29 +3464,43 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         Some(b"server evidence".to_vec())
     );
 
-    // Proof of possession: a different key cannot relay with this grant.
+    // Proof of possession: a different key cannot relay with a fresh grant.
+    // Do not reuse the earlier grant here: its budget is intentionally
+    // exhausted above, which would test the tombstone rather than PoP.
+    let pop_grant_path = test_home.join("pop-grant.json");
+    client::issue_grant_until(
+        "direct-e2e",
+        direct_passphrase,
+        vec!["ssh.exec".into()],
+        1,
+        &pop_grant_path,
+    )
+    .await
+    .unwrap();
+    let (pop_grant, _pop_signing) = client::load_agent_grant(&pop_grant_path).unwrap();
     let other_key = SigningKey::generate(&mut OsRng);
-    let pop_error = client::agent_exec_until(&loaded_grant, &other_key, "ok", 3_000)
+    let exec_events_before_pop_denial = state.latest_exec_generation().await;
+    let pop_error = client::agent_exec_until(&pop_grant, &other_key, "ok", 3_000)
         .await
         .unwrap_err();
-    assert!(pop_error
-        .to_string()
-        .contains("proof-of-possession verification failed"));
+    let pop_error = pop_error.to_string();
+    eprintln!("agent PoP-denial evidence: {pop_error}");
+    assert!(pop_error.contains("proof-of-possession"));
+    state
+        .assert_no_exec_start(
+            exec_events_before_pop_denial,
+            b"ok",
+            "invalid proof-of-possession agent exec",
+        )
+        .await;
 
-    // The audit trail persists accepted relays and rejections.
-    let audit_path = serctl_core::daemon_runtime::grant_audit_path().unwrap();
-    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    // The daemon audit trail persists requests that actually reached its
+    // authorization boundary. Local scope/budget fail-fast paths above are
+    // deliberately absent and separately proven to have no SSH side effect.
+    let audit = std::fs::read_to_string(&grant_audit_path).unwrap();
     assert!(
         audit.contains("\"accepted\""),
         "grant audit log is missing accepted relays: {audit}"
-    );
-    assert!(
-        audit.contains("rejected: grant budget exhausted"),
-        "grant audit log is missing budget rejections: {audit}"
-    );
-    assert!(
-        audit.contains("rejected: grant does not authorize this operation kind"),
-        "grant audit log is missing scope rejections: {audit}"
     );
     assert!(
         audit.contains("proof-of-possession verification failed"),
@@ -2873,4 +3664,615 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         "isolated E2E home was not removed: {}",
         test_home.display()
     );
+}
+
+/// Recursively invoked in three separate OS processes by
+/// `operation_grant_survives_issuer_exit_and_expires_across_processes`.
+///
+/// The helper uses only the isolated mock-test home supplied by its parent.
+/// Keeping issuance and Agent JSONL consumption in this process role proves
+/// the grant is not accidentally backed by process-local CLI state. A normal
+/// harness invocation has no role and is a deliberate no-op; the parent E2E
+/// exercises every real role. This avoids an ignored result in release test
+/// accounting without allowing the helper to act on ambient state.
+#[test]
+fn operation_grant_lifecycle_subprocess_helper() {
+    let role = match std::env::var(GRANT_SUBPROCESS_ROLE_ENV) {
+        Ok(role) => role,
+        Err(std::env::VarError::NotPresent) => return,
+        Err(error) => panic!("read OperationGrant subprocess role: {error}"),
+    };
+    let home = std::env::var_os(GRANT_SUBPROCESS_HOME_ENV)
+        .map(PathBuf::from)
+        .expect("missing OperationGrant subprocess home");
+    let grant_path = home.join(GRANT_SUBPROCESS_FILE);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build OperationGrant subprocess runtime");
+
+    match role.as_str() {
+        "issuer" => runtime.block_on(async {
+            let grant = client::issue_grant_with_ttl_until(
+                GRANT_SUBPROCESS_PROFILE,
+                GRANT_SUBPROCESS_PASSPHRASE,
+                vec!["ssh.exec".into()],
+                3,
+                serctl_protocol::grant::GRANT_MIN_TTL,
+                &grant_path,
+            )
+            .await
+            .expect("issue subprocess OperationGrant");
+            // This marker deliberately contains only public lifecycle data;
+            // the private holder key remains exclusively in the protected
+            // grant file consumed by the later Agent process.
+            std::fs::write(
+                home.join(GRANT_SUBPROCESS_MARKER),
+                serde_json::to_vec(&serde_json::json!({
+                    "issuer_pid": std::process::id(),
+                    "expires_unix_ms": grant.expires_unix_ms,
+                }))
+                .expect("serialize OperationGrant subprocess marker"),
+            )
+            .expect("write OperationGrant subprocess marker");
+        }),
+        "relay" => runtime
+            .block_on(client::agent_stdio_loop(&grant_path))
+            .expect("run subprocess Agent JSONL gateway"),
+        "armed-expired" => {
+            // Load while the protected file is still valid, then retain this
+            // exact in-memory grant/key pair across the expiry boundary. This
+            // closes a different path from the `expired` role below, which
+            // proves that a newly started process rejects the file at load.
+            let (grant, signing) = client::load_agent_grant(&grant_path)
+                .expect("load OperationGrant before its expiry boundary");
+            runtime.block_on(async {
+                let now_unix_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock precedes Unix epoch")
+                    .as_millis() as u64;
+                assert!(
+                    !grant.is_expired(now_unix_ms),
+                    "armed OperationGrant was already expired at subprocess load"
+                );
+                if let Some(remaining_ms) = grant.expires_unix_ms.checked_sub(now_unix_ms) {
+                    tokio::time::sleep(Duration::from_millis(remaining_ms.saturating_add(50)))
+                        .await;
+                }
+                let expired_now_unix_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock precedes Unix epoch")
+                    .as_millis() as u64;
+                assert!(grant.is_expired(expired_now_unix_ms));
+                let error = client::agent_exec_until(&grant, &signing, "ok", 1_000)
+                    .await
+                    .expect_err("preloaded expired grant unexpectedly reached daemon/SSH");
+                assert_eq!(error.to_string(), "operation would exceed the grant expiry");
+            });
+        }
+        "expired" => {
+            let error = client::load_agent_grant(&grant_path)
+                .expect_err("expired grant unexpectedly loaded");
+            assert_eq!(error.to_string(), "agent grant has expired");
+        }
+        other => panic!("unexpected OperationGrant subprocess role: {other}"),
+    }
+}
+
+struct GrantSubprocessOutput {
+    pid: u32,
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn run_grant_subprocess(
+    role: &'static str,
+    home: PathBuf,
+    input: Option<&'static [u8]>,
+) -> GrantSubprocessOutput {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new(std::env::current_exe().expect("resolve CLI test binary"));
+        command
+            .arg("--exact")
+            .arg(GRANT_SUBPROCESS_TEST_NAME)
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(GRANT_SUBPROCESS_ROLE_ENV, role)
+            .env(GRANT_SUBPROCESS_HOME_ENV, &home)
+            .env("USERPROFILE", &home)
+            .env("HOME", &home)
+            .env_remove("SERCTL_SSH_PASS")
+            .env_remove("SERCTL_PROFILE_PASS")
+            .env_remove("SERCTL_ADMIN_PASS")
+            .env_remove("SERCTL_LEGACY_MASTER")
+            .env_remove("SERCTL_MASTER")
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn OperationGrant {role} subprocess: {error}"));
+        let pid = child.id();
+        if let Some(input) = input {
+            let mut stdin = child
+                .stdin
+                .take()
+                .expect("OperationGrant subprocess stdin was not piped");
+            stdin
+                .write_all(input)
+                .expect("write Agent JSONL subprocess input");
+            drop(stdin);
+        }
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|error| panic!("wait for OperationGrant {role} subprocess: {error}"));
+        GrantSubprocessOutput {
+            pid,
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }
+    })
+    .await
+    .expect("join OperationGrant subprocess waiter")
+}
+
+fn assert_grant_subprocess_success(role: &str, output: &GrantSubprocessOutput) {
+    assert!(
+        output.status.success(),
+        "OperationGrant {role} subprocess {} failed with {}; stdout={}; stderr={}",
+        output.pid,
+        output.status,
+        String::from_utf8_lossy(&output.stdout).escape_debug(),
+        String::from_utf8_lossy(&output.stderr).escape_debug(),
+    );
+}
+
+async fn spawn_published_test_global_daemon(
+    build_commit: &'static str,
+    idle_exit_timeout: Duration,
+) -> (
+    ipc::v6::InstanceId,
+    ipc::v6::ActivationSecret,
+    serctl_core::daemon_runtime::DaemonRuntimeDescriptor,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let instance = ipc::v6::InstanceId::random();
+    let secret = ipc::v6::ActivationSecret::random();
+    let mut task = tokio::spawn(daemon::run_global_with_idle_timeout(
+        instance,
+        secret.clone(),
+        build_commit.to_owned(),
+        idle_exit_timeout,
+    ));
+    let publish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(descriptor) = serctl_core::daemon_runtime::read_descriptor().unwrap() {
+            assert_eq!(descriptor.instance_id, instance.as_hex());
+            return (instance, secret, descriptor, task);
+        }
+        if task.is_finished() {
+            let outcome = (&mut task).await;
+            panic!("test global daemon exited before publication: {outcome:?}");
+        }
+        assert!(
+            tokio::time::Instant::now() < publish_deadline,
+            "test global daemon did not publish its descriptor"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_loss_after_grant_exec_is_unknown_and_new_instance_never_replays_it() {
+    let _test_home_lock = E2E_TEST_HOME_LOCK.lock().await;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_home_guard = E2eTestHome::create(unique);
+    let test_home = test_home_guard.path().to_owned();
+
+    #[cfg(windows)]
+    let mut recovery_media = Zeroizing::new(Vec::new());
+    #[cfg(windows)]
+    vault::initialize_admin_password(E2E_ADMINISTRATOR_PASSPHRASE, |media| {
+        recovery_media.extend_from_slice(media);
+        Ok(())
+    })
+    .unwrap();
+    let administrator_passphrase = if cfg!(windows) {
+        Some(E2E_ADMINISTRATOR_PASSPHRASE)
+    } else {
+        None
+    };
+
+    let state = Arc::new(TestState::default());
+    let mut rng = CompatibleOsRng(OsRng);
+    let key = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+    let fingerprint = key
+        .public_key()
+        .fingerprint(ssh_key::HashAlg::Sha256)
+        .to_string();
+    let config = Arc::new(russh::server::Config {
+        auth_rejection_time: Duration::ZERO,
+        auth_rejection_time_initial: Some(Duration::ZERO),
+        keys: vec![key],
+        ..Default::default()
+    });
+    let ssh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ssh_port = ssh_listener.local_addr().unwrap().port();
+    let ssh_state = Arc::clone(&state);
+    let ssh_task = tokio::spawn(async move {
+        loop {
+            let (socket, _) = ssh_listener.accept().await.unwrap();
+            let connection = ssh_state.next_connection.fetch_add(1, Ordering::SeqCst);
+            let handler = TestSsh {
+                state: Arc::clone(&ssh_state),
+                connection,
+                channels: Arc::new(Mutex::new(HashMap::new())),
+            };
+            let config = Arc::clone(&config);
+            let connection_state = Arc::clone(&ssh_state);
+            tokio::spawn(async move {
+                let result = match russh::server::run_stream(config, socket, handler).await {
+                    Ok(running) => running.await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    eprintln!("daemon-loss mock SSH transport failed: {error:#}");
+                }
+                connection_state.record_connection_closed(connection).await;
+            });
+        }
+    });
+
+    let profile = "grant-daemon-loss-e2e";
+    let passphrase = "grant-daemon-loss-profile-passphrase";
+    vault::create_profile(
+        profile,
+        &vault::Creds {
+            host: "127.0.0.1".into(),
+            port: ssh_port,
+            user: "tester".into(),
+            password: "password".into(),
+            host_key: Some(fingerprint),
+        },
+        passphrase,
+        administrator_passphrase,
+    )
+    .unwrap();
+
+    let (_first_instance, first_secret, first_descriptor, first_daemon) =
+        spawn_published_test_global_daemon("grant-daemon-loss-e2e", Duration::from_secs(30)).await;
+    let grant_path = test_home.join("daemon-loss-grant.json");
+    client::issue_grant_with_ttl_until(
+        profile,
+        passphrase,
+        vec!["ssh.exec".into()],
+        2,
+        serctl_protocol::grant::GRANT_MIN_TTL,
+        &grant_path,
+    )
+    .await
+    .unwrap();
+    let (grant, signing) = client::load_agent_grant(&grant_path).unwrap();
+
+    let before_exec = state.latest_exec_generation().await;
+    let submitted_grant = grant.clone();
+    let submitted_signing = signing.clone();
+    let exec = tokio::spawn(async move {
+        client::agent_exec_until(&submitted_grant, &submitted_signing, "hang", 10_000).await
+    });
+    let submitted_channel = state.wait_for_exec_start(before_exec, b"hang").await;
+    assert_eq!(state.latest_exec_generation().await, before_exec + 1);
+
+    // Aborting the daemon task models process loss after the authenticated
+    // root request reached SSH but before an IPC terminal response existed.
+    first_daemon.abort();
+    assert!(first_daemon.await.unwrap_err().is_cancelled());
+    let error = tokio::time::timeout(Duration::from_secs(5), exec)
+        .await
+        .expect("client did not settle after daemon loss")
+        .unwrap()
+        .expect_err("lost daemon response invented exec success");
+    assert!(error.is::<serctl_core::ssh::ExecOutcomeUnknown>());
+    state
+        .wait_for_connection_closed(submitted_channel.connection, "daemon task abort")
+        .await;
+
+    // An in-process task abort cannot make this process PID dead. Remove only
+    // the exact descriptor/secret owned by the aborted instance under the
+    // normal startup lock; this emulates the stale-owner reconciliation that
+    // a replacement OS process performs after a real crash.
+    let startup_lock = match serctl_core::daemon_runtime::acquire_startup_lock().unwrap() {
+        serctl_core::daemon_runtime::StartupLockAcquire::Acquired(lock) => lock,
+        serctl_core::daemon_runtime::StartupLockAcquire::Contended => {
+            panic!("aborted daemon retained the startup lock")
+        }
+    };
+    assert!(serctl_core::daemon_runtime::cleanup_runtime_if_owner(
+        &startup_lock,
+        &first_descriptor,
+        &first_secret,
+    )
+    .unwrap());
+    drop(startup_lock);
+
+    let (second_instance, _second_secret, second_descriptor, mut second_daemon) =
+        spawn_published_test_global_daemon("grant-daemon-loss-e2e", Duration::from_secs(1)).await;
+    assert_ne!(second_instance.as_hex(), first_descriptor.instance_id);
+    assert_ne!(second_descriptor.instance_id, first_descriptor.instance_id);
+    let before_stale_grant = state.latest_exec_generation().await;
+    let stale_error = client::agent_exec_until(&grant, &signing, "ok", 1_000)
+        .await
+        .expect_err("replacement daemon restored an old in-memory grant");
+    assert!(!stale_error.is::<serctl_core::ssh::ExecOutcomeUnknown>());
+    assert!(
+        stale_error
+            .to_string()
+            .contains("grant is not registered in this daemon instance"),
+        "unexpected stale-grant rejection: {stale_error:#}"
+    );
+    assert_eq!(
+        state.latest_exec_generation().await,
+        before_stale_grant,
+        "replacement daemon replayed the old request or old grant"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), &mut second_daemon)
+        .await
+        .expect("replacement daemon did not idle-exit")
+        .unwrap()
+        .unwrap();
+    assert!(!client::daemon_is_published().unwrap());
+    ssh_task.abort();
+    drop(test_home_guard);
+    assert!(!test_home.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operation_grant_survives_issuer_exit_and_expires_across_processes() {
+    let _test_home_lock = E2E_TEST_HOME_LOCK.lock().await;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_home_guard = E2eTestHome::create(unique);
+    let test_home = test_home_guard.path().to_owned();
+
+    #[cfg(windows)]
+    let mut recovery_media = Zeroizing::new(Vec::new());
+    #[cfg(windows)]
+    vault::initialize_admin_password(E2E_ADMINISTRATOR_PASSPHRASE, |media| {
+        recovery_media.extend_from_slice(media);
+        Ok(())
+    })
+    .unwrap();
+    let administrator_passphrase = if cfg!(windows) {
+        Some(E2E_ADMINISTRATOR_PASSPHRASE)
+    } else {
+        None
+    };
+
+    let state = Arc::new(TestState::default());
+    let mut rng = CompatibleOsRng(OsRng);
+    let key = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+    let fingerprint = key
+        .public_key()
+        .fingerprint(ssh_key::HashAlg::Sha256)
+        .to_string();
+    let config = Arc::new(russh::server::Config {
+        auth_rejection_time: Duration::ZERO,
+        auth_rejection_time_initial: Some(Duration::ZERO),
+        keys: vec![key],
+        ..Default::default()
+    });
+    let ssh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ssh_port = ssh_listener.local_addr().unwrap().port();
+    let ssh_state = Arc::clone(&state);
+    let ssh_task = tokio::spawn(async move {
+        loop {
+            let (socket, _) = ssh_listener.accept().await.unwrap();
+            let connection = ssh_state.next_connection.fetch_add(1, Ordering::SeqCst);
+            let handler = TestSsh {
+                state: Arc::clone(&ssh_state),
+                connection,
+                channels: Arc::new(Mutex::new(HashMap::new())),
+            };
+            let config = Arc::clone(&config);
+            let connection_state = Arc::clone(&ssh_state);
+            tokio::spawn(async move {
+                let result = match russh::server::run_stream(config, socket, handler).await {
+                    Ok(running) => running.await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    eprintln!("OperationGrant mock SSH transport failed: {error:#}");
+                }
+                connection_state.record_connection_closed(connection).await;
+            });
+        }
+    });
+
+    vault::create_profile(
+        GRANT_SUBPROCESS_PROFILE,
+        &vault::Creds {
+            host: "127.0.0.1".into(),
+            port: ssh_port,
+            user: "tester".into(),
+            password: "password".into(),
+            host_key: Some(fingerprint),
+        },
+        GRANT_SUBPROCESS_PASSPHRASE,
+        administrator_passphrase,
+    )
+    .unwrap();
+
+    let daemon_instance = ipc::v6::InstanceId::random();
+    let daemon_instance_hex = daemon_instance.as_hex();
+    let daemon_secret = ipc::v6::ActivationSecret::random();
+    let mut daemon_task = tokio::spawn(daemon::run_global_with_idle_timeout(
+        daemon_instance,
+        daemon_secret,
+        "grant-subprocess-e2e".to_owned(),
+        Duration::from_secs(5),
+    ));
+    let publish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if serctl_core::daemon_runtime::read_descriptor()
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        if daemon_task.is_finished() {
+            let outcome = (&mut daemon_task).await;
+            panic!("OperationGrant E2E daemon exited before publication: {outcome:?}");
+        }
+        assert!(
+            tokio::time::Instant::now() < publish_deadline,
+            "OperationGrant E2E daemon did not publish its descriptor"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let daemon_descriptor = serctl_core::daemon_runtime::read_descriptor()
+        .unwrap()
+        .expect("OperationGrant E2E daemon descriptor disappeared after publication");
+    assert_eq!(daemon_descriptor.instance_id, daemon_instance_hex);
+    assert_eq!(daemon_descriptor.pid, std::process::id());
+
+    let issuer = run_grant_subprocess("issuer", test_home.clone(), None).await;
+    assert_grant_subprocess_success("issuer", &issuer);
+    assert_ne!(issuer.pid, std::process::id());
+    assert!(test_home.join(GRANT_SUBPROCESS_FILE).is_file());
+    assert!(test_home.join(GRANT_SUBPROCESS_MARKER).is_file());
+
+    // The issuing process has terminated and every ordinary IPC connection
+    // has had more than the configured idle window to drain. Only the
+    // daemon's in-memory live-grant reference can keep it published here.
+    tokio::time::sleep(Duration::from_millis(5_250)).await;
+    assert!(
+        !daemon_task.is_finished(),
+        "daemon lost the live grant after issuer exit"
+    );
+    assert!(client::daemon_is_published().unwrap());
+    assert_eq!(
+        serctl_core::daemon_runtime::read_descriptor().unwrap(),
+        Some(daemon_descriptor.clone()),
+        "issuer exit was followed by an unexpected daemon identity replacement"
+    );
+
+    let exec_before_relay = state.latest_exec_generation().await;
+    let relay_input: &'static [u8] =
+        br#"{"schema_version":1,"op":"exec","request_id":41,"cmd":"ok","timeout_ms":3000}
+{"schema_version":1,"op":"exec","request_id":42,"cmd":"ok","timeout_ms":3000}
+"#;
+    let relay = run_grant_subprocess("relay", test_home.clone(), Some(relay_input)).await;
+    assert_grant_subprocess_success("relay", &relay);
+    assert_ne!(relay.pid, std::process::id());
+    assert_ne!(relay.pid, issuer.pid);
+    let relay_lines = String::from_utf8_lossy(&relay.stdout)
+        .lines()
+        // With `--nocapture`, libtest can print `test <name> ... ` and the
+        // gateway's first stdout record on one physical line. Parse only the
+        // JSON suffix; later records remain ordinary JSONL lines.
+        .filter_map(|line| line.find('{').map(|start| &line[start..]))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relay_lines.len(),
+        2,
+        "unexpected Agent output: {}",
+        String::from_utf8_lossy(&relay.stdout).escape_debug()
+    );
+    for (line, request_id) in relay_lines.iter().zip([41_u64, 42]) {
+        assert_eq!(line["schema_version"], 1);
+        assert_eq!(line["request_id"], request_id);
+        assert_eq!(line["ok"], true);
+        assert_eq!(line["data"]["code"], 0);
+        assert_eq!(
+            B64.decode(line["data"]["stdout"].as_str().unwrap())
+                .unwrap(),
+            b"evidence\n"
+        );
+    }
+    assert_eq!(
+        state.latest_exec_generation().await,
+        exec_before_relay + 2,
+        "the independent Agent process did not relay exactly two SSH operations"
+    );
+    assert_eq!(
+        serctl_core::daemon_runtime::read_descriptor().unwrap(),
+        Some(daemon_descriptor.clone()),
+        "continuous Grant requests crossed daemon identities"
+    );
+
+    tokio::time::sleep(Duration::from_millis(5_250)).await;
+    assert!(
+        !daemon_task.is_finished(),
+        "daemon dropped the partly spent live grant"
+    );
+
+    let marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(test_home.join(GRANT_SUBPROCESS_MARKER)).unwrap())
+            .unwrap();
+    assert_eq!(marker["issuer_pid"], issuer.pid);
+    assert!(marker["expires_unix_ms"].as_u64().is_some());
+
+    // This process loaded the Grant while valid, retained it in memory across
+    // expiry, and then attempted an exec. The client-side absolute-expiry
+    // guard must reject before IPC/SSH, while the original daemon identity is
+    // still published until its reaper releases the active reference.
+    let exec_before_armed_expired = state.latest_exec_generation().await;
+    let armed_expired = run_grant_subprocess("armed-expired", test_home.clone(), None).await;
+    assert_grant_subprocess_success("armed-expired", &armed_expired);
+    assert_ne!(armed_expired.pid, std::process::id());
+    assert_ne!(armed_expired.pid, issuer.pid);
+    assert_ne!(armed_expired.pid, relay.pid);
+    assert_eq!(
+        state.latest_exec_generation().await,
+        exec_before_armed_expired,
+        "preloaded expired grant process reached mock SSH"
+    );
+
+    // The daemon's one-second reaper plus five-second idle window leaves it
+    // running while this fresh process rejects the expired protected grant
+    // locally. The mock SSH generation proves denial caused no remote work.
+    assert!(client::daemon_is_published().unwrap());
+    assert_eq!(
+        serctl_core::daemon_runtime::read_descriptor().unwrap(),
+        Some(daemon_descriptor),
+        "Grant expiry was observed against a replacement daemon identity"
+    );
+    let exec_before_expired = state.latest_exec_generation().await;
+    let expired = run_grant_subprocess("expired", test_home.clone(), None).await;
+    assert_grant_subprocess_success("expired", &expired);
+    assert_ne!(expired.pid, std::process::id());
+    assert_ne!(expired.pid, issuer.pid);
+    assert_ne!(expired.pid, relay.pid);
+    assert_eq!(
+        state.latest_exec_generation().await,
+        exec_before_expired,
+        "expired grant process reached mock SSH"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), &mut daemon_task)
+        .await
+        .expect("daemon did not idle-exit after the grant reference expired")
+        .unwrap()
+        .unwrap();
+    assert!(!client::daemon_is_published().unwrap());
+
+    ssh_task.abort();
+    drop(test_home_guard);
+    assert!(!test_home.exists());
 }

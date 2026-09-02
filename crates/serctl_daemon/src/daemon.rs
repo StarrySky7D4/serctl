@@ -3,7 +3,10 @@
 //! per-operation dispatch; the global mode additionally owns the runtime
 //! descriptor/secret, per-profile credential leases, and the unlock flow.
 use anyhow::{bail, ensure, Context, Result};
+use hmac::{Hmac, Mac};
+use rand::{rngs::OsRng, RngCore};
 use russh::ChannelMsg;
+use serctl_core::audit::{AuditDecision, AuditEvent, AuditLedger, AuditPhase};
 use serctl_core::daemon_runtime::{self, DaemonRuntimeDescriptor, DESCRIPTOR_SCHEMA_VERSION};
 use serctl_core::vault::{self, now_unix, Creds, LockInfo, ProfileCallKey};
 use serctl_protocol::v6::{
@@ -19,12 +22,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
 
 use serctl_core::ssh::{
-    commit_remote_upload_no_replace_until, is_explicit_sftp_status, poll_remote_mutation_until,
-    temporary_remote_path, validate_remote_command, validate_remote_path,
-    validate_shell_dimensions, validate_upload_remote_path, ExecSubmissionState, SshSession,
+    commit_remote_upload_no_replace_until, is_explicit_sftp_status,
+    is_ssh_transport_terminal_error, poll_remote_mutation_until, temporary_remote_path,
+    validate_remote_command, validate_remote_path, validate_shell_dimensions,
+    validate_upload_remote_path, ExecSubmissionState, RunningCommand, RunningTunnel, SshSession,
     MAX_TRANSFER_BYTES,
 };
 use serctl_protocol as ipc;
@@ -45,11 +50,32 @@ const REMOTE_PARTIAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_PARTIAL_CLEANUP_RETRY: Duration = Duration::from_millis(50);
 const POST_AUTH_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SHELL_INPUT_BYTES: usize = 64 * 1024;
-const MAX_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_UPLOAD_CHUNK_BYTES: usize = ipc::NATIVE_IPC_CHUNK_BYTES;
 const BUFFERED_HEAVY_OPERATION_LIMIT: usize = 8;
 const TUNNEL_CONTROL_LIMIT: usize = 8;
 const TUNNEL_COMPLETION_POLL: Duration = Duration::from_millis(100);
 const TRANSFER_RECORD_RETENTION: Duration = Duration::from_secs(15 * 60);
+/// Active transfers retain cancellation state and may live for a full request
+/// deadline. Bound them independently from the IPC connection count so a
+/// caller cannot turn the progress registry into unbounded resident state.
+const MAX_ACTIVE_TRANSFERS_PER_PROFILE: usize = 8;
+/// Keep sixteen of the daemon's sixty-four connection slots available for
+/// status, cancellation, and unrelated control requests at peak transfer use.
+const MAX_ACTIVE_TRANSFERS_GLOBAL: usize = 48;
+/// A status-all response is a single 16 KiB control frame. Eight active plus
+/// sixteen completed records fit below that bound even when every validated
+/// progress field uses its largest JSON representation. Finished records are
+/// additionally capped globally so many short-lived profiles cannot retain an
+/// unbounded amount of daemon memory during the fifteen-minute retention
+/// window.
+const MAX_COMPLETED_TRANSFERS_PER_PROFILE: usize = 16;
+const MAX_COMPLETED_TRANSFERS_GLOBAL: usize = 256;
+const MANAGED_TUNNEL_RECORD_RETENTION: Duration = Duration::from_secs(15 * 60);
+const MAX_ACTIVE_MANAGED_TUNNELS_PER_PROFILE: usize = 8;
+const MAX_ACTIVE_MANAGED_TUNNELS_GLOBAL: usize = 32;
+const MAX_COMPLETED_MANAGED_TUNNELS_PER_PROFILE: usize = 16;
+const MAX_COMPLETED_MANAGED_TUNNELS_GLOBAL: usize = 128;
+const MANAGED_TUNNEL_CANCEL_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Default)]
 struct TransferCancellation {
@@ -83,11 +109,14 @@ struct TransferRecord {
     progress: ipc::TransferProgress,
     cancellation: Arc<TransferCancellation>,
     finished_at: Option<Instant>,
+    finished_order: Option<usize>,
+    context_discovered: bool,
 }
 
 #[derive(Default)]
 struct TransferRegistry {
     records: StdMutex<HashMap<String, TransferRecord>>,
+    next_finished_order: AtomicUsize,
 }
 
 impl TransferRegistry {
@@ -97,6 +126,76 @@ impl TransferRegistry {
                 .finished_at
                 .is_none_or(|finished| now.duration_since(finished) < TRANSFER_RECORD_RETENTION)
         });
+    }
+
+    fn remove_oldest_finished_locked(
+        records: &mut HashMap<String, TransferRecord>,
+        profile: Option<&str>,
+    ) -> bool {
+        let oldest = records
+            .iter()
+            .filter(|(_, record)| {
+                record.finished_at.is_some()
+                    && profile.is_none_or(|profile| record.profile == profile)
+            })
+            .min_by(|(left_id, left), (right_id, right)| {
+                left.finished_order
+                    .cmp(&right.finished_order)
+                    .then_with(|| left_id.cmp(right_id))
+            })
+            .map(|(transfer_id, _)| transfer_id.clone());
+        oldest.is_some_and(|transfer_id| records.remove(&transfer_id).is_some())
+    }
+
+    fn enforce_finished_caps_locked(records: &mut HashMap<String, TransferRecord>, profile: &str) {
+        while records
+            .values()
+            .filter(|record| record.profile == profile && record.finished_at.is_some())
+            .count()
+            > MAX_COMPLETED_TRANSFERS_PER_PROFILE
+        {
+            let removed = Self::remove_oldest_finished_locked(records, Some(profile));
+            debug_assert!(removed);
+            if !removed {
+                break;
+            }
+        }
+        while records
+            .values()
+            .filter(|record| record.finished_at.is_some())
+            .count()
+            > MAX_COMPLETED_TRANSFERS_GLOBAL
+        {
+            let removed = Self::remove_oldest_finished_locked(records, None);
+            debug_assert!(removed);
+            if !removed {
+                break;
+            }
+        }
+    }
+
+    fn replace_progress(
+        record: &mut TransferRecord,
+        profile: &str,
+        progress: ipc::TransferProgress,
+    ) -> Result<()> {
+        ensure!(record.profile == profile, "transfer profile mismatch");
+        ensure!(
+            progress.confirmed_bytes >= record.progress.confirmed_bytes,
+            "transfer confirmation moved backwards"
+        );
+        ensure!(
+            progress.operation_context_id == record.progress.operation_context_id,
+            "transfer operation context changed"
+        );
+        let mut progress = progress;
+        progress.revision = record
+            .progress
+            .revision
+            .checked_add(1)
+            .context("transfer revision is exhausted")?;
+        record.progress = progress;
+        Ok(())
     }
 
     fn begin(
@@ -111,6 +210,22 @@ impl TransferRegistry {
             .map_err(|_| anyhow::anyhow!("transfer registry lock is poisoned"))?;
         Self::prune_locked(&mut records, Instant::now());
         ensure!(
+            records
+                .values()
+                .filter(|record| record.finished_at.is_none())
+                .count()
+                < MAX_ACTIVE_TRANSFERS_GLOBAL,
+            "global active transfer capacity is exhausted"
+        );
+        ensure!(
+            records
+                .values()
+                .filter(|record| record.profile == profile && record.finished_at.is_none())
+                .count()
+                < MAX_ACTIVE_TRANSFERS_PER_PROFILE,
+            "profile active transfer capacity is exhausted"
+        );
+        ensure!(
             !records.contains_key(progress.transfer_id.as_str()),
             "transfer id is already registered"
         );
@@ -122,6 +237,8 @@ impl TransferRegistry {
                 progress,
                 cancellation: Arc::clone(&cancellation),
                 finished_at: None,
+                finished_order: None,
+                context_discovered: false,
             },
         );
         Ok(cancellation)
@@ -136,25 +253,32 @@ impl TransferRegistry {
         let record = records
             .get_mut(progress.transfer_id.as_str())
             .context("transfer is not registered")?;
-        ensure!(record.profile == profile, "transfer profile mismatch");
-        ensure!(
-            progress.confirmed_bytes >= record.progress.confirmed_bytes,
-            "transfer confirmation moved backwards"
-        );
-        record.progress = progress;
-        Ok(())
+        Self::replace_progress(record, profile, progress)
     }
 
     fn finish(&self, profile: &str, progress: ipc::TransferProgress) -> Result<()> {
-        self.update(profile, progress.clone())?;
+        progress.validate()?;
         let mut records = self
             .records
             .lock()
             .map_err(|_| anyhow::anyhow!("transfer registry lock is poisoned"))?;
-        let record = records
-            .get_mut(progress.transfer_id.as_str())
-            .context("transfer is not registered")?;
-        record.finished_at = Some(Instant::now());
+        let now = Instant::now();
+        Self::prune_locked(&mut records, now);
+        let finished_order = self
+            .next_finished_order
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |order| {
+                order.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("transfer completion order is exhausted"))?;
+        {
+            let record = records
+                .get_mut(progress.transfer_id.as_str())
+                .context("transfer is not registered")?;
+            Self::replace_progress(record, profile, progress)?;
+            record.finished_at = Some(now);
+            record.finished_order = Some(finished_order);
+        }
+        Self::enforce_finished_caps_locked(&mut records, profile);
         Ok(())
     }
 
@@ -162,27 +286,54 @@ impl TransferRegistry {
         &self,
         profile: &str,
         transfer_id: Option<&ipc::TransferId>,
+        operation_context_id: Option<&ipc::OperationContextId>,
+        enforce_context_discovery: bool,
     ) -> Result<Vec<ipc::TransferProgress>> {
         let mut records = self
             .records
             .lock()
             .map_err(|_| anyhow::anyhow!("transfer registry lock is poisoned"))?;
         Self::prune_locked(&mut records, Instant::now());
-        let mut snapshots = records
-            .values()
-            .filter(|record| {
-                record.profile == profile
-                    && transfer_id
-                        .is_none_or(|id| id.as_str() == record.progress.transfer_id.as_str())
-            })
-            .map(|record| record.progress.clone())
-            .collect::<Vec<_>>();
+        let mut snapshots = Vec::new();
+        for record in records.values_mut().filter(|record| {
+            record.profile == profile
+                && transfer_id.is_none_or(|id| id.as_str() == record.progress.transfer_id.as_str())
+        }) {
+            if record.progress.operation_context_id.is_some() {
+                match operation_context_id {
+                    Some(expected) => ensure!(
+                        record.progress.operation_context_id.as_ref() == Some(expected),
+                        "transfer operation context does not match this daemon instance and object"
+                    ),
+                    None if enforce_context_discovery && record.context_discovered => {
+                        bail!("transfer operation context is required after initial discovery")
+                    }
+                    None if enforce_context_discovery => record.context_discovered = true,
+                    None => {}
+                }
+            }
+            snapshots.push(record.progress.clone());
+        }
         snapshots.sort_by(|left, right| left.transfer_id.as_str().cmp(right.transfer_id.as_str()));
+        ensure!(
+            operation_context_id.is_none() || snapshots.len() == 1,
+            "transfer operation context does not match this daemon instance and object"
+        );
+        let frame = ipc::Frame::TransferStatusInfo {
+            transfers: snapshots.clone(),
+        };
+        ipc::encoded_frame_len_limited(&frame, ipc::MAX_CONTROL_FRAME - 1)
+            .context("transfer status snapshot exceeds the control-frame bound")?;
         Ok(snapshots)
     }
 
-    fn cancel(&self, profile: &str, transfer_id: &ipc::TransferId) -> Result<()> {
-        let records = self
+    fn cancel(
+        &self,
+        profile: &str,
+        transfer_id: &ipc::TransferId,
+        operation_context_id: Option<&ipc::OperationContextId>,
+    ) -> Result<ipc::TransferProgress> {
+        let mut records = self
             .records
             .lock()
             .map_err(|_| anyhow::anyhow!("transfer registry lock is poisoned"))?;
@@ -193,10 +344,496 @@ impl TransferRegistry {
             record.profile == profile,
             "transfer was not found for this profile"
         );
+        if let Some(expected) = operation_context_id {
+            ensure!(
+                record.progress.operation_context_id.as_ref() == Some(expected),
+                "transfer operation context does not match this daemon instance and object"
+            );
+        }
         ensure!(record.finished_at.is_none(), "transfer is no longer active");
         record.cancellation.cancel();
+        let record = records
+            .get_mut(transfer_id.as_str())
+            .context("transfer disappeared during cancellation")?;
+        record.progress.revision = record
+            .progress
+            .revision
+            .checked_add(1)
+            .context("transfer revision is exhausted")?;
+        record.progress.event = "cancel_requested".to_owned();
+        record.progress.updated_unix_ms = now_unix_ms();
+        Ok(record.progress.clone())
+    }
+}
+
+struct OperationContextKey(Zeroizing<[u8; 32]>);
+
+#[derive(Clone, Copy)]
+struct OperationContextBinding {
+    instance_id: InstanceId,
+    grant_id: [u8; 16],
+    request_id: [u8; 16],
+    profile: vault::ProfileIdentity,
+    root_request_hash: [u8; 32],
+}
+
+impl OperationContextKey {
+    fn random() -> Self {
+        let mut bytes = Zeroizing::new([0_u8; 32]);
+        OsRng.fill_bytes(&mut *bytes);
+        Self(bytes)
+    }
+
+    fn derive(
+        &self,
+        binding: OperationContextBinding,
+        transport_attempt_id: &str,
+        object_id: &str,
+        action: &str,
+    ) -> Result<ipc::OperationContextId> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.0.as_ref())
+            .map_err(|_| anyhow::anyhow!("initialize operation context HMAC"))?;
+        mac.update(b"serctl/operation-context/hmac-sha256/v1\0");
+        mac.update(&binding.instance_id.0);
+        mac.update(&binding.grant_id);
+        mac.update(&binding.request_id);
+        mac.update(&binding.profile.profile_id);
+        mac.update(&binding.profile.generation.to_be_bytes());
+        mac.update(&binding.root_request_hash);
+        for value in [
+            transport_attempt_id.as_bytes(),
+            object_id.as_bytes(),
+            action.as_bytes(),
+        ] {
+            mac.update(&(value.len() as u64).to_be_bytes());
+            mac.update(value);
+        }
+        ipc::OperationContextId::parse(&hex::encode(mac.finalize().into_bytes()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedTunnelOwner {
+    profile_id: [u8; 16],
+    generation: u64,
+}
+
+struct ManagedTunnelRecord {
+    owner: ManagedTunnelOwner,
+    status: ipc::TunnelStatus,
+    cancellation: CancellationToken,
+    completion: Arc<Notify>,
+    finished_at: Option<Instant>,
+    finished_order: Option<usize>,
+    context_discovered: bool,
+    _idle_guard: Option<IdleGuard>,
+    _profile_entry: Option<Arc<ProfilePoolEntry>>,
+}
+
+#[derive(Default)]
+struct ManagedTunnelRegistry {
+    records: StdMutex<HashMap<String, ManagedTunnelRecord>>,
+    next_finished_order: AtomicUsize,
+}
+
+impl ManagedTunnelRegistry {
+    fn prune_locked(records: &mut HashMap<String, ManagedTunnelRecord>, now: Instant) {
+        records.retain(|_, record| {
+            record.finished_at.is_none_or(|finished| {
+                now.saturating_duration_since(finished) < MANAGED_TUNNEL_RECORD_RETENTION
+            })
+        });
+    }
+
+    fn remove_oldest_finished_locked(
+        records: &mut HashMap<String, ManagedTunnelRecord>,
+        owner: Option<&ManagedTunnelOwner>,
+    ) -> bool {
+        let oldest = records
+            .iter()
+            .filter(|(_, record)| {
+                record.finished_at.is_some() && owner.is_none_or(|owner| record.owner == *owner)
+            })
+            .min_by(|(left_id, left), (right_id, right)| {
+                left.finished_order
+                    .cmp(&right.finished_order)
+                    .then_with(|| left_id.cmp(right_id))
+            })
+            .map(|(id, _)| id.clone());
+        oldest.is_some_and(|id| records.remove(&id).is_some())
+    }
+
+    fn enforce_finished_caps_locked(
+        records: &mut HashMap<String, ManagedTunnelRecord>,
+        owner: &ManagedTunnelOwner,
+    ) {
+        while records
+            .values()
+            .filter(|record| record.owner == *owner && record.finished_at.is_some())
+            .count()
+            > MAX_COMPLETED_MANAGED_TUNNELS_PER_PROFILE
+        {
+            if !Self::remove_oldest_finished_locked(records, Some(owner)) {
+                break;
+            }
+        }
+        while records
+            .values()
+            .filter(|record| record.finished_at.is_some())
+            .count()
+            > MAX_COMPLETED_MANAGED_TUNNELS_GLOBAL
+        {
+            if !Self::remove_oldest_finished_locked(records, None) {
+                break;
+            }
+        }
+    }
+
+    fn begin(
+        &self,
+        owner: ManagedTunnelOwner,
+        status: ipc::TunnelStatus,
+        cancellation: CancellationToken,
+        idle_guard: IdleGuard,
+        profile_entry: Option<Arc<ProfilePoolEntry>>,
+    ) -> Result<Arc<Notify>> {
+        status.validate()?;
+        ensure!(
+            status.profile_id == hex::encode(owner.profile_id)
+                && status.profile_generation == owner.generation,
+            "tunnel status identity does not match its owner"
+        );
+        ensure!(
+            status.stage == ipc::TunnelStage::Ready,
+            "new tunnel must enter the registry ready"
+        );
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed tunnel registry lock is poisoned"))?;
+        Self::prune_locked(&mut records, Instant::now());
+        ensure!(
+            records
+                .values()
+                .filter(|record| record.finished_at.is_none())
+                .count()
+                < MAX_ACTIVE_MANAGED_TUNNELS_GLOBAL,
+            "global active tunnel capacity is exhausted"
+        );
+        ensure!(
+            records
+                .values()
+                .filter(|record| record.owner == owner && record.finished_at.is_none())
+                .count()
+                < MAX_ACTIVE_MANAGED_TUNNELS_PER_PROFILE,
+            "profile active tunnel capacity is exhausted"
+        );
+        ensure!(
+            !records.contains_key(status.tunnel_id.as_str()),
+            "tunnel id is already registered"
+        );
+        let completion = Arc::new(Notify::new());
+        records.insert(
+            status.tunnel_id.as_str().to_owned(),
+            ManagedTunnelRecord {
+                owner,
+                status,
+                cancellation,
+                completion: Arc::clone(&completion),
+                finished_at: None,
+                finished_order: None,
+                context_discovered: false,
+                _idle_guard: Some(idle_guard),
+                _profile_entry: profile_entry,
+            },
+        );
+        Ok(completion)
+    }
+
+    fn finish_worker(
+        &self,
+        owner: &ManagedTunnelOwner,
+        tunnel_id: &ipc::TunnelId,
+        stage: ipc::TunnelStage,
+    ) -> Result<()> {
+        ensure!(
+            matches!(stage, ipc::TunnelStage::Closed | ipc::TunnelStage::Unknown),
+            "managed tunnel terminal stage is invalid"
+        );
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed tunnel registry lock is poisoned"))?;
+        let now = Instant::now();
+        Self::prune_locked(&mut records, now);
+        let finished_order = self
+            .next_finished_order
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |order| {
+                order.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("managed tunnel completion order is exhausted"))?;
+        let completion = {
+            let record = records
+                .get_mut(tunnel_id.as_str())
+                .context("tunnel is not registered")?;
+            ensure!(
+                record.owner == *owner,
+                "tunnel was not found for this profile"
+            );
+            if record.finished_at.is_some() {
+                return Ok(());
+            }
+            record.status.stage = stage;
+            record.status.updated_unix_ms = now_unix_ms();
+            if record.status.operation_context_id.is_some() {
+                record.status.revision = record
+                    .status
+                    .revision
+                    .checked_add(1)
+                    .context("managed tunnel revision is exhausted")?;
+            }
+            record.finished_at = Some(now);
+            record.finished_order = Some(finished_order);
+            record._idle_guard.take();
+            Arc::clone(&record.completion)
+        };
+        Self::enforce_finished_caps_locked(&mut records, owner);
+        completion.notify_waiters();
         Ok(())
     }
+
+    fn snapshots(
+        &self,
+        owner: &ManagedTunnelOwner,
+        tunnel_id: Option<&ipc::TunnelId>,
+        operation_context_id: Option<&ipc::OperationContextId>,
+        enforce_context_discovery: bool,
+    ) -> Result<Vec<ipc::TunnelStatus>> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed tunnel registry lock is poisoned"))?;
+        Self::prune_locked(&mut records, Instant::now());
+        let mut snapshots = Vec::new();
+        for record in records.values_mut().filter(|record| {
+            record.owner == *owner
+                && tunnel_id.is_none_or(|id| id.as_str() == record.status.tunnel_id.as_str())
+        }) {
+            if record.status.operation_context_id.is_some() {
+                match operation_context_id {
+                    Some(expected) => ensure!(
+                        record.status.operation_context_id.as_ref() == Some(expected),
+                        "managed tunnel operation context does not match this daemon instance and object"
+                    ),
+                    None if enforce_context_discovery && record.context_discovered => {
+                        bail!("managed tunnel operation context is required after initial discovery")
+                    }
+                    None if enforce_context_discovery => record.context_discovered = true,
+                    None => {}
+                }
+            }
+            snapshots.push(record.status.clone());
+        }
+        snapshots.sort_by(|left, right| left.tunnel_id.as_str().cmp(right.tunnel_id.as_str()));
+        ensure!(
+            operation_context_id.is_none() || snapshots.len() == 1,
+            "managed tunnel operation context does not match this daemon instance and object"
+        );
+        ipc::encoded_frame_len_limited(
+            &ipc::Frame::ManagedTunnelStatusInfo {
+                tunnels: snapshots.clone(),
+            },
+            ipc::MAX_CONTROL_FRAME - 1,
+        )
+        .context("managed tunnel status snapshot exceeds the control-frame bound")?;
+        Ok(snapshots)
+    }
+
+    fn request_cancel(
+        &self,
+        owner: &ManagedTunnelOwner,
+        tunnel_id: &ipc::TunnelId,
+        operation_context_id: Option<&ipc::OperationContextId>,
+    ) -> Result<(ipc::TunnelStatus, Arc<Notify>)> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed tunnel registry lock is poisoned"))?;
+        let record = records
+            .get_mut(tunnel_id.as_str())
+            .context("tunnel was not found for this profile")?;
+        ensure!(
+            record.owner == *owner,
+            "tunnel was not found for this profile"
+        );
+        if record.status.operation_context_id.is_some() {
+            let expected = operation_context_id
+                .context("managed tunnel operation context is required for cancellation")?;
+            ensure!(
+                record.status.operation_context_id.as_ref() == Some(expected),
+                "managed tunnel operation context does not match this daemon instance and object"
+            );
+        }
+        if record.finished_at.is_none() && record.status.stage != ipc::TunnelStage::Cancelling {
+            record.status.stage = ipc::TunnelStage::Cancelling;
+            record.status.updated_unix_ms = now_unix_ms();
+            if record.status.operation_context_id.is_some() {
+                record.status.revision = record
+                    .status
+                    .revision
+                    .checked_add(1)
+                    .context("managed tunnel revision is exhausted")?;
+            }
+            record.cancellation.cancel();
+        }
+        Ok((record.status.clone(), Arc::clone(&record.completion)))
+    }
+
+    async fn cancel_and_wait(
+        &self,
+        owner: &ManagedTunnelOwner,
+        tunnel_id: &ipc::TunnelId,
+        operation_context_id: Option<&ipc::OperationContextId>,
+        deadline: Instant,
+    ) -> Result<ipc::TunnelStatus> {
+        let (initial, completion) = self.request_cancel(owner, tunnel_id, operation_context_id)?;
+        if matches!(
+            initial.stage,
+            ipc::TunnelStage::Closed | ipc::TunnelStage::Unknown
+        ) {
+            return Ok(initial);
+        }
+        loop {
+            let notified = completion.notified();
+            let current = self
+                .snapshots(owner, Some(tunnel_id), operation_context_id, false)?
+                .into_iter()
+                .next()
+                .context("tunnel was not found for this profile")?;
+            if matches!(
+                current.stage,
+                ipc::TunnelStage::Closed | ipc::TunnelStage::Unknown
+            ) {
+                return Ok(current);
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                self.finish_worker(owner, tunnel_id, ipc::TunnelStage::Unknown)?;
+                return self
+                    .snapshots(owner, Some(tunnel_id), operation_context_id, false)?
+                    .into_iter()
+                    .next()
+                    .context("tunnel was not found for this profile");
+            }
+        }
+    }
+
+    async fn shutdown_all(&self, deadline: Instant) {
+        let active = match self.records.lock() {
+            Ok(mut records) => {
+                Self::prune_locked(&mut records, Instant::now());
+                records
+                    .values_mut()
+                    .filter(|record| record.finished_at.is_none())
+                    .map(|record| {
+                        record.status.stage = ipc::TunnelStage::Cancelling;
+                        record.status.updated_unix_ms = now_unix_ms();
+                        if record.status.operation_context_id.is_some() {
+                            record.status.revision = record.status.revision.saturating_add(1);
+                        }
+                        record.cancellation.cancel();
+                        (
+                            record.owner.clone(),
+                            record.status.tunnel_id.clone(),
+                            record.status.operation_context_id.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+            Err(_) => return,
+        };
+        for (owner, tunnel_id, operation_context_id) in active {
+            if self
+                .cancel_and_wait(&owner, &tunnel_id, operation_context_id.as_ref(), deadline)
+                .await
+                .is_err()
+            {
+                let _ = self.finish_worker(&owner, &tunnel_id, ipc::TunnelStage::Unknown);
+            }
+        }
+    }
+}
+
+fn managed_tunnel_status(
+    owner: &ManagedTunnelOwner,
+    tunnel_id: ipc::TunnelId,
+    spec: &ipc::TunnelSpec,
+    ready: &ipc::TunnelReady,
+    deadline_unix_ms: u64,
+    operation_context_id: Option<ipc::OperationContextId>,
+) -> Result<ipc::TunnelStatus> {
+    ensure!(
+        ready.mode == spec.mode(),
+        "SSH tunnel readiness mode does not match the request"
+    );
+    let target_host = match spec.mode() {
+        ipc::TunnelMode::Local | ipc::TunnelMode::Remote => Some("127.0.0.1".to_owned()),
+        ipc::TunnelMode::Dynamic => None,
+    };
+    let status = ipc::TunnelStatus {
+        schema_version: ipc::TUNNEL_STATUS_SCHEMA_VERSION,
+        tunnel_id,
+        profile_id: hex::encode(owner.profile_id),
+        profile_generation: owner.generation,
+        mode: ready.mode,
+        bind_host: ready.bind_host.clone(),
+        bind_port: ready.bind_port,
+        target_host,
+        target_port: spec.target_port,
+        deadline_unix_ms,
+        stage: ipc::TunnelStage::Ready,
+        updated_unix_ms: now_unix_ms(),
+        revision: u64::from(operation_context_id.is_some()),
+        operation_context_id,
+    };
+    status.validate()?;
+    Ok(status)
+}
+
+fn spawn_managed_tunnel_worker(
+    registry: Arc<ManagedTunnelRegistry>,
+    owner: ManagedTunnelOwner,
+    tunnel_id: ipc::TunnelId,
+    tunnel: RunningTunnel,
+    deadline: Instant,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let cancellation = tunnel.cancellation_token();
+        let wait = tunnel.wait();
+        tokio::pin!(wait);
+        let result = tokio::select! {
+            result = &mut wait => result,
+            _ = tokio::time::sleep_until(deadline) => {
+                cancellation.cancel();
+                wait.await
+            }
+            _ = shutdown.changed() => {
+                cancellation.cancel();
+                wait.await
+            }
+        };
+        let stage = if result.is_ok() {
+            ipc::TunnelStage::Closed
+        } else {
+            ipc::TunnelStage::Unknown
+        };
+        if let Err(error) = registry.finish_worker(&owner, &tunnel_id, stage) {
+            log::warn!(
+                "managed tunnel terminal registry update failed: {}",
+                terminal_safe_error(&error)
+            );
+        }
+    });
 }
 
 fn resolved_sftp_backend(requested: ipc::TransferBackend) -> Result<ipc::TransferBackend> {
@@ -218,43 +855,39 @@ struct NativeTransferChannel {
     resume: bool,
 }
 
-enum NegotiatedTransferBackend {
-    Native(Box<NativeTransferChannel>),
-    Sftp,
+#[derive(Debug)]
+struct NativeHelperUnavailable(anyhow::Error);
+
+impl std::fmt::Display for NativeHelperUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "native transfer helper is unavailable: {}",
+            self.0
+        )
+    }
 }
 
-async fn open_native_transfer_channel(
-    session: &SshSession,
-    deadline: Instant,
-) -> Result<NativeTransferChannel> {
-    let mut stream = session.native_transfer_stream_until(deadline).await?;
-    let hello = tokio::time::timeout_at(deadline, native::read_frame(&mut stream))
-        .await
-        .map_err(|_| anyhow::anyhow!("native helper handshake exceeded its deadline"))??;
-    let Some(native::Frame::Control(native::Control::Hello {
-        version,
-        max_chunk,
-        max_window,
-        resume,
-        sha256,
-        fsync,
-        no_replace,
-    })) = hello
-    else {
-        bail!("native helper did not send a compatible hello")
+impl std::error::Error for NativeHelperUnavailable {}
+
+fn expected_native_helper_identity(
+    expected: &ipc::ExpectedNativeHelperIdentity,
+) -> Result<native::HelperRuntimeIdentity> {
+    expected.validate()?;
+    let identity = native::HelperRuntimeIdentity {
+        name: expected.name.clone(),
+        binary_size: expected.binary_size,
+        sha256: expected.sha256.clone(),
+        version: expected.version.clone(),
     };
-    ensure!(version == native::VERSION, "native helper version mismatch");
-    ensure!(
-        sha256 && fsync && no_replace,
-        "native helper lacks required integrity or commit features"
-    );
+    identity.validate()?;
+    Ok(identity)
+}
+
+fn negotiated_native_limits(max_chunk: u32, max_window: u32) -> Result<(u32, u32)> {
     let chunk_bytes = max_chunk
         .min(native::DEFAULT_CHUNK_BYTES)
-        // The same russh channel stall reproduced for the first native frame
-        // above 2 KiB that motivated the SFTP fallback cap. Keep the wire
-        // protocol capable of larger chunks, but negotiate only the largest
-        // complete-channel size for which ACK delivery is currently proven.
-        .min(ipc::SFTP_SAFE_CHUNK_BYTES as u32);
+        .min(ipc::NATIVE_IPC_CHUNK_BYTES as u32);
     let window_bytes = max_window.min(native::MAX_WINDOW_BYTES);
     ensure!(
         chunk_bytes > 0,
@@ -264,7 +897,82 @@ async fn open_native_transfer_channel(
         window_bytes >= chunk_bytes,
         "native helper window is smaller than one chunk"
     );
-    native::write_control(
+    Ok((chunk_bytes, window_bytes))
+}
+
+enum NegotiatedTransferBackend {
+    Native(Box<NativeTransferChannel>),
+    Sftp,
+}
+
+async fn open_native_transfer_channel(
+    session: &SshSession,
+    expected: &ipc::ExpectedNativeHelperIdentity,
+    deadline: Instant,
+) -> Result<NativeTransferChannel> {
+    let stream = session
+        .native_transfer_stream_until(deadline)
+        .await
+        .map_err(NativeHelperUnavailable)?;
+    let (stream, chunk_bytes, window_bytes, resume) =
+        negotiate_native_stream(stream, expected, deadline).await?;
+    Ok(NativeTransferChannel {
+        stream,
+        chunk_bytes,
+        window_bytes,
+        resume,
+    })
+}
+
+async fn negotiate_native_stream<S>(
+    mut stream: S,
+    expected: &ipc::ExpectedNativeHelperIdentity,
+    deadline: Instant,
+) -> Result<(S, u32, u32, bool)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let expected = expected_native_helper_identity(expected)?;
+    let hello = tokio::time::timeout_at(deadline, native::read_frame(&mut stream))
+        .await
+        .map_err(|_| {
+            NativeHelperUnavailable(anyhow::anyhow!(
+                "native helper handshake exceeded its deadline"
+            ))
+        })??;
+    let Some(native::Frame::Control(control)) = hello else {
+        return Err(NativeHelperUnavailable(anyhow::anyhow!(
+            "native helper closed before its identity hello"
+        ))
+        .into());
+    };
+    control.validate_handshake_sender(native::HandshakePeer::Helper)?;
+    let native::Control::HelperHello {
+        version,
+        max_chunk,
+        max_window,
+        resume,
+        sha256,
+        fsync,
+        no_replace,
+        identity,
+    } = control
+    else {
+        bail!("native helper did not send its server-only identity hello")
+    };
+    native::verify_expected_helper_identity(&identity, &expected)?;
+    ensure!(version == native::VERSION, "native helper version mismatch");
+    ensure!(
+        sha256 && fsync && no_replace,
+        "native helper lacks required integrity or commit features"
+    );
+    // SFTP's confirmed-WRITE cap does not apply to this independently framed
+    // helper protocol. The native path uses a bounded 32 KiB IPC payload and
+    // retains the separately negotiated receiver/durability window. Its
+    // transfer loops still wait for the helper's cumulative ACK before
+    // acknowledging the corresponding local IPC chunk.
+    let (chunk_bytes, window_bytes) = negotiated_native_limits(max_chunk, max_window)?;
+    native::write_handshake_control(
         &mut stream,
         &native::Control::Hello {
             version: native::VERSION,
@@ -275,32 +983,33 @@ async fn open_native_transfer_channel(
             fsync: true,
             no_replace: true,
         },
+        native::HandshakePeer::Client,
     )
-    .await?;
-    Ok(NativeTransferChannel {
-        stream,
-        chunk_bytes,
-        window_bytes,
-        resume,
-    })
+    .await
+    .map_err(NativeHelperUnavailable)?;
+    Ok((stream, chunk_bytes, window_bytes, resume))
 }
 
 async fn negotiate_transfer_backend(
     session: &SshSession,
     requested: ipc::TransferBackend,
     resume: ipc::TransferResumeMode,
+    expected_helper_identity: Option<&ipc::ExpectedNativeHelperIdentity>,
     deadline: Instant,
 ) -> Result<(ipc::TransferBackend, NegotiatedTransferBackend)> {
-    if matches!(
-        requested,
-        ipc::TransferBackend::Auto | ipc::TransferBackend::Native
-    ) {
+    if should_probe_native_helper(requested, expected_helper_identity)? {
         let probe_deadline = if requested == ipc::TransferBackend::Auto {
             deadline.min(Instant::now() + Duration::from_secs(2))
         } else {
             deadline
         };
-        match open_native_transfer_channel(session, probe_deadline).await {
+        match open_native_transfer_channel(
+            session,
+            expected_helper_identity.expect("identity presence checked above"),
+            probe_deadline,
+        )
+        .await
+        {
             Ok(channel) => {
                 if resume == ipc::TransferResumeMode::Auto && !channel.resume {
                     bail!("native helper does not support resume=auto")
@@ -310,7 +1019,10 @@ async fn negotiate_transfer_backend(
                     NegotiatedTransferBackend::Native(Box::new(channel)),
                 ));
             }
-            Err(error) if requested == ipc::TransferBackend::Auto => {
+            Err(error)
+                if requested == ipc::TransferBackend::Auto
+                    && error.is::<NativeHelperUnavailable>() =>
+            {
                 log::debug!("native transfer probe fell back to SFTP: {error:#}");
             }
             Err(error) => return Err(error).context("native transfer helper is unavailable"),
@@ -324,6 +1036,17 @@ async fn negotiate_transfer_backend(
         resolved_sftp_backend(requested)?,
         NegotiatedTransferBackend::Sftp,
     ))
+}
+
+fn should_probe_native_helper(
+    requested: ipc::TransferBackend,
+    expected: Option<&ipc::ExpectedNativeHelperIdentity>,
+) -> Result<bool> {
+    validate_expected_helper_for_backend(requested, expected)?;
+    Ok(matches!(
+        requested,
+        ipc::TransferBackend::Auto | ipc::TransferBackend::Native
+    ) && expected.is_some())
 }
 
 fn transfer_progress(
@@ -346,6 +1069,8 @@ fn transfer_progress(
         schema_version: ipc::TRANSFER_PROGRESS_SCHEMA_VERSION,
         event: "progress".to_owned(),
         transfer_id,
+        operation_context_id: None,
+        revision: 0,
         direction,
         stage,
         total_bytes,
@@ -433,6 +1158,7 @@ fn daemon_up_line(
 struct ConnInfo {
     profile: String,
     profile_id: Option<[u8; 16]>,
+    profile_generation: Option<u64>,
     host: String,
     user: String,
     started: i64,
@@ -443,8 +1169,25 @@ impl ConnInfo {
     fn transfer_owner_key(&self) -> String {
         self.profile_id.as_ref().map_or_else(
             || format!("legacy-name:{}", self.profile),
-            |profile_id| format!("profile-id:{}", hex::encode(profile_id)),
+            |profile_id| {
+                format!(
+                    "profile-id:{}:generation:{}",
+                    hex::encode(profile_id),
+                    self.profile_generation.unwrap_or_default()
+                )
+            },
         )
+    }
+
+    fn managed_tunnel_owner(&self) -> Result<ManagedTunnelOwner> {
+        Ok(ManagedTunnelOwner {
+            profile_id: self
+                .profile_id
+                .context("managed tunnels require a generation-bound profile id")?,
+            generation: self
+                .profile_generation
+                .context("managed tunnels require a generation-bound profile")?,
+        })
     }
 }
 
@@ -456,19 +1199,86 @@ struct HandlerContext {
     buffered_operation_slots: Arc<Semaphore>,
     tunnel_control_slots: Arc<Semaphore>,
     transfers: Arc<TransferRegistry>,
+    managed_tunnels: Arc<ManagedTunnelRegistry>,
+    idle: Arc<IdleTracker>,
+    profile_entry: Option<Arc<ProfilePoolEntry>>,
     call_key: Arc<ProfileCallKey>,
     /// Hard upper bound for this root operation. Global-v6 handlers set it to
     /// the earliest credential/grant/request deadline; legacy v5 uses `None`.
     authorization_deadline: Option<Instant>,
 }
 
-fn status_info_frame(info: &ConnInfo) -> ipc::Frame {
+fn status_info_frame(
+    info: &ConnInfo,
+    operation_context_id: Option<ipc::OperationContextId>,
+    revision: u64,
+) -> ipc::Frame {
     ipc::Frame::StatusInfo {
         profile: info.profile.clone(),
         host: info.host.clone(),
         user: info.user.clone(),
         started_unix: info.started,
+        operation_context_id,
+        revision,
     }
+}
+
+fn accepted_operation_context(
+    session: &SshSession,
+    object_id: &str,
+    action: &str,
+) -> Result<(Option<ipc::OperationContextId>, u64)> {
+    let operation_context_id = match ACTIVE_GRANT_AUDIT.try_with(|audit| {
+        audit.operation_context_id(
+            session.connection_identity().transport_attempt_id(),
+            object_id,
+            action,
+        )
+    }) {
+        Ok(result) => Some(result?),
+        Err(_) => None,
+    };
+    let revision = u64::from(operation_context_id.is_some());
+    Ok((operation_context_id, revision))
+}
+
+fn accepted_operation_context_without_ssh(
+    object_id: &str,
+    action: &str,
+) -> Result<(Option<ipc::OperationContextId>, u64)> {
+    let operation_context_id = match ACTIVE_GRANT_AUDIT
+        .try_with(|audit| audit.operation_context_id("no-ssh-transport", object_id, action))
+    {
+        Ok(result) => Some(result?),
+        Err(_) => None,
+    };
+    let revision = u64::from(operation_context_id.is_some());
+    Ok((operation_context_id, revision))
+}
+
+fn connection_identity_frame(info: &ConnInfo, session: &SshSession) -> Result<ipc::Frame> {
+    let snapshot = session.connection_identity();
+    let (operation_context_id, revision) = accepted_operation_context(
+        session,
+        "authenticated-transport",
+        "ssh.connection-identity/accepted",
+    )?;
+    let identity = ipc::SshConnectionIdentity {
+        profile_id: info
+            .profile_id
+            .context("SSH connection identity requires a bound profile id")?,
+        profile_generation: info
+            .profile_generation
+            .context("SSH connection identity requires a bound profile generation")?,
+        observed_host_key_sha256: snapshot.observed_host_key_sha256().to_owned(),
+        pin_match: snapshot.pin_match(),
+        server_identification: snapshot.server_identification().to_owned(),
+        transport_attempt_id: snapshot.transport_attempt_id().to_owned(),
+        operation_context_id,
+        revision,
+    };
+    identity.validate()?;
+    Ok(ipc::Frame::ConnectionIdentityInfo { identity })
 }
 
 struct RuntimeLockGuard {
@@ -549,6 +1359,34 @@ impl SessionManager {
         match tokio::time::timeout_at(deadline, operation).await {
             Ok(result) => result,
             Err(_) => bail!("SSH reconnect exceeded the request deadline"),
+        }
+    }
+
+    /// Acquire an exec channel before any command has been submitted. A russh
+    /// channel-confirmation disconnect can race ahead of `Handle::is_closed()`;
+    /// the core channel-open guard marks that exact Arc unusable, then this
+    /// method reconnects under the original absolute deadline and retries the
+    /// side-effect-free channel acquisition exactly once.
+    async fn open_exec_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(RunningCommand, Arc<SshSession>)> {
+        let current = self.current_until(deadline).await?;
+        match current.open_exec_until(deadline).await {
+            Ok(command) => Ok((command, current)),
+            Err(error) if is_ssh_transport_terminal_error(&error) => {
+                ensure!(
+                    deadline > Instant::now(),
+                    "SSH reconnect exceeded the request deadline"
+                );
+                let replacement = self.current_until(deadline).await?;
+                let command = replacement
+                    .open_exec_until(deadline)
+                    .await
+                    .context("open exec channel after SSH reconnect")?;
+                Ok((command, replacement))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1153,6 +1991,7 @@ async fn run_after_startup_lock_reconciliation(
     let info = ConnInfo {
         profile: profile.to_string(),
         profile_id: None,
+        profile_generation: None,
         host,
         user,
         started: now_unix(),
@@ -1164,6 +2003,8 @@ async fn run_after_startup_lock_reconciliation(
     let buffered_operation_slots = Arc::new(Semaphore::new(BUFFERED_HEAVY_OPERATION_LIMIT));
     let tunnel_control_slots = Arc::new(Semaphore::new(TUNNEL_CONTROL_LIMIT));
     let transfers = Arc::new(TransferRegistry::default());
+    let managed_tunnels = Arc::new(ManagedTunnelRegistry::default());
+    let idle = Arc::new(IdleTracker::default());
     let mut handlers = JoinSet::new();
 
     let mut listener_error = None;
@@ -1194,6 +2035,9 @@ async fn run_after_startup_lock_reconciliation(
                     buffered_operation_slots: Arc::clone(&buffered_operation_slots),
                     tunnel_control_slots: Arc::clone(&tunnel_control_slots),
                     transfers: Arc::clone(&transfers),
+                    managed_tunnels: Arc::clone(&managed_tunnels),
+                    idle: Arc::clone(&idle),
+                    profile_entry: None,
                     call_key: Arc::clone(&call_key),
                     authorization_deadline: None,
                 };
@@ -1272,6 +2116,15 @@ async fn write_frame_until<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    let active_audit = ACTIVE_GRANT_AUDIT.try_with(Arc::clone).ok();
+    let replacement = match active_audit {
+        Some(audit) => audit.before_terminal_frame(frame).await,
+        None => None,
+    };
+    let replacement = replacement.map(ZeroizingResponseFrame);
+    let frame = replacement
+        .as_ref()
+        .map_or(frame, |replacement| &replacement.0);
     if request_deadline <= Instant::now() {
         return Err(
             IpcResponseWriteFailure("IPC response write exceeded its deadline".into()).into(),
@@ -1286,9 +2139,14 @@ where
         | ipc::Frame::TransferDigest { .. }
         | ipc::Frame::TransferProgress { .. }
         | ipc::Frame::TransferStatusInfo { .. }
+        | ipc::Frame::TransferCancelAccepted { .. }
         | ipc::Frame::StatusInfo { .. }
         | ipc::Frame::TunnelReady { .. }
         | ipc::Frame::TunnelClosed
+        | ipc::Frame::ManagedTunnelOpened { .. }
+        | ipc::Frame::ManagedTunnelStatusInfo { .. }
+        | ipc::Frame::ManagedTunnelTerminal { .. }
+        | ipc::Frame::ConnectionIdentityInfo { .. }
         | ipc::Frame::Error { .. } => ipc::MAX_CONTROL_FRAME,
         _ => ipc::MAX_RESPONSE_FRAME,
     };
@@ -1306,6 +2164,356 @@ where
             Err(IpcResponseWriteFailure("IPC response write exceeded its deadline".into()).into())
         }
     }
+}
+
+const AUDIT_STATE_PENDING: usize = 0;
+const AUDIT_STATE_FINALIZING: usize = 1;
+const AUDIT_STATE_COMPLETE: usize = 2;
+const AUDIT_STATE_FAILED: usize = 3;
+
+tokio::task_local! {
+    /// Present only while dispatching one authenticated Grant root request.
+    /// The central response writer uses it to durably append the authoritative
+    /// Outcome before releasing a terminal response to the client.
+    static ACTIVE_GRANT_AUDIT: Arc<GrantAuditOperation>;
+}
+
+struct GrantAuditOperation {
+    ledger: Arc<AuditLedger>,
+    quarantined: Arc<AtomicBool>,
+    profile: vault::ProfileIdentity,
+    request_id: [u8; 16],
+    operation_kind: String,
+    policy_digest: String,
+    intent_digest: String,
+    instance_id: InstanceId,
+    grant_id: [u8; 16],
+    operation_context_key: Arc<OperationContextKey>,
+    deadline: Instant,
+    state: AtomicUsize,
+}
+
+struct AuditTerminal {
+    decision: AuditDecision,
+    reason_code: &'static str,
+    result_material: Vec<u8>,
+}
+
+impl GrantAuditOperation {
+    fn new(
+        record: &GrantRecord,
+        prelude: &V6RequestPrelude,
+        deadline: Instant,
+        instance_id: InstanceId,
+        operation_context_key: Arc<OperationContextKey>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            ledger: Arc::clone(&record.entry.authoritative_audit),
+            quarantined: Arc::clone(&record.entry.quarantined),
+            profile: record.entry.identity,
+            request_id: prelude.request_id,
+            operation_kind: prelude.operation_kind.clone(),
+            policy_digest: record.policy_digest(),
+            intent_digest: hex::encode(prelude.root_request_hash),
+            instance_id,
+            grant_id: record.grant.grant_id,
+            operation_context_key,
+            deadline,
+            state: AtomicUsize::new(AUDIT_STATE_PENDING),
+        })
+    }
+
+    fn operation_context_id(
+        &self,
+        transport_attempt_id: &str,
+        object_id: &str,
+        action: &str,
+    ) -> Result<ipc::OperationContextId> {
+        self.operation_context_key.derive(
+            OperationContextBinding {
+                instance_id: self.instance_id,
+                grant_id: self.grant_id,
+                request_id: self.request_id,
+                profile: self.profile,
+                root_request_hash: hex::decode(&self.intent_digest)
+                    .context("decode retained root request commitment")?
+                    .try_into()
+                    .map_err(|_| {
+                        anyhow::anyhow!("retained root request commitment length changed")
+                    })?,
+            },
+            transport_attempt_id,
+            object_id,
+            action,
+        )
+    }
+
+    fn event(
+        &self,
+        phase: AuditPhase,
+        decision: AuditDecision,
+        reason_code: &str,
+        result_digest: Option<String>,
+    ) -> AuditEvent {
+        AuditEvent {
+            profile_id: hex::encode(self.profile.profile_id),
+            profile_generation: self.profile.generation,
+            request_id: self.request_id,
+            at_unix_ms: now_unix_ms(),
+            operation_kind: self.operation_kind.clone(),
+            phase,
+            decision,
+            policy_digest: self.policy_digest.clone(),
+            intent_digest: self.intent_digest.clone(),
+            result_digest,
+            reason_code: reason_code.to_owned(),
+        }
+    }
+
+    async fn append(&self, event: AuditEvent) -> Result<()> {
+        ensure!(
+            self.deadline > Instant::now(),
+            "authoritative audit persistence deadline expired"
+        );
+        let ledger = Arc::clone(&self.ledger);
+        let mut worker = tokio::task::spawn_blocking(move || ledger.append(&event).map(|_| ()));
+        match tokio::time::timeout_at(self.deadline, &mut worker).await {
+            Ok(result) => result.context("join authoritative audit persistence")?,
+            Err(_) => {
+                worker.abort();
+                bail!("authoritative audit persistence exceeded its deadline")
+            }
+        }
+    }
+
+    async fn record_intent(&self) -> Result<()> {
+        let result = self
+            .append(self.event(
+                AuditPhase::Intent,
+                AuditDecision::Pending,
+                "intent.recorded",
+                None,
+            ))
+            .await;
+        if result.is_err() {
+            self.quarantined.store(true, Ordering::Release);
+        }
+        result.context("persist authoritative grant intent")
+    }
+
+    fn outcome_digest(&self, terminal: &AuditTerminal) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"serctl/audit/grant-result/v1\0");
+        digest.update(self.intent_digest.as_bytes());
+        digest.update(match terminal.decision {
+            AuditDecision::Allowed => b"allowed".as_slice(),
+            AuditDecision::Denied => b"denied".as_slice(),
+            AuditDecision::Succeeded => b"succeeded".as_slice(),
+            AuditDecision::Failed => b"failed".as_slice(),
+            AuditDecision::Unknown => b"unknown".as_slice(),
+            AuditDecision::Pending => b"pending".as_slice(),
+        });
+        digest.update(terminal.reason_code.as_bytes());
+        digest.update((terminal.result_material.len() as u64).to_be_bytes());
+        digest.update(&terminal.result_material);
+        hex::encode(digest.finalize())
+    }
+
+    async fn record_outcome(&self, terminal: AuditTerminal) -> Result<()> {
+        match self.state.compare_exchange(
+            AUDIT_STATE_PENDING,
+            AUDIT_STATE_FINALIZING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(AUDIT_STATE_COMPLETE) => return Ok(()),
+            Err(AUDIT_STATE_FAILED) => bail!("authoritative audit outcome persistence failed"),
+            Err(_) => bail!("authoritative audit outcome is already being finalized"),
+        }
+        let result_digest = self.outcome_digest(&terminal);
+        let result = self
+            .append(self.event(
+                AuditPhase::Outcome,
+                terminal.decision,
+                terminal.reason_code,
+                Some(result_digest),
+            ))
+            .await;
+        match result {
+            Ok(()) => {
+                self.state.store(AUDIT_STATE_COMPLETE, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                self.state.store(AUDIT_STATE_FAILED, Ordering::Release);
+                self.quarantined.store(true, Ordering::Release);
+                Err(error).context("persist authoritative grant outcome")
+            }
+        }
+    }
+
+    fn terminal_for_frame(&self, frame: &ipc::Frame) -> Option<AuditTerminal> {
+        if let ipc::Frame::Error { msg } = frame {
+            let normalized = msg.to_ascii_lowercase();
+            let outcome_unknown = normalized.contains("outcome unknown")
+                || normalized.contains("outcome is unknown")
+                || normalized.contains("may have reached remote");
+            return Some(AuditTerminal {
+                decision: if outcome_unknown {
+                    AuditDecision::Unknown
+                } else {
+                    AuditDecision::Failed
+                },
+                reason_code: if outcome_unknown {
+                    "dispatch.outcome_unknown"
+                } else {
+                    "dispatch.failed"
+                },
+                result_material: Vec::new(),
+            });
+        }
+        match (self.operation_kind.as_str(), frame) {
+            ("ssh.exec", ipc::Frame::ExecExit { code: Some(0), .. }) => Some(AuditTerminal {
+                decision: AuditDecision::Succeeded,
+                reason_code: "dispatch.succeeded",
+                result_material: 0_i32.to_be_bytes().to_vec(),
+            }),
+            (
+                "ssh.exec",
+                ipc::Frame::ExecExit {
+                    code: Some(code), ..
+                },
+            ) => Some(AuditTerminal {
+                decision: AuditDecision::Failed,
+                reason_code: "dispatch.remote_failure",
+                result_material: code.to_be_bytes().to_vec(),
+            }),
+            ("ssh.exec", ipc::Frame::ExecExit { code: None, .. }) => Some(AuditTerminal {
+                decision: AuditDecision::Unknown,
+                reason_code: "dispatch.outcome_unknown",
+                result_material: Vec::new(),
+            }),
+            ("daemon.status", ipc::Frame::StatusInfo { .. })
+            | ("ssh.connection-identity", ipc::Frame::ConnectionIdentityInfo { .. })
+            | ("sftp.list", ipc::Frame::DirList { .. })
+            | ("sftp.write", ipc::Frame::CreateDirAccepted { .. })
+            | ("transfer.status", ipc::Frame::TransferStatusInfo { .. })
+            | ("transfer.cancel", ipc::Frame::TransferCancelAccepted { .. })
+            | ("forward.local/open", ipc::Frame::ManagedTunnelOpened { .. })
+            | ("forward.remote/open", ipc::Frame::ManagedTunnelOpened { .. })
+            | ("forward.dynamic/open", ipc::Frame::ManagedTunnelOpened { .. })
+            | ("forward.status", ipc::Frame::ManagedTunnelStatusInfo { .. })
+            | ("transfer.write", ipc::Frame::TransferDone { .. }) => Some(AuditTerminal {
+                decision: AuditDecision::Succeeded,
+                reason_code: "dispatch.succeeded",
+                result_material: match frame {
+                    ipc::Frame::TransferDone { bytes } => bytes.to_be_bytes().to_vec(),
+                    _ => Vec::new(),
+                },
+            }),
+            (
+                "transfer.read",
+                ipc::Frame::TransferProgress {
+                    progress:
+                        ipc::TransferProgress {
+                            stage: ipc::TransferStage::Completed,
+                            ..
+                        },
+                },
+            ) => Some(AuditTerminal {
+                decision: AuditDecision::Succeeded,
+                reason_code: "dispatch.succeeded",
+                result_material: match frame {
+                    ipc::Frame::TransferProgress { progress } => {
+                        progress.confirmed_bytes.to_be_bytes().to_vec()
+                    }
+                    _ => unreachable!("matched completed transfer progress"),
+                },
+            }),
+            (
+                "forward.cancel",
+                ipc::Frame::ManagedTunnelTerminal {
+                    status:
+                        ipc::TunnelStatus {
+                            stage: ipc::TunnelStage::Closed,
+                            ..
+                        },
+                },
+            ) => Some(AuditTerminal {
+                decision: AuditDecision::Succeeded,
+                reason_code: "dispatch.succeeded",
+                result_material: Vec::new(),
+            }),
+            (
+                "forward.cancel",
+                ipc::Frame::ManagedTunnelTerminal {
+                    status:
+                        ipc::TunnelStatus {
+                            stage: ipc::TunnelStage::Unknown,
+                            ..
+                        },
+                },
+            ) => Some(AuditTerminal {
+                decision: AuditDecision::Unknown,
+                reason_code: "dispatch.outcome_unknown",
+                result_material: Vec::new(),
+            }),
+            _ => None,
+        }
+    }
+
+    async fn before_terminal_frame(&self, frame: &ipc::Frame) -> Option<ipc::Frame> {
+        let terminal = self.terminal_for_frame(frame)?;
+        if self.record_outcome(terminal).await.is_ok() {
+            None
+        } else {
+            Some(ipc::Frame::Error {
+                msg: "operation outcome is unknown because authoritative audit persistence failed; profile quarantined".to_owned(),
+            })
+        }
+    }
+
+    async fn record_denied(&self, reason_code: &'static str) -> Result<()> {
+        self.record_outcome(AuditTerminal {
+            decision: AuditDecision::Denied,
+            reason_code,
+            result_material: Vec::new(),
+        })
+        .await
+    }
+
+    async fn finalize_unknown_if_pending(&self) -> Result<()> {
+        match self.state.load(Ordering::Acquire) {
+            AUDIT_STATE_PENDING => {
+                self.record_outcome(AuditTerminal {
+                    decision: AuditDecision::Unknown,
+                    reason_code: "dispatch.no_terminal_result",
+                    result_material: Vec::new(),
+                })
+                .await
+            }
+            AUDIT_STATE_COMPLETE => Ok(()),
+            AUDIT_STATE_FAILED => bail!("authoritative audit outcome persistence failed"),
+            AUDIT_STATE_FINALIZING => {
+                self.state.store(AUDIT_STATE_FAILED, Ordering::Release);
+                self.quarantined.store(true, Ordering::Release);
+                bail!("authoritative audit outcome finalization was interrupted")
+            }
+            _ => bail!("authoritative audit state is invalid"),
+        }
+    }
+}
+
+fn operation_allowed_while_quarantined(operation_kind: &str) -> bool {
+    matches!(
+        operation_kind,
+        "daemon.status"
+            | "ssh.connection-identity"
+            | "sftp.list"
+            | "transfer.read"
+            | "transfer.status"
+    ) || operation_kind.starts_with("audit.")
 }
 
 async fn write_frame_or_shutdown<W>(
@@ -1396,18 +2604,37 @@ fn validate_request_frame(frame: &ipc::Frame) -> Result<()> {
         }
         ipc::Frame::ListDir { path, .. } => validate_remote_path(path, true)?,
         ipc::Frame::CreateDir { path, .. } => validate_remote_path(path, false)?,
+        ipc::Frame::ConnectionIdentity {
+            profile_generation, ..
+        } => ensure!(
+            *profile_generation > 0,
+            "SSH connection identity request generation must be positive"
+        ),
         ipc::Frame::Download {
             path,
+            local_target_sha256,
+            backend,
             resume,
             resume_offset,
             expected_size,
             expected_sha256,
+            expected_helper_identity,
             idle_timeout_ms,
             deadline_ms,
             ..
         } => {
             validate_remote_path(path, false)?;
+            if let Some(commitment) = local_target_sha256 {
+                ensure!(
+                    commitment.len() == 64
+                        && commitment
+                            .bytes()
+                            .all(|byte| { byte.is_ascii_digit() || matches!(byte, b'a'..=b'f') }),
+                    "download local-target commitment must be 64 lowercase hex characters"
+                );
+            }
             validate_transfer_timeouts(*idle_timeout_ms, *deadline_ms)?;
+            validate_expected_helper_for_backend(*backend, expected_helper_identity.as_deref())?;
             match (resume, resume_offset, expected_size, expected_sha256) {
                 (ipc::TransferResumeMode::Never, 0, None, None) => {}
                 (ipc::TransferResumeMode::Auto, 0, None, None) => {}
@@ -1424,8 +2651,10 @@ fn validate_request_frame(frame: &ipc::Frame) -> Result<()> {
             path,
             size,
             sha256,
+            backend,
             resume,
             resume_token,
+            expected_helper_identity,
             idle_timeout_ms,
             deadline_ms,
             ..
@@ -1439,6 +2668,7 @@ fn validate_request_frame(frame: &ipc::Frame) -> Result<()> {
                 "upload SHA-256 must be 64 lowercase hex characters"
             );
             validate_transfer_timeouts(*idle_timeout_ms, *deadline_ms)?;
+            validate_expected_helper_for_backend(*backend, expected_helper_identity.as_deref())?;
             match (resume, resume_token) {
                 (ipc::TransferResumeMode::Never, None) => {}
                 (ipc::TransferResumeMode::Auto, Some(token))
@@ -1464,9 +2694,76 @@ fn validate_request_frame(frame: &ipc::Frame) -> Result<()> {
             bail!("upload chunk exceeds {MAX_UPLOAD_CHUNK_BYTES} bytes");
         }
         ipc::Frame::TunnelOpen { spec } => spec.validate()?,
+        ipc::Frame::ManagedTunnelOpen {
+            spec,
+            deadline_unix_ms,
+        } => {
+            spec.validate()?;
+            let now = now_unix_ms();
+            ensure!(*deadline_unix_ms > now, "tunnel deadline has expired");
+            ensure!(
+                deadline_unix_ms.saturating_sub(now) <= ipc::MAX_EXEC_TIMEOUT_MS,
+                "tunnel deadline is outside the supported range"
+            );
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn validate_grant_frame_binding(frame: &ipc::Frame) -> Result<()> {
+    if matches!(
+        frame,
+        ipc::Frame::Download {
+            local_target_sha256: None,
+            ..
+        }
+    ) {
+        bail!("grant-authorized downloads require a local-target commitment");
+    }
+    if let ipc::Frame::TransferCancel {
+        operation_context_id: None,
+        ..
+    } = frame
+    {
+        bail!("grant-authorized transfer cancellation requires an operation context id");
+    }
+    Ok(())
+}
+
+fn validate_connection_identity_binding(
+    frame: &ipc::Frame,
+    identity: vault::ProfileIdentity,
+) -> Result<()> {
+    if let ipc::Frame::ConnectionIdentity {
+        profile_id,
+        profile_generation,
+    } = frame
+    {
+        ensure!(
+            *profile_id == identity.profile_id && *profile_generation == identity.generation,
+            "SSH connection identity request does not match the authorized profile generation"
+        );
+    }
+    Ok(())
+}
+
+fn validate_expected_helper_for_backend(
+    backend: ipc::TransferBackend,
+    expected: Option<&ipc::ExpectedNativeHelperIdentity>,
+) -> Result<()> {
+    if let Some(expected) = expected {
+        expected.validate()?;
+    }
+    match (backend, expected) {
+        (ipc::TransferBackend::Native, None) => {
+            bail!("backend=native requires an exact expected Linux helper identity")
+        }
+        (ipc::TransferBackend::Sftp | ipc::TransferBackend::SftpFallback, Some(_)) => {
+            bail!("an expected native helper identity is invalid for an explicit SFTP backend")
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_transfer_timeouts(idle_timeout_ms: u64, deadline_ms: Option<u64>) -> Result<()> {
@@ -1588,6 +2885,9 @@ where
         buffered_operation_slots,
         tunnel_control_slots,
         transfers,
+        managed_tunnels,
+        idle,
+        profile_entry,
         call_key,
         authorization_deadline,
     } = context;
@@ -1638,6 +2938,9 @@ where
         buffered_operation_slots,
         tunnel_control_slots,
         transfers,
+        managed_tunnels,
+        idle,
+        profile_entry,
         call_key,
         authorization_deadline,
     };
@@ -1697,8 +3000,11 @@ where
         buffered_operation_slots,
         tunnel_control_slots,
         transfers,
+        managed_tunnels,
+        idle,
+        profile_entry,
         call_key: _call_key,
-        authorization_deadline: _,
+        authorization_deadline,
     } = context;
     let transfer_owner = info.transfer_owner_key();
     if let Err(error) = validate_request_frame(&frame) {
@@ -1715,6 +3021,44 @@ where
         return Ok(());
     }
     match frame {
+        ipc::Frame::ConnectionIdentity {
+            profile_id,
+            profile_generation,
+        } => {
+            ensure!(
+                info.profile_id == Some(profile_id)
+                    && info.profile_generation == Some(profile_generation),
+                "SSH connection identity request does not match the dispatch profile generation"
+            );
+            let deadline = authorization_deadline
+                .context("SSH connection identity requires bounded authorization")?
+                .min(Instant::now() + CONTROL_SETUP_TIMEOUT);
+            let session =
+                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: terminal_safe_error(&error),
+                            },
+                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            let response = connection_identity_frame(&info, &session)?;
+            write_frame_or_shutdown(
+                &mut wr,
+                &response,
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await?;
+        }
         ipc::Frame::Exec { cmd, timeout_ms } => {
             let cmd = Zeroizing::new(cmd);
             let timeout = match validated_exec_timeout(timeout_ms) {
@@ -1756,33 +3100,13 @@ where
                     return Ok(());
                 }
             };
-            let session =
-                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
-                    Ok(Some(session)) => session,
-                    Ok(None) => return Ok(()),
-                    Err(error) => {
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            deadline,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
-            let mut command = match tokio::select! {
-                result = session.open_exec_until(deadline) => Some(result),
+            let command = match tokio::select! {
+                result = sessions.open_exec_until(deadline) => Some(result),
                 _ = rd.read_u8() => None,
                 _ = shutdown_rx.changed() => None,
             } {
                 Some(Ok(command)) => command,
-                None => {
-                    session.invalidate().await;
-                    return Ok(());
-                }
+                None => return Ok(()),
                 Some(Err(error)) => {
                     write_owned_frame_or_shutdown(
                         &mut wr,
@@ -1796,6 +3120,12 @@ where
                     return Ok(());
                 }
             };
+            let (mut command, command_session) = command;
+            let (operation_context_id, revision) = accepted_operation_context(
+                &command_session,
+                "remote-command",
+                "ssh.exec/accepted",
+            )?;
             let requested = tokio::select! {
                 result = command.request_exec_until(cmd.as_str(), deadline) => Some(result),
                 _ = rd.read_u8() => None,
@@ -1847,7 +3177,11 @@ where
                         ).await?;
                         write_frame_or_shutdown(
                             &mut wr,
-                            &ipc::Frame::ExecExit { code },
+                            &ipc::Frame::ExecExit {
+                                code,
+                                operation_context_id,
+                                revision,
+                            },
                             deadline,
                             &mut shutdown_rx,
                         ).await?;
@@ -2042,37 +3376,35 @@ where
             // Status is exact-intent call-key authorized before dispatch.
             // It still reports only daemon lifetime metadata and never
             // probes SSH health or reconnects with the retained password.
+            let (operation_context_id, revision) = accepted_operation_context_without_ssh(
+                "daemon-lifetime-metadata",
+                "daemon.status/accepted",
+            )?;
             write_owned_frame_or_shutdown(
                 &mut wr,
-                status_info_frame(&info),
+                status_info_frame(&info, operation_context_id, revision),
                 deadline,
                 &mut shutdown_rx,
             )
             .await?;
         }
-        ipc::Frame::TransferStatus { transfer_id } => {
-            let snapshots = transfers.snapshots(&transfer_owner, transfer_id.as_ref())?;
-            write_owned_frame_or_shutdown(
-                &mut wr,
-                ipc::Frame::TransferStatusInfo {
-                    transfers: snapshots,
-                },
-                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                &mut shutdown_rx,
-            )
-            .await?;
-        }
-        ipc::Frame::TransferCancel { transfer_id } => {
-            match transfers.cancel(&transfer_owner, &transfer_id) {
-                Ok(()) => {
-                    write_frame_or_shutdown(
-                        &mut wr,
-                        &ipc::Frame::Ack,
-                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                        &mut shutdown_rx,
-                    )
-                    .await?;
-                }
+        ipc::Frame::TransferStatus {
+            transfer_id,
+            operation_context_id,
+        } => {
+            if operation_context_id.is_some() {
+                ensure!(
+                    transfer_id.is_some(),
+                    "transfer context requires one transfer id"
+                );
+            }
+            let snapshots = match transfers.snapshots(
+                &transfer_owner,
+                transfer_id.as_ref(),
+                operation_context_id.as_ref(),
+                ACTIVE_GRANT_AUDIT.try_with(|_| ()).is_ok(),
+            ) {
+                Ok(snapshots) => snapshots,
                 Err(error) => {
                     write_owned_frame_or_shutdown(
                         &mut wr,
@@ -2083,9 +3415,61 @@ where
                         &mut shutdown_rx,
                     )
                     .await?;
+                    return Ok(());
                 }
+            };
+            if transfer_id.is_some() && snapshots.is_empty() {
+                write_owned_frame_or_shutdown(
+                    &mut wr,
+                    ipc::Frame::Error {
+                        msg: "transfer outcome unknown: object is not registered in this daemon instance"
+                            .to_owned(),
+                    },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await?;
+                return Ok(());
             }
+            write_owned_frame_or_shutdown(
+                &mut wr,
+                ipc::Frame::TransferStatusInfo {
+                    transfers: snapshots,
+                },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await?;
         }
+        ipc::Frame::TransferCancel {
+            transfer_id,
+            operation_context_id,
+        } => match transfers.cancel(&transfer_owner, &transfer_id, operation_context_id.as_ref()) {
+            Ok(progress) => {
+                write_frame_or_shutdown(
+                    &mut wr,
+                    &ipc::Frame::TransferCancelAccepted { progress },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await?;
+            }
+            Err(error) => {
+                let message = if error.to_string().contains("was not found") {
+                    "transfer outcome unknown: object is not registered in this daemon instance"
+                        .to_owned()
+                } else {
+                    error.to_string()
+                };
+                write_owned_frame_or_shutdown(
+                    &mut wr,
+                    ipc::Frame::Error { msg: message },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await?;
+            }
+        },
         ipc::Frame::ListDir { path, timeout_ms } => {
             let timeout = match validated_sftp_timeout(timeout_ms) {
                 Ok(timeout) => timeout,
@@ -2143,6 +3527,8 @@ where
                         return Ok(());
                     }
                 };
+            let (operation_context_id, revision) =
+                accepted_operation_context(&session, "directory-listing", "sftp.list/accepted")?;
             let result = match tokio::select! {
                 result = session.list_dir_until(&path, deadline) => Some(result),
                 _ = rd.read_u8() => None,
@@ -2158,7 +3544,12 @@ where
                 Ok((path, entries)) => {
                     write_owned_frame_or_shutdown(
                         &mut wr,
-                        ipc::Frame::DirList { path, entries },
+                        ipc::Frame::DirList {
+                            path,
+                            entries,
+                            operation_context_id,
+                            revision,
+                        },
                         deadline,
                         &mut shutdown_rx,
                     )
@@ -2211,6 +3602,8 @@ where
                         return Ok(());
                     }
                 };
+            let (operation_context_id, revision) =
+                accepted_operation_context(&session, &path, "sftp.write/create-dir/accepted")?;
             let result = match tokio::select! {
                 result = session.create_dir_until(&path, deadline) => Some(result),
                 _ = rd.read_u8() => None,
@@ -2224,8 +3617,26 @@ where
             };
             match result {
                 Ok(()) => {
-                    write_frame_or_shutdown(&mut wr, &ipc::Frame::Ack, deadline, &mut shutdown_rx)
+                    if operation_context_id.is_some() {
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::CreateDirAccepted {
+                                operation_context_id,
+                                revision,
+                            },
+                            deadline,
+                            &mut shutdown_rx,
+                        )
                         .await?;
+                    } else {
+                        write_frame_or_shutdown(
+                            &mut wr,
+                            &ipc::Frame::Ack,
+                            deadline,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                    }
                 }
                 Err(error) => {
                     write_owned_frame_or_shutdown(
@@ -2243,11 +3654,13 @@ where
         ipc::Frame::Download {
             transfer_id,
             path,
+            local_target_sha256: _,
             backend,
             resume,
             resume_offset,
             expected_size,
             expected_sha256,
+            expected_helper_identity,
             idle_timeout_ms,
             deadline_ms,
         } => {
@@ -2260,6 +3673,54 @@ where
                 0,
                 backend,
             );
+            let timeout =
+                match validated_sftp_timeout(deadline_ms.unwrap_or(ipc::MAX_SFTP_TIMEOUT_MS)) {
+                    Ok(timeout) => timeout,
+                    Err(error) => {
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            let deadline = Instant::now() + timeout;
+            let session =
+                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                            deadline,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            initial.operation_context_id = ACTIVE_GRANT_AUDIT
+                .try_with(|audit| {
+                    audit.operation_context_id(
+                        session.connection_identity().transport_attempt_id(),
+                        transfer_id.as_str(),
+                        "transfer.read/accepted",
+                    )
+                })
+                .ok()
+                .transpose()?;
+            initial.revision = u64::from(initial.operation_context_id.is_some());
+            if initial.operation_context_id.is_some() {
+                initial.event = "accepted".to_owned();
+            }
             let cancellation = transfers.begin(&transfer_owner, initial.clone())?;
             if let Err(error) = write_frame_or_shutdown(
                 &mut wr,
@@ -2280,67 +3741,11 @@ where
                 )?;
                 return Err(error);
             }
-            let timeout =
-                match validated_sftp_timeout(deadline_ms.unwrap_or(ipc::MAX_SFTP_TIMEOUT_MS)) {
-                    Ok(timeout) => timeout,
-                    Err(error) => {
-                        finish_transfer_setup(
-                            &transfers,
-                            &transfer_owner,
-                            initial,
-                            ipc::TransferStage::Failed,
-                            "failed",
-                        )?;
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
-            let deadline = Instant::now() + timeout;
-            let session =
-                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
-                    Ok(Some(session)) => session,
-                    Ok(None) => {
-                        finish_transfer_setup(
-                            &transfers,
-                            &transfer_owner,
-                            initial,
-                            ipc::TransferStage::Cancelled,
-                            "cancelled",
-                        )?;
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        finish_transfer_setup(
-                            &transfers,
-                            &transfer_owner,
-                            initial,
-                            ipc::TransferStage::Failed,
-                            "failed",
-                        )?;
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            deadline,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
             let (actual_backend, negotiated) = match negotiate_transfer_backend(
                 &session,
                 backend,
                 resume,
+                expected_helper_identity.as_deref(),
                 deadline.min(Instant::now() + Duration::from_millis(idle_timeout_ms)),
             )
             .await
@@ -2370,7 +3775,10 @@ where
             match &negotiated {
                 NegotiatedTransferBackend::Native(channel) => {
                     initial.chunk_bytes = channel.chunk_bytes;
-                    initial.window_bytes = channel.window_bytes;
+                    // Native transfer is currently one data frame per helper
+                    // acknowledgement. Report the effective in-flight window,
+                    // not the larger receiver/durability negotiation ceiling.
+                    initial.window_bytes = channel.chunk_bytes;
                 }
                 NegotiatedTransferBackend::Sftp => {
                     initial.chunk_bytes = ipc::SFTP_SAFE_CHUNK_BYTES as u32;
@@ -2436,6 +3844,7 @@ where
             backend,
             resume,
             resume_token,
+            expected_helper_identity,
             idle_timeout_ms,
             deadline_ms,
         } => {
@@ -2448,6 +3857,54 @@ where
                 0,
                 backend,
             );
+            let timeout =
+                match validated_sftp_timeout(deadline_ms.unwrap_or(ipc::MAX_SFTP_TIMEOUT_MS)) {
+                    Ok(timeout) => timeout,
+                    Err(error) => {
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            let deadline = Instant::now() + timeout;
+            let session =
+                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                            deadline,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            initial.operation_context_id = ACTIVE_GRANT_AUDIT
+                .try_with(|audit| {
+                    audit.operation_context_id(
+                        session.connection_identity().transport_attempt_id(),
+                        initial.transfer_id.as_str(),
+                        "transfer.write/accepted",
+                    )
+                })
+                .ok()
+                .transpose()?;
+            initial.revision = u64::from(initial.operation_context_id.is_some());
+            if initial.operation_context_id.is_some() {
+                initial.event = "accepted".to_owned();
+            }
             let cancellation = transfers.begin(&transfer_owner, initial.clone())?;
             if let Err(error) = write_frame_or_shutdown(
                 &mut wr,
@@ -2468,67 +3925,11 @@ where
                 )?;
                 return Err(error);
             }
-            let timeout =
-                match validated_sftp_timeout(deadline_ms.unwrap_or(ipc::MAX_SFTP_TIMEOUT_MS)) {
-                    Ok(timeout) => timeout,
-                    Err(error) => {
-                        finish_transfer_setup(
-                            &transfers,
-                            &transfer_owner,
-                            initial,
-                            ipc::TransferStage::Failed,
-                            "failed",
-                        )?;
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
-            let deadline = Instant::now() + timeout;
-            let session =
-                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, deadline).await {
-                    Ok(Some(session)) => session,
-                    Ok(None) => {
-                        finish_transfer_setup(
-                            &transfers,
-                            &transfer_owner,
-                            initial,
-                            ipc::TransferStage::Cancelled,
-                            "cancelled",
-                        )?;
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        finish_transfer_setup(
-                            &transfers,
-                            &transfer_owner,
-                            initial,
-                            ipc::TransferStage::Failed,
-                            "failed",
-                        )?;
-                        write_owned_frame_or_shutdown(
-                            &mut wr,
-                            ipc::Frame::Error {
-                                msg: error.to_string(),
-                            },
-                            deadline,
-                            &mut shutdown_rx,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
             let (actual_backend, negotiated) = match negotiate_transfer_backend(
                 &session,
                 backend,
                 resume,
+                expected_helper_identity.as_deref(),
                 deadline.min(Instant::now() + Duration::from_millis(idle_timeout_ms)),
             )
             .await
@@ -2558,7 +3959,10 @@ where
             match &negotiated {
                 NegotiatedTransferBackend::Native(channel) => {
                     initial.chunk_bytes = channel.chunk_bytes;
-                    initial.window_bytes = channel.window_bytes;
+                    // Native transfer is currently one data frame per helper
+                    // acknowledgement. Report the effective in-flight window,
+                    // not the larger receiver/durability negotiation ceiling.
+                    initial.window_bytes = channel.chunk_bytes;
                 }
                 NegotiatedTransferBackend::Sftp => {
                     initial.chunk_bytes = ipc::SFTP_SAFE_CHUNK_BYTES as u32;
@@ -2622,6 +4026,187 @@ where
             // request loop from ever treating a partial upload frame as a
             // new request header.
             return Ok(());
+        }
+        ipc::Frame::ManagedTunnelOpen {
+            spec,
+            deadline_unix_ms,
+        } => {
+            let owner = info.managed_tunnel_owner()?;
+            let setup_deadline = authorization_deadline
+                .unwrap_or_else(|| Instant::now() + CONTROL_SETUP_TIMEOUT)
+                .min(Instant::now() + CONTROL_SETUP_TIMEOUT);
+            let _tunnel_control_permit = match acquire_tunnel_control_slot(
+                Arc::clone(&tunnel_control_slots),
+                &mut rd,
+                &mut shutdown_rx,
+                setup_deadline,
+            )
+            .await
+            {
+                Ok(Some(permit)) => permit,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let session =
+                match current_or_disconnect(&sessions, &mut rd, &mut shutdown_rx, setup_deadline)
+                    .await
+                {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: error.to_string(),
+                            },
+                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            &mut shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            let tunnel = match session.start_tunnel(spec.clone(), setup_deadline).await {
+                Ok(tunnel) => tunnel,
+                Err(error) => {
+                    write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error {
+                            msg: error.to_string(),
+                        },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let tunnel_id = ipc::TunnelId::random();
+            let action = match spec.mode() {
+                ipc::TunnelMode::Local => "forward.local/open/accepted",
+                ipc::TunnelMode::Remote => "forward.remote/open/accepted",
+                ipc::TunnelMode::Dynamic => "forward.dynamic/open/accepted",
+            };
+            let (operation_context_id, _) =
+                accepted_operation_context(&session, tunnel_id.as_str(), action)?;
+            let status = managed_tunnel_status(
+                &owner,
+                tunnel_id.clone(),
+                &spec,
+                tunnel.ready(),
+                deadline_unix_ms,
+                operation_context_id,
+            )?;
+            let remaining_ms = deadline_unix_ms.saturating_sub(now_unix_ms()).max(1);
+            let tunnel_deadline = Instant::now() + Duration::from_millis(remaining_ms);
+            let cancellation = tunnel.cancellation_token();
+            if let Err(error) = managed_tunnels.begin(
+                owner.clone(),
+                status.clone(),
+                cancellation,
+                idle.acquire(),
+                profile_entry,
+            ) {
+                let cleanup = tunnel.stop().await;
+                if cleanup.is_err() {
+                    sessions.invalidate_current().await;
+                }
+                write_owned_frame_or_shutdown(
+                    &mut wr,
+                    ipc::Frame::Error {
+                        msg: error.to_string(),
+                    },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await?;
+                return Ok(());
+            }
+            spawn_managed_tunnel_worker(
+                Arc::clone(&managed_tunnels),
+                owner,
+                tunnel_id,
+                tunnel,
+                tunnel_deadline,
+                shutdown_rx.clone(),
+            );
+            write_frame_or_shutdown(
+                &mut wr,
+                &ipc::Frame::ManagedTunnelOpened { status },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await?;
+        }
+        ipc::Frame::ManagedTunnelStatus {
+            tunnel_id,
+            operation_context_id,
+        } => {
+            let owner = info.managed_tunnel_owner()?;
+            ensure!(
+                operation_context_id.is_none() || tunnel_id.is_some(),
+                "managed tunnel operation context requires an exact tunnel id"
+            );
+            let tunnels = managed_tunnels.snapshots(
+                &owner,
+                tunnel_id.as_ref(),
+                operation_context_id.as_ref(),
+                tunnel_id.is_some(),
+            )?;
+            if tunnel_id.is_some() && tunnels.is_empty() {
+                write_owned_frame_or_shutdown(
+                    &mut wr,
+                    ipc::Frame::Error {
+                        msg: "tunnel was not found for this profile".to_owned(),
+                    },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await?;
+                return Ok(());
+            }
+            write_frame_or_shutdown(
+                &mut wr,
+                &ipc::Frame::ManagedTunnelStatusInfo { tunnels },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await?;
+        }
+        ipc::Frame::ManagedTunnelCancel {
+            tunnel_id,
+            operation_context_id,
+        } => {
+            let owner = info.managed_tunnel_owner()?;
+            let cancel_deadline = authorization_deadline
+                .unwrap_or_else(|| Instant::now() + MANAGED_TUNNEL_CANCEL_TIMEOUT)
+                .min(Instant::now() + MANAGED_TUNNEL_CANCEL_TIMEOUT);
+            let status = managed_tunnels
+                .cancel_and_wait(
+                    &owner,
+                    &tunnel_id,
+                    operation_context_id.as_ref(),
+                    cancel_deadline,
+                )
+                .await?;
+            write_frame_or_shutdown(
+                &mut wr,
+                &ipc::Frame::ManagedTunnelTerminal { status },
+                Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                &mut shutdown_rx,
+            )
+            .await?;
         }
         ipc::Frame::TunnelOpen { spec } => {
             let deadline = Instant::now() + CONTROL_SETUP_TIMEOUT;
@@ -2695,11 +4280,29 @@ static GRANT_AUDIT_LOCK: std::sync::LazyLock<StdMutex<()>> =
     std::sync::LazyLock::new(|| StdMutex::new(()));
 
 struct ProfilePoolEntry {
+    identity: vault::ProfileIdentity,
     conn_info: ConnInfo,
     sessions: Arc<SessionManager>,
     call_key: Arc<ProfileCallKey>,
+    authoritative_audit: Arc<AuditLedger>,
+    quarantined: Arc<AtomicBool>,
     expires_at: Instant,
     _lease: Arc<vault::ProfileLease>,
+}
+
+trait GrantProfileBinding {
+    fn identity(&self) -> vault::ProfileIdentity;
+    fn profile_name(&self) -> &str;
+}
+
+impl GrantProfileBinding for ProfilePoolEntry {
+    fn identity(&self) -> vault::ProfileIdentity {
+        self.identity
+    }
+
+    fn profile_name(&self) -> &str {
+        &self.conn_info.profile
+    }
 }
 
 #[derive(Default)]
@@ -2789,17 +4392,25 @@ impl Drop for IdleGuard {
     }
 }
 
-/// Operation kinds the current Agent JSONL gateway can actually consume.
-/// Keep issuance fail-closed until a corresponding AgentRequest handler exists;
-/// otherwise a syntactically valid Grant would advertise an unusable capability.
+/// Exact data-plane operation kinds accepted by the authenticated daemon.
 /// Interactive shells and control operations (unlock, shutdown, grant issuance)
-/// are never grantable.
+/// are never grantable. Tunnel scopes deliberately distinguish mode and
+/// lifecycle action so one Grant cannot be replayed as a broader forward.
 const GRANTABLE_OPERATION_KINDS: &[&str] = &[
     "ssh.exec",
+    "ssh.connection-identity",
     "daemon.status",
     "sftp.list",
     "sftp.write",
+    "transfer.read",
     "transfer.write",
+    "transfer.status",
+    "transfer.cancel",
+    "forward.local/open",
+    "forward.remote/open",
+    "forward.dynamic/open",
+    "forward.status",
+    "forward.cancel",
 ];
 
 const UNKNOWN_GRANT_ERROR: &str = "grant is not registered in this daemon instance; the daemon may have restarted, so reissue the grant";
@@ -2813,51 +4424,166 @@ fn now_unix_ms() -> u64 {
 
 /// Live registry of issued grants. Grants die with the daemon instance: a
 /// restart rebinds every capability to a fresh activation secret.
-struct GrantRegistry {
-    grants: StdMutex<HashMap<[u8; 16], Arc<GrantRecord>>>,
+const GRANT_TERMINAL_TOMBSTONE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GrantTerminalKind {
+    Exhausted,
+    Expired,
+}
+
+struct GrantTombstone {
+    kind: GrantTerminalKind,
+    expires_at: Instant,
+    forget_at: Instant,
+}
+
+struct GrantRegistryState<E> {
+    live: HashMap<[u8; 16], Arc<GrantRecord<E>>>,
+    tombstones: HashMap<[u8; 16], GrantTombstone>,
+}
+
+enum GrantLookup<E> {
+    Live(Arc<GrantRecord<E>>),
+    Exhausted,
+    Expired,
+    Unknown,
+}
+
+struct GrantRegistry<E = ProfilePoolEntry> {
+    state: StdMutex<GrantRegistryState<E>>,
     idle: Arc<IdleTracker>,
 }
 
-impl GrantRegistry {
+impl<E: GrantProfileBinding> GrantRegistry<E> {
     fn new(idle: Arc<IdleTracker>) -> Self {
         Self {
-            grants: StdMutex::new(HashMap::new()),
+            state: StdMutex::new(GrantRegistryState {
+                live: HashMap::new(),
+                tombstones: HashMap::new(),
+            }),
             idle,
         }
     }
 
-    fn get(&self, grant_id: &[u8; 16]) -> Option<Arc<GrantRecord>> {
-        self.grants.lock().ok()?.get(grant_id).cloned()
+    fn prune_locked(state: &mut GrantRegistryState<E>, now: Instant) {
+        state
+            .tombstones
+            .retain(|_, tombstone| tombstone.forget_at > now);
+        let expired_ids: Vec<_> = state
+            .live
+            .iter()
+            .filter_map(|(grant_id, record)| (record.expires_at <= now).then_some(*grant_id))
+            .collect();
+        for grant_id in expired_ids {
+            let Some(record) = state.live.remove(&grant_id) else {
+                continue;
+            };
+            let forget_at = record
+                .expires_at
+                .checked_add(GRANT_TERMINAL_TOMBSTONE_TTL)
+                .unwrap_or(record.expires_at);
+            if forget_at > now {
+                state.tombstones.insert(
+                    grant_id,
+                    GrantTombstone {
+                        kind: GrantTerminalKind::Expired,
+                        expires_at: record.expires_at,
+                        forget_at,
+                    },
+                );
+            }
+        }
     }
 
-    fn insert(&self, grant: serctl_protocol::grant::OperationGrant) -> Result<()> {
-        let mut grants = self
-            .grants
+    fn lookup(&self, grant_id: &[u8; 16], now: Instant) -> GrantLookup<E> {
+        let Ok(mut state) = self.state.lock() else {
+            return GrantLookup::Unknown;
+        };
+        Self::prune_locked(&mut state, now);
+        if let Some(record) = state.live.get(grant_id) {
+            return GrantLookup::Live(Arc::clone(record));
+        }
+        match state.tombstones.get(grant_id) {
+            Some(tombstone)
+                if tombstone.kind == GrantTerminalKind::Exhausted && now < tombstone.expires_at =>
+            {
+                GrantLookup::Exhausted
+            }
+            Some(_) => GrantLookup::Expired,
+            None => GrantLookup::Unknown,
+        }
+    }
+
+    fn insert(&self, grant: serctl_protocol::grant::OperationGrant, entry: Arc<E>) -> Result<()> {
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| anyhow::anyhow!("grant registry lock is poisoned"))?;
         let now = Instant::now();
-        grants.retain(|_, record| record.expires_at > now);
+        Self::prune_locked(&mut state, now);
         ensure!(
-            grants.len() < GRANT_REGISTRY_LIMIT,
+            state.live.len() + state.tombstones.len() < GRANT_REGISTRY_LIMIT,
             "grant registry is at its capacity"
         );
-        ensure!(!grants.contains_key(&grant.grant_id), "grant id collision");
+        ensure!(
+            !state.live.contains_key(&grant.grant_id)
+                && !state.tombstones.contains_key(&grant.grant_id),
+            "grant id collision"
+        );
         let idle_guard = self.idle.acquire();
-        let record = GrantRecord::new(grant, now, idle_guard)?;
-        grants.insert(record.grant.grant_id, Arc::new(record));
+        let record = GrantRecord::new(grant, entry, now, idle_guard)?;
+        state.live.insert(record.grant.grant_id, Arc::new(record));
         Ok(())
     }
 
+    fn mark_terminal_if_same(
+        &self,
+        grant_id: &[u8; 16],
+        expected: &Arc<GrantRecord<E>>,
+        kind: GrantTerminalKind,
+        now: Instant,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            Self::prune_locked(&mut state, now);
+            let should_remove = state
+                .live
+                .get(grant_id)
+                .is_some_and(|current| Arc::ptr_eq(current, expected));
+            if should_remove {
+                let record = state
+                    .live
+                    .remove(grant_id)
+                    .expect("grant checked under the registry lock");
+                let forget_at = record
+                    .expires_at
+                    .checked_add(GRANT_TERMINAL_TOMBSTONE_TTL)
+                    .unwrap_or(record.expires_at);
+                state.tombstones.insert(
+                    *grant_id,
+                    GrantTombstone {
+                        kind,
+                        expires_at: record.expires_at,
+                        forget_at,
+                    },
+                );
+            }
+        }
+    }
+
     fn prune_expired(&self, now: Instant) {
-        if let Ok(mut grants) = self.grants.lock() {
-            grants.retain(|_, record| record.expires_at > now);
+        if let Ok(mut state) = self.state.lock() {
+            Self::prune_locked(&mut state, now);
         }
     }
 }
 
 /// One grant plus its remaining budget and audit sink.
-struct GrantRecord {
+struct GrantRecord<E = ProfilePoolEntry> {
     grant: serctl_protocol::grant::OperationGrant,
+    /// Exact credential/session/profile-use lease captured at issuance. Grant
+    /// requests never remap through the mutable profile pool.
+    entry: Arc<E>,
     remaining: AtomicUsize,
     expires_at: Instant,
     _idle_guard: IdleGuard,
@@ -2873,28 +4599,63 @@ struct GrantAuditLine {
     outcome: String,
 }
 
-impl GrantRecord {
+impl<E: GrantProfileBinding> GrantRecord<E> {
     fn new(
         grant: serctl_protocol::grant::OperationGrant,
+        entry: Arc<E>,
         issued_at: Instant,
         idle_guard: IdleGuard,
     ) -> Result<Self> {
         let ttl = grant.policy_ttl()?;
+        ensure!(
+            entry.identity().profile_id == grant.profile_id,
+            "grant profile id does not match its bound profile entry"
+        );
+        ensure!(
+            entry.identity().generation == grant.profile_generation,
+            "grant profile generation does not match its bound profile entry"
+        );
+        ensure!(
+            entry.profile_name() == grant.profile_name,
+            "grant profile name does not match its bound profile entry"
+        );
         let expires_at = issued_at
             .checked_add(ttl)
             .context("grant monotonic expiry overflow")?;
         Ok(Self {
             remaining: AtomicUsize::new(grant.budget as usize),
             grant,
+            entry,
             expires_at,
             _idle_guard: idle_guard,
         })
     }
 
-    /// Validate expiry, requested deadline, scope, and proof of possession,
-    /// then atomically spend one budget unit.
-    fn check_and_spend(&self, prelude: &V6RequestPrelude, now: Instant, now_ms: u64) -> Result<()> {
+    /// Validate immutable binding, expiry, requested deadline, scope, and
+    /// proof of possession without consuming budget. The caller must durably
+    /// persist the authoritative Intent before calling `spend_budget`.
+    fn validate_request(
+        &self,
+        prelude: &V6RequestPrelude,
+        now: Instant,
+        now_ms: u64,
+    ) -> Result<()> {
         let grant = &self.grant;
+        // Recheck the immutable binding before touching the atomic budget. It
+        // makes accidental construction or future refactors fail closed and
+        // gives generation/name/id mismatch deterministic pre-spend semantics.
+        ensure!(
+            self.entry.identity().profile_id == grant.profile_id,
+            "grant profile id does not match its bound profile entry"
+        );
+        ensure!(
+            self.entry.identity().generation == grant.profile_generation,
+            "grant profile generation does not match its bound profile entry"
+        );
+        ensure!(
+            self.entry.profile_name() == grant.profile_name,
+            "grant profile name does not match its bound profile entry"
+        );
         ensure!(now < self.expires_at, "grant has expired");
         ensure!(
             prelude.requested_deadline_unix_ms > now_ms
@@ -2911,6 +4672,12 @@ impl GrantRecord {
             .as_deref()
             .context("grant prelude must carry a proof-of-possession signature")?;
         serctl_protocol::grant::verify_prelude_pop(&grant.holder_key, signature, prelude)?;
+        Ok(())
+    }
+
+    /// Atomically spend one budget unit after authoritative Intent
+    /// persistence. Returns true when this request consumed the final unit.
+    fn spend_budget(&self) -> Result<bool> {
         let mut remaining = self.remaining.load(Ordering::Acquire);
         loop {
             if remaining == 0 {
@@ -2922,16 +4689,36 @@ impl GrantRecord {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(remaining == 1),
                 Err(current) => remaining = current,
             }
         }
     }
 
-    /// Append one audit line to the protected grant audit log in the runtime
-    /// directory. Persistence failures are logged, never fatal: audit must not
-    /// become a new failure mode for relayed operations.
-    fn audit(&self, prelude: &V6RequestPrelude, outcome: &str) {
+    fn policy_digest(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"serctl/audit/grant-policy/v1\0");
+        digest.update(self.grant.grant_id);
+        digest.update(self.grant.profile_id);
+        digest.update(self.grant.profile_generation.to_be_bytes());
+        digest.update(self.grant.budget.to_be_bytes());
+        digest.update(self.grant.issued_unix_ms.to_be_bytes());
+        digest.update(self.grant.expires_unix_ms.to_be_bytes());
+        for operation in &self.grant.operations {
+            digest.update((operation.len() as u64).to_be_bytes());
+            digest.update(operation.as_bytes());
+        }
+        hex::encode(digest.finalize())
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        now >= self.expires_at
+    }
+
+    /// Append to the legacy compatibility diagnostic. This JSONL is explicitly
+    /// non-authoritative: authorization and quarantine are driven only by the
+    /// profile-scoped HMAC-checkpointed `AuditLedger`.
+    fn compatibility_audit(&self, prelude: &V6RequestPrelude, outcome: &str) {
         let entry = GrantAuditLine {
             at_unix_ms: now_unix_ms(),
             grant_id: self.grant.grant_id_hex(),
@@ -3035,14 +4822,14 @@ fn issue_grant(
         VerifyingKey::from_bytes(&key_bytes).context("grant holder public key is invalid")?;
     let grant = serctl_protocol::grant::OperationGrant::new_with_ttl(
         profile.clone(),
-        profile_id,
+        serctl_protocol::grant::GrantProfileIdentity::new(profile_id, entry.identity.generation),
         unique,
         *budget,
         &holder,
         now_unix_ms(),
         Duration::from_secs(u64::from(*ttl_secs)),
     )?;
-    grants.insert(grant.clone())?;
+    grants.insert(grant.clone(), entry)?;
     Ok(grant)
 }
 
@@ -3132,14 +4919,27 @@ async fn unlock_profile(
             None,
             lock_timeout,
         )?;
-        let profile_id = vault::list_profile_metadata()?
+        let identity = vault::list_profile_metadata()?
             .into_iter()
             .find(|metadata| metadata.name == profile_owned)
-            .map(|metadata| metadata.profile_id)
+            .map(|metadata| metadata.identity())
             .context("profile disappeared from the vault catalog")?;
-        Ok::<_, anyhow::Error>((creds, call_key, profile_id, lease))
+        // The authenticated ledger must be usable before any SSH connection
+        // is opened. A bit flip, truncation, wrong generation or wrong
+        // ProfileCallKey therefore fails this unlock before business access.
+        let audit_directory = vault::run_dir()?.join("audit");
+        std::fs::create_dir_all(&audit_directory).context("create profile audit directory")?;
+        let authoritative_audit = Arc::new(AuditLedger::from_profile_call_key(
+            &audit_directory,
+            identity,
+            &call_key,
+        )?);
+        authoritative_audit
+            .verify_complete(None)
+            .context("verify authenticated profile audit ledger")?;
+        Ok::<_, anyhow::Error>((creds, call_key, identity, lease, authoritative_audit))
     });
-    let (mut creds, call_key, profile_id, lease) =
+    let (mut creds, call_key, identity, lease, authoritative_audit) =
         match tokio::time::timeout_at(deadline, &mut snapshot).await {
             Ok(result) => result.context("join daemon unlock worker")??,
             Err(_) => {
@@ -3156,18 +4956,22 @@ async fn unlock_profile(
     let sessions = Arc::new(SessionManager::new(creds.clone(), session));
     let conn_info = ConnInfo {
         profile: name.clone(),
-        profile_id: Some(profile_id),
+        profile_id: Some(identity.profile_id),
+        profile_generation: Some(identity.generation),
         host: creds.host.clone(),
         user: creds.user.clone(),
         started: now_unix(),
         token: Arc::new(Zeroizing::new(vault::new_ipc_token())),
     };
     pool.insert(
-        profile_id,
+        identity.profile_id,
         ProfilePoolEntry {
+            identity,
             conn_info,
             sessions,
             call_key: Arc::new(call_key),
+            authoritative_audit,
+            quarantined: Arc::new(AtomicBool::new(false)),
             expires_at,
             _lease: Arc::new(lease),
         },
@@ -3185,6 +4989,10 @@ struct GlobalHandlerContext {
     buffered_operation_slots: Arc<Semaphore>,
     tunnel_control_slots: Arc<Semaphore>,
     transfers: Arc<TransferRegistry>,
+    managed_tunnels: Arc<ManagedTunnelRegistry>,
+    idle: Arc<IdleTracker>,
+    instance_id: InstanceId,
+    operation_context_key: Arc<OperationContextKey>,
 }
 
 async fn handle_global_conn<S>(
@@ -3202,6 +5010,10 @@ where
         buffered_operation_slots,
         tunnel_control_slots,
         transfers,
+        managed_tunnels,
+        idle,
+        instance_id,
+        operation_context_key,
     } = context;
     let (mut rd, mut wr) = tokio::io::split(io);
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -3288,6 +5100,7 @@ where
                     &mut wr,
                     &ipc::Frame::GrantIssued {
                         grant_id: grant.grant_id_hex(),
+                        profile_generation: grant.profile_generation,
                         issued_unix_ms: grant.issued_unix_ms,
                         expires_unix_ms: grant.expires_unix_ms,
                     },
@@ -3357,10 +5170,15 @@ where
             // A grant-bound request names the grant instead of a profile id:
             // the grant's bound profile and budget authorize the operation.
             let grant_record: Option<Arc<GrantRecord>> = if let Some(grant_id) = prelude.grant_id {
-                let record = match grants.get(&grant_id) {
-                    Some(record) => record,
-                    None => {
-                        let msg = UNKNOWN_GRANT_ERROR.to_owned();
+                let record = match grants.lookup(&grant_id, Instant::now()) {
+                    GrantLookup::Live(record) => record,
+                    terminal => {
+                        let msg = match terminal {
+                            GrantLookup::Exhausted => "grant budget exhausted".to_owned(),
+                            GrantLookup::Expired => "grant has expired".to_owned(),
+                            GrantLookup::Unknown => UNKNOWN_GRANT_ERROR.to_owned(),
+                            GrantLookup::Live(_) => unreachable!("matched live grant above"),
+                        };
                         return write_owned_frame_or_shutdown(
                             &mut wr,
                             ipc::Frame::Error { msg },
@@ -3370,10 +5188,30 @@ where
                         .await;
                     }
                 };
-                if let Err(error) = record.check_and_spend(&prelude, Instant::now(), now_unix_ms())
-                {
+                let check_now = Instant::now();
+                if let Err(error) = record.validate_request(&prelude, check_now, now_unix_ms()) {
+                    if record.is_expired(check_now) {
+                        grants.mark_terminal_if_same(
+                            &grant_id,
+                            &record,
+                            GrantTerminalKind::Expired,
+                            check_now,
+                        );
+                    }
                     let msg = terminal_safe_error(&error);
-                    record.audit(&prelude, &format!("rejected: {msg}"));
+                    record.compatibility_audit(&prelude, &format!("rejected: {msg}"));
+                    return write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error { msg },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await;
+                }
+                if let Err(error) = validate_grant_frame_binding(&frame) {
+                    let msg = terminal_safe_error(&error);
+                    record
+                        .compatibility_audit(&prelude, "rejected: missing local-target commitment");
                     return write_owned_frame_or_shutdown(
                         &mut wr,
                         ipc::Frame::Error { msg },
@@ -3386,9 +5224,21 @@ where
             } else {
                 None
             };
-            let profile_id = match (&grant_record, prelude.profile_id) {
-                (Some(record), _) => record.grant.profile_id,
-                (None, Some(profile_id)) => profile_id,
+            let entry = match (&grant_record, prelude.profile_id) {
+                (Some(record), _) => Arc::clone(&record.entry),
+                (None, Some(profile_id)) => match pool.entry_for(&profile_id) {
+                    Some(entry) => entry,
+                    None => {
+                        let msg = "profile is locked: unlock it first".to_owned();
+                        return write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error { msg },
+                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            &mut shutdown_rx,
+                        )
+                        .await;
+                    }
+                },
                 (None, None) => {
                     let msg = "profile id is required for this operation".to_owned();
                     return write_owned_frame_or_shutdown(
@@ -3400,16 +5250,6 @@ where
                     .await;
                 }
             };
-            let Some(entry) = pool.entry_for(&profile_id) else {
-                let msg = "profile is locked: unlock it first".to_owned();
-                return write_owned_frame_or_shutdown(
-                    &mut wr,
-                    ipc::Frame::Error { msg },
-                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
-                    &mut shutdown_rx,
-                )
-                .await;
-            };
             let expected_profile = grant_record
                 .as_ref()
                 .map(|record| record.grant.profile_name.as_str())
@@ -3419,6 +5259,7 @@ where
                 entry.conn_info.profile == expected_profile,
                 "profile name does not match its profile id"
             );
+            validate_connection_identity_binding(&frame, entry.identity)?;
 
             if grant_record.is_none() {
                 let proof = prelude
@@ -3433,9 +5274,10 @@ where
             }
 
             let now = Instant::now();
-            let mut authorization_deadline = entry.expires_at;
-            if let Some(record) = &grant_record {
-                authorization_deadline = authorization_deadline.min(record.expires_at);
+            let mut authorization_deadline = grant_record
+                .as_ref()
+                .map_or(entry.expires_at, |record| record.expires_at);
+            if grant_record.is_some() {
                 let wall_now = now_unix_ms();
                 let remaining_ms = prelude
                     .requested_deadline_unix_ms
@@ -3450,6 +5292,117 @@ where
                 authorization_deadline > now,
                 "profile authorization lease expired"
             );
+
+            // A Grant root becomes dispatchable only after its authenticated
+            // Intent is durable. Validation above is budget-free, so an audit
+            // failure cannot consume capability budget or reach SSH/local
+            // business side effects.
+            let grant_audit = if let Some(record) = &grant_record {
+                let audit = GrantAuditOperation::new(
+                    record,
+                    &prelude,
+                    authorization_deadline,
+                    instance_id,
+                    Arc::clone(&operation_context_key),
+                );
+                if let Err(error) = audit.record_intent().await {
+                    let msg = terminal_safe_error(&error);
+                    record.compatibility_audit(
+                        &prelude,
+                        "rejected: authoritative intent persistence failed",
+                    );
+                    return write_owned_frame_or_shutdown(
+                        &mut wr,
+                        ipc::Frame::Error { msg },
+                        Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                        &mut shutdown_rx,
+                    )
+                    .await;
+                }
+                Some(audit)
+            } else {
+                None
+            };
+
+            if entry.quarantined.load(Ordering::Acquire)
+                && !operation_allowed_while_quarantined(&prelude.operation_kind)
+            {
+                let msg = "profile is quarantined; mutation operations are disabled".to_owned();
+                if let Some(audit) = &grant_audit {
+                    if audit
+                        .record_denied("quarantine.mutation_denied")
+                        .await
+                        .is_err()
+                    {
+                        return write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error {
+                                msg: "profile audit is unavailable; operation denied and outcome unknown"
+                                    .to_owned(),
+                            },
+                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            &mut shutdown_rx,
+                        )
+                        .await;
+                    }
+                }
+                if let Some(record) = &grant_record {
+                    record.compatibility_audit(&prelude, "rejected: profile quarantined");
+                }
+                return write_owned_frame_or_shutdown(
+                    &mut wr,
+                    ipc::Frame::Error { msg },
+                    Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                    &mut shutdown_rx,
+                )
+                .await;
+            }
+
+            if let (Some(record), Some(grant_id)) = (&grant_record, prelude.grant_id) {
+                let spend_now = Instant::now();
+                match record.spend_budget() {
+                    Ok(exhausted_after_spend) => {
+                        if exhausted_after_spend {
+                            // The accepted request and audit context retain the
+                            // exact entry. The registry releases its credential
+                            // reference as soon as the final unit is claimed.
+                            grants.mark_terminal_if_same(
+                                &grant_id,
+                                record,
+                                GrantTerminalKind::Exhausted,
+                                spend_now,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        grants.mark_terminal_if_same(
+                            &grant_id,
+                            record,
+                            GrantTerminalKind::Exhausted,
+                            spend_now,
+                        );
+                        let audit_result = match &grant_audit {
+                            Some(audit) => audit.record_denied("grant.budget_exhausted").await,
+                            None => Ok(()),
+                        };
+                        let msg = if audit_result.is_ok() {
+                            terminal_safe_error(&error)
+                        } else {
+                            "profile audit is unavailable; operation denied and outcome unknown"
+                                .to_owned()
+                        };
+                        record.compatibility_audit(&prelude, "rejected: grant budget exhausted");
+                        return write_owned_frame_or_shutdown(
+                            &mut wr,
+                            ipc::Frame::Error { msg },
+                            Instant::now() + IPC_RESPONSE_WRITE_TIMEOUT,
+                            &mut shutdown_rx,
+                        )
+                        .await;
+                    }
+                }
+            }
+
             let context = HandlerContext {
                 sessions: entry.sessions.clone(),
                 info: entry.conn_info.clone(),
@@ -3457,14 +5410,32 @@ where
                 buffered_operation_slots,
                 tunnel_control_slots,
                 transfers,
+                managed_tunnels,
+                idle,
+                profile_entry: Some(Arc::clone(&entry)),
                 call_key: entry.call_key.clone(),
                 authorization_deadline: Some(authorization_deadline),
             };
-            let outcome = dispatch_root_request(rd, wr, shutdown_rx, context, frame).await;
+            let outcome = if let Some(audit) = &grant_audit {
+                ACTIVE_GRANT_AUDIT
+                    .scope(
+                        Arc::clone(audit),
+                        dispatch_root_request(rd, wr, shutdown_rx, context, frame),
+                    )
+                    .await
+            } else {
+                dispatch_root_request(rd, wr, shutdown_rx, context, frame).await
+            };
+            let audit_finalization = match &grant_audit {
+                Some(audit) => audit.finalize_unknown_if_pending().await,
+                None => Ok(()),
+            };
             if let Some(record) = &grant_record {
-                record.audit(
+                record.compatibility_audit(
                     &prelude,
-                    if outcome.is_ok() {
+                    if audit_finalization.is_err() {
+                        "authoritative outcome persistence failed; profile quarantined"
+                    } else if outcome.is_ok() {
                         "accepted"
                     } else {
                         "rejected: dispatch failure"
@@ -3480,6 +5451,7 @@ where
                     );
                 }
             }
+            audit_finalization?;
             outcome
         }
     }
@@ -3542,6 +5514,8 @@ pub async fn run_global_with_idle_timeout(
     let pool = Arc::new(ProfilePool::default());
     let grants = Arc::new(GrantRegistry::new(Arc::clone(&idle)));
     let transfers = Arc::new(TransferRegistry::default());
+    let managed_tunnels = Arc::new(ManagedTunnelRegistry::default());
+    let operation_context_key = Arc::new(OperationContextKey::random());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut daemon_shutdown = shutdown_rx.clone();
     let connection_slots = Arc::new(Semaphore::new(GLOBAL_CONNECTION_LIMIT));
@@ -3590,10 +5564,13 @@ pub async fn run_global_with_idle_timeout(
                 let pool = Arc::clone(&pool);
                 let grants = Arc::clone(&grants);
                 let transfers = Arc::clone(&transfers);
+                let managed_tunnels = Arc::clone(&managed_tunnels);
+                let idle_for_handler = Arc::clone(&idle);
                 let secret = secret.clone();
                 let shutdown_tx = shutdown_tx.clone();
                 let buffered_operation_slots = Arc::clone(&buffered_operation_slots);
                 let tunnel_control_slots = Arc::clone(&tunnel_control_slots);
+                let operation_context_key = Arc::clone(&operation_context_key);
                 let work_guard = idle.acquire();
                 handlers.spawn(async move {
                     let _permit = permit;
@@ -3616,6 +5593,10 @@ pub async fn run_global_with_idle_timeout(
                                 buffered_operation_slots,
                                 tunnel_control_slots,
                                 transfers,
+                                managed_tunnels,
+                                idle: idle_for_handler,
+                                instance_id,
+                                operation_context_key,
                             })
                             .await
                         }
@@ -3651,6 +5632,9 @@ pub async fn run_global_with_idle_timeout(
     };
 
     let _ = shutdown_tx.send(true);
+    managed_tunnels
+        .shutdown_all(Instant::now() + MANAGED_TUNNEL_CANCEL_TIMEOUT)
+        .await;
     let _ = reaper_task.await;
     let drained = tokio::time::timeout(HANDLER_SHUTDOWN_GRACE, async {
         while let Some(joined) = handlers.join_next().await {
@@ -4091,6 +6075,8 @@ where
                         "remote source SHA-256 changed since the resume journal was written"
                     );
                 }
+                progress.chunk_bytes = chunk;
+                progress.window_bytes = chunk;
                 (size, sha256, start_offset)
             }
             native::Frame::Control(native::Control::Error {
@@ -4723,7 +6709,7 @@ where
                 _ => bail!("native helper did not accept the upload request"),
             };
         progress.chunk_bytes = helper_chunk;
-        progress.window_bytes = helper_window;
+        progress.window_bytes = helper_chunk;
         progress.stage = ipc::TransferStage::Transferring;
         progress.confirmed_bytes = confirmed;
         progress.durable_bytes = durable;
@@ -5554,23 +7540,139 @@ mod tests {
         acquire_buffered_operation_slot, acquire_tunnel_control_slot,
         authenticate_incoming_protocol, await_owned_blocking_until, daemon_up_line,
         exec_outcome_unknown_wire_message, exec_request_rejected_wire_message, handoff_readiness,
-        ipc, read_authenticated_request, read_shell_frame_pump, read_shell_frame_pump_inner,
-        recover_invalid_startup_lock_read, status_info_frame, stop_tunnel_and_report,
-        terminal_safe_error, transfer_progress, validate_request_frame, validated_exec_timeout,
-        validated_sftp_timeout, wait_for_tunnel_control_or_completion, write_all_until_or_shutdown,
-        write_frame_or_shutdown, ConnInfo, Creds, GrantRegistry, IdleTracker, TransferRegistry,
-        TunnelControlWait, GRANTABLE_OPERATION_KINDS, MAX_UPLOAD_CHUNK_BYTES, UNKNOWN_GRANT_ERROR,
+        ipc, native, negotiate_native_stream, negotiated_native_limits, read_authenticated_request,
+        read_shell_frame_pump, read_shell_frame_pump_inner, recover_invalid_startup_lock_read,
+        should_probe_native_helper, status_info_frame, stop_tunnel_and_report, terminal_safe_error,
+        transfer_progress, validate_connection_identity_binding, validate_grant_frame_binding,
+        validate_request_frame, validated_exec_timeout, validated_sftp_timeout,
+        wait_for_tunnel_control_or_completion, write_all_until_or_shutdown,
+        write_frame_or_shutdown, ConnInfo, Creds, GrantAuditOperation, GrantLookup,
+        GrantProfileBinding, GrantRecord, GrantRegistry, GrantTerminalKind, IdleTracker,
+        InstanceId, ManagedTunnelOwner, ManagedTunnelRegistry, OperationContextBinding,
+        OperationContextKey, TransferRegistry, TunnelControlWait, AUDIT_STATE_COMPLETE,
+        AUDIT_STATE_PENDING, GRANTABLE_OPERATION_KINDS, GRANT_TERMINAL_TOMBSTONE_TTL,
+        MAX_ACTIVE_MANAGED_TUNNELS_PER_PROFILE, MAX_ACTIVE_TRANSFERS_GLOBAL,
+        MAX_ACTIVE_TRANSFERS_PER_PROFILE, MAX_COMPLETED_TRANSFERS_GLOBAL,
+        MAX_COMPLETED_TRANSFERS_PER_PROFILE, MAX_UPLOAD_CHUNK_BYTES, TRANSFER_RECORD_RETENTION,
+        UNKNOWN_GRANT_ERROR,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
     use tokio::time::Instant;
+    use tokio_util::sync::CancellationToken;
     use zeroize::Zeroize;
 
     /// `vault::set_test_home` is process-global; the three global-daemon tests
     /// serialize on it for their whole lifetime.
     static TEST_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn expected_native_helper_identity() -> ipc::ExpectedNativeHelperIdentity {
+        ipc::ExpectedNativeHelperIdentity {
+            name: "serctl-xfer".to_owned(),
+            binary_size: 123,
+            sha256: "ab".repeat(32),
+            version: "serctl-xfer 1.0.0-beta (git 0123456789ab; transfer protocol v1)".to_owned(),
+        }
+    }
+
+    #[test]
+    fn native_probe_requires_an_exact_backend_appropriate_identity() {
+        let expected = expected_native_helper_identity();
+        assert!(!should_probe_native_helper(ipc::TransferBackend::Auto, None).unwrap());
+        assert!(should_probe_native_helper(ipc::TransferBackend::Auto, Some(&expected)).unwrap());
+        assert!(should_probe_native_helper(ipc::TransferBackend::Native, Some(&expected)).unwrap());
+        assert!(should_probe_native_helper(ipc::TransferBackend::Native, None).is_err());
+        assert!(should_probe_native_helper(ipc::TransferBackend::Sftp, Some(&expected)).is_err());
+    }
+
+    #[tokio::test]
+    async fn helper_identity_mismatch_precedes_every_client_or_target_frame() {
+        let expected = expected_native_helper_identity();
+        let mut observed = expected.clone();
+        observed.sha256 = "cd".repeat(32);
+        let (client, mut helper) = tokio::io::duplex(16 * 1024);
+        let helper_task = tokio::spawn(async move {
+            native::write_handshake_control(
+                &mut helper,
+                &native::Control::HelperHello {
+                    version: native::VERSION,
+                    max_chunk: native::DEFAULT_CHUNK_BYTES,
+                    max_window: native::MAX_WINDOW_BYTES,
+                    resume: true,
+                    sha256: true,
+                    fsync: true,
+                    no_replace: true,
+                    identity: native::HelperRuntimeIdentity {
+                        name: observed.name,
+                        binary_size: observed.binary_size,
+                        sha256: observed.sha256,
+                        version: observed.version,
+                    },
+                },
+                native::HandshakePeer::Helper,
+            )
+            .await
+            .unwrap();
+            native::read_frame(&mut helper).await.unwrap()
+        });
+        let error =
+            negotiate_native_stream(client, &expected, Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("exact release provenance"));
+        assert!(helper_task.await.unwrap().is_none());
+    }
+
+    struct TestGrantEntry {
+        profile_id: [u8; 16],
+        generation: AtomicUsize,
+        profile: String,
+    }
+
+    impl GrantProfileBinding for TestGrantEntry {
+        fn identity(&self) -> serctl_core::vault::ProfileIdentity {
+            serctl_core::vault::ProfileIdentity {
+                profile_id: self.profile_id,
+                generation: self.generation.load(Ordering::Acquire) as u64,
+            }
+        }
+
+        fn profile_name(&self) -> &str {
+            &self.profile
+        }
+    }
+
+    fn signed_grant_prelude(
+        grant: &serctl_protocol::grant::OperationGrant,
+        signing: &ed25519_dalek::SigningKey,
+    ) -> serctl_protocol::v6::V6RequestPrelude {
+        signed_grant_prelude_for_operation(grant, signing, "daemon.status")
+    }
+
+    fn signed_grant_prelude_for_operation(
+        grant: &serctl_protocol::grant::OperationGrant,
+        signing: &ed25519_dalek::SigningKey,
+        operation_kind: &str,
+    ) -> serctl_protocol::v6::V6RequestPrelude {
+        let mut prelude = serctl_protocol::v6::V6RequestPrelude {
+            protocol_version: serctl_protocol::v6::IPC_PROTOCOL_VERSION_V6,
+            client_session_id: [1_u8; 16],
+            request_id: [2_u8; 16],
+            operation_kind: operation_kind.into(),
+            profile_id: None,
+            profile_name: Some(grant.profile_name.clone()),
+            grant_id: Some(grant.grant_id),
+            pop_signature: None,
+            profile_proof: None,
+            requested_deadline_unix_ms: grant.expires_unix_ms - 1,
+            root_request_hash: [3_u8; 32],
+        };
+        prelude.pop_signature =
+            Some(serctl_protocol::grant::sign_prelude_pop(signing, &prelude).unwrap());
+        prelude
+    }
 
     #[cfg(unix)]
     static TEST_HOME_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -5766,17 +7868,462 @@ mod tests {
     }
 
     #[test]
-    fn grantable_operations_match_the_current_agent_gateway() {
+    fn grantable_operations_match_the_authenticated_daemon_data_plane() {
         assert_eq!(
             GRANTABLE_OPERATION_KINDS,
             &[
                 "ssh.exec",
+                "ssh.connection-identity",
                 "daemon.status",
                 "sftp.list",
                 "sftp.write",
+                "transfer.read",
                 "transfer.write",
+                "transfer.status",
+                "transfer.cancel",
+                "forward.local/open",
+                "forward.remote/open",
+                "forward.dynamic/open",
+                "forward.status",
+                "forward.cancel",
             ]
         );
+    }
+
+    fn managed_tunnel_test_status(
+        owner: &ManagedTunnelOwner,
+        id_suffix: usize,
+    ) -> ipc::TunnelStatus {
+        ipc::TunnelStatus {
+            schema_version: ipc::TUNNEL_STATUS_SCHEMA_VERSION,
+            tunnel_id: ipc::TunnelId::parse(&format!("{id_suffix:032x}")).unwrap(),
+            profile_id: hex::encode(owner.profile_id),
+            profile_generation: owner.generation,
+            mode: ipc::TunnelMode::Local,
+            bind_host: "127.0.0.1".into(),
+            bind_port: 2200 + u16::try_from(id_suffix).unwrap(),
+            target_host: Some("127.0.0.1".into()),
+            target_port: 22,
+            deadline_unix_ms: 1_900_000_000_000,
+            stage: ipc::TunnelStage::Ready,
+            updated_unix_ms: 1_800_000_000_000,
+            operation_context_id: Some(
+                ipc::OperationContextId::parse(&format!("{id_suffix:064x}")).unwrap(),
+            ),
+            revision: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_tunnel_registry_is_generation_scoped_cancelled_and_replay_safe() {
+        let registry = Arc::new(ManagedTunnelRegistry::default());
+        let idle = Arc::new(IdleTracker::default());
+        let owner = ManagedTunnelOwner {
+            profile_id: [0x31; 16],
+            generation: 7,
+        };
+        let stale = ManagedTunnelOwner {
+            profile_id: owner.profile_id,
+            generation: 6,
+        };
+        let other = ManagedTunnelOwner {
+            profile_id: [0x32; 16],
+            generation: 7,
+        };
+        let status = managed_tunnel_test_status(&owner, 1);
+        let tunnel_id = status.tunnel_id.clone();
+        let operation_context_id = status.operation_context_id.clone().unwrap();
+        let cancellation = CancellationToken::new();
+        registry
+            .begin(
+                owner.clone(),
+                status,
+                cancellation.clone(),
+                idle.acquire(),
+                None,
+            )
+            .unwrap();
+        assert!(
+            !idle.is_idle(),
+            "active tunnel must retain daemon idle ownership"
+        );
+        let discovered = registry
+            .snapshots(&owner, Some(&tunnel_id), None, true)
+            .unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(
+            discovered[0].operation_context_id.as_ref(),
+            Some(&operation_context_id)
+        );
+        assert_eq!(discovered[0].revision, 1);
+        assert!(registry
+            .snapshots(&owner, Some(&tunnel_id), None, true)
+            .is_err());
+        let forged_context = ipc::OperationContextId::parse(&"ff".repeat(32)).unwrap();
+        assert!(registry
+            .snapshots(&owner, Some(&tunnel_id), Some(&forged_context), true,)
+            .is_err());
+        assert!(registry.request_cancel(&owner, &tunnel_id, None).is_err());
+        assert!(registry
+            .request_cancel(&owner, &tunnel_id, Some(&forged_context))
+            .is_err());
+        assert!(registry
+            .snapshots(&stale, None, None, false)
+            .unwrap()
+            .is_empty());
+        assert!(registry
+            .snapshots(&other, None, None, false)
+            .unwrap()
+            .is_empty());
+        assert!(registry
+            .request_cancel(&stale, &tunnel_id, Some(&operation_context_id))
+            .is_err());
+        assert!(registry
+            .request_cancel(&other, &tunnel_id, Some(&operation_context_id))
+            .is_err());
+
+        let worker_registry = Arc::clone(&registry);
+        let worker_owner = owner.clone();
+        let worker_id = tunnel_id.clone();
+        tokio::spawn(async move {
+            cancellation.cancelled().await;
+            worker_registry
+                .finish_worker(&worker_owner, &worker_id, ipc::TunnelStage::Closed)
+                .unwrap();
+        });
+        let terminal = registry
+            .cancel_and_wait(
+                &owner,
+                &tunnel_id,
+                Some(&operation_context_id),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.stage, ipc::TunnelStage::Closed);
+        assert_eq!(terminal.revision, 3);
+        assert!(
+            idle.is_idle(),
+            "terminal tunnel must release daemon idle ownership"
+        );
+
+        // A replayed cancel is idempotent and cannot re-arm a terminal tunnel.
+        let replay = registry
+            .cancel_and_wait(
+                &owner,
+                &tunnel_id,
+                Some(&operation_context_id),
+                Instant::now() + Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.stage, ipc::TunnelStage::Closed);
+    }
+
+    #[test]
+    fn managed_tunnel_registry_enforces_profile_capacity_and_unknown_terminal() {
+        let registry = ManagedTunnelRegistry::default();
+        let idle = Arc::new(IdleTracker::default());
+        let owner = ManagedTunnelOwner {
+            profile_id: [0x41; 16],
+            generation: 9,
+        };
+        for index in 1..=MAX_ACTIVE_MANAGED_TUNNELS_PER_PROFILE {
+            registry
+                .begin(
+                    owner.clone(),
+                    managed_tunnel_test_status(&owner, index),
+                    CancellationToken::new(),
+                    idle.acquire(),
+                    None,
+                )
+                .unwrap();
+        }
+        let overflow =
+            managed_tunnel_test_status(&owner, MAX_ACTIVE_MANAGED_TUNNELS_PER_PROFILE + 1);
+        assert!(registry
+            .begin(
+                owner.clone(),
+                overflow,
+                CancellationToken::new(),
+                idle.acquire(),
+                None,
+            )
+            .is_err());
+
+        let first = ipc::TunnelId::parse("00000000000000000000000000000001").unwrap();
+        let first_context = ipc::OperationContextId::parse(&format!("{:064x}", 1)).unwrap();
+        registry
+            .finish_worker(&owner, &first, ipc::TunnelStage::Unknown)
+            .unwrap();
+        assert_eq!(
+            registry
+                .snapshots(&owner, Some(&first), Some(&first_context), false)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .stage,
+            ipc::TunnelStage::Unknown
+        );
+    }
+
+    fn test_grant_audit(
+        directory: &std::path::Path,
+        request_id: u8,
+        operation_kind: &str,
+    ) -> (
+        Arc<GrantAuditOperation>,
+        Arc<serctl_core::audit::AuditLedger>,
+        Arc<AtomicBool>,
+    ) {
+        let identity = serctl_core::vault::ProfileIdentity {
+            profile_id: [0x51; 16],
+            generation: 13,
+        };
+        let key = serctl_core::vault::ProfileCallKey::from_bytes_for_test([0x61; 32]);
+        let ledger = Arc::new(
+            serctl_core::audit::AuditLedger::from_profile_call_key(directory, identity, &key)
+                .unwrap(),
+        );
+        match (
+            ledger.log_path().try_exists().unwrap(),
+            ledger.checkpoint_path().try_exists().unwrap(),
+        ) {
+            (false, false) => {
+                ledger
+                    .initialize_generation(
+                        None,
+                        "grant-audit-test",
+                        "grant-audit-test",
+                        1_900_000_500_000,
+                    )
+                    .unwrap();
+            }
+            (true, true) => {}
+            _ => panic!("test audit generation is only partially initialized"),
+        }
+        let quarantined = Arc::new(AtomicBool::new(false));
+        let audit = Arc::new(GrantAuditOperation {
+            ledger: Arc::clone(&ledger),
+            quarantined: Arc::clone(&quarantined),
+            profile: identity,
+            request_id: [request_id; 16],
+            operation_kind: operation_kind.into(),
+            policy_digest: hex::encode([0x71; 32]),
+            intent_digest: hex::encode([request_id; 32]),
+            instance_id: InstanceId([0x44; 16]),
+            grant_id: [0x55; 16],
+            operation_context_key: Arc::new(OperationContextKey::random()),
+            deadline: Instant::now() + Duration::from_secs(5),
+            state: AtomicUsize::new(AUDIT_STATE_PENDING),
+        });
+        (audit, ledger, quarantined)
+    }
+
+    #[tokio::test]
+    async fn authoritative_intent_is_durable_before_dispatch_side_effect() {
+        let directory = create_global_test_base();
+        let (audit, ledger, quarantined) = test_grant_audit(&directory, 1, "sftp.write");
+        let side_effect = AtomicBool::new(false);
+
+        audit.record_intent().await.unwrap();
+        assert_eq!(ledger.verify(None).unwrap().sequence, 2);
+        assert!(!side_effect.load(Ordering::Acquire));
+
+        side_effect.store(true, Ordering::Release);
+        assert!(audit
+            .before_terminal_frame(&ipc::Frame::CreateDirAccepted {
+                operation_context_id: Some(
+                    ipc::OperationContextId::parse(&"ab".repeat(32)).unwrap(),
+                ),
+                revision: 1,
+            })
+            .await
+            .is_none());
+        assert_eq!(ledger.verify(None).unwrap().sequence, 3);
+        assert!(side_effect.load(Ordering::Acquire));
+        assert!(!quarantined.load(Ordering::Acquire));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transfer_read_audit_waits_for_verified_local_commit_terminal() {
+        let directory = create_global_test_base();
+        let (audit, ledger, quarantined) = test_grant_audit(&directory, 19, "transfer.read");
+        audit.record_intent().await.unwrap();
+
+        // TransferDone means the daemon finished sending verified remote
+        // bytes, not that the client durably committed its protected local
+        // destination. It must not close the authoritative audit outcome.
+        assert!(audit
+            .before_terminal_frame(&ipc::Frame::TransferDone { bytes: 4096 })
+            .await
+            .is_none());
+        assert_eq!(audit.state.load(Ordering::Acquire), AUDIT_STATE_PENDING);
+        assert_eq!(ledger.verify(None).unwrap().sequence, 2);
+
+        let mut completed = super::transfer_progress(
+            ipc::TransferId::parse("00112233445566778899aabbccddeeff").unwrap(),
+            ipc::TransferDirection::Pull,
+            ipc::TransferStage::Completed,
+            4096,
+            4096,
+            4096,
+            ipc::TransferBackend::Sftp,
+        );
+        completed.event = "completed".into();
+        assert!(audit
+            .before_terminal_frame(&ipc::Frame::TransferProgress {
+                progress: completed,
+            })
+            .await
+            .is_none());
+        assert_eq!(audit.state.load(Ordering::Acquire), AUDIT_STATE_COMPLETE);
+        assert_eq!(ledger.verify(None).unwrap().sequence, 3);
+        assert!(!quarantined.load(Ordering::Acquire));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn authoritative_intent_io_failure_quarantines_before_any_side_effect() {
+        let directory = create_global_test_base();
+        let (audit, ledger, quarantined) = test_grant_audit(&directory, 2, "sftp.write");
+        std::fs::remove_file(ledger.log_path()).unwrap();
+        std::fs::create_dir(ledger.log_path()).unwrap();
+        let side_effect = AtomicBool::new(false);
+
+        let dispatch = async {
+            audit.record_intent().await?;
+            side_effect.store(true, Ordering::Release);
+            Ok::<(), anyhow::Error>(())
+        };
+        assert!(dispatch.await.is_err());
+        assert!(!side_effect.load(Ordering::Acquire));
+        assert!(quarantined.load(Ordering::Acquire));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn authoritative_intent_failure_does_not_consume_grant_budget() {
+        use ed25519_dalek::SigningKey;
+        use serctl_protocol::grant::{GrantProfileIdentity, OperationGrant};
+
+        let holder = SigningKey::from_bytes(&[0x62; 32]);
+        let entry = Arc::new(TestGrantEntry {
+            profile_id: [0x63; 16],
+            generation: AtomicUsize::new(17),
+            profile: "audit-budget-test".into(),
+        });
+        let grant = OperationGrant::new(
+            entry.profile.clone(),
+            GrantProfileIdentity::new(entry.profile_id, 17),
+            vec!["daemon.status".into()],
+            1,
+            &holder.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let request = signed_grant_prelude(&grant, &holder);
+        let idle = Arc::new(IdleTracker::default());
+        let record = GrantRecord::new(grant, entry, Instant::now(), idle.acquire()).unwrap();
+        record
+            .validate_request(&request, Instant::now(), super::now_unix_ms())
+            .unwrap();
+
+        let directory = create_global_test_base();
+        let (audit, ledger, _) = test_grant_audit(&directory, 6, "daemon.status");
+        std::fs::remove_file(ledger.log_path()).unwrap();
+        std::fs::create_dir(ledger.log_path()).unwrap();
+        if audit.record_intent().await.is_ok() {
+            record.spend_budget().unwrap();
+        }
+        assert_eq!(record.remaining.load(Ordering::Acquire), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bitflip_and_truncation_quarantine_before_a_following_dispatch() {
+        for (request_id, mode) in [(3_u8, "bitflip"), (4_u8, "truncate")] {
+            let directory = create_global_test_base();
+            let (first, ledger, _) = test_grant_audit(&directory, request_id, "daemon.status");
+            first.record_intent().await.unwrap();
+            let mut bytes = std::fs::read(ledger.log_path()).unwrap();
+            if mode == "bitflip" {
+                bytes[0] ^= 1;
+            } else {
+                bytes.pop();
+            }
+            std::fs::write(ledger.log_path(), bytes).unwrap();
+            let (following, _, quarantined) =
+                test_grant_audit(&directory, request_id + 10, "sftp.write");
+            assert!(following.record_intent().await.is_err(), "{mode}");
+            assert!(quarantined.load(Ordering::Acquire), "{mode}");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn outcome_persistence_failure_returns_unknown_and_denies_future_mutation() {
+        let directory = create_global_test_base();
+        let (audit, ledger, quarantined) = test_grant_audit(&directory, 5, "sftp.write");
+        audit.record_intent().await.unwrap();
+        std::fs::write(ledger.checkpoint_path(), b"{").unwrap();
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        super::ACTIVE_GRANT_AUDIT
+            .scope(
+                Arc::clone(&audit),
+                super::write_frame_until(
+                    &mut server,
+                    &ipc::Frame::CreateDirAccepted {
+                        operation_context_id: Some(
+                            ipc::OperationContextId::parse(&"ab".repeat(32)).unwrap(),
+                        ),
+                        revision: 1,
+                    },
+                    Instant::now() + Duration::from_secs(2),
+                ),
+            )
+            .await
+            .unwrap();
+        let replacement = ipc::read_frame_limited(&mut client, ipc::MAX_CONTROL_FRAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let ipc::Frame::Error { msg } = replacement else {
+            panic!("audit failure did not return an unknown error")
+        };
+        assert!(msg.contains("outcome is unknown"));
+        assert!(quarantined.load(Ordering::Acquire));
+        assert!(!super::operation_allowed_while_quarantined("sftp.write"));
+        assert!(!super::operation_allowed_while_quarantined(
+            "transfer.write"
+        ));
+        assert!(!super::operation_allowed_while_quarantined("job.submit"));
+        assert!(super::operation_allowed_while_quarantined("daemon.status"));
+        assert!(super::operation_allowed_while_quarantined(
+            "ssh.connection-identity"
+        ));
+        assert!(super::operation_allowed_while_quarantined("sftp.list"));
+        assert!(super::operation_allowed_while_quarantined("transfer.read"));
+        assert!(super::operation_allowed_while_quarantined(
+            "transfer.status"
+        ));
+        assert!(super::operation_allowed_while_quarantined("audit.diagnose"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_outcome_finalization_quarantines_the_profile() {
+        let directory = create_global_test_base();
+        let (audit, _, quarantined) = test_grant_audit(&directory, 7, "sftp.write");
+        audit.state.store(
+            super::AUDIT_STATE_FINALIZING,
+            std::sync::atomic::Ordering::Release,
+        );
+        assert!(audit.finalize_unknown_if_pending().await.is_err());
+        assert!(quarantined.load(Ordering::Acquire));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -5793,10 +8340,19 @@ mod tests {
             ipc::TransferBackend::Sftp,
         );
         let cancellation = registry.begin("alpha", initial.clone()).unwrap();
-        assert_eq!(registry.snapshots("alpha", None).unwrap().len(), 1);
-        assert!(registry.snapshots("beta", None).unwrap().is_empty());
-        assert!(registry.cancel("beta", &transfer_id).is_err());
-        registry.cancel("alpha", &transfer_id).unwrap();
+        assert_eq!(
+            registry
+                .snapshots("alpha", None, None, false)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(registry
+            .snapshots("beta", None, None, false)
+            .unwrap()
+            .is_empty());
+        assert!(registry.cancel("beta", &transfer_id, None).is_err());
+        registry.cancel("alpha", &transfer_id, None).unwrap();
         assert!(cancellation.is_cancelled());
 
         let mut advanced = initial.clone();
@@ -5809,10 +8365,432 @@ mod tests {
     }
 
     #[test]
+    fn operation_context_is_unforgeable_bound_and_registry_revisioned() {
+        let key = OperationContextKey::random();
+        let instance = InstanceId([1; 16]);
+        let profile = serctl_core::vault::ProfileIdentity {
+            profile_id: [2; 16],
+            generation: 7,
+        };
+        let root = [3; 32];
+        let binding = OperationContextBinding {
+            instance_id: instance,
+            grant_id: [4; 16],
+            request_id: [5; 16],
+            profile,
+            root_request_hash: root,
+        };
+        let context = key
+            .derive(
+                binding,
+                &"A".repeat(32),
+                &"05".repeat(16),
+                "transfer.write/accepted",
+            )
+            .unwrap();
+        let same = key
+            .derive(
+                binding,
+                &"A".repeat(32),
+                &"05".repeat(16),
+                "transfer.write/accepted",
+            )
+            .unwrap();
+        assert_eq!(context, same);
+        let changed_bindings = [
+            OperationContextBinding {
+                instance_id: InstanceId([9; 16]),
+                ..binding
+            },
+            OperationContextBinding {
+                grant_id: [8; 16],
+                ..binding
+            },
+            OperationContextBinding {
+                request_id: [9; 16],
+                ..binding
+            },
+            OperationContextBinding {
+                profile: serctl_core::vault::ProfileIdentity {
+                    profile_id: [2; 16],
+                    generation: 8,
+                },
+                ..binding
+            },
+            OperationContextBinding {
+                root_request_hash: [6; 32],
+                ..binding
+            },
+        ];
+        for changed in changed_bindings
+            .into_iter()
+            .map(|changed| {
+                key.derive(
+                    changed,
+                    &"A".repeat(32),
+                    &"05".repeat(16),
+                    "transfer.write/accepted",
+                )
+                .unwrap()
+            })
+            .chain([
+                key.derive(
+                    binding,
+                    &"B".repeat(32),
+                    &"05".repeat(16),
+                    "transfer.write/accepted",
+                )
+                .unwrap(),
+                key.derive(
+                    binding,
+                    &"A".repeat(32),
+                    &"06".repeat(16),
+                    "transfer.write/accepted",
+                )
+                .unwrap(),
+                key.derive(
+                    binding,
+                    &"A".repeat(32),
+                    &"05".repeat(16),
+                    "transfer.read/accepted",
+                )
+                .unwrap(),
+                key.derive(
+                    binding,
+                    &"A".repeat(32),
+                    &"05".repeat(16),
+                    "ssh.connection-identity/accepted",
+                )
+                .unwrap(),
+                key.derive(
+                    binding,
+                    &"A".repeat(32),
+                    &"05".repeat(16),
+                    "ssh.exec/accepted",
+                )
+                .unwrap(),
+                key.derive(
+                    binding,
+                    &"A".repeat(32),
+                    &"05".repeat(16),
+                    "sftp.list/accepted",
+                )
+                .unwrap(),
+                key.derive(
+                    binding,
+                    &"A".repeat(32),
+                    &"05".repeat(16),
+                    "forward.local/open/accepted",
+                )
+                .unwrap(),
+                key.derive(
+                    binding,
+                    "no-ssh-transport",
+                    "daemon-lifetime-metadata",
+                    "daemon.status/accepted",
+                )
+                .unwrap(),
+                key.derive(
+                    binding,
+                    &"A".repeat(32),
+                    "/tmp/created",
+                    "sftp.write/create-dir/accepted",
+                )
+                .unwrap(),
+            ])
+        {
+            assert_ne!(context, changed);
+        }
+
+        let registry = TransferRegistry::default();
+        let transfer_id = ipc::TransferId::parse(&"05".repeat(16)).unwrap();
+        let mut progress = transfer_progress(
+            transfer_id.clone(),
+            ipc::TransferDirection::Push,
+            ipc::TransferStage::Negotiating,
+            10,
+            0,
+            0,
+            ipc::TransferBackend::Sftp,
+        );
+        progress.operation_context_id = Some(context.clone());
+        progress.revision = 1;
+        registry
+            .begin("profile-a-generation-7", progress.clone())
+            .unwrap();
+        assert!(registry
+            .begin("profile-a-generation-7", progress.clone())
+            .is_err());
+        let first = registry
+            .snapshots("profile-a-generation-7", Some(&transfer_id), None, true)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(first.revision, 1);
+        assert_eq!(first.operation_context_id.as_ref(), Some(&context));
+        assert!(registry
+            .snapshots("profile-a-generation-7", Some(&transfer_id), None, true)
+            .is_err());
+        assert_eq!(
+            registry
+                .snapshots(
+                    "profile-a-generation-7",
+                    Some(&transfer_id),
+                    Some(&context),
+                    true
+                )
+                .unwrap()[0]
+                .revision,
+            1
+        );
+        let forged = ipc::OperationContextId::parse(&"ff".repeat(32)).unwrap();
+        assert!(registry
+            .snapshots(
+                "profile-a-generation-7",
+                Some(&transfer_id),
+                Some(&forged),
+                true
+            )
+            .is_err());
+        assert!(registry
+            .snapshots(
+                "profile-b-generation-7",
+                Some(&transfer_id),
+                Some(&context),
+                true
+            )
+            .is_err());
+        let cancelled = registry
+            .cancel("profile-a-generation-7", &transfer_id, Some(&context))
+            .unwrap();
+        assert_eq!(cancelled.revision, 2);
+        assert_eq!(cancelled.event, "cancel_requested");
+        assert!(registry
+            .cancel("profile-a-generation-7", &transfer_id, Some(&forged))
+            .is_err());
+    }
+
+    fn indexed_transfer_id(index: u128) -> ipc::TransferId {
+        ipc::TransferId::parse(&format!("{index:032x}")).unwrap()
+    }
+
+    fn indexed_transfer_progress(index: u128, stage: ipc::TransferStage) -> ipc::TransferProgress {
+        let completed_bytes = if stage == ipc::TransferStage::Completed {
+            1
+        } else {
+            0
+        };
+        let mut progress = transfer_progress(
+            indexed_transfer_id(index),
+            ipc::TransferDirection::Push,
+            stage,
+            1,
+            completed_bytes,
+            completed_bytes,
+            ipc::TransferBackend::Sftp,
+        );
+        progress.event = if stage == ipc::TransferStage::Completed {
+            "completed"
+        } else {
+            "progress"
+        }
+        .to_owned();
+        progress
+    }
+
+    fn worst_case_transfer_progress(
+        index: u128,
+        stage: ipc::TransferStage,
+    ) -> ipc::TransferProgress {
+        let mut progress = indexed_transfer_progress(index, stage);
+        // A quote consumes two JSON bytes, covering the largest escaped form
+        // permitted by TransferProgress::validate's 64-byte event cap.
+        progress.event = "\"".repeat(64);
+        progress.total_bytes = u64::MAX;
+        progress.confirmed_bytes = u64::MAX;
+        progress.durable_bytes = u64::MAX;
+        progress.window_bps = f64::MAX;
+        progress.average_bps = f64::MAX;
+        progress.eta_ms = Some(u64::MAX);
+        progress.backend = ipc::TransferBackend::SftpFallback;
+        progress.chunk_bytes = u32::MAX;
+        progress.window_bytes = u32::MAX;
+        progress.updated_unix_ms = u64::MAX;
+        progress.validate().unwrap();
+        progress
+    }
+
+    #[test]
+    fn transfer_registry_bounds_active_transfers_per_profile_and_globally() {
+        let per_profile = TransferRegistry::default();
+        for index in 0..MAX_ACTIVE_TRANSFERS_PER_PROFILE {
+            per_profile
+                .begin(
+                    "alpha",
+                    indexed_transfer_progress(index as u128, ipc::TransferStage::Transferring),
+                )
+                .unwrap();
+        }
+        let error = per_profile
+            .begin(
+                "alpha",
+                indexed_transfer_progress(
+                    MAX_ACTIVE_TRANSFERS_PER_PROFILE as u128,
+                    ipc::TransferStage::Transferring,
+                ),
+            )
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("profile active transfer capacity is exhausted"));
+
+        let global = TransferRegistry::default();
+        for index in 0..MAX_ACTIVE_TRANSFERS_GLOBAL {
+            global
+                .begin(
+                    &format!("profile-{index}"),
+                    indexed_transfer_progress(index as u128, ipc::TransferStage::Transferring),
+                )
+                .unwrap();
+        }
+        let error = global
+            .begin(
+                "one-too-many",
+                indexed_transfer_progress(
+                    MAX_ACTIVE_TRANSFERS_GLOBAL as u128,
+                    ipc::TransferStage::Transferring,
+                ),
+            )
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("global active transfer capacity is exhausted"));
+    }
+
+    #[test]
+    fn transfer_registry_retains_latest_finished_records_with_profile_isolation() {
+        let registry = TransferRegistry::default();
+        let completed_per_profile = MAX_COMPLETED_TRANSFERS_PER_PROFILE * 4;
+        for index in 0..completed_per_profile {
+            let progress = indexed_transfer_progress(
+                (completed_per_profile - index) as u128,
+                ipc::TransferStage::Completed,
+            );
+            registry.begin("alpha", progress.clone()).unwrap();
+            registry.finish("alpha", progress).unwrap();
+        }
+        for index in 0..completed_per_profile {
+            let progress =
+                indexed_transfer_progress(1_000 + index as u128, ipc::TransferStage::Completed);
+            registry.begin("beta", progress.clone()).unwrap();
+            registry.finish("beta", progress).unwrap();
+        }
+
+        let alpha = registry.snapshots("alpha", None, None, false).unwrap();
+        let beta = registry.snapshots("beta", None, None, false).unwrap();
+        assert_eq!(alpha.len(), MAX_COMPLETED_TRANSFERS_PER_PROFILE);
+        assert_eq!(beta.len(), MAX_COMPLETED_TRANSFERS_PER_PROFILE);
+        assert_eq!(alpha.first().unwrap().transfer_id, indexed_transfer_id(1));
+        assert_eq!(
+            alpha.last().unwrap().transfer_id,
+            indexed_transfer_id(MAX_COMPLETED_TRANSFERS_PER_PROFILE as u128)
+        );
+        let beta_floor = indexed_transfer_id(1_000);
+        assert!(beta
+            .iter()
+            .all(|progress| progress.transfer_id.as_str() >= beta_floor.as_str()));
+    }
+
+    #[test]
+    fn transfer_registry_globally_bounds_many_rapid_finished_records() {
+        let registry = TransferRegistry::default();
+        let total = MAX_COMPLETED_TRANSFERS_GLOBAL + 64;
+        for index in 0..total {
+            let progress = indexed_transfer_progress(
+                10_000 + (total - index) as u128,
+                ipc::TransferStage::Completed,
+            );
+            let profile = format!("profile-{index}");
+            registry.begin(&profile, progress.clone()).unwrap();
+            registry.finish(&profile, progress).unwrap();
+        }
+
+        let records = registry.records.lock().unwrap();
+        assert_eq!(records.len(), MAX_COMPLETED_TRANSFERS_GLOBAL);
+        assert!(records.values().all(|record| record.finished_at.is_some()));
+        assert!(!records.contains_key(indexed_transfer_id(10_000 + total as u128).as_str()));
+        assert!(records.contains_key(indexed_transfer_id(10_001).as_str()));
+    }
+
+    #[test]
+    fn transfer_registry_prunes_terminal_records_at_the_retention_boundary() {
+        let registry = TransferRegistry::default();
+        let expired = indexed_transfer_progress(19_001, ipc::TransferStage::Completed);
+        let retained = indexed_transfer_progress(19_002, ipc::TransferStage::Completed);
+        let active = indexed_transfer_progress(19_003, ipc::TransferStage::Transferring);
+        registry.begin("alpha", expired.clone()).unwrap();
+        registry.finish("alpha", expired.clone()).unwrap();
+        registry.begin("alpha", retained.clone()).unwrap();
+        registry.finish("alpha", retained.clone()).unwrap();
+        registry.begin("alpha", active.clone()).unwrap();
+
+        let base = Instant::now();
+        let mut records = registry.records.lock().unwrap();
+        records
+            .get_mut(expired.transfer_id.as_str())
+            .unwrap()
+            .finished_at = Some(base);
+        records
+            .get_mut(retained.transfer_id.as_str())
+            .unwrap()
+            .finished_at = Some(base + Duration::from_nanos(1));
+        TransferRegistry::prune_locked(&mut records, base + TRANSFER_RECORD_RETENTION);
+
+        assert!(!records.contains_key(expired.transfer_id.as_str()));
+        assert!(records.contains_key(retained.transfer_id.as_str()));
+        assert!(records.contains_key(active.transfer_id.as_str()));
+    }
+
+    #[test]
+    fn transfer_status_all_worst_case_is_strictly_below_control_frame_limit() {
+        let registry = TransferRegistry::default();
+        for index in 0..MAX_COMPLETED_TRANSFERS_PER_PROFILE {
+            let progress = worst_case_transfer_progress(
+                20_000 + index as u128,
+                ipc::TransferStage::Transferring,
+            );
+            registry.begin("alpha", progress.clone()).unwrap();
+            registry.finish("alpha", progress).unwrap();
+        }
+        for index in 0..MAX_ACTIVE_TRANSFERS_PER_PROFILE {
+            let progress = worst_case_transfer_progress(
+                30_000 + index as u128,
+                ipc::TransferStage::Transferring,
+            );
+            registry.begin("alpha", progress).unwrap();
+        }
+
+        let snapshots = registry.snapshots("alpha", None, None, false).unwrap();
+        assert_eq!(
+            snapshots.len(),
+            MAX_COMPLETED_TRANSFERS_PER_PROFILE + MAX_ACTIVE_TRANSFERS_PER_PROFILE
+        );
+        let frame = ipc::Frame::TransferStatusInfo {
+            transfers: snapshots,
+        };
+        let encoded_len =
+            ipc::encoded_frame_len_limited(&frame, ipc::MAX_CONTROL_FRAME - 1).unwrap();
+        assert!(encoded_len < ipc::MAX_CONTROL_FRAME);
+    }
+
+    #[test]
     fn transfer_registry_owner_changes_when_a_profile_name_is_recreated() {
         let old = ConnInfo {
             profile: "same-name".into(),
             profile_id: Some([0x11; 16]),
+            profile_generation: Some(1),
             host: "old.example".into(),
             user: "alice".into(),
             started: 1,
@@ -5821,6 +8799,7 @@ mod tests {
         let replacement = ConnInfo {
             profile: "same-name".into(),
             profile_id: Some([0x22; 16]),
+            profile_generation: Some(1),
             host: "new.example".into(),
             user: "alice".into(),
             started: 2,
@@ -5843,7 +8822,7 @@ mod tests {
         registry.begin(&old_owner, progress.clone()).unwrap();
         registry.finish(&old_owner, progress).unwrap();
         assert!(registry
-            .snapshots(&replacement_owner, None)
+            .snapshots(&replacement_owner, None, None, false)
             .unwrap()
             .is_empty());
     }
@@ -6060,15 +9039,26 @@ mod tests {
     #[test]
     fn policy_max_grant_holds_daemon_idle_guard_until_its_own_expiry() {
         use ed25519_dalek::SigningKey;
-        use serctl_protocol::grant::{OperationGrant, GRANT_DEFAULT_TTL, GRANT_MAX_TTL};
+        use serctl_protocol::grant::{
+            GrantProfileIdentity, OperationGrant, GRANT_DEFAULT_TTL, GRANT_MAX_TTL,
+        };
         use serctl_protocol::v6::{V6RequestPrelude, IPC_PROTOCOL_VERSION_V6};
 
         let idle = Arc::new(IdleTracker::default());
-        let grants = GrantRegistry::new(Arc::clone(&idle));
+        let grants = GrantRegistry::<TestGrantEntry>::new(Arc::clone(&idle));
         let holder = SigningKey::from_bytes(&[7_u8; 32]);
+        let identity = serctl_core::vault::ProfileIdentity {
+            profile_id: [9_u8; 16],
+            generation: 7,
+        };
+        let entry = Arc::new(TestGrantEntry {
+            profile_id: identity.profile_id,
+            generation: AtomicUsize::new(identity.generation as usize),
+            profile: "grant-idle-test".into(),
+        });
         let grant = OperationGrant::new_with_ttl(
             "grant-idle-test".into(),
-            [9_u8; 16],
+            GrantProfileIdentity::new(identity.profile_id, identity.generation),
             vec!["daemon.status".into()],
             1,
             &holder.verifying_key(),
@@ -6079,14 +9069,18 @@ mod tests {
 
         assert!(idle.is_idle());
         let grant_id = grant.grant_id;
-        grants.insert(grant).unwrap();
+        grants.insert(grant, Arc::clone(&entry)).unwrap();
+        assert_eq!(Arc::strong_count(&entry), 2);
         assert!(
             !idle.is_idle(),
             "an issued grant must prevent automatic daemon idle exit"
         );
 
-        let record = grants.get(&grant_id).unwrap();
-        let expired_request = V6RequestPrelude {
+        let record = match grants.lookup(&grant_id, Instant::now()) {
+            GrantLookup::Live(record) => record,
+            _ => panic!("new grant was not live"),
+        };
+        let mut grant_request = V6RequestPrelude {
             protocol_version: IPC_PROTOCOL_VERSION_V6,
             client_session_id: [1_u8; 16],
             request_id: [2_u8; 16],
@@ -6096,33 +9090,431 @@ mod tests {
             grant_id: Some(grant_id),
             pop_signature: None,
             profile_proof: None,
-            requested_deadline_unix_ms: u64::MAX,
+            requested_deadline_unix_ms: record.grant.expires_unix_ms - 1,
             root_request_hash: [0_u8; 32],
         };
-        let error = record
-            .check_and_spend(
-                &expired_request,
-                Instant::now() + GRANT_DEFAULT_TTL + Duration::from_millis(1),
+        grant_request.pop_signature =
+            Some(serctl_protocol::grant::sign_prelude_pop(&holder, &grant_request).unwrap());
+        record
+            .validate_request(
+                &grant_request,
+                record.expires_at - (GRANT_MAX_TTL - GRANT_DEFAULT_TTL) + Duration::from_millis(1),
                 super::now_unix_ms(),
             )
-            .unwrap_err();
-        assert_ne!(terminal_safe_error(&error), "grant has expired");
+            .unwrap();
+        let exhausted = record.spend_budget().unwrap();
+        assert!(exhausted);
         let error = record
-            .check_and_spend(
-                &expired_request,
-                Instant::now() + GRANT_MAX_TTL + Duration::from_millis(1),
+            .validate_request(
+                &grant_request,
+                record.expires_at + Duration::from_millis(1),
                 super::now_unix_ms(),
             )
             .unwrap_err();
         assert_eq!(terminal_safe_error(&error), "grant has expired");
         assert!(!UNKNOWN_GRANT_ERROR.contains("expired"));
+        let expired_at = record.expires_at;
         drop(record);
 
-        grants.prune_expired(Instant::now() + GRANT_MAX_TTL + Duration::from_millis(1));
+        grants.prune_expired(expired_at + Duration::from_millis(1));
         assert!(
             idle.is_idle(),
             "reaping the expired grant must release its idle guard"
         );
+        assert_eq!(Arc::strong_count(&entry), 1);
+        assert!(matches!(
+            grants.lookup(&grant_id, expired_at + Duration::from_millis(1)),
+            GrantLookup::Expired
+        ));
+        assert!(matches!(
+            grants.lookup(
+                &grant_id,
+                expired_at + GRANT_TERMINAL_TOMBSTONE_TTL + Duration::from_millis(1)
+            ),
+            GrantLookup::Unknown
+        ));
+        let restarted = GrantRegistry::<TestGrantEntry>::new(Arc::new(IdleTracker::default()));
+        assert!(matches!(
+            restarted.lookup(&grant_id, Instant::now()),
+            GrantLookup::Unknown
+        ));
+    }
+
+    #[test]
+    fn grant_generation_binding_rejects_old_or_changed_entry_before_budget_spend() {
+        use ed25519_dalek::SigningKey;
+        use serctl_protocol::grant::{GrantProfileIdentity, OperationGrant};
+
+        let holder = SigningKey::from_bytes(&[11_u8; 32]);
+        let idle = Arc::new(IdleTracker::default());
+        let entry = Arc::new(TestGrantEntry {
+            profile_id: [0x31; 16],
+            generation: AtomicUsize::new(7),
+            profile: "generation-test".into(),
+        });
+        let old_grant = OperationGrant::new(
+            "generation-test".into(),
+            GrantProfileIdentity::new(entry.profile_id, 6),
+            vec!["daemon.status".into()],
+            2,
+            &holder.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let error = GrantRecord::new(
+            old_grant,
+            Arc::clone(&entry),
+            Instant::now(),
+            idle.acquire(),
+        )
+        .err()
+        .expect("old generation must be rejected");
+        assert!(
+            terminal_safe_error(&error).contains("generation"),
+            "unexpected error: {error:#}"
+        );
+
+        let grant = OperationGrant::new(
+            "generation-test".into(),
+            GrantProfileIdentity::new(entry.profile_id, 7),
+            vec!["daemon.status".into()],
+            2,
+            &holder.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let record = GrantRecord::new(
+            grant.clone(),
+            Arc::clone(&entry),
+            Instant::now(),
+            idle.acquire(),
+        )
+        .unwrap();
+        let request = signed_grant_prelude(&grant, &holder);
+        entry.generation.store(8, Ordering::Release);
+        let error = record
+            .validate_request(&request, Instant::now(), super::now_unix_ms())
+            .unwrap_err();
+        assert!(terminal_safe_error(&error).contains("generation"));
+        assert_eq!(
+            record.remaining.load(Ordering::Acquire),
+            2,
+            "generation mismatch consumed grant budget"
+        );
+    }
+
+    #[test]
+    fn connection_identity_grant_scope_and_profile_generation_are_exact() {
+        use ed25519_dalek::SigningKey;
+        use serctl_protocol::grant::{GrantProfileIdentity, OperationGrant};
+
+        let holder = SigningKey::from_bytes(&[0x37_u8; 32]);
+        let idle = Arc::new(IdleTracker::default());
+        let entry = Arc::new(TestGrantEntry {
+            profile_id: [0x38; 16],
+            generation: AtomicUsize::new(4),
+            profile: "identity-scope".into(),
+        });
+        let grant = OperationGrant::new(
+            entry.profile.clone(),
+            GrantProfileIdentity::new(entry.profile_id, 4),
+            vec!["ssh.connection-identity".into()],
+            2,
+            &holder.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let record = GrantRecord::new(
+            grant.clone(),
+            Arc::clone(&entry),
+            Instant::now(),
+            idle.acquire(),
+        )
+        .unwrap();
+
+        let exact = signed_grant_prelude_for_operation(&grant, &holder, "ssh.connection-identity");
+        record
+            .validate_request(&exact, Instant::now(), super::now_unix_ms())
+            .unwrap();
+        assert!(!record.spend_budget().unwrap());
+        assert_eq!(record.remaining.load(Ordering::Acquire), 1);
+
+        let wrong_scope = signed_grant_prelude_for_operation(&grant, &holder, "ssh.exec");
+        let error = record
+            .validate_request(&wrong_scope, Instant::now(), super::now_unix_ms())
+            .unwrap_err();
+        assert!(error.to_string().contains("does not authorize"));
+        assert_eq!(record.remaining.load(Ordering::Acquire), 1);
+
+        entry.generation.store(5, Ordering::Release);
+        let error = record
+            .validate_request(&exact, Instant::now(), super::now_unix_ms())
+            .unwrap_err();
+        assert!(terminal_safe_error(&error).contains("generation"));
+        assert_eq!(record.remaining.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn transfer_read_grant_is_exactly_profile_generation_and_scope_bound() {
+        use ed25519_dalek::SigningKey;
+        use serctl_protocol::grant::{GrantProfileIdentity, OperationGrant};
+
+        let holder = SigningKey::from_bytes(&[0x47_u8; 32]);
+        let idle = Arc::new(IdleTracker::default());
+        let entry = Arc::new(TestGrantEntry {
+            profile_id: [0x48; 16],
+            generation: AtomicUsize::new(12),
+            profile: "pull-scope".into(),
+        });
+        let grant = OperationGrant::new(
+            entry.profile.clone(),
+            GrantProfileIdentity::new(entry.profile_id, 12),
+            vec!["transfer.read".into()],
+            2,
+            &holder.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let record = GrantRecord::new(
+            grant.clone(),
+            Arc::clone(&entry),
+            Instant::now(),
+            idle.acquire(),
+        )
+        .unwrap();
+        let exact = signed_grant_prelude_for_operation(&grant, &holder, "transfer.read");
+        record
+            .validate_request(&exact, Instant::now(), super::now_unix_ms())
+            .unwrap();
+
+        let wrong_scope = signed_grant_prelude_for_operation(&grant, &holder, "transfer.write");
+        assert!(record
+            .validate_request(&wrong_scope, Instant::now(), super::now_unix_ms())
+            .unwrap_err()
+            .to_string()
+            .contains("does not authorize"));
+        assert_eq!(record.remaining.load(Ordering::Acquire), 2);
+
+        entry.generation.store(13, Ordering::Release);
+        assert!(terminal_safe_error(
+            &record
+                .validate_request(&exact, Instant::now(), super::now_unix_ms())
+                .unwrap_err()
+        )
+        .contains("generation"));
+        assert_eq!(record.remaining.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn connection_identity_request_binding_rejects_profile_or_generation_substitution() {
+        let identity = serctl_core::vault::ProfileIdentity {
+            profile_id: [0x41; 16],
+            generation: 9,
+        };
+        let exact = serctl_protocol::Frame::ConnectionIdentity {
+            profile_id: identity.profile_id,
+            profile_generation: identity.generation,
+        };
+        validate_connection_identity_binding(&exact, identity).unwrap();
+
+        for substituted in [
+            serctl_protocol::Frame::ConnectionIdentity {
+                profile_id: [0x42; 16],
+                profile_generation: identity.generation,
+            },
+            serctl_protocol::Frame::ConnectionIdentity {
+                profile_id: identity.profile_id,
+                profile_generation: identity.generation + 1,
+            },
+        ] {
+            let error = validate_connection_identity_binding(&substituted, identity).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("does not match the authorized profile generation"));
+        }
+    }
+
+    #[test]
+    fn serialized_grant_metadata_cannot_expand_registered_authority() {
+        use ed25519_dalek::SigningKey;
+        use serctl_protocol::grant::{GrantProfileIdentity, OperationGrant};
+
+        let holder = SigningKey::from_bytes(&[0x51_u8; 32]);
+        let idle = Arc::new(IdleTracker::default());
+        let grants = GrantRegistry::<TestGrantEntry>::new(Arc::clone(&idle));
+        let entry = Arc::new(TestGrantEntry {
+            profile_id: [0x52; 16],
+            generation: AtomicUsize::new(11),
+            profile: "registered-profile".into(),
+        });
+        let issued = OperationGrant::new(
+            entry.profile.clone(),
+            GrantProfileIdentity::new(entry.profile_id, 11),
+            vec!["daemon.status".into()],
+            1,
+            &holder.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let registered_id = issued.grant_id;
+        grants.insert(issued.clone(), Arc::clone(&entry)).unwrap();
+        let record = match grants.lookup(&registered_id, Instant::now()) {
+            GrantLookup::Live(record) => record,
+            _ => panic!("issued grant was not registered"),
+        };
+
+        // Round-trip through JSON first: every mutation below represents an
+        // edit to the advisory Agent-side grant-file metadata, while `record`
+        // remains the daemon's authoritative in-memory registration.
+        let serialized = serde_json::to_vec(&issued).unwrap();
+        let from_file = || {
+            serde_json::from_slice::<OperationGrant>(&serialized)
+                .expect("deserialize simulated grant file")
+        };
+        let resign = |prelude: &mut serctl_protocol::v6::V6RequestPrelude| {
+            prelude.pop_signature = None;
+            prelude.pop_signature =
+                Some(serctl_protocol::grant::sign_prelude_pop(&holder, prelude).unwrap());
+        };
+
+        let mut widened_scope = from_file();
+        widened_scope.operations.push("sftp.write".into());
+        let mut request = signed_grant_prelude(&widened_scope, &holder);
+        request.operation_kind = "sftp.write".into();
+        resign(&mut request);
+        let error = record
+            .validate_request(&request, Instant::now(), super::now_unix_ms())
+            .unwrap_err();
+        assert_eq!(
+            terminal_safe_error(&error),
+            "grant does not authorize this operation kind"
+        );
+
+        let mut changed_profile = from_file();
+        changed_profile.profile_name = "other-profile".into();
+        let request = signed_grant_prelude(&changed_profile, &holder);
+        let error = record
+            .validate_request(&request, Instant::now(), super::now_unix_ms())
+            .unwrap_err();
+        assert_eq!(terminal_safe_error(&error), "grant profile mismatch");
+
+        let mut extended_expiry = from_file();
+        extended_expiry.expires_unix_ms += 60_000;
+        let mut request = signed_grant_prelude(&extended_expiry, &holder);
+        request.requested_deadline_unix_ms = issued.expires_unix_ms + 1;
+        resign(&mut request);
+        let error = record
+            .validate_request(&request, Instant::now(), super::now_unix_ms())
+            .unwrap_err();
+        assert_eq!(
+            terminal_safe_error(&error),
+            "requested deadline exceeds the grant expiry"
+        );
+
+        let mut changed_id = from_file();
+        changed_id.grant_id[0] ^= 1;
+        assert!(matches!(
+            grants.lookup(&changed_id.grant_id, Instant::now()),
+            GrantLookup::Unknown
+        ));
+
+        let mut advisory_identity_and_budget = from_file();
+        advisory_identity_and_budget.profile_id[0] ^= 1;
+        advisory_identity_and_budget.profile_generation += 1;
+        advisory_identity_and_budget.budget = 1_000;
+        assert_eq!(record.grant.profile_id, issued.profile_id);
+        assert_eq!(record.grant.profile_generation, issued.profile_generation);
+        assert_eq!(record.grant.budget, 1);
+        let request = signed_grant_prelude(&advisory_identity_and_budget, &holder);
+        record
+            .validate_request(&request, Instant::now(), super::now_unix_ms())
+            .unwrap();
+        assert!(record.spend_budget().unwrap());
+        assert_eq!(
+            terminal_safe_error(&record.spend_budget().unwrap_err()),
+            "grant budget exhausted"
+        );
+    }
+
+    #[test]
+    fn grant_budget_one_is_atomic_and_terminal_tombstone_releases_exact_entry() {
+        use ed25519_dalek::SigningKey;
+        use serctl_protocol::grant::{GrantProfileIdentity, OperationGrant};
+        use std::sync::Barrier;
+
+        let idle = Arc::new(IdleTracker::default());
+        let grants = Arc::new(GrantRegistry::<TestGrantEntry>::new(Arc::clone(&idle)));
+        let holder = SigningKey::from_bytes(&[12_u8; 32]);
+        let entry = Arc::new(TestGrantEntry {
+            profile_id: [0x41; 16],
+            generation: AtomicUsize::new(9),
+            profile: "budget-test".into(),
+        });
+        let replacement = Arc::new(TestGrantEntry {
+            profile_id: entry.profile_id,
+            generation: AtomicUsize::new(9),
+            profile: "budget-test".into(),
+        });
+        let grant = OperationGrant::new(
+            "budget-test".into(),
+            GrantProfileIdentity::new(entry.profile_id, 9),
+            vec!["daemon.status".into()],
+            1,
+            &holder.verifying_key(),
+            super::now_unix_ms(),
+        )
+        .unwrap();
+        let grant_id = grant.grant_id;
+        let request = Arc::new(signed_grant_prelude(&grant, &holder));
+        grants.insert(grant, Arc::clone(&entry)).unwrap();
+        let record = match grants.lookup(&grant_id, Instant::now()) {
+            GrantLookup::Live(record) => record,
+            _ => panic!("new grant was not live"),
+        };
+        assert!(Arc::ptr_eq(&record.entry, &entry));
+        assert!(!Arc::ptr_eq(&record.entry, &replacement));
+
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut threads = Vec::new();
+        for _ in 0..workers {
+            let record = Arc::clone(&record);
+            let request = Arc::clone(&request);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                record.validate_request(&request, Instant::now(), super::now_unix_ms())?;
+                record.spend_budget()
+            }));
+        }
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .all(|error| terminal_safe_error(error) == "grant budget exhausted"));
+        assert!(results.iter().any(|result| matches!(result, Ok(true))));
+
+        grants.mark_terminal_if_same(
+            &grant_id,
+            &record,
+            GrantTerminalKind::Exhausted,
+            Instant::now(),
+        );
+        assert!(matches!(
+            grants.lookup(&grant_id, Instant::now()),
+            GrantLookup::Exhausted
+        ));
+        drop(record);
+        assert_eq!(
+            Arc::strong_count(&entry),
+            1,
+            "terminal tombstone retained the credential entry"
+        );
+        assert!(idle.is_idle());
     }
 
     #[tokio::test]
@@ -6262,22 +9654,27 @@ mod tests {
         let info = ConnInfo {
             profile: "prod".into(),
             profile_id: Some([0x11; 16]),
+            profile_generation: Some(1),
             host: "ssh.example".into(),
             user: "alice".into(),
             started: 123,
             token: Arc::new(zeroize::Zeroizing::new("unused-token".into())),
         };
-        match status_info_frame(&info) {
+        match status_info_frame(&info, None, 0) {
             serctl_protocol::Frame::StatusInfo {
                 profile,
                 host,
                 user,
                 started_unix,
+                operation_context_id,
+                revision,
             } => {
                 assert_eq!(profile, "prod");
                 assert_eq!(host, "ssh.example");
                 assert_eq!(user, "alice");
                 assert_eq!(started_unix, 123);
+                assert!(operation_context_id.is_none());
+                assert_eq!(revision, 0);
             }
             other => panic!("unexpected authorized status response: {other:?}"),
         }
@@ -6664,6 +10061,29 @@ mod tests {
     }
 
     #[test]
+    fn native_chunk_limit_is_independent_from_sftp_confirmed_write_cap() {
+        let (chunk, window) = negotiated_native_limits(
+            serctl_transfer_protocol::DEFAULT_CHUNK_BYTES,
+            serctl_transfer_protocol::MAX_WINDOW_BYTES,
+        )
+        .unwrap();
+        assert_eq!(chunk, serctl_protocol::NATIVE_IPC_CHUNK_BYTES as u32);
+        assert!(chunk > serctl_protocol::SFTP_SAFE_CHUNK_BYTES as u32);
+        assert_eq!(window, serctl_transfer_protocol::MAX_WINDOW_BYTES);
+
+        let (smaller_chunk, smaller_window) = negotiated_native_limits(32 * 1024, 128 * 1024)
+            .expect("valid helper limits should negotiate downward");
+        assert_eq!(smaller_chunk, 32 * 1024);
+        assert_eq!(smaller_window, 128 * 1024);
+        assert!(negotiated_native_limits(0, 1).is_err());
+        assert!(negotiated_native_limits(
+            128 * 1024,
+            serctl_protocol::NATIVE_IPC_CHUNK_BYTES as u32 - 1,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn startup_rereads_after_removing_a_shadowing_hashed_lock() {
         let legacy = recover_invalid_startup_lock_read::<u8, _, _>(
             Err(anyhow::anyhow!("malformed hashed lock")),
@@ -6684,6 +10104,20 @@ mod tests {
 
     #[test]
     fn authenticated_request_semantic_limits_are_enforced() {
+        assert!(
+            validate_request_frame(&serctl_protocol::Frame::ConnectionIdentity {
+                profile_id: [0x55; 16],
+                profile_generation: 0,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_request_frame(&serctl_protocol::Frame::ConnectionIdentity {
+                profile_id: [0x55; 16],
+                profile_generation: 1,
+            })
+            .is_ok()
+        );
         assert!(validate_request_frame(&serctl_protocol::Frame::Exec {
             cmd: "x".repeat(serctl_core::ssh::MAX_REMOTE_COMMAND_BYTES + 1),
             timeout_ms: 1,
@@ -6704,6 +10138,7 @@ mod tests {
                 backend: serctl_protocol::TransferBackend::Sftp,
                 resume: serctl_protocol::TransferResumeMode::Never,
                 resume_token: None,
+                expected_helper_identity: None,
                 idle_timeout_ms: 1,
                 deadline_ms: Some(1),
             })
@@ -6715,11 +10150,22 @@ mod tests {
                 serctl_protocol::Frame::Download {
                     transfer_id: serctl_protocol::TransferId::random(),
                     path: "/tmp/x".into(),
+                    local_target_sha256: Some("33".repeat(32)),
                     backend: serctl_protocol::TransferBackend::Native,
                     resume,
                     resume_offset,
                     expected_size,
                     expected_sha256,
+                    expected_helper_identity: Some(Box::new(
+                        serctl_protocol::ExpectedNativeHelperIdentity {
+                            name: "serctl-xfer".into(),
+                            binary_size: 123,
+                            sha256: "44".repeat(32),
+                            version:
+                                "serctl-xfer 1.0.0-beta (git 0123456789ab; transfer protocol v1)"
+                                    .into(),
+                        },
+                    )),
                     idle_timeout_ms: 1,
                     deadline_ms: Some(1),
                 }
@@ -6731,6 +10177,28 @@ mod tests {
             Some("ab".repeat(32)),
         );
         assert!(validate_request_frame(&valid_download).is_ok());
+        assert!(validate_grant_frame_binding(&valid_download).is_ok());
+        let mut missing_local_target = valid_download.clone();
+        let serctl_protocol::Frame::Download {
+            local_target_sha256,
+            ..
+        } = &mut missing_local_target
+        else {
+            unreachable!()
+        };
+        *local_target_sha256 = None;
+        assert!(validate_request_frame(&missing_local_target).is_ok());
+        assert!(validate_grant_frame_binding(&missing_local_target).is_err());
+        let mut invalid_local_target = valid_download.clone();
+        let serctl_protocol::Frame::Download {
+            local_target_sha256,
+            ..
+        } = &mut invalid_local_target
+        else {
+            unreachable!()
+        };
+        *local_target_sha256 = Some("NOT-A-DIGEST".into());
+        assert!(validate_request_frame(&invalid_local_target).is_err());
         for invalid in [
             download_with(serctl_protocol::TransferResumeMode::Auto, 5, Some(10), None),
             download_with(
@@ -6777,11 +10245,13 @@ mod tests {
             assert!(validate_request_frame(&serctl_protocol::Frame::Download {
                 transfer_id: serctl_protocol::TransferId::random(),
                 path: invalid_path,
+                local_target_sha256: None,
                 backend: serctl_protocol::TransferBackend::Sftp,
                 resume: serctl_protocol::TransferResumeMode::Never,
                 resume_offset: 0,
                 expected_size: None,
                 expected_sha256: None,
+                expected_helper_identity: None,
                 idle_timeout_ms: 1,
                 deadline_ms: Some(1),
             })

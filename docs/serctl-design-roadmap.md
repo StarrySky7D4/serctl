@@ -40,9 +40,9 @@
 
 截至本文日期，当前基线是：
 
-- **已实现**：vault/record v4；逐 profile 独立 Argon2id KDF、DEK/AuthSeed、随机 `profile_id` 与 generation；Windows 超管密码 + 离线介质 2-of-2 恢复边界。
+- **已实现**：候选存储契约 `vault-storage read=v4..=v5 write=v5`，顶层 `VaultFile` 与外层 profile record 双层均读 v4/v5、只写 v5；从 v2 迁移或对 beta-2 v4 首次成功 mutation 时原子推进 v5；逐 profile 独立 Argon2id KDF、DEK/AuthSeed/AuditSeed、随机 `profile_id` 与 generation；Windows 超管密码 + 离线介质 2-of-2 恢复边界。
 - **已实现**：全局 broker、per-profile pool、IPC wire v8、握手 transcript、方向独立 AEAD、严格计数器、exact root intent、profile call-key 与 OperationGrant PoP/scope/budget。
-- **部分实现**：OperationGrant 显式 TTL 已进入 `v0.3.0-beta.2` 源码候选，默认 30 分钟、整分钟 `1..=40`，客户端与 daemon 双端校验；2026-08-31 全量本地测试/Clippy 已通过，仍缺最终匹配 clean 制品和“签发进程退出→另进程连续请求→到期退出”的组合生命周期 E2E。
+- **部分实现**：OperationGrant 显式 TTL 已进入 `v1.0.0-beta` 源码候选，默认 30 分钟、整分钟 `1..=40`，客户端与 daemon 双端校验；本地组合生命周期 E2E 覆盖“签发进程退出→等待→另进程首次/连续请求→到期拒绝并释放 idle reference”；仍需最终匹配 clean 制品与 exact-tag 证据。
 - **部分实现**：可观察的 SFTP ACK、transfer registry、status/cancel、protected journal、连续 durable-prefix resume、no-overwrite commit，以及仅在 Linux 生产启用的 `serctl-xfer serve --stdio` helper。
 - **部分实现**：原生传输协议采用有界 JSON 控制帧 + raw data frame；完整 russh exec/SFTP 服务端的 4/8/16/32 KiB 矩阵已经通过，2 KiB 根因继续收窄到现实 OpenSSH + helper 子进程 stdio 边界。当前 daemon 仍保守限制为 2 KiB，尚未达到外部吞吐门槛。
 - **部分实现且范围专用**：transfer helper 的 schema 2 sidecar/committed receipt 绑定 token hash、transfer id、size、SHA-256、durable offset、partial identity 与状态，可供同一 id/token 的显式恢复请求对账；它没有消费 ACK/GC/保留策略，不等同于规划中的通用 job/audit receipt 与外部锚定。
@@ -252,7 +252,8 @@ OperationGrant TTL 只决定“调用授权能持续多久”，不能替代远�
 | 产品版本 | 范围 | 退出门槛 |
 | --- | --- | --- |
 | `v0.2.1` | 仅在仍维护无 wire-break 的 v0.2 来源分支且确有热修需求时，回移 SFTP ACK/进度/idle timeout | 不从 IPC v8 工作树直接挑入 wire change；固定快照真实服务端通过 |
-| `v0.3.0-alpha → v0.3.0-beta.2 → v0.3.0` | 当前 IPC v8 + M1/M2 + Linux M3 功能预览、Grant 生命周期、resume/status/cancel、匹配集合预发布 | 全量门禁、Grant 完整生命周期 E2E、签名 helper bootstrap、Ubuntu descriptor/linkat 故障注入、Local-Linux2 21 B/1.3 MB/64 MiB/1 GiB 哈希一致、unknown/cleanup 证据、同机 `scp` 吞吐达到 80% 后方可从 beta 升为 stable |
+| `v0.3.0-alpha → v0.3.0-beta.2` | IPC v8 + M1/M2 + Linux M3 功能预览、Grant 生命周期、resume/status/cancel 的前代预发布 | 只作 predecessor/回滚输入与历史证据；不把 v0.3 证据重标为 v1 通过 |
+| `v1.0.0-beta` | 当前 IPC v9、storage `read=v4..=v5 write=v5`、M1/M2 与 Linux M3 候选、Grant 生命周期、Agent transfer status/cancel、匹配集合预发布 | 全量门禁、exact clean tag 与外部 SSH 证据、签名 helper bootstrap、Ubuntu descriptor/linkat 故障注入、Local-Linux2 21 B/1.3 MB/64 MiB/1 GiB 哈希一致、unknown/cleanup 证据、同机 `scp` 吞吐达到 80% |
 | `v0.4.0` | 作业/receipt、远端/relay deadline 分离、锁页/no-dump 基础 | crash/restart/reconcile、receipt 恢复、锁页失败策略与平台测试 |
 | `v0.5.0` | typed capability、Policy IR、deny-only evaluator、`explain`/dry-run | parser/fuzz、不可放宽不变量、policy digest/grant invalidation、无 UI 的 enforcement E2E |
 | `v0.6.0` | 审计 v1、认证 checkpoint、外部锚定、quarantine/retire | 篡改/截断/重排/回滚、远端不可用、retention 与 unverified 状态矩阵 |

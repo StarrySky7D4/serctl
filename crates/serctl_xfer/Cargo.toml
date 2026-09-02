@@ -14,7 +14,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 atomic-write-file.workspace = true
 hex.workspace = true
-serctl-transfer-protocol = { version = "0.3.0-beta.2", path = "../serctl_transfer_protocol" }
+serctl-transfer-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

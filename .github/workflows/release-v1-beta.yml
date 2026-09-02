@@ -1,0 +1,1103 @@
+name: v1 beta tagged release
+
+on:
+  push:
+    tags:
+      # The initial candidate is v1.0.0-beta. A failed immutable candidate is
+      # repaired only as a new canonical SemVer prerelease such as beta.1;
+      # Verify-ReleaseConsistency rejects noncanonical suffixes.
+      - "v1.0.0-beta*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    name: Validate immutable release identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+      tag_object: ${{ steps.release.outputs.tag_object }}
+    steps:
+      - name: Check out the complete tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the exact tag commit to be the current remote main
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $remoteMain = & gh api --method GET `
+            "repos/$env:GITHUB_REPOSITORY/git/ref/heads/main" `
+            --jq '.object.type + " " + .object.sha'
+          if ($LASTEXITCODE -ne 0) {
+            throw 'cannot read the current remote main ref'
+          }
+          $head = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $head -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'cannot resolve the exact checked-out tag commit'
+          }
+          if (($remoteMain | Out-String).Trim().ToLowerInvariant() -cne "commit $head") {
+            throw 'exact tag commit does not equal the current remote main SHA'
+          }
+
+      - name: Validate tag, Cargo graph, lockfile, and release documents
+        id: release
+        shell: pwsh
+        env:
+          # Keep the untrusted ref in an environment value. The verifier first
+          # constrains it to canonical SemVer before passing it to Git as argv.
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          ./scripts/Verify-ReleaseConsistency.ps1
+          -Tag $env:RELEASE_TAG
+          -RequireGitTag
+          -GithubOutput $env:GITHUB_OUTPUT
+
+      - name: Bind subsequent timestamps to the tagged commit
+        shell: pwsh
+        run: |
+          "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+  quality:
+    name: Tagged source quality and supply-chain policy
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Reject whitespace errors in the tagged diff
+        run: git diff --check HEAD^
+
+      - name: Test release governance scripts and invariants
+        shell: pwsh
+        run: ./scripts/Test-ReleaseGovernance.ps1
+
+      - name: Run strict Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Reject source-only crates from runtime dependency graphs
+        shell: pwsh
+        run: ./scripts/Test-RuntimeDependencyBoundary.ps1 -Offline
+
+      - name: Install pinned dependency policy checker
+        run: cargo install cargo-deny --version '=0.20.2' --locked
+
+      - name: Enforce dependency license, source, and duplicate policy
+        run: cargo deny --locked check bans licenses sources
+
+      - name: Run standalone provenance build-script tests
+        shell: pwsh
+        run: ./scripts/Test-BuildScriptFixtures.ps1
+
+  parser-fuzz:
+    name: Exact-tag bounded parser fuzzing
+    needs: preflight
+    permissions:
+      contents: read
+    uses: ./.github/workflows/parser-fuzz.yml
+    with:
+      tag: ${{ needs.preflight.outputs.tag }}
+      tag_object: ${{ needs.preflight.outputs.tag_object }}
+      commit: ${{ needs.preflight.outputs.commit }}
+
+  test:
+    name: Tagged tests (${{ matrix.name }})
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu x86_64
+            runner: ubuntu-latest
+            expected_os: Linux
+            expected_arch: X64
+            expected_rust_host: x86_64-unknown-linux-gnu
+          - name: Windows x86_64
+            runner: windows-latest
+            expected_os: Windows
+            expected_arch: X64
+            expected_rust_host: x86_64-pc-windows-msvc
+          - name: macOS arm64
+            runner: macos-15
+            expected_os: macOS
+            expected_arch: ARM64
+            expected_rust_host: aarch64-apple-darwin
+          - name: macOS x86_64
+            runner: macos-15-intel
+            expected_os: macOS
+            expected_arch: X64
+            expected_rust_host: x86_64-apple-darwin
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require the declared native runner architecture
+        shell: pwsh
+        env:
+          ACTUAL_RUNNER_OS: ${{ runner.os }}
+          ACTUAL_RUNNER_ARCH: ${{ runner.arch }}
+          EXPECTED_RUNNER_OS: ${{ matrix.expected_os }}
+          EXPECTED_RUNNER_ARCH: ${{ matrix.expected_arch }}
+          EXPECTED_RUST_HOST: ${{ matrix.expected_rust_host }}
+        run: |
+          if ($env:ACTUAL_RUNNER_OS -cne $env:EXPECTED_RUNNER_OS) {
+            throw "runner OS '$env:ACTUAL_RUNNER_OS' is not '$env:EXPECTED_RUNNER_OS'"
+          }
+          if ($env:ACTUAL_RUNNER_ARCH -cne $env:EXPECTED_RUNNER_ARCH) {
+            throw "runner architecture '$env:ACTUAL_RUNNER_ARCH' is not '$env:EXPECTED_RUNNER_ARCH'"
+          }
+          $hostLine = rustc --version --verbose |
+            Where-Object { $_ -match '^host: ' }
+          if ($hostLine -cne "host: $env:EXPECTED_RUST_HOST") {
+            throw "Rust host '$hostLine' is not 'host: $env:EXPECTED_RUST_HOST'"
+          }
+
+      - name: Windows PowerShell 5.1 governance smoke
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          ./scripts/Test-V1BetaDocumentation.ps1
+          ./scripts/Test-V1BetaLocalGate.ps1
+
+      - name: Require the privileged Windows reparse-point rejection branch
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"SERCTL_REQUIRE_WINDOWS_REPARSE_TEST=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+
+      - name: Run build-script fixtures on the native runner
+        shell: pwsh
+        run: ./scripts/Test-BuildScriptFixtures.ps1
+
+      - name: Verify portable release archives and the isolated fuzz lock
+        shell: pwsh
+        run: |
+          cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 |
+            Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw 'isolated fuzz lock metadata resolution failed'
+          }
+          ./scripts/Test-ParserFuzzBoundary.ps1 -RepositoryRoot .
+          ./scripts/Test-DownloadedReleaseSetSelfTest.ps1
+          ./scripts/Test-ReleaseAssetSnapshot.ps1
+
+      - name: Check all targets and features
+        run: >-
+          cargo check --locked --workspace --all-targets --all-features
+          --target ${{ matrix.expected_rust_host }}
+
+      - name: Run strict Clippy on this platform
+        run: >-
+          cargo clippy --locked --workspace --all-targets --all-features
+          --target ${{ matrix.expected_rust_host }} -- -D warnings
+
+      - name: Test all targets and features serially
+        run: >-
+          cargo test --locked --workspace --all-targets --all-features
+          --target ${{ matrix.expected_rust_host }} -- --test-threads=1
+
+      - name: Build the CLI for mandatory Windows multi-account ACL testing
+        if: runner.os == 'Windows'
+        run: >-
+          cargo build --locked -p serctl-cli --bin serctl_cli
+          --target ${{ matrix.expected_rust_host }}
+
+      - name: Require Windows multi-account DACL and owner isolation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          ./scripts/Test-WindowsMultiAccountAcl.ps1
+          -CliPath target/${{ matrix.expected_rust_host }}/debug/serctl_cli.exe
+
+  rustsec:
+    name: Tagged online RustSec audit
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version '=0.22.2' --locked
+
+      - name: Audit the tagged lockfile against current RustSec data
+        run: cargo audit --deny warnings
+
+  windows-bundle:
+    name: Windows x86_64 matched CLI and daemon bundle
+    needs: [preflight, quality, parser-fuzz, test, rustsec]
+    runs-on: windows-2025
+    timeout-minutes: 35
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    env:
+      # The workspace release profile strips symbols and does not otherwise
+      # request debuginfo. Override both settings so the fresh Windows build
+      # produces PDBs, which are then packaged separately from the runtime.
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+      CARGO_PROFILE_RELEASE_STRIP: none
+      CARGO_TARGET_DIR: target/v1-beta-release
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Bind build timestamp to the tagged commit
+        shell: pwsh
+        run: |
+          "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Require empty dedicated Windows build staging
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath $env:CARGO_TARGET_DIR) {
+            throw "dedicated release target already exists: $env:CARGO_TARGET_DIR"
+          }
+
+      - name: Build only supported Windows release binaries
+        run: cargo build --locked --release -p serctl-cli -p serctl-daemon
+
+      - name: Package runtime separately from PDB symbols
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+        run: >-
+          ./scripts/New-ReleaseBundle.ps1
+          -Platform windows-x86_64
+          -Version $env:RELEASE_VERSION
+          -Commit $env:RELEASE_COMMIT
+          -TagObject $env:RELEASE_TAG_OBJECT
+          -OutputDirectory dist
+
+      - name: Upload Windows release inputs
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-input-windows-${{ needs.preflight.outputs.commit }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-helper-bundle:
+    name: Linux x86_64 serctl-xfer bundle
+    needs: [preflight, quality, parser-fuzz, test, rustsec]
+    # Keep the first beta's GNU ABI baseline stable. New-ReleaseBundle also
+    # inspects the final ELF and rejects any GLIBC requirement above 2.35, so
+    # a future runner-image migration cannot silently raise the requirement.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    env:
+      # Build with debug information once, then split it with objcopy. The
+      # runtime archive remains stripped and the symbols archive is separate.
+      CARGO_PROFILE_RELEASE_STRIP: none
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+      CARGO_TARGET_DIR: target/v1-beta-release
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Bind build timestamp to the tagged commit
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+
+      - name: Require empty dedicated Linux build staging
+        run: test ! -e "$CARGO_TARGET_DIR"
+
+      - name: Build the supported Linux transfer helper
+        run: >-
+          cargo build --locked --release
+          -p serctl-xfer --bin serctl-xfer
+
+      - name: Split Linux debug symbols
+        working-directory: target/v1-beta-release/release
+        run: |
+          objcopy --only-keep-debug ./serctl-xfer ./serctl-xfer.debug
+          strip --strip-debug --strip-unneeded ./serctl-xfer
+          objcopy --add-gnu-debuglink=./serctl-xfer.debug ./serctl-xfer
+
+      - name: Verify Linux architecture and symbol separation
+        working-directory: target/v1-beta-release/release
+        run: |
+          test -s ./serctl-xfer
+          test -s ./serctl-xfer.debug
+          test ! -e ./serctl-remote
+          test ! -e ./serctl-remote.debug
+          file ./serctl-xfer | grep -Eq 'ELF 64-bit LSB.*x86-64'
+          readelf --string-dump=.gnu_debuglink ./serctl-xfer | grep -F 'serctl-xfer.debug'
+          if readelf --sections ./serctl-xfer | grep -Eq '\.debug_(info|line)'; then
+            echo 'runtime serctl-xfer still contains debug sections' >&2
+            exit 1
+          fi
+          readelf --sections ./serctl-xfer.debug | grep -Eq '\.debug_(info|line)'
+
+      - name: Package runtime separately from debug symbols
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+        run: >-
+          ./scripts/New-ReleaseBundle.ps1
+          -Platform linux-x86_64
+          -Version $env:RELEASE_VERSION
+          -Commit $env:RELEASE_COMMIT
+          -TagObject $env:RELEASE_TAG_OBJECT
+          -OutputDirectory dist
+
+      - name: Upload Linux transfer-helper release inputs
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-input-linux-${{ needs.preflight.outputs.commit }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  attest:
+    name: Assemble, hash, and attest release
+    needs: [preflight, parser-fuzz, windows-bundle, linux-helper-bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require empty release assembly staging
+        run: |
+          test ! -e target/v1-beta-release-input
+          test ! -e release-dist
+
+      - name: Bind release provenance timestamp to the tagged commit
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+
+      - name: Require exact upstream artifact identities
+        shell: pwsh
+        env:
+          WINDOWS_ARTIFACT_ID: ${{ needs.windows-bundle.outputs.artifact_id }}
+          WINDOWS_ARTIFACT_DIGEST: ${{ needs.windows-bundle.outputs.artifact_digest }}
+          LINUX_ARTIFACT_ID: ${{ needs.linux-helper-bundle.outputs.artifact_id }}
+          LINUX_ARTIFACT_DIGEST: ${{ needs.linux-helper-bundle.outputs.artifact_digest }}
+          FUZZ_ARTIFACT_ID: ${{ needs.parser-fuzz.outputs.artifact_id }}
+          FUZZ_ARTIFACT_DIGEST: ${{ needs.parser-fuzz.outputs.artifact_digest }}
+        run: |
+          foreach ($entry in @(
+            @{ Name = 'Windows'; Id = $env:WINDOWS_ARTIFACT_ID; Digest = $env:WINDOWS_ARTIFACT_DIGEST },
+            @{ Name = 'Linux'; Id = $env:LINUX_ARTIFACT_ID; Digest = $env:LINUX_ARTIFACT_DIGEST },
+            @{ Name = 'Parser fuzz'; Id = $env:FUZZ_ARTIFACT_ID; Digest = $env:FUZZ_ARTIFACT_DIGEST }
+          )) {
+            if ($entry.Id -cnotmatch '^[1-9][0-9]*$') {
+              throw "$($entry.Name) release-input artifact ID is missing or noncanonical"
+            }
+            if ($entry.Digest -cnotmatch '^[0-9a-f]{64}$') {
+              throw "$($entry.Name) release-input artifact digest is missing or noncanonical"
+            }
+          }
+          if ($env:WINDOWS_ARTIFACT_ID -ceq $env:LINUX_ARTIFACT_ID) {
+            throw 'Windows and Linux release inputs resolved to the same artifact ID'
+          }
+          if ($env:FUZZ_ARTIFACT_ID -ceq $env:WINDOWS_ARTIFACT_ID -or
+              $env:FUZZ_ARTIFACT_ID -ceq $env:LINUX_ARTIFACT_ID) {
+            throw 'parser fuzz receipt resolved to a platform release-input artifact ID'
+          }
+
+      - name: Download Windows inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.windows-bundle.outputs.artifact_id }}
+          path: target/v1-beta-release-input/windows
+          digest-mismatch: error
+
+      - name: Download Linux transfer-helper inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.linux-helper-bundle.outputs.artifact_id }}
+          path: target/v1-beta-release-input/linux
+          digest-mismatch: error
+
+      - name: Download exact-tag parser fuzz success receipt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.parser-fuzz.outputs.artifact_id }}
+          path: target/v1-beta-parser-fuzz-receipt
+          digest-mismatch: error
+
+      - name: Verify exact-tag parser fuzz success receipt
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          FUZZ_RECEIPT_SHA256: ${{ needs.parser-fuzz.outputs.receipt_sha256 }}
+        run: |
+          $receipt = 'target/v1-beta-parser-fuzz-receipt/parser-fuzz-success.json'
+          ./scripts/Test-ParserFuzzReceipt.ps1 `
+            -Path $receipt `
+            -Tag $env:RELEASE_TAG `
+            -TagObject $env:RELEASE_TAG_OBJECT `
+            -Commit $env:RELEASE_COMMIT `
+            -Repository $env:GITHUB_REPOSITORY `
+            -RunId $env:GITHUB_RUN_ID `
+            -RunAttempt $env:GITHUB_RUN_ATTEMPT
+          if ((Get-FileHash -LiteralPath $receipt -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+              $env:FUZZ_RECEIPT_SHA256) {
+            throw 'parser fuzz success receipt SHA-256 output mismatch'
+          }
+
+      - name: Install pinned CycloneDX generator
+        run: cargo install cargo-cyclonedx --version '=0.5.9' --locked
+
+      - name: Generate exact published-component CycloneDX 1.5 SBOMs
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          cargo metadata --locked --all-features --format-version 1 > target/v1-beta-release-sbom-metadata.json
+          sbom_lock_sha="$(sha256sum Cargo.lock | cut -d ' ' -f 1)"
+          for path in \
+            crates/serctl_cli/v1-beta-release-sbom.xml \
+            crates/serctl_cli/v1-beta-release-sbom.json \
+            crates/serctl_daemon/v1-beta-release-sbom.xml \
+            crates/serctl_daemon/v1-beta-release-sbom.json \
+            crates/serctl_xfer/v1-beta-release-sbom.xml \
+            crates/serctl_xfer/v1-beta-release-sbom.json; do
+            test ! -e "$path"
+          done
+          cargo cyclonedx --manifest-path crates/serctl_cli/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format xml --override-filename v1-beta-release-sbom
+          cargo cyclonedx --manifest-path crates/serctl_cli/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format json --override-filename v1-beta-release-sbom
+          cargo cyclonedx --manifest-path crates/serctl_daemon/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format xml --override-filename v1-beta-release-sbom
+          cargo cyclonedx --manifest-path crates/serctl_daemon/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format json --override-filename v1-beta-release-sbom
+          cargo cyclonedx --manifest-path crates/serctl_xfer/Cargo.toml --all-features --target x86_64-unknown-linux-gnu --spec-version 1.5 --format xml --override-filename v1-beta-release-sbom
+          cargo cyclonedx --manifest-path crates/serctl_xfer/Cargo.toml --all-features --target x86_64-unknown-linux-gnu --spec-version 1.5 --format json --override-filename v1-beta-release-sbom
+          test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" = "$sbom_lock_sha"
+          for path in \
+            crates/serctl_cli/v1-beta-release-sbom.xml \
+            crates/serctl_cli/v1-beta-release-sbom.json \
+            crates/serctl_daemon/v1-beta-release-sbom.xml \
+            crates/serctl_daemon/v1-beta-release-sbom.json \
+            crates/serctl_xfer/v1-beta-release-sbom.xml \
+            crates/serctl_xfer/v1-beta-release-sbom.json; do
+            test -f "$path"
+            test ! -L "$path"
+            test -s "$path"
+          done
+          expected_status="$(printf '%s\n' \
+            '?? crates/serctl_cli/v1-beta-release-sbom.json' \
+            '?? crates/serctl_cli/v1-beta-release-sbom.xml' \
+            '?? crates/serctl_daemon/v1-beta-release-sbom.json' \
+            '?? crates/serctl_daemon/v1-beta-release-sbom.xml' \
+            '?? crates/serctl_xfer/v1-beta-release-sbom.json' \
+            '?? crates/serctl_xfer/v1-beta-release-sbom.xml')"
+          actual_status="$(git status --porcelain=v1 --untracked-files=all)"
+          test "$actual_status" = "$expected_status"
+
+      - name: Reject source-only components from release SBOMs
+        shell: pwsh
+        run: |
+          ./scripts/Test-RuntimeDependencyBoundary.ps1 `
+            -MetadataPath target/v1-beta-release-sbom-metadata.json `
+            -SbomPath @(
+              'crates/serctl_cli/v1-beta-release-sbom.xml',
+              'crates/serctl_cli/v1-beta-release-sbom.json',
+              'crates/serctl_daemon/v1-beta-release-sbom.xml',
+              'crates/serctl_daemon/v1-beta-release-sbom.json',
+              'crates/serctl_xfer/v1-beta-release-sbom.xml',
+              'crates/serctl_xfer/v1-beta-release-sbom.json'
+            )
+
+      - name: Assemble immutable release inputs
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Path release-dist | Out-Null
+          $inputs = Get-ChildItem -LiteralPath target/v1-beta-release-input -File -Recurse | Sort-Object Name
+          if ($inputs.Count -ne 6) {
+            throw "expected exactly six platform release inputs, found $($inputs.Count)"
+          }
+          foreach ($input in $inputs) {
+            $destination = Join-Path release-dist $input.Name
+            if (($input.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $input.Length -le 0) {
+              throw "platform release input is not a nonempty regular file: $($input.FullName)"
+            }
+            [System.IO.File]::Copy($input.FullName, $destination, $false)
+          }
+          $sboms = @(
+            @{
+              Source = 'crates/serctl_cli/v1-beta-release-sbom.xml'
+              Name = "serctl-$env:RELEASE_VERSION-serctl-cli.sbom.cdx.xml"
+            },
+            @{
+              Source = 'crates/serctl_cli/v1-beta-release-sbom.json'
+              Name = "serctl-$env:RELEASE_VERSION-serctl-cli.sbom.cdx.json"
+            },
+            @{
+              Source = 'crates/serctl_daemon/v1-beta-release-sbom.xml'
+              Name = "serctl-$env:RELEASE_VERSION-serctl-daemon.sbom.cdx.xml"
+            },
+            @{
+              Source = 'crates/serctl_daemon/v1-beta-release-sbom.json'
+              Name = "serctl-$env:RELEASE_VERSION-serctl-daemon.sbom.cdx.json"
+            },
+            @{
+              Source = 'crates/serctl_xfer/v1-beta-release-sbom.xml'
+              Name = "serctl-$env:RELEASE_VERSION-serctl-xfer.sbom.cdx.xml"
+            },
+            @{
+              Source = 'crates/serctl_xfer/v1-beta-release-sbom.json'
+              Name = "serctl-$env:RELEASE_VERSION-serctl-xfer.sbom.cdx.json"
+            }
+          )
+          foreach ($sbom in $sboms) {
+            $source = Get-Item -LiteralPath $sbom.Source -Force -ErrorAction Stop
+            if ($source.PSIsContainer -or
+                ($source.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $source.Length -le 0) {
+              throw "SBOM is not a nonempty regular file: $($source.FullName)"
+            }
+            [System.IO.File]::Copy(
+              $source.FullName,
+              (Join-Path release-dist $sbom.Name),
+              $false
+            )
+          }
+
+      - name: Generate release provenance and SHA-256 manifest
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+        run: >-
+          ./scripts/New-ReleaseManifest.ps1
+          -Directory release-dist
+          -Version $env:RELEASE_VERSION
+          -Commit $env:RELEASE_COMMIT
+          -Tag $env:RELEASE_TAG
+          -TagObject $env:RELEASE_TAG_OBJECT
+          -ParserFuzzReceiptPath target/v1-beta-parser-fuzz-receipt/parser-fuzz-success.json
+          -ParserFuzzArtifactId ${{ needs.parser-fuzz.outputs.artifact_id }}
+          -ParserFuzzArtifactDigest ${{ needs.parser-fuzz.outputs.artifact_digest }}
+
+      - name: Freeze the exact 14-file formal OIDC subject set
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: >-
+          ./scripts/ReleaseAssetSnapshot.ps1
+          -Mode Create
+          -Directory release-dist
+          -Version $env:RELEASE_VERSION
+          -SnapshotPath target/v1-beta-release-set.snapshot.json
+
+      - name: Reverify the frozen set before exact-path attestation
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: >-
+          ./scripts/ReleaseAssetSnapshot.ps1
+          -Mode Verify
+          -Directory release-dist
+          -Version $env:RELEASE_VERSION
+          -SnapshotPath target/v1-beta-release-set.snapshot.json
+
+      # Keep every formal subject as a literal path. A wildcard would be
+      # re-expanded by the action after the snapshot check and could attest an
+      # injected non-release file before the publish job rejects the artifact.
+      - name: Attest SHA256SUMS
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/SHA256SUMS
+          show-summary: true
+
+      - name: Attest aggregate release provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/release-provenance.json
+          show-summary: true
+
+      - name: Attest Linux x86_64 xfer symbols
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64-xfer-symbols.tar.gz
+          show-summary: true
+
+      - name: Attest Linux x86_64 platform provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64.provenance.json
+          show-summary: true
+
+      - name: Attest Linux x86_64 xfer runtime
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64-xfer.tar.gz
+          show-summary: true
+
+      - name: Attest CLI CycloneDX JSON SBOM
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-cli.sbom.cdx.json
+          show-summary: true
+
+      - name: Attest CLI CycloneDX XML SBOM
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-cli.sbom.cdx.xml
+          show-summary: true
+
+      - name: Attest daemon CycloneDX JSON SBOM
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-daemon.sbom.cdx.json
+          show-summary: true
+
+      - name: Attest daemon CycloneDX XML SBOM
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-daemon.sbom.cdx.xml
+          show-summary: true
+
+      - name: Attest xfer CycloneDX JSON SBOM
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-xfer.sbom.cdx.json
+          show-summary: true
+
+      - name: Attest xfer CycloneDX XML SBOM
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-xfer.sbom.cdx.xml
+          show-summary: true
+
+      - name: Attest Windows x86_64 symbols
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64-symbols.zip
+          show-summary: true
+
+      - name: Attest Windows x86_64 platform provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64.provenance.json
+          show-summary: true
+
+      - name: Attest Windows x86_64 runtime
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64.zip
+          show-summary: true
+
+      - name: Reverify the frozen set after attestation and before upload
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: >-
+          ./scripts/ReleaseAssetSnapshot.ps1
+          -Mode Verify
+          -Directory release-dist
+          -Version $env:RELEASE_VERSION
+          -SnapshotPath target/v1-beta-release-set.snapshot.json
+
+      - name: Upload the attested release set
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: serctl-${{ needs.preflight.outputs.version }}-attested-release
+          path: |
+            release-dist/SHA256SUMS
+            release-dist/release-provenance.json
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64-xfer-symbols.tar.gz
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64.provenance.json
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64-xfer.tar.gz
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-cli.sbom.cdx.json
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-cli.sbom.cdx.xml
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-daemon.sbom.cdx.json
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-daemon.sbom.cdx.xml
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-xfer.sbom.cdx.json
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-xfer.sbom.cdx.xml
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64-symbols.zip
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64.provenance.json
+            release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Publish immutable GitHub prerelease
+    needs: [preflight, parser-fuzz, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # This environment must require independent reviewers and prevent
+    # self-review. Its variables identify a create-new external acceptance
+    # record produced only after exact-artifact host, upgrade, privilege, and
+    # rollback validation. Without that environment configuration publication
+    # fails closed instead of following tag push automatically.
+    environment: v1-beta-external-acceptance
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - name: Check out tagged verification scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require empty publish download staging
+        run: test ! -e release-dist
+
+      - name: Require exact attested artifact identity
+        shell: pwsh
+        env:
+          ATTESTED_ARTIFACT_ID: ${{ needs.attest.outputs.artifact_id }}
+          ATTESTED_ARTIFACT_DIGEST: ${{ needs.attest.outputs.artifact_digest }}
+          FUZZ_ARTIFACT_ID: ${{ needs.parser-fuzz.outputs.artifact_id }}
+          FUZZ_ARTIFACT_DIGEST: ${{ needs.parser-fuzz.outputs.artifact_digest }}
+          FUZZ_RECEIPT_SHA256: ${{ needs.parser-fuzz.outputs.receipt_sha256 }}
+        run: |
+          if ($env:ATTESTED_ARTIFACT_ID -cnotmatch '^[1-9][0-9]*$') {
+            throw 'attested release artifact ID is missing or noncanonical'
+          }
+          if ($env:ATTESTED_ARTIFACT_DIGEST -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'attested release artifact digest is missing or noncanonical'
+          }
+          if ($env:FUZZ_ARTIFACT_ID -cnotmatch '^[1-9][0-9]*$' -or
+              $env:FUZZ_ARTIFACT_DIGEST -cnotmatch '^[0-9a-f]{64}$' -or
+              $env:FUZZ_RECEIPT_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'parser fuzz success artifact identity is missing or noncanonical'
+          }
+
+      - name: Download the attested release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.attest.outputs.artifact_id }}
+          path: release-dist
+          digest-mismatch: error
+
+      - name: Download retained parser fuzz success receipt independently
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.parser-fuzz.outputs.artifact_id }}
+          path: target/v1-beta-publish-parser-fuzz-receipt
+          digest-mismatch: error
+
+      - name: Independently verify retained parser fuzz success receipt
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          FUZZ_RECEIPT_SHA256: ${{ needs.parser-fuzz.outputs.receipt_sha256 }}
+        run: |
+          $receipt = 'target/v1-beta-publish-parser-fuzz-receipt/parser-fuzz-success.json'
+          ./scripts/Test-ParserFuzzReceipt.ps1 `
+            -Path $receipt `
+            -Tag $env:RELEASE_TAG `
+            -TagObject $env:RELEASE_TAG_OBJECT `
+            -Commit $env:RELEASE_COMMIT `
+            -Repository $env:GITHUB_REPOSITORY `
+            -RunId $env:GITHUB_RUN_ID `
+            -RunAttempt $env:GITHUB_RUN_ATTEMPT
+          if ((Get-FileHash -LiteralPath $receipt -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+              $env:FUZZ_RECEIPT_SHA256) {
+            throw 'independently downloaded parser fuzz receipt SHA-256 mismatch'
+          }
+
+      - name: Reverify the downloaded release set before publication
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: >-
+          ./scripts/Test-DownloadedReleaseSet.ps1
+          -Directory release-dist
+          -Version $env:RELEASE_VERSION
+          -Commit $env:RELEASE_COMMIT
+          -Tag $env:RELEASE_TAG
+          -TagObject $env:RELEASE_TAG_OBJECT
+          -Repository $env:RELEASE_REPOSITORY
+
+      - name: Verify OIDC provenance for every downloaded release file
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          . ./scripts/ReleaseAssetContract.ps1
+          $expectedSubjects = @(Get-V1BetaFinalReleaseNames -Version $env:RELEASE_VERSION)
+          if ($expectedSubjects.Count -ne 14) {
+            throw "attestation subject allowlist contains $($expectedSubjects.Count) files, expected 14"
+          }
+          foreach ($subject in $expectedSubjects) {
+            $subjectPath = Join-Path release-dist $subject
+            gh attestation verify $subjectPath `
+              --repo $env:RELEASE_REPOSITORY `
+              --signer-repo $env:RELEASE_REPOSITORY `
+              --signer-workflow "$env:RELEASE_REPOSITORY/.github/workflows/release-v1-beta.yml" `
+              --source-digest $env:RELEASE_COMMIT `
+              --source-ref "refs/tags/$env:RELEASE_TAG"
+            if ($LASTEXITCODE -ne 0) {
+              throw "OIDC provenance verification failed for release subject '$subject'"
+            }
+          }
+
+      # These create-new external files are publication-gate inputs only. They
+      # never enter release-dist, the release upload, or the OIDC subject set.
+      - name: Verify non-release external receipts against release component bytes
+        shell: pwsh
+        env:
+          ACCEPTANCE_RECORD_URL: ${{ vars.V1_BETA_ACCEPTANCE_RECORD_URL }}
+          ACCEPTANCE_RECORD_SHA256: ${{ vars.V1_BETA_ACCEPTANCE_RECORD_SHA256 }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+        run: |
+          if ($env:ACCEPTANCE_RECORD_SHA256 -cnotmatch '^[0-9A-F]{64}$') {
+            throw 'external acceptance record SHA-256 is missing or noncanonical uppercase hex'
+          }
+          $recordPath = Join-Path $env:RUNNER_TEMP 'serctl-v1-beta-acceptance.json'
+          $evidencePath = Join-Path $env:RUNNER_TEMP 'serctl-v1-beta-evidence.json'
+          ./scripts/Save-BoundedHttpsFile.ps1 `
+            -Url $env:ACCEPTANCE_RECORD_URL `
+            -Destination $recordPath `
+            -MaxBytes 65536
+          $manifestPlanJson = ./scripts/Get-ExternalAcceptanceDownloadPlan.ps1 `
+            -Phase manifest `
+            -AcceptanceRecordPath $recordPath `
+            -AcceptanceRecordSha256 $env:ACCEPTANCE_RECORD_SHA256 `
+            -AcceptanceRecordUrl $env:ACCEPTANCE_RECORD_URL `
+            -ReleaseManifestPath release-dist/SHA256SUMS `
+            -Tag $env:RELEASE_TAG `
+            -Commit $env:RELEASE_COMMIT `
+            -TagObject $env:RELEASE_TAG_OBJECT
+          $manifestPlan = $manifestPlanJson | ConvertFrom-Json
+          ./scripts/Save-BoundedHttpsFile.ps1 `
+            -Url ([string]$manifestPlan.manifest_url) `
+            -Destination $evidencePath `
+            -MaxBytes 262144
+          $actualEvidenceHash = (
+            Get-FileHash -LiteralPath $evidencePath -Algorithm SHA256
+          ).Hash
+          if ($actualEvidenceHash -cne [string]$manifestPlan.manifest_sha256) {
+            throw 'external evidence manifest SHA-256 mismatch'
+          }
+          $artifactPlanJson = ./scripts/Get-ExternalAcceptanceDownloadPlan.ps1 `
+            -Phase artifacts `
+            -AcceptanceRecordPath $recordPath `
+            -AcceptanceRecordSha256 $env:ACCEPTANCE_RECORD_SHA256 `
+            -AcceptanceRecordUrl $env:ACCEPTANCE_RECORD_URL `
+            -EvidenceManifestPath $evidencePath `
+            -ReleaseManifestPath release-dist/SHA256SUMS `
+            -Tag $env:RELEASE_TAG `
+            -Commit $env:RELEASE_COMMIT `
+            -TagObject $env:RELEASE_TAG_OBJECT
+          $artifactPlan = $artifactPlanJson | ConvertFrom-Json
+          $artifactDirectory = Join-Path $env:RUNNER_TEMP 'serctl-v1-beta-evidence-artifacts'
+          if (Test-Path -LiteralPath $artifactDirectory) {
+            throw 'external evidence artifact directory already exists'
+          }
+          [System.IO.Directory]::CreateDirectory($artifactDirectory) | Out-Null
+          foreach ($artifact in @($artifactPlan.artifacts)) {
+            $categoryName = [string]$artifact.category
+            $artifactPath = Join-Path $artifactDirectory "$categoryName.evidence"
+            ./scripts/Save-BoundedHttpsFile.ps1 `
+              -Url ([string]$artifact.artifact_url) `
+              -Destination $artifactPath `
+              -MaxBytes 8388608
+            if ((Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash -cne
+                [string]$artifact.artifact_sha256) {
+              throw "external evidence artifact SHA-256 mismatch for '$categoryName'"
+            }
+          }
+          # The verifier rehashes the complete downloaded release set, then derives the
+          # accepted CLI, daemon and helper digests from its platform provenance files.
+          ./scripts/Test-ExternalAcceptanceEvidence.ps1 `
+            -AcceptanceRecordPath $recordPath `
+            -AcceptanceRecordSha256 $env:ACCEPTANCE_RECORD_SHA256 `
+            -AcceptanceRecordUrl $env:ACCEPTANCE_RECORD_URL `
+            -EvidenceManifestPath $evidencePath `
+            -EvidenceArtifactDirectory $artifactDirectory `
+            -ReleaseManifestPath release-dist/SHA256SUMS `
+            -Tag $env:RELEASE_TAG `
+            -Commit $env:RELEASE_COMMIT `
+            -TagObject $env:RELEASE_TAG_OBJECT
+
+      - name: Publish once without mutating an existing release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          $remoteMain = & gh api --method GET `
+            "repos/$env:GITHUB_REPOSITORY/git/ref/heads/main" `
+            --jq '.object.type + " " + .object.sha'
+          if ($LASTEXITCODE -ne 0) {
+            throw 'cannot re-read the current remote main ref before publication'
+          }
+          if (($remoteMain | Out-String).Trim().ToLowerInvariant() -cne
+              "commit $($env:RELEASE_COMMIT.ToLowerInvariant())") {
+            throw 'remote main no longer equals the exact release commit'
+          }
+          $remoteTag = & gh api --method GET `
+            "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" `
+            --jq '.object.type + " " + .object.sha'
+          if ($LASTEXITCODE -ne 0) {
+            throw "cannot re-read remote tag $env:RELEASE_TAG"
+          }
+          $expectedRemoteTag = "tag $env:RELEASE_TAG_OBJECT"
+          if (($remoteTag | Out-String).Trim() -cne $expectedRemoteTag) {
+            throw "remote tag changed after preflight; refusing publication"
+          }
+          $remoteTagTarget = & gh api --method GET `
+            "repos/$env:GITHUB_REPOSITORY/git/tags/$env:RELEASE_TAG_OBJECT" `
+            --jq '.object.type + " " + .object.sha'
+          if ($LASTEXITCODE -ne 0) {
+            throw "cannot peel remote annotated tag object $env:RELEASE_TAG_OBJECT"
+          }
+          $expectedRemoteTarget = "commit $env:RELEASE_COMMIT"
+          if (($remoteTagTarget | Out-String).Trim() -cne $expectedRemoteTarget) {
+            throw 'remote annotated tag object no longer peels to the preflight commit'
+          }
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $releaseProbe = Invoke-WebRequest `
+            -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" `
+            -Headers $headers `
+            -MaximumRedirection 0 `
+            -SkipHttpErrorCheck
+          if ([int]$releaseProbe.StatusCode -eq 200) {
+            throw "release $env:RELEASE_TAG already exists; refusing to mutate immutable assets"
+          }
+          if ([int]$releaseProbe.StatusCode -ne 404) {
+            throw "cannot prove release absence; GitHub returned HTTP $([int]$releaseProbe.StatusCode)"
+          }
+
+          # Copy only snapshot-bound bytes into a new private directory. The
+          # helper uses CREATE_NEW handles, verifies the copied size/hash on the
+          # same destination handles, and protects the completed directory as
+          # mode 0500 with mode-0400 files before returning.
+          $publishSnapshot = 'target/v1-beta-publish-source.snapshot.json'
+          $publishDirectory = 'target/v1-beta-publish-staging'
+          ./scripts/ReleaseAssetSnapshot.ps1 `
+            -Mode Create `
+            -Directory release-dist `
+            -Version $env:RELEASE_VERSION `
+            -SnapshotPath $publishSnapshot
+          ./scripts/ReleaseAssetSnapshot.ps1 `
+            -Mode CopyCreateNew `
+            -Directory release-dist `
+            -Version $env:RELEASE_VERSION `
+            -SnapshotPath $publishSnapshot `
+            -DestinationDirectory $publishDirectory
+
+          # Re-run the complete checksum/archive/provenance verifier over the
+          # actual protected bytes that gh will open, not the earlier download.
+          ./scripts/Test-DownloadedReleaseSet.ps1 `
+            -Directory $publishDirectory `
+            -Version $env:RELEASE_VERSION `
+            -Commit $env:RELEASE_COMMIT `
+            -Tag $env:RELEASE_TAG `
+            -TagObject $env:RELEASE_TAG_OBJECT `
+            -Repository $env:RELEASE_REPOSITORY
+
+          . ./scripts/ReleaseAssetContract.ps1
+          $expectedSubjects = @(
+            Get-V1BetaFinalReleaseNames -Version $env:RELEASE_VERSION |
+              Sort-Object
+          )
+          if ($expectedSubjects.Count -ne 14) {
+            throw "publish allowlist contains $($expectedSubjects.Count) files, expected 14"
+          }
+          foreach ($subject in $expectedSubjects) {
+            $subjectPath = Join-Path $publishDirectory $subject
+            gh attestation verify $subjectPath `
+              --repo $env:RELEASE_REPOSITORY `
+              --signer-repo $env:RELEASE_REPOSITORY `
+              --signer-workflow "$env:RELEASE_REPOSITORY/.github/workflows/release-v1-beta.yml" `
+              --source-digest $env:RELEASE_COMMIT `
+              --source-ref "refs/tags/$env:RELEASE_TAG"
+            if ($LASTEXITCODE -ne 0) {
+              throw "final OIDC provenance verification failed for publish subject '$subject'"
+            }
+          }
+          ./scripts/ReleaseAssetSnapshot.ps1 `
+            -Mode Verify `
+            -Directory $publishDirectory `
+            -Version $env:RELEASE_VERSION `
+            -SnapshotPath $publishSnapshot
+          $assets = @(
+            $expectedSubjects |
+              ForEach-Object { (Join-Path $publishDirectory $_) }
+          )
+          & gh release create $env:RELEASE_TAG @assets `
+            --verify-tag `
+            --prerelease `
+            --generate-notes `
+            --title "serctl v$env:RELEASE_VERSION"
+          if ($LASTEXITCODE -ne 0) {
+            throw 'GitHub prerelease publication failed'
+          }
+          ./scripts/ReleaseAssetSnapshot.ps1 `
+            -Mode Verify `
+            -Directory $publishDirectory `
+            -Version $env:RELEASE_VERSION `
+            -SnapshotPath $publishSnapshot

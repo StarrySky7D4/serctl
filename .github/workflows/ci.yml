@@ -41,36 +41,86 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Test release governance scripts and invariants
+        shell: pwsh
+        run: ./scripts/Test-ReleaseGovernance.ps1
+
       - name: Run Clippy with warnings denied
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Install pinned dependency policy checker
         run: cargo install cargo-deny --version '=0.20.2' --locked
 
       - name: Enforce dependency licenses, sources, and manifest policy
-        run: cargo deny check bans licenses sources
+        run: cargo deny --locked check bans licenses sources
 
       - name: Run standalone build-script tests
-        run: |
-          rustc --edition=2021 --test crates/serctl_cli/build.rs -o target/cli-build-script-tests
-          ./target/cli-build-script-tests
-          rustc --edition=2021 --test crates/serctl_daemon/build.rs -o target/daemon-build-script-tests
-          ./target/daemon-build-script-tests
-          rustc --edition=2021 --test crates/serctl_xfer/build.rs -o target/xfer-build-script-tests
-          ./target/xfer-build-script-tests
+        shell: pwsh
+        run: ./scripts/Test-BuildScriptFixtures.ps1
 
       - name: Generate dependency evidence
         run: |
-          cargo metadata --locked --format-version 1 > cargo-metadata.json
-          cargo tree --locked --all-features --edges normal,build,dev > cargo-dependency-tree.txt
+          set -euo pipefail
+          mkdir -p target/ci-evidence
+          cargo metadata --locked --all-features --format-version 1 > target/ci-evidence/cargo-metadata.json
+          cargo tree --locked --all-features --edges normal,build,dev > target/ci-evidence/cargo-dependency-tree.txt
+
+      - name: Reject source-only crates from runtime dependency graphs
+        shell: pwsh
+        run: >-
+          ./scripts/Test-RuntimeDependencyBoundary.ps1
+          -MetadataPath target/ci-evidence/cargo-metadata.json
 
       - name: Install pinned CycloneDX generator
         run: cargo install cargo-cyclonedx --version '=0.5.9' --locked
 
-      - name: Generate CycloneDX 1.5 SBOMs
+      - name: Generate exact published-component CycloneDX 1.5 SBOMs
         run: |
-          cargo cyclonedx --all-features --target all --spec-version 1.5 --format xml --override-filename bom
-          cargo cyclonedx --all-features --target all --spec-version 1.5 --format json --override-filename bom
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          cargo metadata --locked --format-version 1 >/dev/null
+          sbom_lock_sha="$(sha256sum Cargo.lock | cut -d ' ' -f 1)"
+          cargo cyclonedx --manifest-path crates/serctl_cli/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format xml --override-filename v1-beta-release-sbom
+          cargo cyclonedx --manifest-path crates/serctl_cli/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format json --override-filename v1-beta-release-sbom
+          cargo cyclonedx --manifest-path crates/serctl_daemon/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format xml --override-filename v1-beta-release-sbom
+          cargo cyclonedx --manifest-path crates/serctl_daemon/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format json --override-filename v1-beta-release-sbom
+          cargo cyclonedx --manifest-path crates/serctl_xfer/Cargo.toml --all-features --target x86_64-unknown-linux-gnu --spec-version 1.5 --format xml --override-filename v1-beta-release-sbom
+          cargo cyclonedx --manifest-path crates/serctl_xfer/Cargo.toml --all-features --target x86_64-unknown-linux-gnu --spec-version 1.5 --format json --override-filename v1-beta-release-sbom
+          test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" = "$sbom_lock_sha"
+          for path in \
+            crates/serctl_cli/v1-beta-release-sbom.xml \
+            crates/serctl_cli/v1-beta-release-sbom.json \
+            crates/serctl_daemon/v1-beta-release-sbom.xml \
+            crates/serctl_daemon/v1-beta-release-sbom.json \
+            crates/serctl_xfer/v1-beta-release-sbom.xml \
+            crates/serctl_xfer/v1-beta-release-sbom.json; do
+            test -f "$path"
+            test ! -L "$path"
+            test -s "$path"
+          done
+          expected_status="$(printf '%s\n' \
+            '?? crates/serctl_cli/v1-beta-release-sbom.json' \
+            '?? crates/serctl_cli/v1-beta-release-sbom.xml' \
+            '?? crates/serctl_daemon/v1-beta-release-sbom.json' \
+            '?? crates/serctl_daemon/v1-beta-release-sbom.xml' \
+            '?? crates/serctl_xfer/v1-beta-release-sbom.json' \
+            '?? crates/serctl_xfer/v1-beta-release-sbom.xml')"
+          actual_status="$(git status --porcelain=v1 --untracked-files=all)"
+          test "$actual_status" = "$expected_status"
+
+      - name: Reject source-only components from published-component SBOMs
+        shell: pwsh
+        run: |
+          ./scripts/Test-RuntimeDependencyBoundary.ps1 `
+            -MetadataPath target/ci-evidence/cargo-metadata.json `
+            -SbomPath @(
+              'crates/serctl_cli/v1-beta-release-sbom.xml',
+              'crates/serctl_cli/v1-beta-release-sbom.json',
+              'crates/serctl_daemon/v1-beta-release-sbom.xml',
+              'crates/serctl_daemon/v1-beta-release-sbom.json',
+              'crates/serctl_xfer/v1-beta-release-sbom.xml',
+              'crates/serctl_xfer/v1-beta-release-sbom.json'
+            )
 
       - name: Upload dependency evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -78,24 +128,45 @@ jobs:
           name: cargo-sbom-and-dependency-manifest
           path: |
             Cargo.lock
-            bom.xml
-            bom.json
-            cargo-metadata.json
-            cargo-dependency-tree.txt
+            crates/serctl_cli/v1-beta-release-sbom.xml
+            crates/serctl_cli/v1-beta-release-sbom.json
+            crates/serctl_daemon/v1-beta-release-sbom.xml
+            crates/serctl_daemon/v1-beta-release-sbom.json
+            crates/serctl_xfer/v1-beta-release-sbom.xml
+            crates/serctl_xfer/v1-beta-release-sbom.json
+            target/ci-evidence/cargo-metadata.json
+            target/ci-evidence/cargo-dependency-tree.txt
           if-no-files-found: error
           retention-days: 30
 
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
+        include:
+          - name: Ubuntu x86_64
+            runner: ubuntu-latest
+            expected_os: Linux
+            expected_arch: X64
+            expected_rust_host: x86_64-unknown-linux-gnu
+          - name: Windows x86_64
+            runner: windows-latest
+            expected_os: Windows
+            expected_arch: X64
+            expected_rust_host: x86_64-pc-windows-msvc
+          - name: macOS arm64
+            runner: macos-15
+            expected_os: macOS
+            expected_arch: ARM64
+            expected_rust_host: aarch64-apple-darwin
+          - name: macOS x86_64
+            runner: macos-15-intel
+            expected_os: macOS
+            expected_arch: X64
+            expected_rust_host: x86_64-apple-darwin
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -107,11 +178,82 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
 
+      - name: Require the declared native runner architecture
+        shell: pwsh
+        env:
+          ACTUAL_RUNNER_OS: ${{ runner.os }}
+          ACTUAL_RUNNER_ARCH: ${{ runner.arch }}
+          EXPECTED_RUNNER_OS: ${{ matrix.expected_os }}
+          EXPECTED_RUNNER_ARCH: ${{ matrix.expected_arch }}
+          EXPECTED_RUST_HOST: ${{ matrix.expected_rust_host }}
+        run: |
+          if ($env:ACTUAL_RUNNER_OS -cne $env:EXPECTED_RUNNER_OS) {
+            throw "runner OS '$env:ACTUAL_RUNNER_OS' is not '$env:EXPECTED_RUNNER_OS'"
+          }
+          if ($env:ACTUAL_RUNNER_ARCH -cne $env:EXPECTED_RUNNER_ARCH) {
+            throw "runner architecture '$env:ACTUAL_RUNNER_ARCH' is not '$env:EXPECTED_RUNNER_ARCH'"
+          }
+          $hostLine = rustc --version --verbose |
+            Where-Object { $_ -match '^host: ' }
+          if ($hostLine -cne "host: $env:EXPECTED_RUST_HOST") {
+            throw "Rust host '$hostLine' is not 'host: $env:EXPECTED_RUST_HOST'"
+          }
+
+      - name: Windows PowerShell 5.1 governance smoke
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          ./scripts/Test-V1BetaDocumentation.ps1
+          ./scripts/Test-V1BetaLocalGate.ps1
+
+      - name: Require the privileged Windows reparse-point rejection branch
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"SERCTL_REQUIRE_WINDOWS_REPARSE_TEST=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+
+      - name: Run build-script fixtures on the native runner
+        shell: pwsh
+        run: ./scripts/Test-BuildScriptFixtures.ps1
+
+      - name: Verify portable release archives and the isolated fuzz lock
+        shell: pwsh
+        run: |
+          cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 |
+            Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw 'isolated fuzz lock metadata resolution failed'
+          }
+          ./scripts/Test-ParserFuzzBoundary.ps1 -RepositoryRoot .
+          ./scripts/Test-DownloadedReleaseSetSelfTest.ps1
+          ./scripts/Test-ReleaseAssetSnapshot.ps1
+
       - name: Check all targets and features
-        run: cargo check --locked --all-targets --all-features
+        run: >-
+          cargo check --locked --workspace --all-targets --all-features
+          --target ${{ matrix.expected_rust_host }}
+
+      - name: Run strict Clippy on this platform
+        run: >-
+          cargo clippy --locked --workspace --all-targets --all-features
+          --target ${{ matrix.expected_rust_host }} -- -D warnings
 
       - name: Test all targets and features
-        run: cargo test --locked --all-targets --all-features -- --test-threads=1
+        run: >-
+          cargo test --locked --workspace --all-targets --all-features
+          --target ${{ matrix.expected_rust_host }} -- --test-threads=1
+
+      - name: Build the CLI for mandatory Windows multi-account ACL testing
+        if: runner.os == 'Windows'
+        run: >-
+          cargo build --locked -p serctl-cli --bin serctl_cli
+          --target ${{ matrix.expected_rust_host }}
+
+      - name: Require Windows multi-account DACL and owner isolation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          ./scripts/Test-WindowsMultiAccountAcl.ps1
+          -CliPath target/${{ matrix.expected_rust_host }}/debug/serctl_cli.exe
 
   rustsec:
     name: RustSec advisory audit
@@ -130,89 +272,3 @@ jobs:
 
       - name: Audit Cargo.lock against the online RustSec database
         run: cargo audit --deny warnings
-
-  release:
-    name: Windows release artifact
-    needs: [quality, test, rustsec]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: windows-2025
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Bind release timestamp to the checked-out commit
-        shell: pwsh
-        run: |
-          "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Build optimized release from the checked-out commit
-        # Production artifacts must never enable serctl-core/test-support.
-        # Build only the shipped binaries with their normal feature sets.
-        run: cargo build --locked --release --workspace --bins
-
-      - name: Verify embedded clean commit and record release evidence
-        shell: pwsh
-        run: |
-          $expected = "${{ github.sha }}".Substring(0, 12)
-          $cliVersion = & .\target\release\serctl_cli.exe --version
-          $daemonVersion = & .\target\release\serctl_daemon.exe --version
-          $helperVersion = & .\target\release\serctl-xfer.exe --version
-          $packageVersion = ($cliVersion -split ' ')[1]
-          $versions = @{
-            cli = $cliVersion
-            daemon = $daemonVersion
-            helper = $helperVersion
-          }
-          foreach ($entry in $versions.GetEnumerator()) {
-            if (-not $entry.Value.Contains("git $expected")) {
-              throw "$($entry.Key) version does not identify the checked-out commit: $($entry.Value)"
-            }
-            if ($entry.Value -match "-dirty") {
-              throw "$($entry.Key) version unexpectedly reports a dirty worktree: $($entry.Value)"
-            }
-            if ($entry.Value -notmatch " $([regex]::Escape($packageVersion)) ") {
-              throw "$($entry.Key) version does not match package version ${packageVersion}: $($entry.Value)"
-            }
-          }
-          if (-not $daemonVersion.Contains("IPC v8..=v8")) {
-            throw "daemon does not report the required IPC range: $daemonVersion"
-          }
-          if (-not $helperVersion.Contains("transfer protocol v1")) {
-            throw "helper does not report the required transfer protocol: $helperVersion"
-          }
-          Get-FileHash .\target\release\serctl_cli.exe, .\target\release\serctl_cli.pdb, .\target\release\serctl_daemon.exe, .\target\release\serctl_daemon.pdb, .\target\release\serctl-xfer.exe, .\target\release\serctl_xfer.pdb -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash)  $([IO.Path]::GetFileName($_.Path))" } |
-            Set-Content -Path release-sha256.txt -Encoding utf8
-          @(
-            "commit=${{ github.sha }}"
-            "event=${{ github.event_name }}"
-            "ref=${{ github.ref }}"
-            "runner_image=$env:ImageOS-$env:ImageVersion"
-            "rustc=$(& rustc --version)"
-            "cargo=$(& cargo --version)"
-            "cli_version=$cliVersion"
-            "daemon_version=$daemonVersion"
-            "helper_version=$helperVersion"
-          ) | Out-File release-environment.txt
-
-      - name: Upload release evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: windows-release-${{ github.sha }}
-          path: |
-            target/release/serctl_cli.exe
-            target/release/serctl_cli.pdb
-            target/release/serctl_daemon.exe
-            target/release/serctl_daemon.pdb
-            target/release/serctl-xfer.exe
-            target/release/serctl_xfer.pdb
-            release-sha256.txt
-            release-environment.txt
-          if-no-files-found: error
-          retention-days: 30

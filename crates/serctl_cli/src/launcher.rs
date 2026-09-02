@@ -188,16 +188,19 @@ mod tests {
         fn GetConsoleCP() -> u32;
     }
 
-    /// This ignored test is recursively invoked in two subprocess roles by
+    /// This test is recursively invoked in two subprocess roles by
     /// `windows_background_daemon_outlives_its_console_owner`. Keeping the
     /// probe inside the test executable avoids launching a real daemon or
-    /// opening a vault.
+    /// opening a vault. A normal test-harness invocation has no role and is a
+    /// deliberate no-op; the parent test exercises both non-empty roles. This
+    /// keeps the aggregate release test result free of ignored cases without
+    /// making the subprocess probe run against ambient state.
     #[test]
-    #[ignore = "subprocess-only launcher lifecycle probe"]
     fn windows_background_lifecycle_probe() {
         match std::env::var(ROLE_ENV).as_deref() {
             Ok(ROLE_LAUNCHER) => spawn_detached_probe(),
             Ok(ROLE_DAEMON) => run_detached_probe(),
+            Err(std::env::VarError::NotPresent) => (),
             role => panic!("unexpected launcher lifecycle probe role: {role:?}"),
         }
     }
@@ -324,7 +327,6 @@ mod tests {
     fn probe_command(role: &str, ready: &Path, observed: &Path, survived: &Path) -> Command {
         let mut command = Command::new(std::env::current_exe().expect("resolve test executable"));
         command
-            .arg("--ignored")
             .arg("--exact")
             .arg(PROBE_TEST_NAME)
             .env(ROLE_ENV, role)

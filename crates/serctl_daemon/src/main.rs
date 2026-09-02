@@ -126,13 +126,14 @@ fn try_main() -> Result<()> {
 }
 
 fn daemon_version_line() -> String {
-    let version = serctl_protocol::v6::IPC_PROTOCOL_VERSION_V8;
+    let version = serctl_protocol::v6::IPC_PROTOCOL_VERSION_V9;
     format!(
-        "serctl_daemon {} (git {}; IPC v{}..=v{})",
+        "serctl_daemon {} (git {}; IPC v{}..=v{}; {})",
         env!("CARGO_PKG_VERSION"),
         env!("SERCTL_BUILD_COMMIT"),
         version,
-        version
+        version,
+        serctl_core::vault::VAULT_STORAGE_VERSION_CONTRACT
     )
 }
 
@@ -202,8 +203,14 @@ mod tests {
     #[test]
     fn version_reports_build_identity_and_supported_ipc_range() {
         let line = daemon_version_line();
-        assert!(line.contains(env!("CARGO_PKG_VERSION")));
-        assert!(line.contains(env!("SERCTL_BUILD_COMMIT")));
-        assert!(line.contains("IPC v8..=v8"));
+        assert_eq!(
+            line,
+            format!(
+                "serctl_daemon {} (git {}; IPC v9..=v9; {})",
+                env!("CARGO_PKG_VERSION"),
+                env!("SERCTL_BUILD_COMMIT"),
+                serctl_core::vault::VAULT_STORAGE_VERSION_CONTRACT
+            )
+        );
     }
 }

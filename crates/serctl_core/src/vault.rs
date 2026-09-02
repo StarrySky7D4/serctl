@@ -3,11 +3,12 @@
 //! Version 4 gives every profile an independent passphrase, KDF, random
 //! incarnation identifier, and random
 //! key package.  The passphrase-derived KEK wraps `{ DEK, AuthSeed,
-//! generation }`; it never encrypts SSH credentials directly.  This keeps
-//! password rotation and offline recovery separate from the payload key and
-//! makes IPC authorization profile- and generation-scoped.
+//! AuditSeed, generation }`; it never encrypts SSH credentials directly.
+//! This keeps password rotation and offline recovery separate from the
+//! payload key, makes IPC authorization profile- and generation-scoped, and
+//! preserves audit continuity without retaining an obsolete IPC seed.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use argon2::{Algorithm, Argon2, Block as Argon2Block, Params, Version};
 use base64::{
     engine::general_purpose::{STANDARD as B64, STANDARD_NO_PAD as B64_NO_PAD},
@@ -26,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::security;
+use crate::{audit::AuditLedger, security};
 
 #[cfg(any(test, feature = "test-support"))]
 static TEST_HOME: std::sync::LazyLock<std::sync::RwLock<Option<PathBuf>>> =
@@ -40,17 +41,33 @@ static LINUX_ADMIN_TARGET_VAULT_DIR: std::sync::OnceLock<File> = std::sync::Once
 static LINUX_ADMIN_TARGET_AUTHORIZED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-const VAULT_FORMAT: u32 = 4;
+const PRE_AUDIT_VAULT_FORMAT: u32 = 4;
+const VAULT_FORMAT: u32 = 5;
 const LEGACY_VAULT_FORMAT: u32 = 2;
 const PROFILE_FORMAT_AAD: u8 = 2;
+/// The beta-2 profile envelope. Current readers accept it only so the first
+/// authenticated audit initialization can upgrade it atomically.
 const PROFILE_FORMAT_ENVELOPE: u8 = 4;
+/// Audit-aware envelope written by the v1 candidate. A beta-2 reader rejects
+/// this format while validating the outer vault, before even destructive
+/// operations such as administrator reset can replace a KeyPackage without
+/// parsing it.
+const PROFILE_FORMAT_AUDIT_ENVELOPE: u8 = 5;
+pub const VAULT_STORAGE_READ_MIN_VERSION: u8 = PROFILE_FORMAT_ENVELOPE;
+pub const VAULT_STORAGE_READ_MAX_VERSION: u8 = PROFILE_FORMAT_AUDIT_ENVELOPE;
+pub const VAULT_STORAGE_WRITE_VERSION: u8 = PROFILE_FORMAT_AUDIT_ENVELOPE;
+pub const VAULT_STORAGE_VERSION_CONTRACT: &str = "vault-storage read=v4..=v5 write=v5";
 #[cfg(any(windows, test))]
 const VERIFIER_TEXT: &[u8] = b"serctl-vault-verifier-v2";
 #[cfg(any(windows, test))]
 const VERIFIER_AAD: &[u8] = b"serctl/vault/verifier/v2";
 const PROFILE_CALL_KEY_DOMAIN: &[u8] = b"serctl/ipc/profile-call-key/v5\0";
+const PROFILE_AUDIT_KEY_DOMAIN: &[u8] = b"serctl/audit/profile-call-key/v1\0";
+const LEGACY_AUDIT_SEED_DOMAIN: &[u8] = b"serctl/audit/legacy-seed-migration/v1\0";
 const PROFILE_KEY_AAD_DOMAIN: &str = "serctl/profile-key-package/v4";
+const PROFILE_AUDIT_KEY_AAD_DOMAIN: &str = "serctl/profile-key-package/v5";
 const PROFILE_PAYLOAD_AAD_DOMAIN: &str = "serctl/profile-payload/v4";
+const PROFILE_AUDIT_PAYLOAD_AAD_DOMAIN: &str = "serctl/profile-payload/v5";
 const RECOVERY_CONFIG_TAG_DOMAIN: &[u8] = b"serctl/profile-recovery-config-tag/v4\0";
 #[cfg(windows)]
 const ADMIN_MARKER: &[u8] = b"serctl/windows-admin-policy/v4";
@@ -68,6 +85,7 @@ const LOCK_OPEN_ACCESS_DENIED_RETRIES: usize = 3;
 const LOCK_OPEN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 #[derive(Serialize, Deserialize, Clone, Default, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
 pub struct Creds {
     pub host: String,
     pub port: u16,
@@ -77,23 +95,34 @@ pub struct Creds {
     pub host_key: Option<String>,
 }
 
-/// A profile-scoped IPC authorization key derived from the profile's random
-/// AuthSeed. It is deliberately neither serializable nor printable and must
-/// never be written to the vault or a runtime lock. The daemon retains only
-/// this domain-separated key, never the profile passphrase, DEK, or AuthSeed.
+/// Profile-scoped runtime keys derived independently from AuthSeed and
+/// AuditSeed. They are deliberately neither serializable nor printable and
+/// must never be written to the vault or a runtime lock. The daemon retains
+/// only these domain-separated keys, never the profile passphrase, DEK, or
+/// either seed.
 #[derive(Zeroize, ZeroizeOnDrop)]
-pub struct ProfileCallKey(Zeroizing<[u8; 32]>);
+pub struct ProfileCallKey {
+    ipc: Zeroizing<[u8; 32]>,
+    audit: Zeroizing<[u8; 32]>,
+}
 
 impl ProfileCallKey {
     pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+        &self.ipc
+    }
+
+    pub(crate) fn audit_bytes(&self) -> &[u8; 32] {
+        &self.audit
     }
 
     /// Test-only constructor, kept unconditional so cross-crate test modules
     /// can build fixed keys without enabling this crate's own test cfg.
     #[doc(hidden)]
     pub fn from_bytes_for_test(bytes: [u8; 32]) -> Self {
-        Self(Zeroizing::new(bytes))
+        Self {
+            ipc: Zeroizing::new(bytes),
+            audit: Zeroizing::new(bytes),
+        }
     }
 }
 
@@ -115,6 +144,7 @@ pub struct ProfileLease {
     name: String,
     profile: File,
     barrier: File,
+    exclusive: bool,
 }
 
 impl ProfileLease {
@@ -133,9 +163,19 @@ impl ProfileLease {
         }
         Ok(())
     }
+
+    fn require_exclusive_profile(&self, expected: &str) -> Result<()> {
+        self.require_profile(expected)?;
+        ensure!(
+            self.exclusive,
+            "profile lease is not exclusive for audit recovery"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct EncProfile {
     pub host: String,
     pub port: u16,
@@ -184,6 +224,7 @@ fn is_zero_u64(value: &u64) -> bool {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct KdfConfig {
     pub memory_kib: u32,
     pub iterations: u32,
@@ -203,12 +244,14 @@ impl Default for KdfConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SealedVerifier {
     pub nonce: String,
     pub ct: String,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VaultFile {
     #[serde(default)]
     pub version: u32,
@@ -248,6 +291,7 @@ impl Default for VaultFile {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AdminPolicy {
     pub salt: String,
     pub kdf: KdfConfig,
@@ -333,6 +377,7 @@ pub enum MigrationProgress {
 
 #[cfg(windows)]
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
 struct AdminSecret {
     marker: Vec<u8>,
     local_share: [u8; 32],
@@ -340,6 +385,7 @@ struct AdminSecret {
 }
 
 #[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
 pub struct LockInfo {
     pub profile: String,
     /// IPC wire protocol spoken by the daemon that owns this lock. Missing
@@ -369,6 +415,7 @@ fn is_zero_port(port: &u16) -> bool {
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
 struct Secret {
     user: String,
     password: String,
@@ -609,6 +656,7 @@ pub fn acquire_runtime_lease(profile: &str) -> Result<ProfileLease> {
         name: profile.to_owned(),
         profile: file,
         barrier,
+        exclusive: true,
     })
 }
 
@@ -630,6 +678,7 @@ pub fn acquire_profile_use_lease(profile: &str) -> Result<ProfileLease> {
         name: profile.to_owned(),
         profile: file,
         barrier,
+        exclusive: false,
     })
 }
 
@@ -645,6 +694,7 @@ fn acquire_profile_mutation_lease(profile: &str) -> Result<ProfileLease> {
         name: profile.to_owned(),
         profile: profile_file,
         barrier,
+        exclusive: true,
     })
 }
 
@@ -775,11 +825,25 @@ fn vault_state_digest(vault: &VaultFile) -> Result<[u8; 32]> {
     Ok(Sha256::digest(serialized.as_slice()).into())
 }
 
+fn is_profile_envelope_format(format: u8) -> bool {
+    matches!(
+        format,
+        PROFILE_FORMAT_ENVELOPE | PROFILE_FORMAT_AUDIT_ENVELOPE
+    )
+}
+
+fn is_modern_vault_format(version: u32) -> bool {
+    matches!(version, PRE_AUDIT_VAULT_FORMAT | VAULT_FORMAT)
+}
+
 fn validate_loaded_vault(vault: &VaultFile) -> Result<()> {
     if vault.version == 3 {
         bail!("pre-release vault format v3 is incompatible with v4 profile identities; use the matching older build to export it or restore a backup, then rebuild the vault")
     }
-    if !matches!(vault.version, 0 | LEGACY_VAULT_FORMAT | VAULT_FORMAT) {
+    if !matches!(
+        vault.version,
+        0 | LEGACY_VAULT_FORMAT | PRE_AUDIT_VAULT_FORMAT | VAULT_FORMAT
+    ) {
         bail!("unsupported vault format version {}", vault.version);
     }
     if vault.profiles.len() > MAX_PROFILES {
@@ -788,8 +852,8 @@ fn validate_loaded_vault(vault: &VaultFile) -> Result<()> {
     for (name, profile) in &vault.profiles {
         validate_profile_name(name)
             .with_context(|| format!("vault contains unsafe profile name '{name}'"))?;
-        let valid_record_format = if vault.version == VAULT_FORMAT {
-            profile.format == PROFILE_FORMAT_ENVELOPE
+        let valid_record_format = if is_modern_vault_format(vault.version) {
+            is_profile_envelope_format(profile.format)
         } else {
             matches!(profile.format, 0 | PROFILE_FORMAT_AAD)
         };
@@ -804,7 +868,7 @@ fn validate_loaded_vault(vault: &VaultFile) -> Result<()> {
                 bail!("profile '{name}' contains an unsafe legacy host-key value");
             }
         }
-        if profile.format == PROFILE_FORMAT_ENVELOPE {
+        if is_profile_envelope_format(profile.format) {
             if profile.generation == 0
                 || profile.profile_id.is_empty()
                 || profile.profile_salt.is_empty()
@@ -858,12 +922,12 @@ fn validate_loaded_vault(vault: &VaultFile) -> Result<()> {
     if let Some(config) = &vault.kdf {
         validate_kdf(config)?;
     }
-    if vault.version == VAULT_FORMAT
+    if is_modern_vault_format(vault.version)
         && (!vault.salt.is_empty() || vault.kdf.is_some() || vault.verifier.is_some())
     {
         bail!("v4 vault must not retain a vault-global passphrase verifier or KDF");
     }
-    if vault.version != VAULT_FORMAT
+    if !is_modern_vault_format(vault.version)
         && (vault.admin.is_some()
             || vault.recovery.is_some()
             || vault.root_recovery_share.is_some())
@@ -892,10 +956,15 @@ fn validate_loaded_vault(vault: &VaultFile) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        if vault.version == VAULT_FORMAT && (vault.admin.is_some() != vault.recovery.is_some()) {
+        if is_modern_vault_format(vault.version)
+            && (vault.admin.is_some() != vault.recovery.is_some())
+        {
             bail!("Windows administrator and recovery policies must be initialized together");
         }
-        if vault.version == VAULT_FORMAT && !vault.profiles.is_empty() && vault.admin.is_none() {
+        if is_modern_vault_format(vault.version)
+            && !vault.profiles.is_empty()
+            && vault.admin.is_none()
+        {
             bail!("Windows v4 profiles require an initialized administrator/recovery policy");
         }
     }
@@ -927,6 +996,13 @@ fn mutate_vault_with_lock_timeout<T>(
     )?;
     let mut vault = load_vault_unlocked()?;
     let result = mutator(&mut vault)?;
+    // The version transition is part of the same protected atomic replace as
+    // the caller's successful mutation. A failed mutator leaves predecessor
+    // bytes untouched; after any successful candidate write, beta-2 rejects
+    // the vault before its destructive administrator-reset path can run.
+    if vault.version == PRE_AUDIT_VAULT_FORMAT {
+        vault.version = VAULT_FORMAT;
+    }
     validate_loaded_vault(&vault).context("vault mutation produced an invalid state")?;
     save_vault_unlocked(&vault)?;
     Ok(result)
@@ -1172,7 +1248,10 @@ fn profile_call_key(vault_key: &[u8; 32], profile: &str) -> Result<ProfileCallKe
     let mut key = Zeroizing::new([0_u8; 32]);
     key.copy_from_slice(&digest);
     digest.as_mut_slice().zeroize();
-    Ok(ProfileCallKey(key))
+    Ok(ProfileCallKey {
+        ipc: key.clone(),
+        audit: key,
+    })
 }
 
 fn decode_nonce(encoded: &str) -> Result<[u8; 12]> {
@@ -1307,36 +1386,38 @@ fn encrypt_profile(name: &str, creds: &Creds, key: &[u8; 32]) -> Result<EncProfi
 }
 
 fn profile_key_aad(
+    format: u8,
     name: &str,
     profile_id: &[u8; 16],
     host: &str,
     port: u16,
     generation: u64,
 ) -> Result<Vec<u8>> {
+    let domain = match format {
+        PROFILE_FORMAT_ENVELOPE => PROFILE_KEY_AAD_DOMAIN,
+        PROFILE_FORMAT_AUDIT_ENVELOPE => PROFILE_AUDIT_KEY_AAD_DOMAIN,
+        _ => bail!("unsupported profile key-envelope format {format}"),
+    };
     Ok(serde_json::to_vec(&(
-        PROFILE_KEY_AAD_DOMAIN,
-        name,
-        profile_id,
-        host,
-        port,
-        generation,
+        domain, name, profile_id, host, port, generation,
     ))?)
 }
 
 fn profile_payload_aad(
+    format: u8,
     name: &str,
     profile_id: &[u8; 16],
     host: &str,
     port: u16,
     generation: u64,
 ) -> Result<Vec<u8>> {
+    let domain = match format {
+        PROFILE_FORMAT_ENVELOPE => PROFILE_PAYLOAD_AAD_DOMAIN,
+        PROFILE_FORMAT_AUDIT_ENVELOPE => PROFILE_AUDIT_PAYLOAD_AAD_DOMAIN,
+        _ => bail!("unsupported profile payload format {format}"),
+    };
     Ok(serde_json::to_vec(&(
-        PROFILE_PAYLOAD_AAD_DOMAIN,
-        name,
-        profile_id,
-        host,
-        port,
-        generation,
+        domain, name, profile_id, host, port, generation,
     ))?)
 }
 
@@ -1447,10 +1528,62 @@ fn new_key_package(profile_id: [u8; 16], generation: u64) -> crate::recovery::Ke
         generation,
         dek: [0_u8; 32],
         auth_seed: [0_u8; 32],
+        audit_seed: [0_u8; 32],
+        audit_initialized: false,
     };
     OsRng.fill_bytes(&mut package.dek);
     OsRng.fill_bytes(&mut package.auth_seed);
+    OsRng.fill_bytes(&mut package.audit_seed);
     package
+}
+
+fn next_key_package(
+    previous: &crate::recovery::KeyPackage,
+    generation: u64,
+) -> Result<crate::recovery::KeyPackage> {
+    if !previous.audit_initialized || previous.audit_seed == [0_u8; 32] {
+        bail!("profile audit must be initialized before advancing its generation");
+    }
+    let mut package = crate::recovery::KeyPackage {
+        profile_id: previous.profile_id,
+        generation,
+        dek: [0_u8; 32],
+        // Only the audit seed crosses a generation boundary. AuthSeed and DEK
+        // are freshly randomized so old IPC authorization material cannot
+        // derive or authenticate calls for the successor generation.
+        auth_seed: [0_u8; 32],
+        audit_seed: previous.audit_seed,
+        audit_initialized: true,
+    };
+    OsRng.fill_bytes(&mut package.dek);
+    OsRng.fill_bytes(&mut package.auth_seed);
+    Ok(package)
+}
+
+/// Derive the one missing field in a pre-audit beta key package from its
+/// independent random DEK. This legacy-only PRF is deterministic so a crash
+/// after creating either member of the audit pair can retry with the same
+/// key, but it is deliberately unrelated to AuthSeed and is persisted in the
+/// first successfully rewrapped package. New packages always use OsRng.
+fn initialize_legacy_audit_seed(package: &mut crate::recovery::KeyPackage) -> Result<()> {
+    if package.audit_seed != [0_u8; 32] {
+        return Ok(());
+    }
+    if package.audit_initialized {
+        bail!("initialized profile is missing its authenticated audit seed");
+    }
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&package.dek)
+        .map_err(|_| anyhow!("invalid legacy profile DEK for audit seed migration"))?;
+    mac.update(LEGACY_AUDIT_SEED_DOMAIN);
+    mac.update(&package.profile_id);
+    mac.update(&package.generation.to_be_bytes());
+    let mut digest = mac.finalize().into_bytes();
+    package.audit_seed.copy_from_slice(&digest);
+    digest.as_mut_slice().zeroize();
+    if package.audit_seed == [0_u8; 32] {
+        bail!("legacy audit seed migration produced an invalid zero seed");
+    }
+    Ok(())
 }
 
 fn profile_kek(encrypted: &EncProfile, passphrase: &str) -> Result<Zeroizing<[u8; 32]>> {
@@ -1470,7 +1603,7 @@ fn unwrap_profile_package(
     encrypted: &EncProfile,
     passphrase: &str,
 ) -> Result<crate::recovery::KeyPackage> {
-    if encrypted.format != PROFILE_FORMAT_ENVELOPE || encrypted.generation == 0 {
+    if !is_profile_envelope_format(encrypted.format) || encrypted.generation == 0 {
         bail!("profile '{name}' requires explicit v2-to-v4 migration");
     }
     let kek = profile_kek(encrypted, passphrase)?;
@@ -1480,6 +1613,7 @@ fn unwrap_profile_package(
         .context("decode profile key envelope")?;
     let profile_id = decode_profile_id(&encrypted.profile_id)?;
     let aad = profile_key_aad(
+        encrypted.format,
         name,
         &profile_id,
         &encrypted.host,
@@ -1498,6 +1632,9 @@ fn unwrap_profile_package(
     let plaintext = Zeroizing::new(plaintext);
     let package: crate::recovery::KeyPackage =
         serde_json::from_slice(&plaintext).context("decode profile key package")?;
+    package
+        .validate_security_state()
+        .context("validate profile key package security state")?;
     if package.profile_id != profile_id || package.generation != encrypted.generation {
         bail!("profile key package identity mismatch");
     }
@@ -1518,6 +1655,7 @@ fn decrypt_profile_v3_with_package(
         .decode(&encrypted.ct)
         .context("decode profile payload ciphertext")?;
     let aad = profile_payload_aad(
+        encrypted.format,
         name,
         &profile_id,
         &encrypted.host,
@@ -1554,7 +1692,31 @@ fn wrap_profile_v3(
     package: &crate::recovery::KeyPackage,
     recovery: Option<&crate::recovery::RecoveryConfig>,
 ) -> Result<EncProfile> {
+    wrap_profile_v3_for_format(
+        name,
+        creds,
+        passphrase,
+        package,
+        recovery,
+        PROFILE_FORMAT_AUDIT_ENVELOPE,
+    )
+}
+
+fn wrap_profile_v3_for_format(
+    name: &str,
+    creds: &Creds,
+    passphrase: &str,
+    package: &crate::recovery::KeyPackage,
+    recovery: Option<&crate::recovery::RecoveryConfig>,
+    record_format: u8,
+) -> Result<EncProfile> {
+    if !is_profile_envelope_format(record_format) {
+        bail!("unsupported profile envelope format {record_format}");
+    }
     validate_new_master_passphrase(passphrase)?;
+    package
+        .validate_security_state()
+        .context("validate profile key package security state")?;
     if package.generation == 0 {
         bail!("profile generation must be non-zero");
     }
@@ -1572,6 +1734,7 @@ fn wrap_profile_v3(
         "profile key package exceeds its safety limit",
     )?;
     let key_aad = profile_key_aad(
+        record_format,
         name,
         &package.profile_id,
         &creds.host,
@@ -1602,6 +1765,7 @@ fn wrap_profile_v3(
         "encrypted profile plaintext exceeds the 16 MiB safety limit",
     )?;
     let payload_aad = profile_payload_aad(
+        record_format,
         name,
         &package.profile_id,
         &creds.host,
@@ -1634,7 +1798,7 @@ fn wrap_profile_v3(
     Ok(EncProfile {
         host: creds.host.clone(),
         port: creds.port,
-        format: PROFILE_FORMAT_ENVELOPE,
+        format: record_format,
         nonce: B64.encode(payload_nonce),
         ct: B64.encode(payload_ct),
         host_key: None,
@@ -1663,11 +1827,15 @@ fn authenticate_profile_v3(
 
 fn profile_call_key_v3(
     auth_seed: &[u8; 32],
+    audit_seed: &[u8; 32],
     profile: &str,
     profile_id: &[u8; 16],
     generation: u64,
 ) -> Result<ProfileCallKey> {
     validate_profile_name(profile)?;
+    if *audit_seed == [0_u8; 32] {
+        bail!("profile audit seed is missing");
+    }
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(auth_seed)
         .map_err(|_| anyhow!("invalid profile authorization seed"))?;
     mac.update(PROFILE_CALL_KEY_DOMAIN);
@@ -1676,10 +1844,95 @@ fn profile_call_key_v3(
     mac.update(profile_id);
     mac.update(&generation.to_be_bytes());
     let mut digest = mac.finalize().into_bytes();
-    let mut key = Zeroizing::new([0_u8; 32]);
-    key.copy_from_slice(&digest);
+    let mut ipc = Zeroizing::new([0_u8; 32]);
+    ipc.copy_from_slice(&digest);
     digest.as_mut_slice().zeroize();
-    Ok(ProfileCallKey(key))
+
+    let mut audit_mac = <Hmac<Sha256> as Mac>::new_from_slice(audit_seed)
+        .map_err(|_| anyhow!("invalid profile audit seed"))?;
+    audit_mac.update(PROFILE_AUDIT_KEY_DOMAIN);
+    audit_mac.update(&(profile.len() as u32).to_be_bytes());
+    audit_mac.update(profile.as_bytes());
+    audit_mac.update(profile_id);
+    audit_mac.update(&generation.to_be_bytes());
+    let mut digest = audit_mac.finalize().into_bytes();
+    let mut audit = Zeroizing::new([0_u8; 32]);
+    audit.copy_from_slice(&digest);
+    digest.as_mut_slice().zeroize();
+    Ok(ProfileCallKey { ipc, audit })
+}
+
+fn profile_audit_ledger(
+    name: &str,
+    package: &crate::recovery::KeyPackage,
+) -> Result<(AuditLedger, ProfileCallKey)> {
+    let identity = ProfileIdentity {
+        profile_id: package.profile_id,
+        generation: package.generation,
+    };
+    let call_key = profile_call_key_v3(
+        &package.auth_seed,
+        &package.audit_seed,
+        name,
+        &package.profile_id,
+        package.generation,
+    )?;
+    let audit_directory = run_dir()?.join("audit");
+    std::fs::create_dir_all(&audit_directory).context("create profile audit directory")?;
+    let ledger = AuditLedger::from_profile_call_key(&audit_directory, identity, &call_key)?;
+    Ok((ledger, call_key))
+}
+
+fn audit_now_unix_ms() -> Result<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_millis();
+    u64::try_from(millis).context("audit timestamp exceeds u64")
+}
+
+fn verify_or_initialize_old_audit(
+    name: &str,
+    package: &crate::recovery::KeyPackage,
+) -> Result<crate::audit::AuditCheckpoint> {
+    let (ledger, _) = profile_audit_ledger(name, package)?;
+    if package.audit_initialized {
+        ledger
+            .verify_complete(None)
+            .context("verify complete authenticated audit before profile mutation")
+    } else {
+        ledger
+            .initialize_generation(None, name, name, audit_now_unix_ms()?)
+            .context("initialize authenticated audit before first profile mutation")
+    }
+}
+
+fn initialize_successor_audit(
+    old_name: &str,
+    new_name: &str,
+    predecessor: &crate::audit::AuditCheckpoint,
+    package: &crate::recovery::KeyPackage,
+) -> Result<()> {
+    let (ledger, _) = profile_audit_ledger(new_name, package)?;
+    ledger
+        .initialize_generation(Some(predecessor), old_name, new_name, audit_now_unix_ms()?)
+        .context("initialize successor authenticated audit generation")?;
+    Ok(())
+}
+
+fn ensure_profile_audit_absent(name: &str, package: &crate::recovery::KeyPackage) -> Result<()> {
+    if package.audit_initialized {
+        bail!(
+            "profile '{name}' has authenticated audit history and cannot be deleted or administratively replaced"
+        );
+    }
+    let (ledger, _) = profile_audit_ledger(name, package)?;
+    if ledger.has_any_material()? {
+        bail!(
+            "profile '{name}' has audit material without an authenticated initialization marker; mutation is denied"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(windows, test))]
@@ -1895,7 +2148,7 @@ fn enforce_profile_capacity_for_upsert(vault: &VaultFile, name: &str) -> Result<
 }
 
 fn require_v3(vault: &VaultFile) -> Result<()> {
-    if vault.version != VAULT_FORMAT {
+    if !is_modern_vault_format(vault.version) {
         bail!(
             "vault format {} requires explicit v2-to-v4 migration",
             vault.version
@@ -2503,7 +2756,7 @@ pub fn catalog_snapshot() -> Result<CatalogSnapshot> {
     let vault = load_vault()?;
     let needs_migration = match vault.version {
         0 | LEGACY_VAULT_FORMAT => true,
-        VAULT_FORMAT => false,
+        PRE_AUDIT_VAULT_FORMAT | VAULT_FORMAT => false,
         3 => bail!("pre-release vault format v3 is incompatible with v4 profile identities; use the matching older build to export it or restore a backup, then rebuild the vault"),
         version => bail!("unsupported vault format version {version}"),
     };
@@ -2514,12 +2767,12 @@ pub fn catalog_snapshot() -> Result<CatalogSnapshot> {
             name: name.clone(),
             host: encrypted.host.clone(),
             port: encrypted.port,
-            generation: if encrypted.format == PROFILE_FORMAT_ENVELOPE {
+            generation: if is_profile_envelope_format(encrypted.format) {
                 encrypted.generation
             } else {
                 0
             },
-            profile_id: if encrypted.format == PROFILE_FORMAT_ENVELOPE {
+            profile_id: if is_profile_envelope_format(encrypted.format) {
                 decode_profile_id(&encrypted.profile_id)
                     .expect("validated v4 profile identity remains canonical")
             } else {
@@ -2651,6 +2904,13 @@ pub fn update_profile(
 ) -> Result<ProfileMetadata> {
     validate_profile_update(name, creds, profile_passphrase)?;
     let _runtime_lease = acquire_profile_mutation_lease(name)?;
+    let bootstrap_key = derive_profile_call_key_with_lock_timeout(
+        name,
+        profile_passphrase,
+        expected_identity,
+        VAULT_LOCK_WAIT_TIMEOUT,
+    )?;
+    drop(bootstrap_key);
     mutate_vault(|vault| {
         require_v3(vault)?;
         let previous = vault
@@ -2658,8 +2918,9 @@ pub fn update_profile(
             .get(name)
             .ok_or_else(|| anyhow!("profile '{name}' not found"))?;
         require_identity(previous, expected_identity)?;
-        let (_, old_creds) =
+        let (old_package, old_creds) =
             authenticate_profile_v3(name, previous, profile_passphrase, vault.recovery.as_ref())?;
+        let predecessor = verify_or_initialize_old_audit(name, &old_package)?;
         let mut updated = creds.clone();
         updated.host_key =
             if old_creds.host.as_bytes() == creds.host.as_bytes() && old_creds.port == creds.port {
@@ -2677,10 +2938,7 @@ pub fn update_profile(
             } else {
                 creds.host_key.clone()
             };
-        let package = new_key_package(
-            decode_profile_id(&previous.profile_id)?,
-            next_generation(previous.generation)?,
-        );
+        let package = next_key_package(&old_package, next_generation(previous.generation)?)?;
         let encrypted = wrap_profile_v3(
             name,
             &updated,
@@ -2688,6 +2946,7 @@ pub fn update_profile(
             &package,
             vault.recovery.as_ref(),
         )?;
+        initialize_successor_audit(name, name, &predecessor, &package)?;
         let row = metadata(name, &encrypted);
         vault.profiles.insert(name.to_owned(), encrypted);
         Ok(row)
@@ -2707,6 +2966,13 @@ pub fn rename_profile_v3(
         bail!("source and destination profile names must differ");
     }
     let (_old_lease, _new_lease) = acquire_rename_leases(old_name, new_name)?;
+    let bootstrap_key = derive_profile_call_key_with_lock_timeout(
+        old_name,
+        profile_passphrase,
+        expected_identity,
+        VAULT_LOCK_WAIT_TIMEOUT,
+    )?;
+    drop(bootstrap_key);
     mutate_vault(|vault| {
         require_v3(vault)?;
         if vault.profiles.contains_key(new_name) {
@@ -2717,12 +2983,13 @@ pub fn rename_profile_v3(
             .get(old_name)
             .ok_or_else(|| anyhow!("profile '{old_name}' not found"))?;
         require_identity(previous, expected_identity)?;
-        let (_, old_creds) = authenticate_profile_v3(
+        let (old_package, old_creds) = authenticate_profile_v3(
             old_name,
             previous,
             profile_passphrase,
             vault.recovery.as_ref(),
         )?;
+        let predecessor = verify_or_initialize_old_audit(old_name, &old_package)?;
         let mut updated = creds.clone();
         updated.host_key =
             if old_creds.host.as_bytes() == creds.host.as_bytes() && old_creds.port == creds.port {
@@ -2740,10 +3007,7 @@ pub fn rename_profile_v3(
             } else {
                 creds.host_key.clone()
             };
-        let new_package = new_key_package(
-            decode_profile_id(&previous.profile_id)?,
-            next_generation(previous.generation)?,
-        );
+        let new_package = next_key_package(&old_package, next_generation(previous.generation)?)?;
         let encrypted = wrap_profile_v3(
             new_name,
             &updated,
@@ -2751,6 +3015,7 @@ pub fn rename_profile_v3(
             &new_package,
             vault.recovery.as_ref(),
         )?;
+        initialize_successor_audit(old_name, new_name, &predecessor, &new_package)?;
         let row = metadata(new_name, &encrypted);
         vault.profiles.remove(old_name);
         vault.profiles.insert(new_name.to_owned(), encrypted);
@@ -2772,9 +3037,10 @@ pub fn remove_profile(
             return Ok(false);
         };
         require_identity(encrypted, expected_identity)?;
-        let (_, authenticated) =
+        let (package, authenticated) =
             authenticate_profile_v3(name, encrypted, profile_passphrase, vault.recovery.as_ref())?;
         drop(authenticated);
+        ensure_profile_audit_absent(name, &package)?;
         Ok(vault.profiles.remove(name).is_some())
     })
 }
@@ -2789,6 +3055,13 @@ pub fn change_profile_passphrase(
     validate_master_passphrase(old_passphrase)?;
     validate_new_master_passphrase(new_passphrase)?;
     let _runtime_lease = acquire_profile_mutation_lease(name)?;
+    let bootstrap_key = derive_profile_call_key_with_lock_timeout(
+        name,
+        old_passphrase,
+        expected_identity,
+        VAULT_LOCK_WAIT_TIMEOUT,
+    )?;
+    drop(bootstrap_key);
     mutate_vault(|vault| {
         require_v3(vault)?;
         let previous = vault
@@ -2796,10 +3069,11 @@ pub fn change_profile_passphrase(
             .get(name)
             .ok_or_else(|| anyhow!("profile '{name}' not found"))?;
         require_identity(previous, expected_identity)?;
-        let (_, credentials) =
+        let (old_package, credentials) =
             authenticate_profile_v3(name, previous, old_passphrase, vault.recovery.as_ref())?;
+        let predecessor = verify_or_initialize_old_audit(name, &old_package)?;
         let generation = next_generation(previous.generation)?;
-        let new_package = new_key_package(decode_profile_id(&previous.profile_id)?, generation);
+        let new_package = next_key_package(&old_package, generation)?;
         let encrypted = wrap_profile_v3(
             name,
             &credentials,
@@ -2807,6 +3081,7 @@ pub fn change_profile_passphrase(
             &new_package,
             vault.recovery.as_ref(),
         )?;
+        initialize_successor_audit(name, name, &predecessor, &new_package)?;
         vault.profiles.insert(name.to_owned(), encrypted);
         Ok(generation)
     })
@@ -2854,26 +3129,19 @@ pub fn admin_reset_profile(
             .profiles
             .get(name)
             .ok_or_else(|| anyhow!("profile '{name}' not found"))?;
-        let package = new_key_package(
-            decode_profile_id(&previous.profile_id)?,
-            next_generation(previous.generation)?,
+        let _ = previous;
+        bail!(
+            "administrator reset cannot authenticate an existing profile's audit history; use the old profile passphrase or 2-of-2 offline recovery"
         );
-        let encrypted = wrap_profile_v3(
-            name,
-            replacement,
-            new_profile_passphrase,
-            &package,
-            vault.recovery.as_ref(),
-        )?;
-        let row = metadata(name, &encrypted);
-        vault.profiles.insert(name.to_owned(), encrypted);
-        Ok(row)
     })
 }
 
 /// Preserve a profile through the 2-of-2 offline recovery path, then install
-/// an independent replacement passphrase and fresh DEK/AuthSeed.  The caller
-/// never receives the old key package, credentials, or old passphrase.
+/// an independent replacement passphrase, fresh DEK, and fresh AuthSeed. Only
+/// the audit-specific seed crosses the generation boundary so the old audit
+/// generation can authenticate a successor transition without preserving IPC
+/// authorization material. The caller never receives the old key package,
+/// credentials, or old passphrase.
 pub fn recover_profile_with_media(
     name: &str,
     media_bytes: &[u8],
@@ -2901,7 +3169,7 @@ pub fn recover_profile_with_media(
         .recovery_envelope
         .as_ref()
         .ok_or_else(|| anyhow!("profile has no offline recovery envelope"))?;
-    let old_package = crate::recovery::open_package(
+    let mut old_package = crate::recovery::open_package(
         recovery,
         name,
         &decode_profile_id(&encrypted.profile_id)?,
@@ -2914,7 +3182,6 @@ pub fn recover_profile_with_media(
     let credentials = decrypt_profile_v3_with_package(name, encrypted, &old_package)?;
     let expected_digest = vault_state_digest(&snapshot)?;
     let generation = next_generation(encrypted.generation)?;
-    let profile_id = decode_profile_id(&encrypted.profile_id)?;
     drop(snapshot);
 
     let _runtime_lease = acquire_profile_mutation_lease(name)?;
@@ -2923,7 +3190,10 @@ pub fn recover_profile_with_media(
         if !bool::from(expected_digest.ct_eq(&vault_state_digest(vault)?)) {
             bail!("vault changed while offline recovery was being authorized; retry");
         }
-        let package = new_key_package(profile_id, generation);
+        initialize_legacy_audit_seed(&mut old_package)?;
+        let predecessor = verify_or_initialize_old_audit(name, &old_package)?;
+        old_package.audit_initialized = true;
+        let package = next_key_package(&old_package, generation)?;
         let encrypted = wrap_profile_v3(
             name,
             &credentials,
@@ -2931,6 +3201,7 @@ pub fn recover_profile_with_media(
             &package,
             vault.recovery.as_ref(),
         )?;
+        initialize_successor_audit(name, name, &predecessor, &package)?;
         let row = metadata(name, &encrypted);
         vault.profiles.insert(name.to_owned(), encrypted);
         Ok(row)
@@ -3113,10 +3384,72 @@ pub fn decrypt_with_call_key_with_lock_timeout(
 ) -> Result<(Creds, ProfileCallKey)> {
     validate_profile_name(name)?;
     validate_master_passphrase(master)?;
+    let started = Instant::now();
     let vault = load_vault_with_lock_timeout(lock_timeout)?;
-    decrypt_with_call_key_from_vault(&vault, name, master, expected_identity)
+    require_v3(&vault)?;
+    let encrypted = vault
+        .profiles
+        .get(name)
+        .ok_or_else(|| anyhow!("profile '{name}' not found"))?;
+    require_identity(encrypted, expected_identity)?;
+    let storage_upgrade_required =
+        vault.version == PRE_AUDIT_VAULT_FORMAT || encrypted.format == PROFILE_FORMAT_ENVELOPE;
+    let (package, creds) =
+        authenticate_profile_v3(name, encrypted, master, vault.recovery.as_ref())?;
+    if package.audit_initialized && !storage_upgrade_required {
+        let (ledger, call_key) = profile_audit_ledger(name, &package)?;
+        ledger
+            .verify_complete(None)
+            .context("verify initialized authenticated profile audit")?;
+        return Ok((creds, call_key));
+    }
+    drop(package);
+    drop(creds);
+    drop(vault);
+
+    let remaining = lock_timeout
+        .checked_sub(started.elapsed())
+        .filter(|duration| !duration.is_zero())
+        .context("profile audit initialization exceeded its vault-lock deadline")?;
+    mutate_vault_with_lock_timeout(remaining, |vault| {
+        require_v3(vault)?;
+        let encrypted = vault
+            .profiles
+            .get(name)
+            .ok_or_else(|| anyhow!("profile '{name}' not found"))?;
+        require_identity(encrypted, expected_identity)?;
+        let (mut package, creds) =
+            authenticate_profile_v3(name, encrypted, master, vault.recovery.as_ref())?;
+        if package.audit_initialized {
+            let (ledger, call_key) = profile_audit_ledger(name, &package)?;
+            ledger
+                .verify_complete(None)
+                .context("verify concurrently initialized authenticated profile audit")?;
+            if encrypted.format == PROFILE_FORMAT_ENVELOPE {
+                let replacement =
+                    wrap_profile_v3(name, &creds, master, &package, vault.recovery.as_ref())?;
+                vault.profiles.insert(name.to_owned(), replacement);
+            }
+            return Ok((creds, call_key));
+        }
+
+        initialize_legacy_audit_seed(&mut package)?;
+        verify_or_initialize_old_audit(name, &package)?;
+        package.audit_initialized = true;
+        let replacement = wrap_profile_v3(name, &creds, master, &package, vault.recovery.as_ref())?;
+        let call_key = profile_call_key_v3(
+            &package.auth_seed,
+            &package.audit_seed,
+            name,
+            &package.profile_id,
+            package.generation,
+        )?;
+        vault.profiles.insert(name.to_owned(), replacement);
+        Ok((creds, call_key))
+    })
 }
 
+#[cfg(test)]
 fn decrypt_with_call_key_from_vault(
     vault: &VaultFile,
     name: &str,
@@ -3133,6 +3466,7 @@ fn decrypt_with_call_key_from_vault(
         authenticate_profile_v3(name, encrypted, profile_passphrase, vault.recovery.as_ref())?;
     let call_key = profile_call_key_v3(
         &package.auth_seed,
+        &package.audit_seed,
         name,
         &package.profile_id,
         package.generation,
@@ -3150,12 +3484,61 @@ pub fn derive_profile_call_key_with_lock_timeout(
     expected_identity: Option<ProfileIdentity>,
     lock_timeout: Duration,
 ) -> Result<ProfileCallKey> {
-    validate_profile_name(name)?;
-    validate_master_passphrase(master)?;
-    let vault = load_vault_with_lock_timeout(lock_timeout)?;
-    derive_profile_call_key_from_vault(&vault, name, master, expected_identity)
+    let (credentials, call_key) =
+        decrypt_with_call_key_with_lock_timeout(name, master, expected_identity, lock_timeout)?;
+    drop(credentials);
+    Ok(call_key)
 }
 
+/// Authenticate one profile for the explicit offline audit-recovery path.
+///
+/// Unlike normal daemon/operation unlock this deliberately does not require a
+/// complete ledger: the caller must hold the exclusive profile runtime lease
+/// and immediately inspect or resolve the authenticated ledger with the
+/// returned key. Corruption, anchor mismatch and non-Intent inconsistencies
+/// therefore still fail closed in `AuditLedger`; only the expected
+/// Intent-without-Outcome quarantine state is allowed to reach recovery.
+#[doc(hidden)]
+pub fn derive_profile_audit_recovery_key_with_lock_timeout(
+    lease: &ProfileLease,
+    name: &str,
+    master: &str,
+    expected_identity: Option<ProfileIdentity>,
+    lock_timeout: Duration,
+) -> Result<ProfileCallKey> {
+    lease.require_exclusive_profile(name)?;
+    validate_profile_name(name)?;
+    validate_master_passphrase(master)?;
+    let started = Instant::now();
+    let vault = load_vault_with_lock_timeout(lock_timeout)?;
+    require_v3(&vault)?;
+    let encrypted = vault
+        .profiles
+        .get(name)
+        .ok_or_else(|| anyhow!("profile '{name}' not found"))?;
+    require_identity(encrypted, expected_identity)?;
+    let (package, credentials) =
+        authenticate_profile_v3(name, encrypted, master, vault.recovery.as_ref())?;
+    drop(credentials);
+    if package.audit_initialized {
+        return profile_call_key_v3(
+            &package.auth_seed,
+            &package.audit_seed,
+            name,
+            &package.profile_id,
+            package.generation,
+        );
+    }
+    drop(package);
+    drop(vault);
+    let remaining = lock_timeout
+        .checked_sub(started.elapsed())
+        .filter(|duration| !duration.is_zero())
+        .context("profile audit initialization exceeded its vault-lock deadline")?;
+    derive_profile_call_key_with_lock_timeout(name, master, expected_identity, remaining)
+}
+
+#[cfg(test)]
 fn derive_profile_call_key_from_vault(
     vault: &VaultFile,
     name: &str,
@@ -3173,6 +3556,7 @@ fn derive_profile_call_key_from_vault(
     drop(authenticated);
     profile_call_key_v3(
         &package.auth_seed,
+        &package.audit_seed,
         name,
         &package.profile_id,
         package.generation,
@@ -3883,6 +4267,18 @@ fn reconcile_lock_if_token_while_leased(
 mod tests {
     use super::*;
 
+    fn assert_unknown_field_rejected<T>(value: &T)
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let mut encoded = serde_json::to_value(value).unwrap();
+        encoded
+            .as_object_mut()
+            .expect("security envelope must serialize as an object")
+            .insert("future_or_misspelled_field".into(), true.into());
+        assert!(serde_json::from_value::<T>(encoded).is_err());
+    }
+
     fn sample_creds() -> Creds {
         Creds {
             host: "server.example".into(),
@@ -3891,6 +4287,40 @@ mod tests {
             password: "correct horse battery staple".into(),
             host_key: Some("SHA256:server-fingerprint".into()),
         }
+    }
+
+    #[test]
+    fn security_sensitive_vault_envelopes_reject_unknown_fields() {
+        assert_unknown_field_rejected(&sample_creds());
+        assert_unknown_field_rejected(&Secret {
+            user: "deploy".into(),
+            password: "secret".into(),
+            host_key: None,
+        });
+        assert_unknown_field_rejected(&legacy_profile(&[7_u8; 32]));
+        assert_unknown_field_rejected(&KdfConfig::default());
+        assert_unknown_field_rejected(&SealedVerifier {
+            nonce: "nonce".into(),
+            ct: "ciphertext".into(),
+        });
+        assert_unknown_field_rejected(&AdminPolicy {
+            salt: "salt".into(),
+            kdf: KdfConfig::default(),
+            nonce: "nonce".into(),
+            ct: "ciphertext".into(),
+        });
+        assert_unknown_field_rejected(&VaultFile::default());
+        assert_unknown_field_rejected(&LockInfo {
+            profile: "prod".into(),
+            protocol: serctl_protocol::IPC_PROTOCOL_VERSION,
+            pid: 7,
+            port: 0,
+            endpoint: "endpoint".into(),
+            host: String::new(),
+            user: String::new(),
+            started_unix: 1,
+            token: "token".into(),
+        });
     }
 
     #[test]
@@ -3916,7 +4346,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(first.format, PROFILE_FORMAT_ENVELOPE);
+        assert_eq!(first.format, PROFILE_FORMAT_AUDIT_ENVELOPE);
         assert_ne!(first.profile_salt, second.profile_salt);
         assert!(unwrap_profile_package("first", &first, second_passphrase).is_err());
         assert!(unwrap_profile_package("second", &second, first_passphrase).is_err());
@@ -3931,6 +4361,7 @@ mod tests {
         );
         let first_call = profile_call_key_v3(
             &opened_first.auth_seed,
+            &opened_first.audit_seed,
             "first",
             &opened_first.profile_id,
             opened_first.generation,
@@ -3938,6 +4369,7 @@ mod tests {
         .unwrap();
         let second_call = profile_call_key_v3(
             &opened_second.auth_seed,
+            &opened_second.audit_seed,
             "second",
             &opened_second.profile_id,
             opened_second.generation,
@@ -3957,6 +4389,7 @@ mod tests {
             wrap_profile_v3("prod", &sample_creds(), passphrase, &old_package, None).unwrap();
         let old_call = profile_call_key_v3(
             &old_package.auth_seed,
+            &old_package.audit_seed,
             "prod",
             &old_package.profile_id,
             old_package.generation,
@@ -3968,6 +4401,7 @@ mod tests {
             wrap_profile_v3("prod", &sample_creds(), passphrase, &new_package, None).unwrap();
         let new_call = profile_call_key_v3(
             &new_package.auth_seed,
+            &new_package.audit_seed,
             "prod",
             &new_package.profile_id,
             new_package.generation,
@@ -3980,6 +4414,198 @@ mod tests {
         tampered.generation = 8;
         assert!(unwrap_profile_package("prod", &tampered, passphrase).is_err());
         assert!(decrypt_profile_v3_with_package("prod", &tampered, &old_package).is_err());
+    }
+
+    #[test]
+    fn audit_successor_preserves_only_the_seed_and_rotates_generation_scoped_call_keys() {
+        let mut previous = new_key_package([0x71_u8; 16], 4);
+        previous.audit_initialized = true;
+        let successor = next_key_package(&previous, 5).unwrap();
+        assert_eq!(successor.profile_id, previous.profile_id);
+        assert_ne!(successor.auth_seed, previous.auth_seed);
+        assert_eq!(successor.audit_seed, previous.audit_seed);
+        assert_ne!(successor.dek, previous.dek);
+        assert!(successor.audit_initialized);
+        let old_key = profile_call_key_v3(
+            &previous.auth_seed,
+            &previous.audit_seed,
+            "old-name",
+            &previous.profile_id,
+            previous.generation,
+        )
+        .unwrap();
+        let generation_key = profile_call_key_v3(
+            &successor.auth_seed,
+            &successor.audit_seed,
+            "old-name",
+            &successor.profile_id,
+            successor.generation,
+        )
+        .unwrap();
+        let rename_key = profile_call_key_v3(
+            &successor.auth_seed,
+            &successor.audit_seed,
+            "new-name",
+            &successor.profile_id,
+            successor.generation,
+        )
+        .unwrap();
+        let compromised_old_auth_key = profile_call_key_v3(
+            &previous.auth_seed,
+            &successor.audit_seed,
+            "old-name",
+            &successor.profile_id,
+            successor.generation,
+        )
+        .unwrap();
+        assert_ne!(old_key.as_bytes(), generation_key.as_bytes());
+        assert_ne!(generation_key.as_bytes(), rename_key.as_bytes());
+        assert_ne!(
+            compromised_old_auth_key.as_bytes(),
+            generation_key.as_bytes()
+        );
+        assert_eq!(
+            compromised_old_auth_key.audit_bytes(),
+            generation_key.audit_bytes()
+        );
+
+        let guessed_audit_from_old_auth = profile_call_key_v3(
+            &previous.auth_seed,
+            &previous.auth_seed,
+            "old-name",
+            &successor.profile_id,
+            successor.generation,
+        )
+        .unwrap();
+        assert_ne!(
+            guessed_audit_from_old_auth.audit_bytes(),
+            generation_key.audit_bytes()
+        );
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "serctl-audit-seed-rotation-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let old_identity = ProfileIdentity {
+            profile_id: previous.profile_id,
+            generation: previous.generation,
+        };
+        let old_ledger =
+            AuditLedger::from_profile_call_key(&directory, old_identity, &old_key).unwrap();
+        let predecessor = old_ledger
+            .initialize_generation(None, "old-name", "old-name", 1_900_200_000_000)
+            .unwrap();
+        let next_identity = ProfileIdentity {
+            profile_id: successor.profile_id,
+            generation: successor.generation,
+        };
+        let next_ledger =
+            AuditLedger::from_profile_call_key(&directory, next_identity, &generation_key).unwrap();
+        next_ledger
+            .initialize_generation(
+                Some(&predecessor),
+                "old-name",
+                "old-name",
+                1_900_200_000_001,
+            )
+            .unwrap();
+        assert!(next_ledger.verify_complete(None).is_ok());
+        let impostor = AuditLedger::from_profile_call_key(
+            &directory,
+            next_identity,
+            &guessed_audit_from_old_auth,
+        )
+        .unwrap();
+        assert!(impostor.verify_complete(None).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_audit_seed_migration_is_deterministic_and_crash_retryable() {
+        let legacy = crate::recovery::KeyPackage {
+            profile_id: [0x81_u8; 16],
+            generation: 7,
+            dek: [0x42_u8; 32],
+            auth_seed: [0x53_u8; 32],
+            audit_seed: [0_u8; 32],
+            audit_initialized: false,
+        };
+        let mut first = legacy.clone();
+        let mut after_log_crash = legacy.clone();
+        let mut after_pair_crash = legacy.clone();
+        initialize_legacy_audit_seed(&mut first).unwrap();
+        initialize_legacy_audit_seed(&mut after_log_crash).unwrap();
+        initialize_legacy_audit_seed(&mut after_pair_crash).unwrap();
+        assert_ne!(first.audit_seed, [0_u8; 32]);
+        assert_ne!(first.audit_seed, first.auth_seed);
+        assert_eq!(first.audit_seed, after_log_crash.audit_seed);
+        assert_eq!(first.audit_seed, after_pair_crash.audit_seed);
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "serctl-legacy-audit-migration-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let ledger_for = |package: &crate::recovery::KeyPackage| {
+            let key = profile_call_key_v3(
+                &package.auth_seed,
+                &package.audit_seed,
+                "legacy",
+                &package.profile_id,
+                package.generation,
+            )
+            .unwrap();
+            AuditLedger::from_profile_call_key(
+                &directory,
+                ProfileIdentity {
+                    profile_id: package.profile_id,
+                    generation: package.generation,
+                },
+                &key,
+            )
+            .unwrap()
+        };
+        let first_ledger = ledger_for(&first);
+        let first_checkpoint = first_ledger
+            .initialize_generation(None, "legacy", "legacy", 1_900_300_000_000)
+            .unwrap();
+
+        // Crash after the authenticated record but before its checkpoint:
+        // the same legacy PRF key authenticates and completes only that exact
+        // genesis record.
+        std::fs::remove_file(first_ledger.checkpoint_path()).unwrap();
+        let log_retry = ledger_for(&after_log_crash);
+        assert_eq!(
+            log_retry
+                .initialize_generation(None, "legacy", "legacy", 1_900_300_000_001)
+                .unwrap(),
+            first_checkpoint
+        );
+
+        // Crash after both files but before the upgraded package is committed:
+        // re-deriving from the still-legacy package verifies the existing pair
+        // rather than creating a new chain.
+        let pair_retry = ledger_for(&after_pair_crash);
+        assert_eq!(
+            pair_retry
+                .initialize_generation(None, "legacy", "legacy", 1_900_300_000_002)
+                .unwrap(),
+            first_checkpoint
+        );
+
+        let mut impossible = legacy;
+        impossible.audit_initialized = true;
+        assert!(initialize_legacy_audit_seed(&mut impossible).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4004,6 +4630,7 @@ mod tests {
 
         let old_call = profile_call_key_v3(
             &old_package.auth_seed,
+            &old_package.audit_seed,
             "prod",
             &old_package.profile_id,
             old_package.generation,
@@ -4011,6 +4638,7 @@ mod tests {
         .unwrap();
         let recreated_call = profile_call_key_v3(
             &recreated_package.auth_seed,
+            &recreated_package.audit_seed,
             "prod",
             &recreated_package.profile_id,
             recreated_package.generation,
@@ -4028,6 +4656,7 @@ mod tests {
         let mut encrypted = wrap_profile_v3("prod", &unpinned, passphrase, &package, None).unwrap();
         let before = profile_call_key_v3(
             &package.auth_seed,
+            &package.audit_seed,
             "prod",
             &package.profile_id,
             package.generation,
@@ -4041,6 +4670,7 @@ mod tests {
         let reopened = unwrap_profile_package("prod", &encrypted, passphrase).unwrap();
         let after = profile_call_key_v3(
             &reopened.auth_seed,
+            &reopened.audit_seed,
             "prod",
             &reopened.profile_id,
             reopened.generation,
@@ -4055,6 +4685,178 @@ mod tests {
                 .as_deref(),
             Some("SHA256:new-pin")
         );
+    }
+
+    #[test]
+    fn current_audit_key_package_unwrap_preserves_seed_and_marker() {
+        let passphrase = "independent-profile-passphrase";
+        let mut package = new_key_package([0x74_u8; 16], 12);
+        package.audit_initialized = true;
+        let encrypted =
+            wrap_profile_v3("current-audit", &sample_creds(), passphrase, &package, None).unwrap();
+        let reopened = unwrap_profile_package("current-audit", &encrypted, passphrase).unwrap();
+        assert_eq!(reopened.profile_id, package.profile_id);
+        assert_eq!(reopened.generation, package.generation);
+        assert_eq!(reopened.auth_seed, package.auth_seed);
+        assert_eq!(reopened.audit_seed, package.audit_seed);
+        assert!(reopened.audit_initialized);
+    }
+
+    /// Exact outer record-format gate used by v0.3.0-beta.2 before any vault
+    /// mutation. Its KeyPackage parser is not reached by the predecessor's
+    /// destructive administrator-reset path, so the outer gate is the
+    /// security boundary exercised here.
+    fn beta2_validate_outer_vault_before_mutation(vault: &VaultFile) -> Result<()> {
+        if vault.version != PRE_AUDIT_VAULT_FORMAT {
+            bail!("beta-2 rejected unsupported vault format");
+        }
+        for profile in vault.profiles.values() {
+            if profile.format != PROFILE_FORMAT_ENVELOPE {
+                bail!("beta-2 rejected unsupported encrypted profile format");
+            }
+        }
+        Ok(())
+    }
+
+    fn beta2_strict_vault_read_then_mutate<F>(bytes: &[u8], mut mutate: F) -> Result<()>
+    where
+        F: FnMut(&mut VaultFile) -> Result<()>,
+    {
+        let mut vault: VaultFile =
+            serde_json::from_slice(bytes).context("beta-2 strict reader decoded vault")?;
+        beta2_validate_outer_vault_before_mutation(&vault)?;
+        mutate(&mut vault)
+    }
+
+    #[test]
+    fn audit_record_format_blocks_beta2_destructive_writer_before_callback() {
+        let passphrase = "independent-profile-passphrase";
+        let (recovery, local_share, _media) = crate::recovery::generate_recovery().unwrap();
+        let admin = seal_admin_policy(
+            "independent-administrator-passphrase",
+            &recovery,
+            &local_share,
+        )
+        .unwrap();
+        let mut package = new_key_package([0x76_u8; 16], 14);
+        package.audit_initialized = true;
+        let encrypted = wrap_profile_v3(
+            "guarded",
+            &sample_creds(),
+            passphrase,
+            &package,
+            Some(&recovery),
+        )
+        .unwrap();
+        assert_eq!(encrypted.format, PROFILE_FORMAT_AUDIT_ENVELOPE);
+        let mut vault = VaultFile {
+            version: VAULT_FORMAT,
+            admin: Some(admin),
+            recovery: Some(recovery),
+            ..VaultFile::default()
+        };
+        vault.profiles.insert("guarded".to_owned(), encrypted);
+        validate_loaded_vault(&vault).unwrap();
+
+        let top_level_v5 = serde_json::to_vec(&vault).unwrap();
+        let top_level_v5_before = top_level_v5.clone();
+        let top_level_v5_hash = Sha256::digest(&top_level_v5);
+        let mut destructive_writer_calls = 0_usize;
+        let error = beta2_strict_vault_read_then_mutate(&top_level_v5, |decoded| {
+            destructive_writer_calls += 1;
+            decoded.profiles.clear();
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unsupported vault format"));
+        assert_eq!(destructive_writer_calls, 0);
+        assert_eq!(top_level_v5, top_level_v5_before);
+        assert_eq!(Sha256::digest(&top_level_v5), top_level_v5_hash);
+        assert!(vault.profiles.contains_key("guarded"));
+
+        // Even if only the per-profile marker survived an interrupted manual
+        // copy, the predecessor still cannot reach its destructive callback.
+        vault.version = PRE_AUDIT_VAULT_FORMAT;
+        let record_v5 = serde_json::to_vec(&vault).unwrap();
+        let record_v5_before = record_v5.clone();
+        let record_v5_hash = Sha256::digest(&record_v5);
+        let error = beta2_strict_vault_read_then_mutate(&record_v5, |_| {
+            destructive_writer_calls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported encrypted profile format"));
+        assert_eq!(destructive_writer_calls, 0);
+        assert_eq!(record_v5, record_v5_before);
+        assert_eq!(Sha256::digest(&record_v5), record_v5_hash);
+    }
+
+    #[test]
+    fn candidate_reads_beta2_record_but_rejects_marker_downgrade_and_future_format() {
+        let passphrase = "independent-profile-passphrase";
+        let legacy_package = crate::recovery::KeyPackage {
+            profile_id: [0x77_u8; 16],
+            generation: 15,
+            dek: [0x31_u8; 32],
+            auth_seed: [0xa7_u8; 32],
+            audit_seed: [0_u8; 32],
+            audit_initialized: false,
+        };
+        let legacy = wrap_profile_v3_for_format(
+            "legacy",
+            &sample_creds(),
+            passphrase,
+            &legacy_package,
+            None,
+            PROFILE_FORMAT_ENVELOPE,
+        )
+        .unwrap();
+        let reopened = unwrap_profile_package("legacy", &legacy, passphrase).unwrap();
+        assert_eq!(reopened.audit_seed, [0_u8; 32]);
+        assert!(!reopened.audit_initialized);
+
+        let mut current_package = new_key_package([0x78_u8; 16], 16);
+        current_package.audit_initialized = true;
+        let current = wrap_profile_v3(
+            "current",
+            &sample_creds(),
+            passphrase,
+            &current_package,
+            None,
+        )
+        .unwrap();
+        let mut downgraded = current.clone();
+        downgraded.format = PROFILE_FORMAT_ENVELOPE;
+        assert!(unwrap_profile_package("current", &downgraded, passphrase).is_err());
+
+        let mut future = current;
+        future.format = PROFILE_FORMAT_AUDIT_ENVELOPE + 1;
+        let mut vault = VaultFile {
+            version: VAULT_FORMAT,
+            ..VaultFile::default()
+        };
+        vault.profiles.insert("future".to_owned(), future);
+        assert!(validate_loaded_vault(&vault).is_err());
+    }
+
+    #[test]
+    fn wrapping_impossible_audit_key_package_is_rejected_before_encryption() {
+        let mut package = new_key_package([0x75_u8; 16], 13);
+        package.audit_seed = [0_u8; 32];
+        package.audit_initialized = true;
+        let error = wrap_profile_v3(
+            "invalid-audit",
+            &sample_creds(),
+            "independent-profile-passphrase",
+            &package,
+            None,
+        )
+        .err()
+        .expect("impossible audit state must fail before encryption");
+        assert!(format!("{error:#}").contains("missing its audit seed"));
     }
 
     #[test]
@@ -5494,5 +6296,326 @@ mod tests {
             serde_json::to_vec(vault.profiles.get("untouched").unwrap()).unwrap(),
             serde_json::to_vec(&untouched).unwrap()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn public_generation_mutations_fail_closed_and_link_clean_successors() {
+        use crate::audit::{AuditDecision, AuditEvent, AuditPhase};
+
+        struct TestHome(PathBuf);
+        impl Drop for TestHome {
+            fn drop(&mut self) {
+                set_test_home(None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn event(identity: ProfileIdentity, id: u8, phase: AuditPhase) -> AuditEvent {
+            AuditEvent {
+                profile_id: hex::encode(identity.profile_id),
+                profile_generation: identity.generation,
+                request_id: [id; 16],
+                at_unix_ms: 1_900_100_000_000 + u64::from(id),
+                operation_kind: "ssh.exec".to_owned(),
+                phase,
+                decision: if phase == AuditPhase::Intent {
+                    AuditDecision::Pending
+                } else {
+                    AuditDecision::Succeeded
+                },
+                policy_digest: hex::encode([3_u8; 32]),
+                intent_digest: hex::encode([id; 32]),
+                result_digest: (phase == AuditPhase::Outcome)
+                    .then(|| hex::encode([id.wrapping_add(1); 32])),
+                reason_code: if phase == AuditPhase::Intent {
+                    "intent.recorded".to_owned()
+                } else {
+                    "result.verified".to_owned()
+                },
+            }
+        }
+
+        fn ledger(identity: ProfileIdentity, key: &ProfileCallKey) -> AuditLedger {
+            let directory = run_dir().unwrap().join("audit");
+            AuditLedger::from_profile_call_key(&directory, identity, key).unwrap()
+        }
+
+        fn assert_all_generation_mutations_denied(
+            name: &str,
+            identity: ProfileIdentity,
+            passphrase: &str,
+            media: &[u8],
+        ) {
+            let mut replacement = sample_creds();
+            replacement.host_key = None;
+            assert!(update_profile(name, &replacement, passphrase, Some(identity)).is_err());
+            assert!(rename_profile_v3(
+                name,
+                "renamed-denied",
+                &replacement,
+                passphrase,
+                Some(identity)
+            )
+            .is_err());
+            assert!(change_profile_passphrase(
+                name,
+                passphrase,
+                "next-denied-profile-passphrase",
+                Some(identity)
+            )
+            .is_err());
+            assert!(admin_reset_profile(
+                name,
+                &replacement,
+                "reset-denied-profile-passphrase",
+                Some("test-administrator-password"),
+                Some(identity)
+            )
+            .is_err());
+            assert!(recover_profile_with_media(
+                name,
+                media,
+                Some("test-administrator-password"),
+                "recovery-denied-profile-passphrase",
+                Some(identity)
+            )
+            .is_err());
+            assert!(remove_profile(name, passphrase, Some(identity)).is_err());
+            assert_eq!(verify_profile_identity(name, passphrase).unwrap(), identity);
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "serctl-audit-generation-vault-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        set_test_home(Some(base.clone()));
+        let _home = TestHome(base.clone());
+        let media_path = base.join("recovery.bin");
+        initialize_admin_password("test-administrator-password", |media| {
+            std::fs::write(&media_path, media).context("persist test recovery media")
+        })
+        .unwrap();
+        let media = std::fs::read(&media_path).unwrap();
+        let mut public_creds = sample_creds();
+        public_creds.host_key = None;
+
+        let original_passphrase = "original-independent-profile-passphrase";
+        let created = create_profile(
+            "guarded",
+            &public_creds,
+            original_passphrase,
+            Some("test-administrator-password"),
+        )
+        .unwrap();
+        let initial_identity = created.identity();
+
+        // Emulate a beta-2 package that predates AuditSeed/marker. The first
+        // authenticated call-key derivation must migrate it in place before
+        // normal audit use, without borrowing AuthSeed as the audit root.
+        mutate_vault(|vault| {
+            let encrypted = vault.profiles.get("guarded").unwrap();
+            let (mut package, credentials) = authenticate_profile_v3(
+                "guarded",
+                encrypted,
+                original_passphrase,
+                vault.recovery.as_ref(),
+            )?;
+            package.audit_seed = [0_u8; 32];
+            package.audit_initialized = false;
+            let legacy = wrap_profile_v3_for_format(
+                "guarded",
+                &credentials,
+                original_passphrase,
+                &package,
+                vault.recovery.as_ref(),
+                PROFILE_FORMAT_ENVELOPE,
+            )?;
+            vault.profiles.insert("guarded".to_owned(), legacy);
+            Ok(())
+        })
+        .unwrap();
+        // The setup above uses the candidate writer, which always advances
+        // the outer generation. Recreate the exact beta-2 outer marker so this
+        // fixture exercises the real v4 -> v5 atomic storage transition.
+        let mut predecessor_vault = load_vault().unwrap();
+        predecessor_vault.version = PRE_AUDIT_VAULT_FORMAT;
+        beta2_validate_outer_vault_before_mutation(&predecessor_vault).unwrap();
+        save_vault_unlocked(&predecessor_vault).unwrap();
+        drop(predecessor_vault);
+        let initial_key = derive_profile_call_key_with_lock_timeout(
+            "guarded",
+            original_passphrase,
+            Some(initial_identity),
+            VAULT_LOCK_WAIT_TIMEOUT,
+        )
+        .unwrap();
+        let upgraded_vault = load_vault().unwrap();
+        assert_eq!(upgraded_vault.version, VAULT_FORMAT);
+        assert!(beta2_validate_outer_vault_before_mutation(&upgraded_vault).is_err());
+        assert_eq!(
+            upgraded_vault.profiles.get("guarded").unwrap().format,
+            PROFILE_FORMAT_AUDIT_ENVELOPE,
+            "audit initialization and the predecessor-rejecting record marker must commit together"
+        );
+        let upgraded_package = unwrap_profile_package(
+            "guarded",
+            upgraded_vault.profiles.get("guarded").unwrap(),
+            original_passphrase,
+        )
+        .unwrap();
+        assert!(upgraded_package.audit_initialized);
+        assert_ne!(upgraded_package.audit_seed, [0_u8; 32]);
+        assert_ne!(upgraded_package.audit_seed, upgraded_package.auth_seed);
+        drop(upgraded_package);
+        drop(upgraded_vault);
+        let initial_ledger = ledger(initial_identity, &initial_key);
+        initial_ledger
+            .append(&event(initial_identity, 1, AuditPhase::Intent))
+            .unwrap();
+
+        assert_all_generation_mutations_denied(
+            "guarded",
+            initial_identity,
+            original_passphrase,
+            &media,
+        );
+
+        initial_ledger
+            .append(&event(initial_identity, 1, AuditPhase::Outcome))
+            .unwrap();
+        let clean_log = std::fs::read(initial_ledger.log_path()).unwrap();
+        let clean_checkpoint = std::fs::read(initial_ledger.checkpoint_path()).unwrap();
+        let mut tampered = clean_log.clone();
+        tampered[0] = b'[';
+        std::fs::write(initial_ledger.log_path(), &tampered).unwrap();
+        assert_all_generation_mutations_denied(
+            "guarded",
+            initial_identity,
+            original_passphrase,
+            &media,
+        );
+
+        std::fs::write(initial_ledger.log_path(), &clean_log).unwrap();
+        std::fs::write(initial_ledger.checkpoint_path(), &clean_checkpoint).unwrap();
+        std::fs::remove_file(initial_ledger.log_path()).unwrap();
+        std::fs::remove_file(initial_ledger.checkpoint_path()).unwrap();
+        assert_all_generation_mutations_denied(
+            "guarded",
+            initial_identity,
+            original_passphrase,
+            &media,
+        );
+        assert!(create_profile(
+            "guarded",
+            &public_creds,
+            "same-name-recreate-passphrase",
+            Some("test-administrator-password"),
+        )
+        .is_err());
+
+        std::fs::write(initial_ledger.log_path(), &clean_log).unwrap();
+        std::fs::write(initial_ledger.checkpoint_path(), &clean_checkpoint).unwrap();
+        let changed_passphrase = "changed-independent-profile-passphrase";
+        let changed_generation = change_profile_passphrase(
+            "guarded",
+            original_passphrase,
+            changed_passphrase,
+            Some(initial_identity),
+        )
+        .unwrap();
+        let changed_identity = verify_profile_identity("guarded", changed_passphrase).unwrap();
+        assert_eq!(changed_generation, initial_identity.generation + 1);
+        let changed_key = derive_profile_call_key_with_lock_timeout(
+            "guarded",
+            changed_passphrase,
+            Some(changed_identity),
+            VAULT_LOCK_WAIT_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger(changed_identity, &changed_key)
+                .verify_complete(None)
+                .unwrap()
+                .sequence,
+            1
+        );
+
+        let renamed = rename_profile_v3(
+            "guarded",
+            "renamed",
+            &public_creds,
+            changed_passphrase,
+            Some(changed_identity),
+        )
+        .unwrap();
+        let renamed_key = derive_profile_call_key_with_lock_timeout(
+            "renamed",
+            changed_passphrase,
+            Some(renamed.identity()),
+            VAULT_LOCK_WAIT_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger(renamed.identity(), &renamed_key)
+                .verify_complete(None)
+                .unwrap()
+                .sequence,
+            1
+        );
+
+        let mut updated_creds = public_creds.clone();
+        updated_creds.host = "updated.example".to_owned();
+        let updated = update_profile(
+            "renamed",
+            &updated_creds,
+            changed_passphrase,
+            Some(renamed.identity()),
+        )
+        .unwrap();
+        let updated_key = derive_profile_call_key_with_lock_timeout(
+            "renamed",
+            changed_passphrase,
+            Some(updated.identity()),
+            VAULT_LOCK_WAIT_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger(updated.identity(), &updated_key)
+                .verify_complete(None)
+                .unwrap()
+                .sequence,
+            1
+        );
+
+        let recovered_passphrase = "recovered-independent-profile-passphrase";
+        let recovered = recover_profile_with_media(
+            "renamed",
+            &media,
+            Some("test-administrator-password"),
+            recovered_passphrase,
+            Some(updated.identity()),
+        )
+        .unwrap();
+        let recovered_key = derive_profile_call_key_with_lock_timeout(
+            "renamed",
+            recovered_passphrase,
+            Some(recovered.identity()),
+            VAULT_LOCK_WAIT_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger(recovered.identity(), &recovered_key)
+                .verify_complete(None)
+                .unwrap()
+                .sequence,
+            1
+        );
+        assert_eq!(recovered.generation, initial_identity.generation + 4);
     }
 }

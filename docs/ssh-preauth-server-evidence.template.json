@@ -1,0 +1,63 @@
+{
+  "schema_version": 2,
+  "evidence_status": "template",
+  "correlation": {
+    "correlation_id": "00000000-0000-4000-8000-000000000001",
+    "probe_id": "00000000-0000-4000-8000-000000000002",
+    "client_record_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "target_binding_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "configured_port": 22,
+    "client_observation": "client_identification_sent_server_silent",
+    "attempt_count": 1,
+    "probe_start_utc": "2026-01-01T00:00:01.000Z",
+    "probe_end_utc": "2026-01-01T00:00:04.000Z",
+    "window_start_utc": "2026-01-01T00:00:00.000Z",
+    "window_end_utc": "2026-01-01T00:00:05.000Z",
+    "server_clock_offset_ms": 0,
+    "clock_uncertainty_ms": 0,
+    "probe_count": 1,
+    "exclusive_window": false,
+    "client_record_bound": false,
+    "connection_binding": "ambiguous"
+  },
+  "listener": {
+    "expected_owner": false,
+    "service": "unknown",
+    "protocol": "tcp",
+    "port": 22
+  },
+  "sshd_admission": {
+    "max_startups_start": 10,
+    "max_startups_rate_percent": 30,
+    "max_startups_full": 100,
+    "per_source_max_startups": -1,
+    "per_source_penalties_supported": false,
+    "per_source_penalties_enabled": false,
+    "login_grace_time_ms": 120000,
+    "max_sessions": 10,
+    "port": 22,
+    "address_family": "any",
+    "log_level": "INFO",
+    "non_default_listen_address_configured": false,
+    "banner_configured": false
+  },
+  "events": [
+    {
+      "relative_ms": 0,
+      "category": "no_matching_event",
+      "admission_decision": "unknown",
+      "phase": "unknown",
+      "count": 1
+    }
+  ],
+  "counters": {
+    "established_connections": 0,
+    "pending_connections": 0,
+    "process_fd_used": 0,
+    "process_fd_limit": 1,
+    "admission_rejections": 0,
+    "penalty_drops": 0,
+    "firewall_or_ban_decision": "unknown"
+  },
+  "classification": "undetermined_path_or_listener"
+}

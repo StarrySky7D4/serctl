@@ -1,0 +1,29 @@
+Persistent SSH control suite: encrypted creds + long-lived daemon + IPC
+
+Usage: serctl_cli [COMMAND]
+
+Commands:
+  ui                Open the Winit-based desktop workspace (also the default with no command)
+  add               Add or update a profile using its independent passphrase
+  list              List saved profiles (host/port only — secrets stay sealed)
+  remove            Remove a profile
+  admin             Initialize or verify the Windows administrator password
+  profile-password  Manage one profile's independent passphrase
+  recovery          Manage the vault-wide 2-of-2 offline recovery policy
+  audit             Inspect or explicitly recover this profile's authenticated audit ledger
+  up                Start the global broker in the foreground; profiles unlock per request
+  exec              Run a remote command through the on-demand global broker
+  upload            Upload a local file without overwriting an existing remote file
+  download          Download a remote file without overwriting an existing local file
+  transfer          Observable, cancellable file transfer with remote-confirmed progress
+  shell             Open an interactive PTY shell through the on-demand global broker
+  tunnel            Run a loopback-only SSH TCP tunnel in the foreground until Ctrl+C
+  status            Show daemon status
+  down              Stop a running daemon after verifying one profile passphrase
+  grant-issue       Issue a policy-bounded OperationGrant for an agent frontend
+  agent             Run the agent stdio gateway: JSONL requests on stdin, JSONL relay results on stdout, authenticated by an issued OperationGrant
+  help              Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version

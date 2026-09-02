@@ -3,6 +3,7 @@
 //! engine. In the split architecture both the daemon and (until Phase 2
 //! removes direct connect) the CLI depend on this crate.
 
+pub mod audit;
 pub mod daemon_runtime;
 pub mod recovery;
 pub mod security;

@@ -152,11 +152,12 @@
   <header class="hero">
     <p class="eyebrow">Implementation review · architecture · security · operations</p>
     <h1>serctl 架构、安全与运维说明</h1>
-    <p class="lede">面向开发、审计与运行人员的实现级说明。内容覆盖 vault/record v4 的逐 profile 独立口令与随机 128 位身份、Windows 超管 + U 盘 2-of-2 恢复、v2 全量迁移、Winit/Egui 分 profile 限时授权、IPC v8 全局 broker、OperationGrant、SSH/SFTP 与原生 helper、强制回环的 L/R/D 隧道、deadline/cancel、可恢复原子传输、测试证据与残余风险。</p>
+    <p class="lede">面向开发、审计与运行人员的实现级说明。内容覆盖双层 vault/record storage v5（read v4..=v5, write v5）的逐 profile 独立口令与随机 128 位身份、独立 AuditSeed 的 Grant-root 本地审计、Windows 超管 + U 盘 2-of-2 恢复、v2 全量迁移、Winit/Egui 分 profile 限时授权、IPC v9 全局 broker、OperationGrant、SSH/SFTP 与原生传输 helper、强制回环的 L/R/D 隧道、deadline/cancel、可恢复原子传输、测试证据与残余风险。</p>
     <div class="meta-row">
-      <span class="meta"><span class="dot"></span>vault/record v4 / IPC v8：当前 wire 对旧版本失败关闭</span>
+      <span class="meta"><span class="dot"></span>vault-storage read=v4..=v5 write=v5 / IPC v9：v1 候选对旧版本失败关闭</span>
       <span class="meta">最新门禁与外部验证边界见 CHANGELOG</span>
-      <span class="meta">预发布候选：<code>v0.3.0-beta.2</code>（来源以最终 clean tag/CI 为准）</span>
+      <span class="meta" data-release-candidate="v1.0.0-beta">预发布候选：<code>v1.0.0-beta</code>（尚未验收；来源以最终 clean tag/CI 为准）</span>
+      <span class="meta" data-release-predecessor="v0.3.0-beta.2">前驱发布标记：<code>v0.3.0-beta.2</code> / IPC v8（仅历史证据）</span>
       <span class="meta">文档日期：2026-08-31</span>
       <span class="meta"><a href="serctl-design-roadmap.md">目标架构与演进路线（规划）</a></span>
       <span class="meta">dirty 制品：仅作本地验证，不作为正式发布</span>
@@ -174,7 +175,7 @@
       <a href="#cli">6. CLI 参考</a>
       <a href="#ui">7. 桌面 UI</a>
       <a href="#credentials">8. 凭证与运行锁</a>
-      <a href="#ipc">9. IPC v8 与调用授权</a>
+      <a href="#ipc">9. IPC v9 与调用授权</a>
       <a href="#timeouts">10. Deadline 与取消</a>
       <a href="#transfer">11. 目录与传输</a>
       <a href="#ssh">12. SSH、隧道与重连</a>
@@ -190,7 +191,7 @@
       <section id="summary">
         <h2>1. 执行摘要</h2>
         <div class="grid three">
-          <div class="card"><div class="kpi">vault v4</div><div class="label">独立 KDF/DEK/AuthSeed；128-bit profile identity + generation</div></div>
+          <div class="card"><div class="kpi">storage v5</div><div class="label">双层 read v4..=v5 / write v5；独立 KDF/DEK/AuthSeed/AuditSeed</div></div>
           <div class="card"><div class="kpi">64 + 8 + 8</div><div class="label">64 个本机连接；8 个重结果槽；8 个 tunnel control</div></div>
           <div class="card"><div class="kpi">300 s</div><div class="label">exec/SFTP 默认硬 deadline；最大 24 小时</div></div>
           <div class="card"><div class="kpi">32 / 128 / 256</div><div class="label">tunnel 默认/硬上限；每 SSH session 合计 live flow 上限</div></div>
@@ -198,48 +199,50 @@
           <div class="card"><div class="kpi">5 / 2 min</div><div class="label">UI profile / 超管固定非滑动授权；互不混用</div></div>
         </div>
         <div class="callout">
-          <strong>结论：</strong>v4 不再存在可解锁全部主机的共享 master。profile 口令派生 KEK，只包裹该 profile 的随机 <code>{DEK, AuthSeed, profile_id, generation}</code>；Windows 超管密码只包裹 vault-local recovery share，必须再配合匹配的 U 盘 share 才能保留式恢复。IPC v8 的激活密钥只建立 transcript-bound 双向认证 AEAD 通道；按 <code>(name, profile_id, generation)</code> 派生的短期 call key 对完整 request prelude 做 HMAC，才允许操作已解锁 profile。<code>down</code> 也必须在 AEAD 内重新验证所选 profile 口令。桌面 UI 对每个 profile 缓存固定五分钟授权，超管授权独立固定两分钟。该设计降低横向解锁、同名重建复用授权、单份恢复材料丢失和 runtime-secret 盗用风险，但仍不是防御进程注入、内存读取、键盘记录或管理员调试器的隔离执行环境。
+          <strong>结论：</strong>候选的顶层 <code>VaultFile</code> 和外层 profile record 均读 v4/v5、只写 v5，并不再存在可解锁全部主机的共享 master。profile 口令派生 KEK，只包裹该 profile 的随机 <code>{DEK, AuthSeed, AuditSeed, profile_id, generation}</code>；<code>AuthSeed</code> 只服务 IPC，独立 <code>AuditSeed</code> 只服务审计。Windows 超管密码只包裹 vault-local recovery share，必须再配合匹配的 U 盘 share 才能保留式恢复。IPC v9 的激活密钥只建立 transcript-bound 双向认证 AEAD 通道；按 <code>(name, profile_id, generation)</code> 派生的短期 call key 对完整 request prelude 做 HMAC，才允许操作已解锁 profile。<code>down</code> 也必须在 AEAD 内重新验证所选 profile 口令。桌面 UI 对每个 profile 缓存固定五分钟授权，超管授权独立固定两分钟。该设计降低横向解锁、同名重建复用授权、单份恢复材料丢失和 runtime-secret 盗用风险，但仍不是防御进程注入、内存读取、键盘记录或管理员调试器的隔离执行环境。
         </div>
-        <p><span class="badge caution">beta-2 冻结前验证</span> dirty 工作树已完成 M2 journal/resume 与 Linux M3 功能预览；2026-08-31 全工作区、全目标、全 feature 串行测试为 360 通过、0 失败、1 忽略，strict Clippy <code>-D warnings</code> 与独立 staging Release 三件套构建通过。<span class="badge caution">产物边界</span>冻结前本地二进制只能证明当时的 dirty 工作树；beta-2 制品必须从最终 clean tag/commit 重建，大小与哈希放在 CI/release metadata 或仓库外交付记录中。</p>
+        <p><span class="badge caution">beta-2 冻结前验证</span> dirty 工作树已完成 M2 journal/resume 与 Linux M3 功能预览；2026-08-31 全工作区、全目标、全 feature 串行测试为 365 通过、0 失败、1 忽略，strict Clippy <code>-D warnings</code> 与独立 staging Release 三件套构建通过。该数字只属于 beta-2 历史快照；v1 候选尚无 clean exact-tag 总数。<span class="badge caution">产物边界</span>冻结前本地二进制只能证明当时的 dirty 工作树；beta-2 制品必须从最终 clean tag/commit 重建，大小与哈希放在 CI/release metadata 或仓库外交付记录中。</p>
       </section>
 
       <section id="scope">
         <h2>2. 检查范围与证据</h2>
         <ul>
           <li>CLI/Winit UI 的 profile、命令、目录、上传、下载、Bash PTY、L/R/D tunnel、状态和关闭流程；</li>
-          <li>Windows Named Pipe 与 Unix Domain Socket 的统一抽象、端点权限、OS peer 预验、IPC v8 双向认证 + AEAD、profile proof、OperationGrant PoP 和所有帧预算；</li>
-          <li>vault/record v4 的独立 Argon2id KEK、DEK/AuthSeed key package、随机 128 位 profile identity、明文 catalog、generation、Windows 2-of-2 recovery、v2→v4 全量迁移、权限、稳定句柄、租约与序列化清零；</li>
+          <li>Windows Named Pipe 与 Unix Domain Socket 的统一抽象、端点权限、OS peer 预验、IPC v9 双向认证 + AEAD、profile proof、OperationGrant PoP 和所有帧预算；</li>
+          <li>双层 vault/record storage v5（read v4..=v5, write v5）的独立 Argon2id KEK、DEK/AuthSeed/AuditSeed key package、随机 128 位 profile identity、每记录审计 MAC、明文 catalog、generation、Windows 2-of-2 recovery、v2 全量原子迁移、权限、稳定句柄、租约与序列化清零；</li>
           <li>russh 建连/KEX、host-key 算法、TOFU、keepalive、单飞重连、exec deadline、L/R/D 转发、channel 终止和 orphan 拒绝；</li>
           <li>SFTP 长度防护、流式目录预算、累计 ACK、原生 helper 协商、push/pull journal、连续 durable prefix 恢复、no-overwrite commit、不确定态和残片清理；</li>
           <li>daemon 连接/重结果/tunnel-control 并发槽、认证后 idle、响应写、shutdown <code>JoinSet</code> 收尾；</li>
           <li>Git provenance、dependency audit、debug 版本与 Cargo Fresh 行为。</li>
         </ul>
         <div class="callout warn"><strong>平台证据边界：</strong>当前本机门禁在 Windows x86_64 MSVC 完成；较早基线覆盖原生 IPC、ACL 与真实 daemon/SSH/SFTP。Unix 条件编译不能代替 Linux/macOS 实机 CI；Windows symlink/reparse 动态用例可能因账户权限 skip，且仍无多账户 DACL 攻击矩阵。</div>
-        <div class="callout"><strong>当前实现与目标设计分离：</strong>本文描述现有源码和已披露验证边界。策略 DSL、typed remote helper、作业 receipt、远端审计锚定、IPC v9 codec 与 QUIC 高速通道仍是规划，不能从本文推断为已支持；完整决策与验收路线见 <a href="serctl-design-roadmap.md">目标架构与演进路线</a>。</div>
+        <div class="callout"><strong>当前实现与目标设计分离：</strong>本文描述现有源码和已披露验证边界。IPC v9 wire 已进入 v1 候选源码；Protobuf codec 迁移、完整策略 DSL、远端审计锚定与 QUIC 高速通道仍是规划。<code>serctl-remote</code>、jobs、remote protocol 与 policy 目前仅为 <strong>source-only experimental / unshipped</strong> 红队修复目标，不发布、不进入 runtime/symbol/SBOM、无受支持运行入口；所有 <code>job.*</code> operation 都不属于 Agent 或 OperationGrant 支持面。不能从源码存在推断为已支持；完整决策与验收路线见 <a href="serctl-design-roadmap.md">目标架构与演进路线</a>。</div>
       </section>
 
       <section id="architecture">
         <h2>3. 总体架构</h2>
         <pre><code>Winit / Egui UI ─┐
-                 ├── client ── OS peer check ── IPC v8 AEAD ── global broker ── per-profile SessionManager
+	                 ├── client ── OS peer check ── IPC v9 AEAD ── global broker ── per-profile SessionManager
 CLI ─────────────┘       │          │              │           ├── russh 0.62.5
                          │          │              │           ├── SFTP v3
                          │          │              │           └── L/R/D TCP tunnel data plane
                          │          │              └── JoinSet + semaphores + shutdown
                          │          └── Named Pipe / Unix Domain Socket（tunnel control only）
-                         └── no broker ready: protected descriptor + on-demand global broker launch（no direct fallback）
+	                         └── no broker ready: protected descriptor + on-demand global broker launch（no direct fallback）
 
-vault/record v4 ── profile passphrase ── Argon2id ── KEK ─┐
+serctl-remote / jobs / remote-protocol / policy ── source-only experimental（no shipped binary / no Agent or Grant route）
+
+vault/record v5 (read v4..=v5, write v5) ── profile passphrase ── Argon2id ── KEK ─┐
                                                           ├─ {DEK, AuthSeed, profile_id, generation}
 Windows recovery ── admin-wrapped local share ─────┤
                    USB offline share ───────────────┘  2-of-2
 DEK ── ChaCha20-Poly1305(username/password/host-key pin)
 AuthSeed + name + profile_id + generation ── HMAC domain separation ── call key</code></pre>
-        <p>UI 与 CLI 复用相同 client API，但授权生存期不同：CLI 的每个普通 profile 操作进程都重新取得目标独立口令；UI 按 <code>(name, profile_id, generation)</code> 保存固定五分钟、非滑动的授权，每个操作只复制对应 profile 的可清零口令。锁定 UI 与 <code>list</code> 仍可读取明文 catalog，但未授权 profile 不执行 status probe 或网络 I/O。所有远程操作只走全局 broker，不再有 direct-connect 回退；首次 unlock 的口令仅在 v8 AEAD 内传输，后续普通请求以短期 call key 对完整 prelude 做 HMAC。<code>Status</code> 要求 profile proof；<code>Shutdown</code> 在 AEAD 内重新验证 profile 口令且不建立新 SSH 连接。</p>
+        <p>UI 与 CLI 复用相同 client API，但授权生存期不同：CLI 的每个普通 profile 操作进程都重新取得目标独立口令；UI 按 <code>(name, profile_id, generation)</code> 保存固定五分钟、非滑动的授权，每个操作只复制对应 profile 的可清零口令。锁定 UI 与 <code>list</code> 仍可读取明文 catalog，但未授权 profile 不执行 status probe 或网络 I/O。所有远程操作只走全局 broker，不再有 direct-connect 回退；首次 unlock 的口令仅在 v9 AEAD 内传输，后续普通请求以短期 call key 对完整 prelude 做 HMAC。<code>Status</code> 要求 profile proof；<code>Shutdown</code> 在 AEAD 内重新验证 profile 口令且不建立新 SSH 连接。</p>
         <div class="flow" aria-label="请求处理流程">
           <div class="node">验证参数 / 目标 profile 口令</div>
           <div class="node">建立 absolute deadline</div>
-          <div class="node">v8 profile proof（仅 broker）</div>
+          <div class="node">v9 profile proof（仅 broker）</div>
           <div class="node">SSH / SFTP / PTY</div>
           <div class="node">有界响应或清理</div>
         </div>
@@ -252,9 +255,10 @@ AuthSeed + name + profile_id + generation ── HMAC domain separation ── c
           <tbody>
             <tr><td><a href="../crates/serctl_cli/src/main.rs"><code>serctl_cli/main.rs</code></a></td><td>CLI、启动与退出码</td><td>runtime 前消费环境秘密；profile/admin/recovery/migrate/grant 命令；loopback-only L/R/D</td></tr>
             <tr><td><a href="../crates/serctl_cli/src/ui.rs"><code>serctl_cli/ui.rs</code></a></td><td>Winit/Egui 工作台</td><td>masked secret、逐 profile 5 分钟与超管 2 分钟授权、锁定 catalog、migration gate</td></tr>
-            <tr><td><a href="../crates/serctl_cli/src/client.rs"><code>serctl_cli/client.rs</code></a></td><td>broker client、Agent 网关</td><td>v8 unlock/profile proof、OperationGrant PoP、deadline、PTY/tunnel lifetime、typed unknown</td></tr>
+            <tr><td><a href="../crates/serctl_cli/src/client.rs"><code>serctl_cli/client.rs</code></a></td><td>broker client、Agent 网关</td><td>v9 unlock/profile proof、OperationGrant PoP、deadline、PTY/tunnel lifetime、typed unknown</td></tr>
             <tr><td><a href="../crates/serctl_daemon/src/daemon.rs"><code>serctl_daemon/daemon.rs</code></a></td><td>全局 broker</td><td>per-profile pool、hard lease、grant registry、并发槽、Status metadata-only 与有界收尾</td></tr>
-            <tr><td><a href="../crates/serctl_protocol/src/lib.rs"><code>serctl_protocol</code></a></td><td>本机 IPC 与协议</td><td>v8 双向认证/AEAD、profile proof、Ed25519 PoP、root hash 与帧预算</td></tr>
+            <tr><td><a href="../crates/serctl_protocol/src/lib.rs"><code>serctl_protocol</code></a></td><td>本机 IPC 与协议</td><td>v9 双向认证/AEAD、profile proof、Ed25519 PoP、root hash 与帧预算</td></tr>
+            <tr><td><code>serctl-remote / jobs / remote-protocol / policy</code></td><td>source-only experimental / unshipped</td><td>红队发现的 P0 修复目标；参与 workspace check/test/strict Clippy 与适用的 build.rs fixture，但不发布、不打包、不进入 symbol/SBOM、无运行时入口，<code>job.*</code> 不可签发</td></tr>
             <tr><td><a href="../crates/serctl_core/src/ssh.rs"><code>serctl_core/ssh.rs</code></a></td><td>SSH/SFTP/tunnel 封装</td><td>可取消 KEX、算法过滤、L/R/D bridge、live-flow 与 SFTP guard</td></tr>
             <tr><td><a href="../crates/serctl_core/src/vault.rs"><code>serctl_core/vault.rs</code></a></td><td>凭证库、超管、迁移与租约</td><td>v4 independent KEK/DEK/AuthSeed、128-bit identity、2-of-2 policy、atomic migration</td></tr>
             <tr><td><a href="../crates/serctl_core/src/recovery.rs"><code>serctl_core/recovery.rs</code></a></td><td>离线恢复原语</td><td>XOR 2-of-2、X25519 + HKDF + AEAD envelope、canonical media</td></tr>
@@ -271,10 +275,10 @@ AuthSeed + name + profile_id + generation ── HMAC domain separation ── c
           <li>取得 per-user/per-vault startup lock，并在锁内二次检查现有 descriptor，避免并发客户端重复启动。</li>
           <li>生成 instance id 与 256-bit activation secret；descriptor 只公开 PID/endpoint/protocol/build，secret 通过 stdin 引导并单独保存为受保护文件。</li>
           <li>绑定 Named Pipe/Unix Socket、发布 runtime 状态并进入 64 连接/8 重结果槽/8 tunnel-control accept loop；所有远程操作只走该 broker。</li>
-          <li>首次 unlock 某 profile 时，在 v8 AEAD 内验证其口令并建立 SSH session/排他 lease；TOFU pin 持久化成功后才发送 SSH 密码。</li>
+          <li>首次 unlock 某 profile 时，在 v9 AEAD 内验证其口令并建立 SSH session/排他 lease；TOFU pin 持久化成功后才发送 SSH 密码。</li>
           <li>profile pool 和 grant registry 每秒主动回收过期项；每个未过期 OperationGrant 都持有工作计数引用，防止 broker 在能力仍有效时空闲退出。最后一个 Grant/连接/长操作释放后，工作计数持续为空十分钟，broker 才自动退出并清除 runtime 状态。</li>
         </ol>
-        <h3>IPC v8 互认证与 profile 调用授权</h3>
+        <h3>IPC v9 互认证与 profile 调用授权</h3>
         <ol>
           <li>客户端从受保护 runtime 状态读取 PID、endpoint 与 activation secret，连接前核对 OS 对端 PID/UID。</li>
           <li>双方以 instance、双 nonce 和完整 prelude 做 transcript-bound HMAC，HKDF 派生方向独立 AEAD keys；后续帧加密且计数器严格递增。</li>
@@ -286,7 +290,7 @@ AuthSeed + name + profile_id + generation ── HMAC domain separation ── c
           <li>校验命令不含 NUL 且不超过 64 KiB，建立 absolute deadline并只路由一次。</li>
           <li>deadline 覆盖 IPC、重结果槽等待、单飞重连、DNS/TCP/KEX/auth、channel open、exec request、输出与退出状态。</li>
           <li>IPC writer 在每次 <code>poll_write</code> 与 <code>poll_flush</code> 前都检查同一 absolute deadline，避免外层 timeout 对 ready inner Future 的最后一次 poll 越过预算。只有 4 字节长度头和完整序列化 payload 都被 <code>AsyncWrite</code> 成功接收后、flush 前才跨过提交边界。序列化失败、零字节/部分帧写失败和完整帧前 deadline 都是确定的 pre-submit；完整帧后的 flush/响应失败、deadline 或断开属于 typed <code>ExecOutcomeUnknown</code>。</li>
-          <li>daemon 的普通 <code>Error</code> 只表示已确认尚未把请求交给 russh，post-submit 错误必须编码为 typed unknown；v8 client 拒绝旧 runtime 状态且不降级 direct。</li>
+          <li>daemon 的普通 <code>Error</code> 只表示已确认尚未把请求交给 russh，post-submit 错误必须编码为 typed unknown；v9 client 拒绝旧 runtime 状态且不降级 direct。</li>
           <li>异常退出依次有界尝试 TERM、短宽限、KILL、EOF、Close 和关闭确认；不能确认时使 transport 失效。</li>
         </ol>
         <h3>创建目录</h3>
@@ -352,17 +356,17 @@ $randomReceipt = Join-Path $env:USERPROFILE 'Documents\serctl-prod-passphrase.tx
             <tr><td><code>ui</code></td><td>打开 Winit/Egui 工作台</td><td>无子命令时默认</td></tr>
             <tr><td><code>add</code></td><td>新建或更新 profile</td><td>新建设置独立口令，Windows 还验证超管；更新只验证目标 profile；<code>--host-key-sha256</code> 可预置规范指纹</td></tr>
             <tr><td><code>list</code></td><td>列出 catalog</td><td>无需口令；只返回明文 name/host/port/profile_id/generation，不解密 SSH 凭据</td></tr>
-            <tr><td><code>remove</code></td><td>删除 profile</td><td>验证目标独立口令与当前 generation</td></tr>
+            <tr><td><code>remove</code></td><td>删除 profile</td><td>验证目标独立口令与当前 generation；存在 authenticated audit material 时失败关闭，禁止手工删除 ledger/checkpoint 绕过</td></tr>
             <tr><td><code>admin status|verify</code></td><td>查看/验证平台管理授权</td><td><code>status</code> 只读策略 metadata；<code>verify</code> 在 Windows 验证超管密码，在 Linux 验证有效 UID 0</td></tr>
-            <tr><td><code>admin init --recovery-media FILE</code></td><td>初始化 Windows 超管策略</td><td>仅空 v4 vault；新绝对路径 create-new；同时建立超管密码与 2-of-2 recovery</td></tr>
+            <tr><td><code>admin init --recovery-media FILE</code></td><td>初始化 Windows 超管策略</td><td>仅空的受支持 v4/v5 vault；新绝对路径 create-new；成功时原子写 storage v5，同时建立超管密码与 2-of-2 recovery</td></tr>
             <tr><td><code>admin change-password</code></td><td>更换 Windows 超管密码</td><td>验证旧密码并只重包 vault-local share；Linux 不保存超管密码并拒绝该命令</td></tr>
             <tr><td><code>profile-password NAME change</code></td><td>手动轮转一个 profile</td><td>验证当前独立口令并交互确认新口令；成功生成新 package/generation</td></tr>
             <tr><td><code>profile-password NAME rotate-random --random-output FILE</code></td><td>随机轮转一个 profile</td><td>先把随机值持久写入受保护的 create-new 绝对路径并回读，再提交新 package/generation；不打印秘密</td></tr>
             <tr><td><code>profile-password NAME admin-reset --media FILE [--random --random-output FILE]</code></td><td>保留式恢复（仅 Windows）</td><td>超管 + 匹配介质 + 新口令；保留 SSH 凭据但不显示旧 profile 口令。Linux root 路径也失败关闭</td></tr>
-            <tr><td><code>profile-password NAME admin-reset --replace-credentials [--host H] [--user U] [--port P] [--host-key-sha256 SHA256:…] [--random --random-output FILE]</code></td><td>Windows 破坏性重置</td><td>超管授权；与 <code>--media</code> 严格二选一；缺少的凭据交互输入；永久丢弃旧凭据/pin/package</td></tr>
-            <tr><td><code>profile-password NAME admin-reset --target-user USER --replace-credentials [credential options] [--random --random-output FILE]</code></td><td>Linux CLI 破坏性重置</td><td>必须以 root 启动；NSS 绑定非 root 账号并在打开 vault 前不可逆降权；不能保留旧秘密。Windows 拒绝 <code>--target-user</code></td></tr>
+            <tr><td><code>profile-password NAME admin-reset --replace-credentials [...]</code></td><td>Windows 破坏性重置</td><td>所有既有 profile 当前失败关闭：超管授权不能认证并衔接旧审计历史；使用旧口令轮转或 2-of-2 保留式恢复</td></tr>
+            <tr><td><code>profile-password NAME admin-reset --target-user USER --replace-credentials [...]</code></td><td>Linux CLI 破坏性重置</td><td>root/NSS/不可逆降权前置边界仍验证，但所有既有 profile 随后失败关闭；Linux 没有保留式恢复</td></tr>
             <tr><td><code>recovery rotate --old-media FILE --new-media FILE</code></td><td>全量轮转恢复策略</td><td>Windows 超管 + 旧介质；新文件 create-new，成功持久化后才原子提交全部 envelope</td></tr>
-            <tr><td><code>recovery migrate-v2 --recovery-media FILE</code></td><td>v2→v4 全量迁移（仅 Windows）</td><td>旧 master、每个 profile 新口令、新超管密码与新介质；每条记录生成随机 128 位 ID；Linux 当前无升级路径并失败关闭</td></tr>
+            <tr><td><code>recovery migrate-v2 --recovery-media FILE</code></td><td>v2 全量原子迁移到 storage v5（仅 Windows）</td><td>旧 master、每个 profile 新口令、新超管密码与新介质；顶层和全部 record 一次写 v5，每条记录生成随机 128 位 ID；Linux 当前无升级路径并失败关闭</td></tr>
             <tr><td><code>recovery init NEW_MEDIA</code></td><td>Linux root 恢复初始化入口</td><td>当前因缺 root-owned system share store 与目标用户边界而明确失败关闭</td></tr>
             <tr><td><code>up/down/status</code></td><td>运行与控制 daemon</td><td>每次调用验证目标 profile；status/down 使用 generation-scoped call-key 精确 intent；Status 纯 metadata、绝不 SSH reconnect</td></tr>
             <tr><td><code>exec</code></td><td>执行命令并保留 stdout/stderr/exit status</td><td>默认 300 秒；非零远端码映射为本地非零</td></tr>
@@ -384,14 +388,14 @@ $randomReceipt = Join-Path $env:USERPROFILE 'Documents\serctl-prod-passphrase.tx
         <h2>7. Winit/Egui 桌面 UI</h2>
         <ul>
           <li>UI 初始即读取本地 catalog；profile 名、host、port、随机 128 位 <code>profile_id</code>、generation 在锁定态可见。只有持有精确 <code>(name, profile_id, generation)</code> grant 的记录才会调度 daemon Status 或网络操作，未授权 refresh 对该 profile 为零 daemon/网络副作用。</li>
-          <li>每个 profile 的独立口令验证后授予固定五分钟、非滑动授权。切换主机保留其他 profile grant，但不会把一个口令用于另一个 profile。保存/编辑、重命名、口令轮转、恢复或 admin reset 保留 ID、产生新 package/generation 后立即撤销旧 grant；删除再同名重建会得到新 ID，旧 grant 仍不可用。首次 TOFU pin 只重封同一 identity/package，不推进 generation。</li>
+          <li>每个 profile 的独立口令验证后授予固定五分钟、非滑动授权。切换主机保留其他 profile grant，但不会把一个口令用于另一个 profile。保存/编辑、重命名、口令轮转或 Windows 2-of-2 保留式恢复保留 ID、产生新 package/generation 后立即撤销旧 grant；已审计 profile 的 remove 与所有既有 profile 的 destructive admin reset 当前失败关闭。未审计对象删除再同名重建会得到新 ID，旧 grant 仍不可用。首次 TOFU pin 只重封同一 identity/package，不推进 generation。</li>
           <li>Windows 超管授权独立固定两分钟，不传入普通 SSH 操作；Linux 同一界面验证有效 UID 0。单项/全部撤销或到期会清零对应口令，关闭该 profile 的 shell/tunnel/transfer 与受保护 workspace；已运行 daemon 故意保留。</li>
           <li>Windows 新建主机在缺少超管授权时记录一个不含秘密的待保存续接标记，实际 SSH/profile 口令仍只留在编辑器。完成恢复策略初始化并授权后，UI 自动关闭安全窗口并继续原保存动作；轮转恢复介质撤销旧授权后需重新授权，再继续同一待办。手动关闭安全窗口只取消自动续接，编辑器内容仍保留。</li>
           <li>目录、文件传输、命令、Bash 与 tunnel 均通过后台 Tokio runtime 执行。profile refresh 使用一个 32 秒 absolute deadline，先读取 catalog，再只对有效 grant 分波执行最多 8 个 daemon status probe；Status 只读 daemon metadata，不触发 SSH reconnect。</li>
-          <li>首次空 v4 vault 在 Windows 必须先输入并确认新超管密码，把新 2-of-2 share 以 create-new 写入指定可移动介质，之后才允许创建 profile。Linux 不设置存储型超管密码。</li>
-          <li>“安全操作”分为三类：手动/随机轮转；仅 Windows 可用的超管 + 匹配介质 + 新口令保留式恢复；以及红色破坏性重置（完整替换凭据/口令并输入 profile 名确认，永久丢弃旧凭据、pin 与 package）。三类随机路径都先在 modal 暂存并一次性显示，明确标注“vault 尚未修改”；只有勾选“已安全保存”后提交按钮才启用，点击才调用既有手动 API。生成阶段无后台消息、网络或 vault 副作用；取消/关闭会清零暂存值。</li>
+          <li>Windows 首次使用空的受支持 v4/v5 vault 时，必须先输入并确认新超管密码，把新 2-of-2 share 以 create-new 写入指定可移动介质；成功提交将顶层写为 storage v5，之后才允许创建 profile。Linux 不设置存储型超管密码。</li>
+          <li>可用“安全操作”只有手动/随机轮转，以及 Windows 的超管 + 匹配介质 + 新口令保留式恢复。两类随机路径都先在 modal 暂存并一次性显示，明确标注“vault 尚未修改”；只有勾选“已安全保存”后提交按钮才启用。生成阶段无后台消息、网络或 vault 副作用；取消/关闭会清零暂存值。红色 destructive reset UI/CLI 对所有既有 profile 当前返回失败关闭，不能认证旧审计历史。</li>
           <li>恢复介质轮转要求旧介质与不存在的新绝对路径；先写新介质，再原子提交全部 profile envelope。v2 vault 显示阻断式迁移向导：旧 master、每 profile 新口令、Windows 新超管密码与新介质必须齐全，单次全量提交前所有网络功能禁用。Linux 迁移按钮禁用，提交入口也会在读取/搬移迁移 secret 前明确失败关闭。</li>
-          <li>Linux UI 不提供任意 home/vault 路径或跨用户选择器。为其他本机账号执行 root 破坏性 reset 必须使用 CLI <code>--target-user USER --replace-credentials</code> 的降权入口；保留式恢复仍不可用。</li>
+          <li>Linux UI 不提供任意 home/vault 路径或跨用户选择器。CLI <code>--target-user USER --replace-credentials</code> 仍执行 root/NSS/home/降权前置校验，但对所有既有 profile 随后失败关闭；Linux 保留式恢复也不可用。</li>
           <li>“隧道”页提供本地 L、远程 R、动态 D/SOCKS5、监听端口、L/R 目标端口和连接上限；监听地址只显示“127.0.0.1（强制回环）”，没有 bind/expose/target-host 输入。ready 后显示实际端口；profile generation + instance id 拒绝迟到消息。</li>
           <li>profile epoch、不可变 <code>(name, profile_id, generation)</code> 与 daemon instance id 进入异步结果身份；切换 profile、停止 daemon 或退出会 cancel tunnel。Shell/Tunnel/Command/Directory/Transfer 均在 reducer 呈现结果前复核 identity 与授权，TTL 到期或撤销后的迟到完成会被取消或拒绝呈现。保存或删除若该 profile 的 tunnel 正在启动、运行或停止中，会明确要求用户先点击“停止隧道”并等待清理完成；未验证的 profile mutation 不会偷偷停止一个活跃本地 listener。</li>
           <li>保存成功消息携带原 profile 名；在已无活跃 tunnel 的前提下，reducer 在 refresh 前清零并删除原名和新名缓存，同时失效当前 profile context、目录、命令输出和 shell。因而 H1 同名覆盖为 H2 后，即使 refresh 失败，旧 H1 状态也不再可操作。</li>
@@ -404,7 +408,7 @@ $randomReceipt = Join-Path $env:USERPROFILE 'Documents\serctl-prod-passphrase.tx
 
       <section id="credentials">
         <h2>8. 凭证保存与运行锁安全</h2>
-        <h3>vault/record v4：独立口令、随机身份与 key package</h3>
+        <h3>vault/record storage v5：双层读 v4..=v5、只写 v5</h3>
         <p>vault 硬上限为 10,000 个 profile；满额时允许更新、重命名或删除既有记录，但拒绝新增。所有 mutation 在原子提交前再次校验容量与结构，因此第 10,001 条不会写盘并锁死 vault。</p>
         <div class="table-wrap"><table>
           <thead><tr><th>字段</th><th>磁盘形态</th><th>保护</th></tr></thead>
@@ -421,12 +425,12 @@ $randomReceipt = Join-Path $env:USERPROFILE 'Documents\serctl-prod-passphrase.tx
           </tbody>
         </table></div>
         <ul>
-          <li>每个新 profile 口令至少 12 字节，只能解包本 profile 的 key package。创建及 v2→v4 迁移产生随机 128 位 <code>profile_id</code>；修改凭据、重命名、口令轮转、保留式恢复或破坏性重置保留 ID，生成 fresh DEK/AuthSeed 和递增 generation。删除再同名重建会产生新 ID；旧 UI grant、daemon call key 和迟到异步结果随即失效。首次 TOFU pin 是例外：fresh nonce 重封同一 identity/package/generation，保留刚建立 daemon 的 call key。</li>
+          <li>每个新 profile 口令至少 12 字节，只能解包本 profile 的 key package。创建及 v2 全量迁移产生随机 128 位 <code>profile_id</code>；修改凭据、重命名、口令轮转或保留式恢复保留 ID，生成 fresh DEK/AuthSeed 和递增 generation，同时保持独立 AuditSeed 以认证代际 transition。所有既有 profile 的 destructive reset 当前失败关闭；已审计 profile 也不能删除。未审计对象删除再同名重建会产生新 ID；旧 UI grant、daemon call key 和迟到异步结果随即失效。首次 TOFU pin 是例外：fresh nonce 重封同一 identity/package/generation，保留刚建立 daemon 的 call key。</li>
           <li>密钥派生通过 <code>hash_password_into_with_memory</code> 直接写入精确的 <code>Zeroizing&lt;Vec&lt;Argon2Block&gt;&gt;</code>；64 MiB 矩阵由 RAII 擦除，Argon2 内部 initial/block hash 的可控副本由开启的 <code>zeroize</code> feature 覆盖。</li>
-          <li>daemon 启动以一次 profile KDF 解包 package，再完成 credential decrypt 与 32 字节 call-key 派生；SSH auth/首次 pin 完成后清除 profile 口令、KEK、DEK/AuthSeed package，只保留 SSH 会话所需状态与域分离 call key。</li>
-          <li><code>remove</code> 与普通编辑先验证目标 profile 口令并认证 key/payload ciphertext。Windows 新建 profile 还要求已初始化且有效的超管授权，但超管密码不参与 profile KEK，因此不能横向解锁现有 profile。</li>
+          <li>daemon 启动以一次 profile KDF 解包 package，再完成 credential decrypt、IPC key 与独立 audit key 派生；SSH auth/首次 pin 完成后清除 profile 口令、KEK 与完整 DEK/AuthSeed/AuditSeed package，只保留 SSH 会话所需状态与域分离 call key。AuditSeed 不复用 AuthSeed。</li>
+          <li><code>remove</code> 与普通编辑先验证目标 profile 口令并认证 key/payload ciphertext；存在 authenticated audit material 时 remove 进一步失败关闭。Windows 新建 profile 还要求已初始化且有效的超管授权，但超管密码不参与 profile KEK，因此不能横向解锁现有 profile。</li>
           <li>CLI 随机口令不是“先改 vault、再打印结果”：受保护的 create-new 输出完成 <code>sync_all</code>、常量时间同句柄回读（Unix 再同步父目录）后，闭包才执行 profile mutation。交付阶段失败时 vault 保持原口令；mutation 失败时输出文件保留为尚未生效的孤立 receipt，避免把 profile 锁在调用者从未取得的随机值后。该顺序只保证非对抗 I/O：同 UID 对手仍可在回读后删除/换名文件，或替换其可写父目录，不能把“路径仍由调用者持有”视为密码学保证。</li>
-          <li>Linux 跨用户管理只开放 CLI 破坏性 reset。进程仍为 euid 0 时按传入账号名通过 NSS 解析 UID/GID/home，拒绝 root、任意 UID/HOME/SUDO_USER/路径输入，使用 <code>O_NOFOLLOW</code> 句柄验证 home 非宽松可写且现有 <code>.serctl</code> 由目标账号独占；随后清空 supplementary groups，并把 real/effective/saved GID/UID 全部不可逆降为该账号，在创建 Tokio worker 和打开 vault 字节前核对降权结果。进程内委托标志只允许丢弃并替换旧秘密，不赋予保留式恢复能力。</li>
+          <li>Linux 跨用户 destructive reset 入口在进程仍为 euid 0 时按传入账号名通过 NSS 解析 UID/GID/home，拒绝 root、任意 UID/HOME/SUDO_USER/路径输入，使用 <code>O_NOFOLLOW</code> 句柄验证 home 非宽松可写且现有 <code>.serctl</code> 由目标账号独占；随后清空 supplementary groups，并把 real/effective/saved GID/UID 全部不可逆降为该账号，在创建 Tokio worker 和打开 vault 字节前核对降权结果。完成这些前置边界后，既有 profile 仍因无法认证旧 audit history 而失败关闭；该入口当前既不替换也不恢复旧秘密。</li>
           <li>密码校验、profile 加解密、vault 更新和运行锁写入的敏感 JSON使用两遍序列化：第一遍仅计数，第二遍写入精确预分配的 <code>Zeroizing&lt;Vec&lt;u8&gt;&gt;</code>。IPC frame 同样不先生成普通敏感 <code>Vec</code>。</li>
           <li>可控明文、命令、帧、输出和缓冲在 Drop/错误路径清零；这不能清除 allocator、OS cache、第三方库、swap 或 crash dump 中的副本。</li>
           <li>vault 更新和运行锁发布共用同目录受保护原子替换；vault 文件锁采用 <code>try_lock</code> 轮询且最多等待 30 秒。Unix 同步临时文件后原子 <code>rename</code>，再 <code>fsync</code> 父目录；Windows 从临时文件创建时即施加 protected DACL，<code>sync_all</code> 后持有稳定、已验证的受保护父目录句柄，并调用 Microsoft <a href="https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw"><code>MoveFileExW</code></a>（<code>MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH</code>）。</li>
@@ -436,11 +440,11 @@ $randomReceipt = Join-Path $env:USERPROFILE 'Documents\serctl-prod-passphrase.tx
         <ul>
           <li>初始化产生一个规范 X25519 私有输入并拆成两个非零 XOR share：本地 share 只以超管密码 KEK 加密后进入 vault，另一 share 以 canonical JSON 写入新 U 盘文件。组合两份 share 后只用于 X25519 + HKDF 派生 recovery-envelope AEAD key；不会还原或显示旧 profile 口令。</li>
           <li>公开 recovery configuration 本身不保密，但必须防替换。AdminSecret 在超管密文中保存完整 canonical configuration 的 SHA-256 digest；每个 profile 同时保存以其 AuthSeed 对完整 configuration 计算的 HMAC-SHA256 tag。超管验证、profile 口令验证、call-key 派生、编辑/轮转/TOFU 和 recovery rotation 均先核对相应绑定，避免管理员只换 public key 后诱使后续正常更新把新 package 密封到攻击者密钥。</li>
-          <li>保留式恢复要求超管密码、匹配介质和新 profile 口令三者齐全；serctl 打开旧 package/凭据后保留 profile ID，立即生成 fresh package/递增 generation 并重新封装。单独超管密码只能验证管理权或执行明确的破坏性替换，单独介质也不能打开 envelope。</li>
+          <li>保留式恢复要求超管密码、匹配介质和新 profile 口令三者齐全；serctl 打开旧 package/凭据后保留 profile ID，立即生成 fresh DEK/AuthSeed、递增 generation，保留 AuditSeed 并写入认证的 successor transition 后重新封装。单独超管密码只能验证管理权，不能执行既有 profile 的破坏性替换；单独介质也不能打开 envelope。</li>
           <li>恢复轮转先用旧 2-of-2 组合认证每个 profile package/payload，生成全新配置与全部 envelope，create-new 持久化新介质，最后一次原子提交 vault。CLI/UI 都要求绝对路径，在同一稳定普通文件 handle 上同步并常量时间回读核对，拒绝 link/reparse 以及 `.serctl` vault 内部输入/输出，Unix 还同步父目录。失败最多留下孤立新介质；旧介质只在 vault 成功提交后失效。</li>
           <li>绝对路径、create-new、文件类型和回读只能证明文件操作约束，不能证明目标卷确是 USB、与主机物理分离、不可复制或使用后已弹出。操作者必须把介质放在与 vault 及其备份分离的可移动存储上，写后核验、弹出并离线保管；UI 的“U 盘”提示不是硬件证明。</li>
-          <li>v2→v4 只支持全量、离线、一次性迁移。Windows 验证旧共享 master，要求 profile 集合与新独立口令集合精确相等，拒绝未认证 format-0 记录，并为每条转换记录生成随机 128 位 ID；UI/CLI 明确报告校验、独占访问、旧库认证、逐 profile KDF、介质持久化和原子提交阶段，介质路径在取走输入秘密及执行 KDF 前预检。全局 runtime barrier/lease、全部认证转换与新介质持久化都成功后才替换 vault。Linux 路径在 root-owned system share store 与明确目标用户边界实现前失败关闭。</li>
-          <li>开发过程中的中间 vault/record v3 从未发布，且其 AAD/KeyPackage 布局与最终 v4 不同；v4 对 v3 的 load、catalog 与 migration 均失败关闭，不会把 v3 猜作 v2、补默认 ID 或自动迁移。需要该临时数据时只能使用匹配的开发期 binary/备份离线处置。</li>
+          <li>v2 只支持全量、离线、一次性迁移。Windows 验证旧共享 master，要求 profile 集合与新独立口令集合精确相等，拒绝未认证 format-0 记录，并为每条转换记录生成随机 128 位 ID；UI/CLI 明确报告校验、独占访问、旧库认证、逐 profile KDF、介质持久化和原子提交阶段，介质路径在取走输入秘密及执行 KDF 前预检。全局 runtime barrier/lease、全部认证转换与新介质持久化都成功后，才在同一受保护原子替换中写入顶层 vault v5 与全部 record v5。对 beta-2 v4 的首次成功 mutation 同样原子推进顶层 v5，并重密封受影响 record 为 v5。Linux 路径在 root-owned system share store 与明确目标用户边界实现前失败关闭。</li>
+          <li>开发过程中的中间 vault/record v3 从未发布，且其 AAD/KeyPackage 布局与 beta-2 v4 及候选 v5 均不同；候选 reader 只接受 v4..=v5，对 v3 的 load、catalog 与 migration 均失败关闭，不会把 v3 猜作 v2、补默认 ID 或自动迁移。需要该临时数据时只能使用匹配的开发期 binary/备份离线处置。</li>
           <li><code>(name, profile_id, generation)</code> 认证绑定当前记录实例并防 UI/IPC 中的陈旧授权、跨 profile 重放、同名删除重建复用和常规并发覆盖；generation 不是 TPM/远端单调计数器。拥有 vault 文件写权限的管理员若恢复整份内部一致的旧 <code>vault.json</code>，当前实现无法检测该完整快照回滚。</li>
         </ul>
         <h3>稳定句柄与平台权限</h3>
@@ -451,11 +455,11 @@ $randomReceipt = Join-Path $env:USERPROFILE 'Documents\serctl-prod-passphrase.tx
         </ul>
         <h3>租约与畸形锁恢复</h3>
         <p>全局 broker 按 profile 持有排他使用租约；profile mutation 在租约竞争时失败关闭。credential lease 由独立 1 秒 reaper 主动清理，所有 handler 与长驻 tunnel 还受该 lease 的 monotonic hard deadline 包裹，到期即取消。首次 TOFU 先 KEX/观测 key，在排他租约下原子只写一次 pin，之后才发送 SSH password。</p>
-        <p>v8 runtime descriptor 不含密钥，激活密钥单独保存在受保护文件中；两者均通过稳定句柄验证 owner、ACL/type 与 reparse/symlink 边界。全局 client 对旧协议状态失败关闭，不提供 direct-connect 回退。</p>
+        <p>v9 runtime descriptor 不含密钥，激活密钥单独保存在受保护文件中；两者均通过稳定句柄验证 owner、ACL/type 与 reparse/symlink 边界。全局 client 对旧协议状态失败关闭，不提供 direct-connect 回退。</p>
       </section>
 
       <section id="ipc">
-        <h2>9. IPC v8：AEAD、profile proof 与 OperationGrant</h2>
+        <h2>9. IPC v9：AEAD、profile proof 与 OperationGrant</h2>
         <h3>传输与 OS 边界</h3>
         <ul>
           <li>Windows Named Pipe 和 Unix Domain Socket 对上层暴露同一 AsyncRead/AsyncWrite、listener、connect 与长度前缀 JSON frame API，不存在两套业务协议。</li>
@@ -469,9 +473,14 @@ daemon  → V6Challenge(server nonce, transcript MAC)
 client  → V6Finish(transcript MAC)
 daemon  ↔ direction-separated AEAD frames with strict counters</code></pre>
         <p>HKDF-SHA256 从每次握手 transcript 派生 c2d/d2c 独立密钥；方向字节、计数器、版本、instance 与长度进入 nonce/AAD。重放、乱序、截断、篡改和 instance 错配均失败关闭。prelude 提交 operation kind 与实际根帧 SHA-256，一个连接只允许一个根请求。</p>
-        <p>激活密钥只建立安全通道。普通 profile 请求另以从 <code>AuthSeed + name + profile_id + generation</code> 派生的短期 call key，对除 proof 自身外的完整 prelude 做 HMAC-SHA256；daemon 核对 profile name/id、proof 和根帧 hash 后才调度业务。OperationGrant 则以 Ed25519 PoP 绑定完整 prelude、profile name/id、scope、budget、非零 deadline 与显式 TTL；默认 30 分钟，CLI、根帧 hash 和 daemon 共同强制 1–40 分钟，registry 的单调过期时间来自 grant 自身 TTL。registry 上限 1024 并主动清理。未过期 Grant 阻止自动空闲退出，但 registry 仍有意只存在于当前 daemon 实例：人工重启、升级或崩溃后必须重新签发，磁盘 Grant 文件不会被新实例直接恢复为授权。未知 Grant 与已过期 Grant 使用不同错误语义。</p>
-        <div class="callout"><strong>控制请求同样授权：</strong><code>Status</code> 必须携带 profile proof；<code>Shutdown</code> 在 v8 AEAD 内重新验证所选 profile 口令，不建立新的 SSH 连接。仅窃取激活密钥不能操作已解锁 profile，也不能停机。</div>
-        <div class="callout warn"><strong>升级边界：</strong>v8 全局 broker 没有旧 per-profile v7/v6/v5/v4 dual-stack，也没有 direct fallback。必须先用与活动旧 daemon 匹配的旧 binary 正常停止，再整体切换 client/daemon，禁止仅覆盖其中一个二进制。</div>
+        <p>激活密钥只建立安全通道。普通 profile 请求另以从 <code>AuthSeed + name + profile_id + generation</code> 派生的短期 call key，对除 proof 自身外的完整 prelude 做 HMAC-SHA256；daemon 核对 profile name/id、proof 和根帧 hash 后才调度业务。OperationGrant 则以 Ed25519 PoP 绑定完整 prelude、profile name/id、scope、budget、非零 deadline 与显式 TTL；默认 30 分钟，CLI、根帧 hash 和 daemon 共同强制 1–40 分钟，registry 的单调过期时间来自 grant 自身 TTL。registry 上限 1024 并主动清理。未过期 Grant 阻止自动空闲退出，但 registry 仍有意只存在于当前 daemon 实例：人工重启、升级或崩溃后必须重新签发。受保护 Grant 文件含 holder 私钥；其 profile/scope/budget/expiry metadata 只用于 Agent 侧 fail-fast，是 advisory 而非授权根。daemon 仅以当前实例 registry 中登记的签名 root intent、holder PoP、profile identity、精确 scope、预算与单调期限为权威，因此编辑磁盘 metadata 不能扩大远端权限。未知 Grant 与已过期 Grant 使用不同错误语义。</p>
+        <div class="callout"><strong>控制请求同样授权：</strong><code>Status</code> 必须携带 profile proof；<code>Shutdown</code> 在 v9 AEAD 内重新验证所选 profile 口令，不建立新的 SSH 连接。仅窃取激活密钥不能操作已解锁 profile，也不能停机。</div>
+        <div class="callout warn"><strong>升级边界：</strong>v9 全局 broker 没有前驱 v8 或旧 per-profile v7/v6/v5/v4 dual-stack，也没有 direct fallback。必须先用与活动旧 daemon 匹配的旧 binary 正常停止，再整体切换 client/daemon，禁止仅覆盖其中一个二进制。</div>
+        <h3>Grant 根请求本地审计与恢复</h3>
+        <p>v1 候选 authenticated local audit 只覆盖 OperationGrant 根请求（Grant-root only），不是全部 CLI/UI/SSH 行为。每个 JSONL record 同时包含公开哈希链和独立 keyed <code>record_mac</code>，authenticated checkpoint 绑定 profile id、generation、sequence 与链头；仅重算 hash 不能伪造 Outcome 或 Administrative 尾记录。审计密钥来自独立 <code>AuditSeed</code>，不复用 IPC <code>AuthSeed</code>。generation mutation 重新随机化 DEK/AuthSeed，同时保持 AuditSeed 并写入绑定 predecessor checkpoint、旧/新名称的 successor transition；这阻止旧 AuthSeed 授权新 IPC，但旧完整 KeyPackage 泄露仍可影响后续 generation 的审计密钥。</p>
+        <p>beta-2 legacy package 仅在 <code>audit_initialized=false</code> 且 seed 为零时，以 DEK 为 HMAC key、绑定版本化 domain/profile id/generation 确定性派生并持久化 AuditSeed；确定性允许 empty-log/log-only/pair-complete 崩溃重试，不会回退或复用 AuthSeed。一旦标记已初始化，缺 seed、缺 log/checkpoint、record MAC/checkpoint 损坏或 pending intent 都失败关闭。</p>
+        <p><code>audit status NAME</code> 和 <code>audit resolve-unknown NAME --acknowledge-unknown-outcome</code> 从口令验证到 inspect/append/export 完成持有同一个独占 profile lease；后者只为精确绑定的 pending Intent 追加 <code>Unknown</code>，不猜测成功或失败。<code>--anchor-output</code> 导出最多 16 KiB 的 regular non-link authenticated checkpoint，使用 create-new、同句柄同步/回读、路径与父目录身份复核，失败回滚不删除未知 replacement。为兼容 FAT/exFAT 离线介质，Windows anchor 继承父目录 ACL，且 Windows 无可移植目录 fsync，特定 unsupported/permission 情况下父目录 flush 是 best-effort；anchor 无秘密，但 ACL、断电持久性与外部保管是操作者责任。</p>
+        <div class="callout warn"><strong>回滚与退役边界：</strong>手工 anchor 不是独立单调 external trust domain。管理员若同步回滚 vault、所有 generation 的 ledger/checkpoint 与所提供 anchor，当前实现无法检测。已有 authenticated audit material 的 profile 不能 remove；所有既有 profile 的 destructive admin-reset 在 Windows/Linux 都失败关闭，因为管理员授权不能认证 predecessor history。Windows 超管密码 + 匹配介质的 2-of-2 保留式恢复仍受支持，且不显示旧口令。</div>
         <h3>帧与并发预算</h3>
         <div class="table-wrap"><table>
           <thead><tr><th>类别</th><th>上限</th><th>说明</th></tr></thead>
@@ -494,7 +503,7 @@ daemon  ↔ direction-separated AEAD frames with strict counters</code></pre>
         <div class="table-wrap"><table>
           <thead><tr><th>操作</th><th>主要 deadline</th><th>取消/收尾</th><th>明确边界</th></tr></thead>
           <tbody>
-            <tr><td>普通 profile call</td><td>调用 absolute deadline；connect/auth 最多 2 秒；credential lease 30 分钟 hard cap</td><td>OS peer + v8 AEAD + 完整 prelude profile proof；daemon 在调度前核对 root hash</td><td>激活密钥不能单独授权；一个连接一个根请求</td></tr>
+            <tr><td>普通 profile call</td><td>调用 absolute deadline；connect/auth 最多 2 秒；credential lease 30 分钟 hard cap</td><td>OS peer + v9 AEAD + 完整 prelude profile proof；daemon 在调度前核对 root hash</td><td>激活密钥不能单独授权；一个连接一个根请求</td></tr>
             <tr><td>status/down</td><td>控制交换 3 秒</td><td>Status 使用 profile proof；Shutdown 在 AEAD 内重新验证 profile 口令，完整 frame 写完、flush 前置 sent</td><td>Status 不 SSH reconnect；错误停机口令不停止 daemon</td></tr>
             <tr><td>UI daemon 启动</td><td>从 status probe 起单一 30 秒</td><td>owned bind/publication + token-CAS/lease Drop cleanup + readiness ownership handoff</td><td>已进入 OS blocking syscall 不可抢占</td></tr>
             <tr><td>UI profile/admin authorization + refresh</td><td>profile 5 分钟；admin 2 分钟；验证 30 秒；refresh 32 秒</td><td>catalog 始终本地可读；未授权 profile 零 status/network；授权期不滑动；到期/撤销停对应 transfer/shell/tunnel</td><td>daemon 保留；运行中 blocking job 可 detach，迟到结果 RAII 清零</td></tr>
@@ -527,12 +536,12 @@ daemon  ↔ direction-separated AEAD frames with strict counters</code></pre>
         </ul>
         <h3>可观察 backend 与恢复协议</h3>
         <ul>
-          <li><code>transfer push/pull/status/cancel</code> 使用固定阶段与脱敏快照；<code>confirmed_bytes</code> 只按接收方累计 ACK 推进，<code>durable_bytes</code> 只按同步并写入 journal 的连续前缀推进，verify + no-overwrite commit 完成前不会显示 100%。registry 以随机 profile id 隔离，同名重建不能读取旧对象仍在保留期内的 transfer id/统计。</li>
+          <li><code>transfer push/pull/status/cancel</code> 使用固定阶段与脱敏快照；<code>confirmed_bytes</code> 只按接收方累计 ACK 推进，<code>durable_bytes</code> 只按同步并写入 journal 的连续前缀推进，verify + no-overwrite commit 完成前不会显示 100%。registry 以随机 profile id 隔离，同名重建不能读取旧对象仍在保留期内的 transfer id/统计；活动项最多每 profile 8、全局 48，终态最多保留每 profile 最新 16、全局 256，并在完成后至多保留 15 分钟。</li>
           <li><code>backend=auto</code> 只通过固定命令 <code>serctl-xfer serve --stdio</code> 探测原生 helper；版本/feature 协商成功才报告 <code>native</code>，否则明确报告 <code>sftp_fallback</code>。<code>backend=native</code> 不回退。生产 helper server 当前只在 Linux 远端启用；macOS、BSD 与 Windows 构建在 Hello 前失败关闭，避免误报 durability/no-follow/no-replace 能力。</li>
           <li>上传 journal 绑定 profile id/generation、目标、size、SHA-256、backend 与随机 ownership token；schema 2 远端 sidecar 还保存 transfer id、size、SHA-256、durable offset、partial device/inode 与 receiving/committed state，不保存 profile 口令。下载 journal 绑定同一 profile identity、远端 size/SHA-256、本地 protected partial 与 durable prefix。</li>
           <li><code>resume=auto</code> 仅允许 auto/native。恢复时重新验证 source/partial identity、长度、摘要、token proof 与 generation；任一不一致都失败关闭，绝不截断未知文件。</li>
-          <li>Linux native push 在 Commit 前对同一 handle 同步、完整复算落盘 SHA-256，并再次验证 owner/mode/dev/inode/size；提交固定 parent dirfd，以 <code>/proc/self/fd/&lt;fd&gt;</code> + <code>linkat</code> 绑定已验证对象，parent fsync 前后通过 <code>openat(O_NOFOLLOW)</code> 复核目标身份。只有进入 linkat 或其后终态丢失才返回 typed <code>outcome_unknown</code>；清理失败返回 <code>cleanup_incomplete</code>。</li>
-          <li>raw protocol 支持有界 chunk/window；完整 russh exec/SFTP 服务端 4/8/16/32 KiB 首帧矩阵均到达 handler 并获 ACK，已排除通用 ChannelStream、window/flush 与分帧本身。现实 OpenSSH + helper 子进程 stdio 边界仍未定位，当前 daemon 因而继续把 native/SFTP 协商值限制为 2 KiB。功能链路可用，但尚未达到相对 <code>scp</code> 80% 的吞吐门槛。</li>
+          <li>Linux native push 在 Commit 前对同一 handle 同步、完整复算落盘 SHA-256，并再次验证 owner/mode/dev/inode/size；提交固定 parent dirfd，以 <code>/proc/self/fd/&lt;fd&gt;</code> + <code>linkat</code> 绑定已验证对象，parent fsync 前后通过 <code>openat(O_NOFOLLOW)</code> 复核目标身份。<code>linkat</code> 明确返回失败时目标链接没有创建，保持确定性的 <code>transfer_failed</code>；只有链接成功后无法完成身份复核或 parent fsync 才返回 typed <code>outcome_unknown</code>，清理失败则返回 <code>cleanup_incomplete</code>。</li>
+          <li>SFTP fallback 固定使用 2 KiB 块。native v1 的有效 chunk 为 32 KiB，并严格执行“一块数据、一次 helper ACK”锁步，因此对外报告的有效 window 也为 32 KiB；helper 内部可协商至 8 MiB 的 durability/receiver 上限，但它不是同时在途窗口，也不得如此报告。受控 mock E2E 已覆盖 push/pull、首个 helper ACK 前 <code>confirmed_bytes=0</code>、no-overwrite、stalled idle timeout 与 cancel；真实 Local-Linux2 helper 安装、1.3 MiB/64 MiB/1 GiB SHA-256 矩阵和同机 <code>scp</code> ≥80% 对比仍未完成，因此目前没有实机吞吐验收结论。</li>
         </ul>
         <h3>远端上传</h3>
         <ul>
@@ -562,7 +571,8 @@ daemon  ↔ direction-separated AEAD frames with strict counters</code></pre>
           <li>依赖 <code>russh 0.62.5</code>，关闭默认 feature 并只启用 <code>ring</code> 后端；KEX/MAC 沿用 russh 当前安全默认。</li>
           <li>server host-key 签名仅允许 Ed25519、ECDSA、RSA-SHA2-256 与 RSA-SHA2-512；没有 hash 标识的 <code>ssh-rsa</code> SHA-1 被明确过滤。</li>
           <li>SSH host key 使用 SHA-256 fingerprint。首次 TOFU 按 KEX/观测 key → 排他租约下原子 pin → 发送 password 的顺序执行；pin 失败时在 auth 前中止 transport。russh password-auth send 的 bounded Future 在每次 poll 前检查 absolute deadline，Pending 不能在预算之后才披露密码。之后所有连接/重连都要求一致。</li>
-          <li>TCP 经双向 copy proxy 交给 russh。deadline 或 cancel 会关闭 proxy 两端并等待退出，解决 russh 在 KEX 前已 spawn session task、丢弃 connect Future 仍可能泄漏的问题。</li>
+          <li>russh 直接持有带收发计数的 TCP stream；serctl 另持同一 socket 的 shutdown handle。deadline 或 cancel 会中断底层 I/O，并有界等待 russh drop stream；真实 KEX 路径不再经过 userspace duplex/copy proxy。诊断分别报告 OS 双向 shutdown 与 stream Drop，只有后者才允许自动重连。</li>
+          <li>初始 unlock 只对“客户端未收到任何服务端字节、没有显式 SSH disconnect reason/host key、旧 stream 已释放”的预 banner EOF/transport 故障在 1.5 秒退避后重连一次；同一 absolute deadline 必须另行保留退避、调度裕量、完整第二轮 KEX，以及后续密码认证（首次 TOFU 还包括 pin 持久化）窗口。收到策略字节/reason、stream 未释放或预算不足时保留首错；第二次失败不再第三连。认证开始后拒绝或断线均不重放密码。诊断同时保留 attempt 1/2 的固定进度类别、字节计数、合法 SSH identification 是否出现、peer EOF、失败/清理耗时和回收状态，可区分静默、pre-banner EOF、非 SSH/策略字节、identification 后未见 host key 与显式 SSH disconnect。<code>tcp_connected=true + rx_bytes=0</code> 仅说明某个已解析端点完成 TCP connect 后，客户端在期限内未读取到字节；它不是 TCP connect 黑洞的证明，且诊断有意不输出 DNS 实际选中的 peer endpoint。MaxStartups、PerSourcePenalties、封禁、accept backlog、资源压力、防火墙或中间设备的归因必须依赖受控服务端日志、连接跟踪或网络抓包。服务端 <code>banner/message/lang</code>、peer endpoint、用户、口令与 fingerprint 均被丢弃。</li>
           <li>keepalive 每 30 秒发送，连续 3 次无响应后连接失效；<code>SessionManager</code> 通过 Mutex 单飞重连，等待锁、DNS/TCP/KEX/auth 全部消耗调用者剩余 deadline。</li>
           <li>在途请求持有旧 <code>Arc&lt;SshSession&gt;</code>；替换不会从请求下方移动对象。不可安全取消的 channel-open/SFTP-init 超时会 invalidate 整个旧 transport。</li>
           <li><code>Status</code> 有意只报告 daemon lifetime metadata，不取得 SSH session、不 reconnect。调用本身仍经过 call-key exact-intent 授权，因此 Status 表示“daemon 在运行”，不是 SSH health probe。</li>
@@ -580,30 +590,31 @@ cargo check --locked --offline --all-targets --all-features
 cargo clippy --locked --offline --all-targets --all-features -- -D warnings
 cargo test --locked --offline --all-targets --all-features -- --test-threads=1
 cargo audit --no-fetch
-cargo build --locked --offline --workspace --bins
-# 生产 Release 禁止启用 serctl-core/test-support
-cargo build --release --locked --offline --workspace --bins
+cargo build --locked --offline -p serctl-cli -p serctl-daemon
+# 生产 Release 禁止启用 serctl-core/test-support；不构建 source-only remote/jobs
+cargo build --release --locked --offline -p serctl-cli -p serctl-daemon
+# Linux 发布另行构建唯一受支持 helper：cargo build --release --locked -p serctl-xfer --bin serctl-xfer
 target\debug\serctl_cli.exe --version
 target\release\serctl_cli.exe --version
                                # 制品大小、哈希与后续 Fresh 结果记入仓库外交付记录</code></pre>
         <div class="grid three">
-          <div class="card"><div class="kpi">串行门禁</div><div class="label">vault v4 / IPC v8 workspace all-targets；最新结果见 CHANGELOG</div></div>
+          <div class="card"><div class="kpi">串行门禁</div><div class="label">vault storage v5（read v4..=v5）/ IPC v9 workspace all-targets；v1 exact-tag 结果见 CHANGELOG/CI</div></div>
           <div class="card"><div class="kpi">三件套</div><div class="label">共享 provenance standalone wrappers；fmt/diff/check/strict-clippy PASS</div></div>
           <div class="card"><div class="kpi">exit 0</div><div class="label">cargo-audit 0.22.2 与 cargo-deny 0.20.2；离线新鲜度边界见下文</div></div>
         </div>
-        <div class="callout"><strong>beta-2 冻结前本机源码门禁：</strong>Rust 1.97.1；<code>cargo fmt --all -- --check</code>、<code>git diff --check</code>、locked workspace all-target/all-feature <code>cargo check</code> 与严格 <code>clippy -D warnings</code> 均通过。完整测试为 365 通过、0 失败、1 忽略；正式 Release 只构建 workspace binaries，禁止 <code>--all-features</code>，避免启用 <code>serctl-core/test-support</code> 的测试 KDF。</div>
+        <div class="callout"><strong>beta-2 冻结前本机源码门禁：</strong>Rust 1.97.1；<code>cargo fmt --all -- --check</code>、<code>git diff --check</code>、locked workspace all-target/all-feature <code>cargo check</code> 与严格 <code>clippy -D warnings</code> 均通过。完整测试为 365 通过、0 失败、1 忽略。v1 正式 runtime build 仅包含 Windows x86_64 的匹配 CLI + daemon，以及 Linux x86_64 的 <code>serctl-xfer</code>；禁止给正式制品启用 <code>--all-features</code>，避免带入 <code>serctl-core/test-support</code> 的测试 KDF。</div>
         <h3>本轮必须验证的 vault / CLI / UI 覆盖</h3>
         <ul>
           <li>每 profile 独立 salt/KDF/KEK；KeyPackage 与 payload 的双 AEAD 绑定 domain/name/profile_id/host/port/generation；错误口令、跨 profile 口令、identity/generation/package mismatch 与篡改拒绝；</li>
-          <li>AuthSeed + name + profile_id + generation call-key 域分离；v8 transcript、AEAD 方向/计数器、完整 prelude profile proof 与 root hash 绑定；旧协议、replay 与二次消费拒绝；</li>
-          <li>Windows admin 初始化只允许空 vault，local share 始终加密且无完整 recovery key 字段；admin-only/media-only 失败；2-of-2 保留式恢复、随机/手动口令、破坏性替换与全量 recovery rotation；</li>
+          <li>AuthSeed + name + profile_id + generation call-key 域分离；v9 transcript、AEAD 方向/计数器、完整 prelude profile proof 与 root hash 绑定；旧协议、replay 与二次消费拒绝；</li>
+          <li>Windows admin 初始化只允许空 vault，local share 始终加密且无完整 recovery key 字段；admin-only/media-only 失败；2-of-2 保留式恢复、随机/手动新口令与全量 recovery rotation；所有既有 profile 的破坏性 admin-reset 必须一致失败关闭；</li>
           <li>恢复介质 canonical JSON、recovery id/checksum/share 边界、绝对路径、稳定普通文件 create-new/拒绝 reparse/拒绝覆盖、同步与同 handle 回读失败时不提交 vault；错误/旧/损坏介质拒绝；</li>
           <li>定向回归 <code>vault::tests::recovery_public_key_substitution_is_rejected_by_admin_and_profile_bindings</code> 已单独通过：只替换 public key 同时被 admin config digest 与 profile AuthSeed tag 拒绝，tag bit flip 与跨 profile tag replay 也被拒绝。该单项结果不替代全量门禁；</li>
           <li>CLI random-output 严格为 <code>passphrase + newline</code>、protected create-new、同步/同句柄回读先于 vault commit；输出失败保持旧口令/generation，commit 失败留下未生效 receipt；</li>
-          <li>v2→v4 迁移要求精确的全 profile 口令集合、认证全部 format-2 记录、为每条记录生成随机 ID、拒绝 format-0、runtime barrier/并发变化/介质失败时旧 vault 不变；未发布中间 v3 的 load/catalog/migration 失败关闭；Linux recovery/migrate/rotate 明确 fail-closed，非 Windows migration/media-preserve 在捕获 secret 前拒绝；</li>
-          <li>Linux <code>--target-user</code> 必须由 root 进入、只接受 NSS 非 root 账号，验证 home/<code>.serctl</code> owner/type/mode 后清空附加组并永久 drop real/effective/saved UID/GID；Windows 拒绝该选项，且委托路径只允许破坏性替换；</li>
+          <li>v2 全量迁移要求精确的全 profile 口令集合、认证全部 format-2 记录、为每条记录生成随机 ID、拒绝 format-0，并原子写入顶层与全部 record v5；beta-2 v4 首次成功 mutation 在同一提交中推进顶层 v5 并重密封受影响 record；runtime barrier/并发变化/介质失败时旧 vault 不变；未发布中间 v3 的 load/catalog/migration 失败关闭；Linux recovery/migrate/rotate 明确 fail-closed，非 Windows migration/media-preserve 在捕获 secret 前拒绝；</li>
+          <li>Linux <code>--target-user</code> 必须由 root 进入、只接受 NSS 非 root 账号，验证 home/<code>.serctl</code> owner/type/mode 后清空附加组并永久 drop real/effective/saved UID/GID；Windows 拒绝该选项。该入口目前只验证并固化目标用户边界，随后对所有既有 profile 的破坏性替换仍失败关闭，不能当作已实现恢复路径；</li>
           <li>明文 catalog 在锁定态/list 可读但不泄露 username/password/pin；创建/迁移随机化 identity，正常 mutation 保留 identity、推进 generation 并撤销 grant，同名删除重建不可复用旧 grant，TOFU pin 保留 identity/generation；完整旧 vault 快照回滚作为未解决边界记录而非误判为已防御；</li>
-          <li>UI 每 profile 5 分钟和 admin 2 分钟固定非滑动授权、跨 profile 隔离、未授权 profile refresh 零 daemon/network、单项/全部撤销；三类随机动作必须验证生成阶段 vault/网络/消息零副作用、未确认不可提交、取消/关闭清零且旧状态不变，另覆盖破坏性确认与迁移网络 gate；</li>
+          <li>UI 每 profile 5 分钟和 admin 2 分钟固定非滑动授权、跨 profile 隔离、未授权 profile refresh 零 daemon/network、单项/全部撤销；随机口令动作必须验证生成阶段 vault/网络/消息零副作用、未确认不可提交、取消/关闭清零且旧状态不变；既有 profile 的破坏性 reset 入口必须明确失败关闭，另覆盖迁移网络 gate；</li>
           <li>既有 IPC/SSH/SFTP/tunnel/lease/atomic-write/cleanup/provenance 回归继续通过，且新增实现没有削弱 deadline、no-overwrite、loopback-only 或旧锁 fail-closed。</li>
         </ul>
         <h3>真实路径与平台证据要求</h3>
@@ -616,10 +627,10 @@ target\release\serctl_cli.exe --version
         <h3>依赖与构建证据</h3>
         <ul>
           <li>发布工具链固定 Rust 1.97.1；<code>argon2</code> 的 <code>zeroize</code> feature 与新增 recovery 依赖必须由最终锁定依赖图复核。</li>
-          <li><code>cargo-audit 0.22.2 --no-fetch</code> 扫描 531 dependencies / 1198 advisories，exit 0；同时出现 cache/index warning，所以只证明本机离线缓存快照，不证明数据库在线最新。<code>cargo-deny 0.20.2</code> 的 bans/licenses/sources 均 exit 0。</li>
+          <li>历史 <code>cargo-audit 0.22.2 --no-fetch</code> 与 <code>cargo-deny 0.20.2</code> 的 bans/licenses/sources 均 exit 0；前者同时出现 cache/index warning，所以只证明当时的本机离线缓存快照，不记录或复用可能随锁文件与数据库变化的依赖/公告总数，也不证明数据库在线最新。</li>
           <li>较早一次 dirty v5 构建曾完成 debug/release 与二次 <code>Fresh</code>，但它早于后续安全修补，不能描述当前源码或当前同名文件。</li>
           <li>dirty 构建只用于本地验证；正式 EXE/PDB 必须从 clean commit/tag 重建，并在 release metadata 中记录完整 commit、工具链、环境与 SHA-256。</li>
-          <li>上一轮标准 release/debug EXE/PDB 大小与摘要仅作为历史体积记录；当前 vault v4 同名文件可能已变化，不能复用旧摘要。</li>
+          <li>上一轮标准 release/debug EXE/PDB 大小与摘要仅作为历史体积记录；当前 storage v5 候选的同名文件可能已变化，不能复用旧摘要。</li>
         </ul>
       </section>
 
@@ -644,7 +655,7 @@ target\release\serctl_cli.exe --version
           </article>
           <article class="risk-item">
             <div class="risk-head"><h3>R5 · 平台验证缺口</h3><span class="badge open">待 CI</span></div>
-            <p>当前 vault v4/recovery/UI 工作树已完成 Windows 本机源码门禁；较早基线还覆盖原生 IPC、DACL、原子写穿和当时存在的 daemon/direct tunnel E2E，但 direct 已不是当前 v8 路由。GitHub Actions 已配置 Windows、Linux、macOS 矩阵，但尚无与本次 clean commit 绑定的远端通过证据。Windows reparse 动态测试可能在无 symlink 权限时 skip，且未做多账户 Named Pipe/vault DACL 攻击矩阵；仍需当前 broker-only L/R/D 与 OpenSSH/Dropbear/其他 SSH/SFTP server 的外部兼容矩阵。</p>
+            <p>当前 vault storage v5（read v4..=v5）/recovery/UI 工作树已完成 Windows 本机源码门禁；较早基线还覆盖原生 IPC、DACL、原子写穿和当时存在的 daemon/direct tunnel E2E，但 direct 已不是当前 v9 路由。GitHub Actions 已配置 Windows、Linux、macOS 矩阵，但尚无与 v1 exact clean tag 绑定的远端通过证据。Windows reparse 动态测试可能在无 symlink 权限时 skip，且未做多账户 Named Pipe/vault DACL 攻击矩阵；仍需当前 broker-only L/R/D 与 OpenSSH/Dropbear/其他 SSH/SFTP server 的外部兼容矩阵。</p>
           </article>
           <article class="risk-item">
             <div class="risk-head"><h3>R6 · 原始远端终端输出</h3><span class="badge caution">信任输入</span></div>
@@ -667,24 +678,24 @@ target\release\serctl_cli.exe --version
             <p>commit + dirty 只是三件套共享 provenance build script 观察到的 Git 来源信号。仓库根不监听，新增根级 untracked 文件可能需其他输入变化才重算；ignored、外部或动态构建输入也可逸出 dirty 判定。它不是签名、制品证明或可复现构建证明；可靠回滚需 clean commit/push。</p>
           </article>
           <article class="risk-item">
-            <div class="risk-head"><h3>R11 · v8 不兼容旧 IPC</h3><span class="badge caution">迁移边界</span></div>
-            <p>v8 的 resume metadata 与 durable ACK 是明确 wire break，且没有 dual-stack。旧 v7/v6/v5/v4、protocol 0/bearer、protocol 2 与未知锁都在 connect 前 fail closed，不发送业务帧、不删除锁、不回退直连。活动旧 daemon 应用匹配旧 executable 正常 down，再把 CLI、daemon 与 helper 作为完整集合切换；stale 旧锁只能在离线核实 PID/进程不存在、租约未持有、owner/ACL/type 安全后人工处置。</p>
+            <div class="risk-head"><h3>R11 · v9 不兼容前驱/旧 IPC</h3><span class="badge caution">迁移边界</span></div>
+            <p>v9 是明确 wire break，且没有 dual-stack。前驱 v8、旧 v7/v6/v5/v4、protocol 0/bearer、protocol 2 与未知锁都在 connect 前 fail closed，不发送业务帧、不删除锁、不回退直连。活动旧 daemon 应用匹配旧 executable 正常 down，再把 CLI、daemon 与已发布 helper 作为完整集合切换；stale 旧锁只能在离线核实 PID/进程不存在、租约未持有、owner/ACL/type 安全后人工处置。</p>
           </article>
           <article class="risk-item">
             <div class="risk-head"><h3>R12 · 普通进程与调试器</h3><span class="badge caution">未隔离</span></div>
             <p>v4、2-of-2 与 zeroize 保护静态数据和可控副本，但正常 SSH/恢复仍必须在普通 serctl 进程中短暂持有输入口令、KEK、key package、SSH 密码或会话材料。管理员调试器可在清零前截获或把已授权组件当作解密/签名 oracle。真正阻止调试读取需要不可导出硬件密钥或不可调试 enclave，并把完整 SSH 认证和会话密码学移出普通进程；当前版本没有实现。</p>
           </article>
           <article class="risk-item">
-            <div class="risk-head"><h3>R13 · catalog 明文与完整快照回滚</h3><span class="badge caution">元数据/回滚</span></div>
-            <p>profile 名、host、port、随机 profile_id、generation 与 recovery id/public key 是明文元数据；不要在名称或地址字段嵌入额外秘密。AEAD/identity/generation 能发现局部改写并拒绝陈旧内存授权，却没有可信单调计数器：拥有文件写权限的管理员可回滚一份完整、内部一致的旧 vault，当前实现无法检测。</p>
+            <div class="risk-head"><h3>R13 · catalog 明文、稳定 AuditSeed 与完整同步回滚</h3><span class="badge caution">元数据/回滚</span></div>
+            <p>profile 名、host、port、随机 profile_id、generation 与 recovery id/public key 是明文元数据；不要在名称或地址字段嵌入额外秘密。AEAD/identity/generation、每记录 MAC 与 authenticated checkpoint 能发现局部改写并拒绝陈旧内存授权，却没有可信单调 external trust domain：generation mutation 为保持审计连续性会保留 AuditSeed，因此泄露任一代完整 KeyPackage 会残留后续审计伪造能力；拥有文件写权限的管理员若同步回滚 vault、所有 generation 的 ledger/checkpoint 与所提供 anchor，当前实现也无法检测。</p>
           </article>
           <article class="risk-item">
             <div class="risk-head"><h3>R14 · Windows 文件介质与 Linux fail-closed</h3><span class="badge caution">恢复边界</span></div>
-            <p>Windows 超管密码或 U 盘 share 单独均不能恢复；两者共同使用时，普通 serctl 进程会解密再重包旧凭据。文件型介质可复制，canonical 格式和“由 serctl 迁移”不是硬件不可复制/不可重实现边界；绝对路径、create-new 与回读也不能证明卷真是 USB、已物理分离或已弹出。Linux 目前没有 root-owned offline share store 与恢复专用 target-vault 边界，因此 recovery、rotation 和 v2 migration 即使以 root 运行也明确失败关闭；root 只可从 CLI 通过 NSS <code>--target-user</code> 绑定并永久降权后，执行不保留旧秘密的破坏性替换，该入口不能被当成已实现的离线恢复边界。</p>
+            <p>Windows 超管密码或 U 盘 share 单独均不能恢复；两者共同使用时，普通 serctl 进程会解密再重包旧凭据。文件型介质可复制，canonical 格式和“由 serctl 迁移”不是硬件不可复制/不可重实现边界；绝对路径、create-new 与回读也不能证明卷真是 USB、已物理分离或已弹出。FAT/exFAT anchor 只能继承父目录 ACL，Windows 父目录 flush 还有 best-effort 残余，因此不等同于强制 owner-only ACL 或断电后可证明持久。Linux 目前没有 root-owned offline share store 与恢复专用 target-vault 边界，因此 recovery、rotation 和 v2 migration 即使以 root 运行也明确失败关闭；root 的 NSS <code>--target-user</code> 入口只验证目标用户并永久降权，所有既有 profile 的破坏性 reset 随后仍失败关闭，不能被当成离线恢复。</p>
           </article>
           <article class="risk-item">
             <div class="risk-head"><h3>R15 · native helper 部署与吞吐未验收</h3><span class="badge open">M3 缺口</span></div>
-            <p>原生 push/pull、连续前缀恢复与完整性提交已有受控功能 E2E，但生产 helper 仅启用 Linux，尚无签名包驱动 bootstrap；远端必须通过可信软件包/运维通道预装。2 KiB cap 的剩余定位边界是现实 OpenSSH + helper 子进程 stdio，而不是已通过的通用 russh 4/8/16/32 KiB 服务端矩阵。尚无 Ubuntu descriptor/linkat 故障注入、Local-Linux2 的 64 MiB/1 GiB 和相对同机 <code>scp</code> 80% 吞吐证据，committed receipt 也缺少消费 ACK/GC，因此不能把功能接入等同于 M3 验收完成。</p>
+            <p>原生 push/pull、连续前缀恢复与完整性提交已有受控 mock E2E，但生产 helper 仅启用 Linux，尚无签名包驱动 bootstrap；远端必须通过可信软件包/运维通道预装。候选实现的 SFTP chunk 为 2 KiB；native 以 32 KiB chunk/32 KiB 有效 window 严格锁步，helper 内部 8 MiB 上限不是在途窗口。尚无真实 Local-Linux2 helper 安装、1.3 MiB/64 MiB/1 GiB SHA-256 矩阵、Ubuntu descriptor/linkat 故障注入或相对同机 <code>scp</code> ≥80% 吞吐证据，committed receipt 也缺少消费 ACK/GC，因此不能把 mock 功能接入等同于 M3 实机或性能验收。</p>
           </article>
           <article class="risk-item">
             <div class="risk-head"><h3>R16 · 长时 exec 不是可恢复作业</h3><span class="badge open">可观测性</span></div>
@@ -697,37 +708,39 @@ target\release\serctl_cli.exe --version
         <h2>15. 运维手册</h2>
         <h3>推荐流程</h3>
         <ol>
-          <li>Windows 首次使用必须在空 v4 vault 中设置至少 12 字节超管密码，并把 create-new 生成的 2-of-2 介质直接写到受控 U 盘；绝对路径/回读不能替代人工确认卷身份，写后应弹出并物理离线保管，再创建 profile。</li>
+          <li>Windows 首次使用必须在空的受支持 v4/v5 vault 中设置至少 12 字节超管密码，并把 create-new 生成的 2-of-2 介质直接写到受控 U 盘；成功 mutation 原子写 storage v5。绝对路径/回读不能替代人工确认卷身份，写后应弹出并物理离线保管，再创建 profile。</li>
           <li>为每个 profile 使用长且唯一的独立口令；不要把超管密码复用为 profile 口令。名称/host/port/profile_id/generation 是明文 catalog，不要在名称中包含敏感业务信息。</li>
           <li>通过独立渠道核对首次 SHA-256 host-key fingerprint，再让 TOFU pin 成为可信基线。</li>
           <li>CLI 的普通 profile 操作每次进程调用都重新提供目标独立口令；<code>list</code>/<code>admin status</code> 只读 metadata。<code>status</code>/<code>down</code> 也执行 generation-scoped call-key exact-intent 授权。</li>
           <li>UI profile grant 固定五分钟、admin grant 固定两分钟，操作不续期。用完即撤销；到期会停止相应 transfer/shell/tunnel 但保留 daemon，并取消或拒绝呈现 Shell/Tunnel/Command/Directory/Transfer 的迟到结果。</li>
           <li>随机口令在 UI 中应先复制到密码管理器、勾选已保存后再提交；取消/关闭只清零且不改 vault。CLI 使用新的绝对 <code>--random-output</code> 路径，只有命令成功才把 receipt 当成现行口令；若 commit 失败，保留文件中的值并未生效。应选择仅当前用户可写的受控父目录，因为同 UID 对手仍可在稳定回读后删除/换名输出或替换可写父目录。</li>
-          <li>Windows 忘记 profile 口令时，优先用超管 + 匹配介质执行保留式恢复并设置新口令；没有介质时只能明确选择破坏性 reset、重新输入 SSH 凭据并接受旧 pin/package 永久丢失。Linux 没有保留式恢复；跨用户破坏性 reset 必须由 root 从 CLI 指定 NSS <code>--target-user</code>，不可传入任意 vault 路径。UI/CLI 都不会显示旧口令。</li>
+          <li>Windows 忘记 profile 口令时，只能用超管 + 匹配介质执行 2-of-2 保留式恢复并设置新口令；没有介质时当前没有安全的原地 reset，必须保留 vault 与审计证据并停止操作。Linux 没有保留式恢复；root 的 NSS <code>--target-user</code> 只验证目标用户边界，既有 profile 的破坏性 reset 仍失败关闭。UI/CLI 都不会显示旧口令。</li>
           <li>轮转恢复介质时保留旧介质直至新介质成功落盘且 vault 提交完成；新路径必须不存在。提交后安全销毁旧介质副本。不要把 vault、vault 备份、随机口令 receipt 与 U 盘 share 存在同一在线卷。</li>
-          <li>v2 vault 必须停止全部旧 daemon/直连操作，使用阻断式向导或 <code>recovery migrate-v2</code> 一次性为全部 profile 设置新口令并迁移到 v4；不能惰性混用 v2/v4。未发布中间 v3 也不能由 v4 load/catalog/migration，需用匹配开发期 binary/备份离线处置。Linux 当前没有可用迁移路径，应保持 fail-closed 并在隔离环境保留旧工具/备份。</li>
+          <li>v2 vault 必须停止全部旧 daemon/直连操作，使用阻断式向导或 <code>recovery migrate-v2</code> 一次性为全部 profile 设置新口令，并原子写入顶层与全部 record v5；不能惰性混用 v2 与当前格式。未发布中间 v3 不能由候选 v4..=v5 reader load/catalog/migration，需用匹配开发期 binary/备份离线处置。未修改的 beta-2 v4 可读，但首次成功 mutation 会原子推进顶层 v5 并重密封受影响 record；之后禁止仅回退旧二进制。Linux 当前没有可用迁移路径，应保持 fail-closed 并在隔离环境保留旧工具/备份。</li>
           <li>为 exec/传输设置符合任务 SLA 的 <code>--timeout-secs</code>，不要无条件使用 24 小时上限。</li>
           <li>tunnel 的所有 listener 与 L/R target 强制为 <code>127.0.0.1</code>；CLI/UI 只配置端口。按 ready 输出记录 port 0 的实际端口；动态 SOCKS5 没有应用层认证，可访问 SSH 主机可达的任意目标，回环只限制 listener 外曝且不隔离同机进程。</li>
           <li>下载 M7 evidence 后独立计算 SHA-256/验证签名，并记录 serctl commit、remote path、时间和摘要。</li>
-          <li>升级跨 IPC 协议版本时，先用与活动旧 daemon 匹配的旧 executable 正常 <code>down</code>，然后把 CLI、daemon 与 helper 作为匹配集合整体切换；当前 v8 对旧 per-profile v7/v6/v5/v4、protocol 0/bearer、protocol 2 与未知 descriptor 在连接前 fail closed，不发送业务帧、不自动删除且不静默降级。</li>
+          <li>升级跨 IPC 协议版本时，先用与活动旧 daemon 匹配的旧 executable 正常 <code>down</code>，然后把 CLI、daemon 与已发布 helper 作为匹配集合整体切换；当前 v9 对前驱 v8 以及旧 per-profile v7/v6/v5/v4、protocol 0/bearer、protocol 2 与未知 descriptor 在连接前 fail closed，不发送业务帧、不自动删除且不静默降级。Linux v1 runtime bundle 只包含 <code>serctl-xfer</code>；不得把 source-only experimental/unshipped remote、jobs、remote protocol 或 policy 混入升级集合。</li>
           <li>定期扫描双方目录中的 <code>.serctl-part-*</code>，只在确认没有运行任务后清理。</li>
         </ol>
         <h3>故障定位</h3>
         <div class="table-wrap"><table>
           <thead><tr><th>症状</th><th>含义</th><th>处理</th></tr></thead>
           <tbody>
-            <tr><td>unsupported runtime lock IPC protocol 4</td><td>旧 v4 daemon/锁不兼容当前 v8；client 在 connect 前停止并保留证据</td><td>活动 daemon 用匹配 v4 binary 正常 down；不要绕过租约强删</td></tr>
-            <tr><td>unsupported runtime lock IPC protocol 3 / legacy 0 or 2</td><td>更早 daemon/锁不兼容当前 v8；client 不连接、不删除、不 fallback</td><td>活动 daemon 用匹配旧 binary 正常停止；stale 情况按离线流程处置</td></tr>
-            <tr><td>stale hashed old-protocol lock after crash</td><td>当前 client 不把旧 per-profile runtime 状态当成可自动接管的 v8 descriptor</td><td>离线确认 PID/进程已消失、租约未持有、owner/ACL/type 安全后再人工处理</td></tr>
+            <tr><td>unsupported runtime lock IPC protocol 8</td><td><code>v0.3.0-beta.2</code> 前驱 daemon/锁不兼容当前 v9；client 在 connect 前停止并保留证据</td><td>活动 daemon 用匹配 v8 binary 正常 down；不要绕过租约强删</td></tr>
+            <tr><td>unsupported runtime lock IPC protocol 4</td><td>旧 v4 daemon/锁不兼容当前 v9；client 在 connect 前停止并保留证据</td><td>活动 daemon 用匹配 v4 binary 正常 down；不要绕过租约强删</td></tr>
+            <tr><td>unsupported runtime lock IPC protocol 3 / legacy 0 or 2</td><td>更早 daemon/锁不兼容当前 v9；client 不连接、不删除、不 fallback</td><td>活动 daemon 用匹配旧 binary 正常停止；stale 情况按离线流程处置</td></tr>
+            <tr><td>stale hashed old-protocol lock after crash</td><td>当前 client 不把旧 per-profile runtime 状态当成可自动接管的 v9 descriptor</td><td>离线确认 PID/进程已消失、租约未持有、owner/ACL/type 安全后再人工处理</td></tr>
             <tr><td>runtime lock ... not eligible for safe recovery</td><td>畸形锁不能在排他租约和安全属性下确认删除</td><td>检查 owner/ACL、活动进程和路径；保持 fail closed</td></tr>
             <tr><td>IPC server PID / Unix peer mismatch</td><td>连接对象与受保护锁不一致</td><td>拒绝连接；检查 stale 锁、同用户冲突或端点替换</td></tr>
-            <tr><td>authentication/authorization timed out or failed</td><td>transcript/call-key proof、intent、版本、profile 或 generation 不匹配</td><td>确认目标 profile 口令以及 client/daemon IPC v8 匹配；错误口令不会建立业务授权</td></tr>
-            <tr><td>profile requires explicit v2-to-v4 migration</td><td>旧 v2 vault/记录被网络路径拒绝</td><td>停止旧进程，在 Windows 使用全量迁移向导或 <code>recovery migrate-v2</code>；不要逐条绕过</td></tr>
-            <tr><td>unsupported vault format 3</td><td>检测到从未发布、AAD/KeyPackage 不兼容的中间 v3</td><td>保持失败关闭；使用匹配开发期 binary/备份离线处置，不能让 v4 猜测或补默认 ID</td></tr>
-            <tr><td>administrator/recovery policy is not initialized</td><td>Windows 空 v4 vault 尚未建立超管 + 介质策略</td><td>使用不存在的 U 盘路径执行 <code>admin init --recovery-media FILE</code>，确认介质成功后再建 profile</td></tr>
+            <tr><td>authentication/authorization timed out or failed</td><td>transcript/call-key proof、intent、版本、profile 或 generation 不匹配</td><td>确认目标 profile 口令以及 client/daemon IPC v9 匹配；错误口令不会建立业务授权</td></tr>
+            <tr><td>profile requires explicit v2-to-v4 migration</td><td>这是保留的兼容错误字面量；旧 v2 vault/记录被网络路径拒绝</td><td>停止旧进程，在 Windows 使用全量迁移向导或 <code>recovery migrate-v2</code>；成功结果为 storage v5，不要逐条绕过</td></tr>
+            <tr><td>unsupported vault format 3</td><td>检测到从未发布、AAD/KeyPackage 不兼容的中间 v3</td><td>保持失败关闭；使用匹配开发期 binary/备份离线处置，不能让候选 v4..=v5 reader 猜测或补默认 ID</td></tr>
+            <tr><td>administrator/recovery policy is not initialized</td><td>Windows 空的受支持 v4/v5 vault 尚未建立超管 + 介质策略</td><td>使用不存在的 U 盘路径执行 <code>admin init --recovery-media FILE</code>，成功将原子写 storage v5；确认介质后再建 profile</td></tr>
             <tr><td>recovery media does not belong / checksum mismatch</td><td>介质 recovery id 不匹配、损坏或非 canonical</td><td>保持 fail-closed，使用该 vault 当前 recovery id 对应介质；不要编辑 JSON 或强制继续</td></tr>
             <tr><td>random-passphrase output ... / vault commit failed</td><td>输出失败时 vault 未改；若输出成功后 mutation 失败，create-new receipt 会保留但口令未生效</td><td>不要盲目重用同一路径或更新密码管理器；先依据退出状态确认，处理孤立文件后用新路径重试</td></tr>
-            <tr><td>Linux administrator reset requires --target-user USER</td><td>root 破坏性 reset 未绑定具体非 root NSS 账号</td><td>使用 <code>--target-user USER --replace-credentials</code>；不要传 UID、HOME 或 vault 路径</td></tr>
+            <tr><td>Linux administrator reset requires --target-user USER / destructive reset is unavailable</td><td>前者表示尚未绑定具体非 root NSS 账号；绑定并降权后，既有 profile 因无法认证旧审计历史仍失败关闭</td><td>不要传 UID、HOME 或 vault 路径，也不要重复尝试绕过；保留 vault/审计证据。Linux 当前没有恢复或破坏性替换路径</td></tr>
+            <tr><td>profile has authenticated audit material and cannot be removed / reset</td><td>删除或管理员破坏性替换会切断无法认证的审计历史</td><td>保持失败关闭；使用旧 profile 口令正常轮转，或在 Windows 使用超管 + 匹配介质执行 2-of-2 保留式恢复</td></tr>
             <tr><td>Linux offline recovery is fail-closed...</td><td>尚无 root-owned system share store 与恢复专用目标用户边界</td><td>当前不可恢复/轮转/迁移；不要把破坏性 <code>--target-user</code> 委托误当成本地 recovery share</td></tr>
             <tr><td>please explicitly stop tunnel before save/remove</td><td>该 profile 的 listener/control 正在启动、运行或清理</td><td>在“隧道”页点击停止并等待完成；程序不会让未验证 mutation 隐式关闭 listener</td></tr>
             <tr><td>unexpected argument '--bind' / '--expose' / '--target-host'</td><td>当前 tunnel 接口已删除地址和公开监听参数</td><td>只提供 <code>--port</code>、L/R 的 <code>--target-port</code> 与 <code>--max-connections</code>；地址固定回环</td></tr>
@@ -750,8 +763,8 @@ target\release\serctl_cli.exe --version
         <h2>16. 构建、发布与来源追踪</h2>
         <div class="grid three">
           <div class="card"><h3>clean 来源基线</h3><p><code>94fb37118f4b</code></p><p class="small">体积优化已提交并推送；当前功能工作树建立于此。</p></div>
-          <div class="card"><h3>beta-2 冻结前门禁</h3><p><strong>360 通过 / 0 失败 / 1 忽略</strong></p><p class="small">2026-08-31 workspace 串行测试、strict Clippy 与独立 staging Release 三件套构建通过。</p></div>
-          <div class="card"><h3>当前发布状态</h3><p><strong>v0.3.0-beta.2 预发布候选</strong></p><p class="small">最终发布身份只接受 clean tag/commit 与对应 CI 摘要。</p></div>
+          <div class="card"><h3>beta-2 冻结前门禁</h3><p><strong>365 通过 / 0 失败 / 1 忽略</strong></p><p class="small">2026-08-31 workspace 串行测试、strict Clippy 与独立 staging Release 三件套构建通过；该数字仅属于历史快照。</p></div>
+          <div class="card"><h3>当前发布状态</h3><p><strong>v1.0.0-beta 候选，尚未验收</strong></p><p class="small"><code>v0.3.0-beta.2</code> / IPC v8 是前驱历史证据；v1 只接受 exact clean tag 与对应 CI 摘要。</p></div>
         </div>
         <h3>Release 体积优化</h3>
         <p>正式 Release 采用体积优先且保持可移植性的 profile：</p>
@@ -771,13 +784,13 @@ strip = "symbols"</code></pre>
             <tr><td>选定的 <code>opt-level=s</code> profile</td><td>10,734,080 B</td><td><strong>-37.1%</strong></td></tr>
           </tbody>
         </table></div>
-        <p>三次 <code>add</code> 的 Argon2 路径测量中，<code>opt-level=s</code> 平均约 215 ms，<code>opt-level=3</code> + fat LTO 平均约 200 ms，差约 7.5%。样本仅有三次，且 Argon2 本身刻意消耗时间和内存，因此这只是历史取舍信号，不是通用吞吐基准；profile 选择后来以 clean commit <code>94fb371</code> 推送。上述 A/B 数据不包含当前 vault v4/recovery/UI 代码。</p>
-        <div class="callout warn"><strong>历史 artifact，不是当前制品：</strong>优化提交前的标准路径测量为 EXE <strong>10,723,840 B</strong>、SHA-256 <code>68F571F7FDAD09986C8E5E6E23F8AE229B8E0043654298F3C349A0B99490F601</code>，PDB <strong>2,748,416 B</strong>。源码随后才以 <code>94fb371</code> clean commit 推送，所以不能把旧摘要重新标成该 commit 的 clean artifact；它也不包含当前 vault v4 修改。</div>
-        <div class="callout warn"><strong>上一轮 IPC v4 dirty 构建：</strong>标准 release 曾为 <strong>11,273,216 B</strong>，SHA-256 <code>A464F57EE7D60ACB583C0300D399E183F1BCB328C60B88CE6498D4C46592DE53</code>；这里只保留为历史对照，不描述当前 v8 文件。</div>
+        <p>三次 <code>add</code> 的 Argon2 路径测量中，<code>opt-level=s</code> 平均约 215 ms，<code>opt-level=3</code> + fat LTO 平均约 200 ms，差约 7.5%。样本仅有三次，且 Argon2 本身刻意消耗时间和内存，因此这只是历史取舍信号，不是通用吞吐基准；profile 选择后来以 clean commit <code>94fb371</code> 推送。上述 A/B 数据不包含当前 storage v5/recovery/UI 代码。</p>
+        <div class="callout warn"><strong>历史 artifact，不是当前制品：</strong>优化提交前的标准路径测量为 EXE <strong>10,723,840 B</strong>、SHA-256 <code>68F571F7FDAD09986C8E5E6E23F8AE229B8E0043654298F3C349A0B99490F601</code>，PDB <strong>2,748,416 B</strong>。源码随后才以 <code>94fb371</code> clean commit 推送，所以不能把旧摘要重新标成该 commit 的 clean artifact；它也不包含当前 storage v5 修改。</div>
+        <div class="callout warn"><strong>上一轮 IPC v4 dirty 构建：</strong>标准 release 曾为 <strong>11,273,216 B</strong>，SHA-256 <code>A464F57EE7D60ACB583C0300D399E183F1BCB328C60B88CE6498D4C46592DE53</code>；这里只保留为历史对照，不描述当前 v9 文件。</div>
         <div class="callout"><strong>v0.3.0-beta.2 冻结边界：</strong>冻结前源码与文档证据来自 dirty 工作树；最终 build 大小、哈希与 Fresh 结果应记录在 clean tag 对应的 CI/release metadata 或仓库外交付记录中，不把自引用制品信息写回受 <code>build.rs</code> 监控的文档。</div>
-        <div class="callout warn"><strong>正式制品边界：</strong>只有 clean commit/tag 上、通过 quality/test/RustSec 门禁后由发布作业生成并附带完整来源与 EXE/PDB SHA-256 的工件，才可作为正式发布候选。</div>
+        <div class="callout warn"><strong>正式制品边界：</strong>只有 exact annotated clean tag <code>v1.0.0-beta</code> 上、通过 quality/test/RustSec 与治理门禁后由发布作业生成并附带来源、SHA-256、SBOM、provenance 与 OIDC attestation 的工件，才可作为正式发布候选。annotated tag 对象本身在 Git 中并非不可移动；组织侧 tag ruleset 与 immutable releases 必须作为仓库外部治理门禁启用并另行核验，workflow 的重复发布拒绝与发布前远端 tag 复核不能替代它们。运行时仅发布 Windows x86_64 的匹配 CLI + daemon，以及 Linux x86_64 的 <code>serctl-xfer</code>；macOS 只在测试矩阵内，不产出 runtime。<code>serctl-remote</code>、jobs、remote protocol 与 policy engine 均属 source-only experimental/unshipped，不得进入资产、runtime manifest、symbol 包或 SBOM。</div>
         <p>CLI、daemon 与 helper 的 <code>build.rs</code> wrapper 共享 <a href="../build_support/git_provenance.rs"><code>build_support/git_provenance.rs</code></a>。共享实现移除所有可重定向 repository/work-tree/index/object/config/replace refs 的继承 Git 环境，禁用 system/global config，只从 manifest 祖先的文件系统发现真实 <code>.git</code>；Windows 去除 <code>\\?\</code> 前缀，canonical root 必须包含 manifest。查询固定 <code>--work-tree</code>，设置 <code>GIT_NO_REPLACE_OBJECTS=1</code>，关闭 fsmonitor/untracked cache。它解析 index stage-0 的 mode/OID/path，并用 <code>git hash-object --no-filters</code> 计算原始工作树 blob OID，使 clean/smudge filter 不能掩盖变更；任何关键查询失败都 fail-dirty。</p>
-        <p>发布链固定 Rust 1.97.1，并配置 Windows/Linux/macOS locked all-target/all-feature CI、严格 Clippy、build-script fixtures、在线 RustSec（warnings 即失败）、cargo-deny 的 license/source/bans 策略、CycloneDX 1.5 XML/JSON SBOM 与 Dependabot。Windows release 只在 <code>main</code> push 且 quality/test/RustSec 全绿后生成；构建与 SBOM 时间戳绑定 commit，证据记录完整 SHA、event/ref、工具链/runner，并哈希三件套 EXE 与 PDB。beta-2 是否通过远端门禁只以其最终 clean SHA 对应的 CI 记录为准。</p>
+        <p>v1 beta 发布链只响应规范 annotated tag <code>v1.0.0-beta</code>，不会把普通 <code>main</code> CI 当作正式发布。preflight 验证远端/本地 tag object 与 peeled commit、workspace/crate/internal path dependency 版本、Cargo.lock 及文档标记一致；Windows/Linux/macOS 运行 locked all-target/all-feature tests，quality 运行严格 Clippy、四个 build-script fixtures（含 source-only <code>serctl-remote</code>）、cargo-deny 与在线 RustSec（warnings 即失败）。从专用空 staging 构建 Windows CLI + daemon 匹配包及 Linux x86_64 <code>serctl-xfer</code>，分离调试符号，生成 CycloneDX 1.5 XML/JSON SBOM、SHA-256 manifest 与 build environment/provenance，并用最小权限 GitHub OIDC attestation。发布前再次核对远端 annotated tag object；已有 release 一律拒绝覆盖。远端复核与 workflow 拒绝只能发现发布时冲突，真正限制 tag/release 后续改写仍依赖平台侧 tag ruleset 与 immutable releases。source-only experimental/unshipped 组件只参加源码质量门禁，不构建到发布 runtime。</p>
         <ul>
           <li>三处 wrapper 监听共享 provenance 实现、tracked 文件、Git HEAD/index/packed-refs/symbolic ref、config/config.worktree、<code>info/exclude</code> 与 <code>info/attributes</code>；mode <code>160000</code> gitlink 直接 fail-dirty，不把 submodule 当普通 blob 跳过。</li>
           <li><code>git ls-files -v -z --cached</code> 发现 assume-unchanged 小写 tag 或 skip-worktree <code>S</code> 就强制 dirty；replace refs 不能改写所嵌 commit/工作树视图。</li>
@@ -789,7 +802,7 @@ strip = "symbols"</code></pre>
         </ul>
         <div class="callout warn"><strong>beta-2 release 边界：</strong><code>v0.3.0-beta.2</code> 仍是预发布测试版本；可回滚来源必须是最终推送的唯一 clean tag/commit。冻结前带 <code>-dirty</code> 的 EXE/PDB 只能证明其构建时工作树。为避免自引用重建循环，最终制品大小与摘要不嵌入本文，必须记录在 clean tag/CI release metadata 或仓库外交付记录中。</div>
         <pre><code># 仅在功能修改已提交、工作树 clean、准备正式发布时执行
-cargo build --release --locked --offline --workspace --bins
+cargo build --release --locked --offline -p serctl-cli -p serctl-daemon
 target\release\serctl_cli.exe --version
 Get-FileHash target\release\serctl_cli.exe -Algorithm SHA256</code></pre>
         <p>正式制品还应记录 commit、Cargo.lock、Rust toolchain、构建环境、SHA-256 与代码签名。项目依据 <a href="../LICENSE">Apache License 2.0</a> 授权，Cargo 元数据使用 SPDX <code>Apache-2.0</code>。</p>
@@ -802,13 +815,14 @@ Get-FileHash target\release\serctl_cli.exe -Algorithm SHA256</code></pre>
           <li><a href="../Cargo.toml">Cargo.toml</a> / <a href="../Cargo.lock">Cargo.lock</a> — 依赖与锁定版本</li>
           <li><a href="../crates/serctl_cli/src/main.rs">crates/serctl_cli/src/main.rs</a> — CLI、入口、退出码与终端诊断</li>
           <li><a href="../crates/serctl_cli/src/ui.rs">crates/serctl_cli/src/ui.rs</a> — Winit/Egui UI 与分层限时授权</li>
-          <li><a href="../crates/serctl_cli/src/client.rs">crates/serctl_cli/src/client.rs</a> — v8 broker client、Agent 网关与命令生命周期</li>
+          <li><a href="../crates/serctl_cli/src/client.rs">crates/serctl_cli/src/client.rs</a> — v9 broker client、Agent 网关与命令生命周期</li>
           <li><a href="../crates/serctl_daemon/src/daemon.rs">crates/serctl_daemon/src/daemon.rs</a> — 全局 broker、per-profile pool、grant 与 shutdown</li>
-          <li><a href="../crates/serctl_protocol/src/lib.rs">crates/serctl_protocol/src/lib.rs</a> — v8 AEAD、profile proof、OperationGrant PoP 与帧预算</li>
+          <li><a href="../crates/serctl_protocol/src/lib.rs">crates/serctl_protocol/src/lib.rs</a> — v9 AEAD、profile proof、OperationGrant PoP 与帧预算</li>
           <li><a href="../crates/serctl_transfer_protocol/src/lib.rs">crates/serctl_transfer_protocol/src/lib.rs</a> — 有界原生传输控制帧、raw data 与协商契约</li>
           <li><a href="../crates/serctl_xfer/src/main.rs">crates/serctl_xfer/src/main.rs</a> — 固定 <code>serve --stdio</code> 的 Linux 原生 helper</li>
+          <li><a href="../crates/serctl_remote/src/main.rs">crates/serctl_remote/src/main.rs</a> / <a href="../crates/serctl_jobs/src/lib.rs">serctl_jobs</a> / <a href="../crates/serctl_remote_protocol/src/lib.rs">serctl_remote_protocol</a> — source-only experimental 红队修复面；参加源码门禁但不发布、无受支持运行入口</li>
           <li><a href="../crates/serctl_core/src/ssh.rs">crates/serctl_core/src/ssh.rs</a> — russh、exec/SFTP 与 L/R/D tunnel</li>
-          <li><a href="../crates/serctl_core/src/vault.rs">crates/serctl_core/src/vault.rs</a> — vault v4、profile identity、admin/recovery、migration 与 lease</li>
+          <li><a href="../crates/serctl_core/src/vault.rs">crates/serctl_core/src/vault.rs</a> — 双层 storage v4..=v5 reader / v5 writer、profile identity、admin/recovery、migration 与 lease</li>
           <li><a href="../crates/serctl_core/src/recovery.rs">crates/serctl_core/src/recovery.rs</a> — 2-of-2 recovery envelope</li>
           <li><a href="../crates/serctl_core/src/security.rs">crates/serctl_core/src/security.rs</a> — 平台权限、稳定 handle 与 durable atomic commit</li>
           <li><a href="../crates/serctl_cli/src/e2e_tests.rs">crates/serctl_cli/src/e2e_tests.rs</a> — 真实 broker/SSH/SFTP/tunnel/grant E2E</li>
@@ -816,7 +830,7 @@ Get-FileHash target\release\serctl_cli.exe -Algorithm SHA256</code></pre>
           <li><a href="../.gitattributes">.gitattributes</a> — 仓库文本规范化与 LF 策略</li>
           <li><a href="serctl-design-roadmap.md">docs/serctl-design-roadmap.md</a> — 尚未发布的目标架构、决策、里程碑与验收矩阵</li>
         </ul>
-        <p class="small">本文为静态、无脚本、无外部样式依赖的 UTF-8 HTML，可离线打开或打印。内容更新至 2026-08-31 的 <code>v0.3.0-beta.2</code> 预发布候选、vault/record v4、IPC v8 全局 broker、profile proof、OperationGrant、UI 分层限时授权、可恢复 transfer 与 loopback-only tunnel；最终制品身份以 clean tag/commit 对应的 CI/release metadata 为准。规划能力单独记录在目标架构文档中。</p>
+        <p class="small">本文为静态、无脚本、无外部样式依赖的 UTF-8 HTML，可离线打开或打印。内容更新至 2026-08-31 的 <code>v1.0.0-beta</code> 候选、vault-storage read=v4..=v5 write=v5、IPC v9 全局 broker、profile proof、OperationGrant、UI 分层限时授权、可恢复 transfer 与 loopback-only tunnel；<code>v0.3.0-beta.2</code> / IPC v8 仅保留为前驱历史证据。最终制品身份以 exact clean tag/commit 对应的 CI/release metadata 为准；source-only experimental/unshipped remote、jobs、remote protocol 与 policy engine 不属于发布或支持面。</p>
       </section>
     </main>
   </div>

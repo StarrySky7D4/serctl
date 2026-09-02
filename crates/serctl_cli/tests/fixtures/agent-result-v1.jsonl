@@ -1,0 +1,8 @@
+{"schema_version":1,"request_id":1,"ok":true,"data":{"status":"ready"}}
+{"schema_version":1,"request_id":2,"ok":false,"error_code":"agent.invalid_request","error":"invalid request (diagnostic detail withheld)"}
+{"schema_version":1,"request_id":3,"ok":false,"error_code":"agent.schema_unsupported","error":"unsupported agent schema version"}
+{"schema_version":1,"request_id":4,"ok":false,"error_code":"agent.scope_denied","error":"grant does not authorize ssh.exec"}
+{"schema_version":1,"request_id":5,"ok":false,"error_code":"agent.operation_failed","error":"exec failed (diagnostic detail withheld)"}
+{"schema_version":1,"request_id":6,"ok":true,"data":{"bind_host":"127.0.0.1","bind_port":45123,"deadline_unix_ms":1900000000000,"mode":"local","stage":"ready","tunnel_id":"00112233445566778899aabbccddeeff"}}
+{"schema_version":1,"request_id":7,"ok":true,"data":{"observed_host_key_sha256":"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","operation_context_id":"abababababababababababababababababababababababababababababababab","pin_match":true,"profile_generation":7,"profile_id":"21212121212121212121212121212121","revision":1,"server_identification":"SSH-2.0-OpenSSH_9.9","transport_attempt_id":"00112233445566778899AABBCCDDEEFF"}}
+{"schema_version":1,"request_id":8,"ok":true,"data":{"backend":"sftp_fallback","backend_requested":"auto","bytes":3400000,"chunk_bytes":2048,"operation_context_id":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","revision":4,"transfer_id":"00112233445566778899aabbccddeeff","window_bytes":2048}}

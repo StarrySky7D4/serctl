@@ -1,0 +1,389 @@
+{
+  "commands": [
+    {
+      "defaults": {},
+      "path": "serctl_cli",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {
+        "port": [
+          "22"
+        ]
+      },
+      "path": "serctl_cli add",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli admin",
+      "required": [],
+      "subcommand_required": true
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli admin change-password",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli admin init",
+      "required": [
+        "recovery_media"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli admin status",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli admin verify",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli agent",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli audit",
+      "required": [],
+      "subcommand_required": true
+    },
+    {
+      "defaults": {
+        "acknowledge_unknown_outcome": [
+          "false"
+        ],
+        "json": [
+          "false"
+        ]
+      },
+      "path": "serctl_cli audit resolve-unknown",
+      "required": [
+        "name",
+        "acknowledge_unknown_outcome"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {
+        "json": [
+          "false"
+        ]
+      },
+      "path": "serctl_cli audit status",
+      "required": [
+        "name"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli down",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {
+        "timeout_secs": [
+          "300"
+        ]
+      },
+      "path": "serctl_cli download",
+      "required": [
+        "name",
+        "remote",
+        "local"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {
+        "timeout_secs": [
+          "300"
+        ]
+      },
+      "path": "serctl_cli exec",
+      "required": [
+        "name",
+        "cmd"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {
+        "budget": [
+          "32"
+        ],
+        "ttl_minutes": [
+          "30"
+        ]
+      },
+      "path": "serctl_cli grant-issue",
+      "required": [
+        "name"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli list",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli profile-password",
+      "required": [
+        "name"
+      ],
+      "subcommand_required": true
+    },
+    {
+      "defaults": {
+        "port": [
+          "22"
+        ],
+        "random": [
+          "false"
+        ],
+        "replace_credentials": [
+          "false"
+        ]
+      },
+      "path": "serctl_cli profile-password admin-reset",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli profile-password change",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli profile-password rotate-random",
+      "required": [
+        "random_output"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli recovery",
+      "required": [],
+      "subcommand_required": true
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli recovery init",
+      "required": [
+        "media"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli recovery migrate-v2",
+      "required": [
+        "recovery_media"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli recovery rotate",
+      "required": [
+        "old_media",
+        "new_media"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli remove",
+      "required": [
+        "name"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli shell",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli status",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli transfer",
+      "required": [],
+      "subcommand_required": true
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli transfer cancel",
+      "required": [
+        "name",
+        "transfer_id"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {
+        "backend": [
+          "auto"
+        ],
+        "idle_timeout_secs": [
+          "30"
+        ],
+        "progress": [
+          "auto"
+        ],
+        "resume": [
+          "never"
+        ]
+      },
+      "path": "serctl_cli transfer pull",
+      "required": [
+        "name",
+        "remote",
+        "local"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {
+        "backend": [
+          "auto"
+        ],
+        "idle_timeout_secs": [
+          "30"
+        ],
+        "progress": [
+          "auto"
+        ],
+        "resume": [
+          "never"
+        ]
+      },
+      "path": "serctl_cli transfer push",
+      "required": [
+        "name",
+        "local",
+        "remote"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {
+        "json": [
+          "false"
+        ],
+        "watch": [
+          "false"
+        ]
+      },
+      "path": "serctl_cli transfer status",
+      "required": [
+        "name"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli tunnel",
+      "required": [
+        "name"
+      ],
+      "subcommand_required": true
+    },
+    {
+      "defaults": {
+        "max_connections": [
+          "32"
+        ],
+        "port": [
+          "0"
+        ]
+      },
+      "path": "serctl_cli tunnel dynamic",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {
+        "max_connections": [
+          "32"
+        ],
+        "port": [
+          "0"
+        ]
+      },
+      "path": "serctl_cli tunnel local",
+      "required": [
+        "target_port"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {
+        "max_connections": [
+          "32"
+        ],
+        "port": [
+          "0"
+        ]
+      },
+      "path": "serctl_cli tunnel remote",
+      "required": [
+        "target_port"
+      ],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli ui",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {},
+      "path": "serctl_cli up",
+      "required": [],
+      "subcommand_required": false
+    },
+    {
+      "defaults": {
+        "timeout_secs": [
+          "300"
+        ]
+      },
+      "path": "serctl_cli upload",
+      "required": [
+        "name",
+        "local",
+        "remote"
+      ],
+      "subcommand_required": false
+    }
+  ],
+  "schema_version": 1
+}

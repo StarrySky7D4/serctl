@@ -32,22 +32,28 @@ use std::pin::Pin;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-/// Wire protocol version carried by the authenticated handshake. Persistent
-/// transfer resume tokens are intentionally a wire break: mixed v7/v8
-/// binaries fail closed during the prelude instead of silently dropping the
-/// ownership proof and weakening resume semantics.
+/// Previous wire version. Retained only so tests can prove that a v8
+/// descriptor or handshake fails closed after the grant-generation wire
+/// break; it is never advertised as supported by current binaries.
 pub const IPC_PROTOCOL_VERSION_V8: u16 = 8;
+/// Current wire protocol version carried by the authenticated handshake.
+/// Binding OperationGrant to the exact profile generation is intentionally a
+/// wire break: mixed v8/v9 binaries fail closed instead of silently dropping
+/// the generation and reviving stale authorization after profile rotation.
+pub const IPC_PROTOCOL_VERSION_V9: u16 = 9;
 /// Compatibility name for callers while the module is split into a dedicated
-/// v8 source file. Its value is v8; no older transport is accepted.
-pub const IPC_PROTOCOL_VERSION_V6: u16 = IPC_PROTOCOL_VERSION_V8;
+/// v9 source file. Its value is v9; no older transport is accepted.
+pub const IPC_PROTOCOL_VERSION_V6: u16 = IPC_PROTOCOL_VERSION_V9;
 
 /// Cap for the plaintext handshake frames.
 pub const V6_MAX_AUTH_FRAME: usize = 4 * 1024;
 /// Transport cap for one encrypted data frame. Tighter per-operation limits
 /// stay the caller's responsibility, mirroring the v5 layering.
 pub const V6_MAX_DATA_FRAME: usize = 64 * 1024 * 1024;
+const V6_AEAD_TAG_BYTES: usize = 16;
+const V6_MAX_PLAINTEXT_FRAME: usize = V6_MAX_DATA_FRAME - V6_AEAD_TAG_BYTES;
 /// Cap for the operation-kind string in a request prelude.
 pub const V6_MAX_OPERATION_KIND_BYTES: usize = 32;
 /// Hard lifetime of one daemon-held decrypted profile credential lease.
@@ -57,6 +63,22 @@ const SERVER_MAC_DOMAIN: &[u8] = b"serctl/ipc/v6/auth/server/v1\0";
 const CLIENT_MAC_DOMAIN: &[u8] = b"serctl/ipc/v6/auth/client/v1\0";
 const KEY_INFO_DOMAIN: &[u8] = b"serctl/ipc/v6/keys/v1\0";
 const FRAME_AAD_DOMAIN: &[u8] = b"serctl/ipc/v6/frame/v1\0";
+
+fn validate_plaintext_frame_len(len: usize) -> Result<()> {
+    ensure!(
+        len <= V6_MAX_PLAINTEXT_FRAME,
+        "IPC v6 plaintext frame exceeds its size cap"
+    );
+    Ok(())
+}
+
+fn validate_ciphertext_frame_len(len: usize) -> Result<()> {
+    ensure!(
+        (V6_AEAD_TAG_BYTES..=V6_MAX_DATA_FRAME).contains(&len),
+        "IPC v6 encrypted data frame length is invalid"
+    );
+    Ok(())
+}
 const PROFILE_PROOF_DOMAIN: &[u8] = b"serctl/ipc/v6/profile-proof/v1\0";
 
 const DIRECTION_C2D: u8 = 0;
@@ -150,6 +172,7 @@ pub fn frame_kind(frame: &Frame) -> &'static str {
         | Frame::AuthChallenge { .. }
         | Frame::AuthAccepted => "auth",
         Frame::Exec { .. } => "ssh.exec",
+        Frame::ConnectionIdentity { .. } => "ssh.connection-identity",
         Frame::Shell { .. } | Frame::ShellInput { .. } => "ssh.pty",
         Frame::Status => "daemon.status",
         Frame::Shutdown { .. } => "daemon.shutdown",
@@ -165,6 +188,13 @@ pub fn frame_kind(frame: &Frame) -> &'static str {
         Frame::TransferStatus { .. } => "transfer.status",
         Frame::TransferCancel { .. } => "transfer.cancel",
         Frame::TunnelOpen { .. } | Frame::TunnelStop => "forward",
+        Frame::ManagedTunnelOpen { spec, .. } => match spec.mode() {
+            crate::TunnelMode::Local => "forward.local/open",
+            crate::TunnelMode::Remote => "forward.remote/open",
+            crate::TunnelMode::Dynamic => "forward.dynamic/open",
+        },
+        Frame::ManagedTunnelStatus { .. } => "forward.status",
+        Frame::ManagedTunnelCancel { .. } => "forward.cancel",
         Frame::ExecOut { .. }
         | Frame::ExecErr { .. }
         | Frame::ExecExit { .. }
@@ -175,6 +205,7 @@ pub fn frame_kind(frame: &Frame) -> &'static str {
         | Frame::ProfileAuthorized { .. }
         | Frame::StatusInfo { .. }
         | Frame::Ack
+        | Frame::CreateDirAccepted { .. }
         | Frame::TransferAck { .. }
         | Frame::DirList { .. }
         | Frame::FileChunk { .. }
@@ -182,8 +213,13 @@ pub fn frame_kind(frame: &Frame) -> &'static str {
         | Frame::TransferDigest { .. }
         | Frame::TransferProgress { .. }
         | Frame::TransferStatusInfo { .. }
+        | Frame::TransferCancelAccepted { .. }
         | Frame::TunnelReady { .. }
         | Frame::TunnelClosed
+        | Frame::ManagedTunnelOpened { .. }
+        | Frame::ManagedTunnelStatusInfo { .. }
+        | Frame::ManagedTunnelTerminal { .. }
+        | Frame::ConnectionIdentityInfo { .. }
         | Frame::Error { .. } => "stream",
     }
 }
@@ -223,16 +259,18 @@ impl V6RequestPrelude {
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.protocol_version == IPC_PROTOCOL_VERSION_V6,
-            "unsupported IPC v6 prelude version {}",
+            "unsupported IPC v9 prelude version {}",
             self.protocol_version
         );
         ensure!(
             !self.operation_kind.is_empty()
                 && self.operation_kind.len() <= V6_MAX_OPERATION_KIND_BYTES
                 && self.operation_kind.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_')
+                    b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || matches!(b, b'.' | b'-' | b'_' | b'/')
                 }),
-            "operation kind must be 1..={V6_MAX_OPERATION_KIND_BYTES} bytes of [a-z0-9._-]"
+            "operation kind must be 1..={V6_MAX_OPERATION_KIND_BYTES} bytes of [a-z0-9._/-]"
         );
         if self.profile_id.is_some() && self.grant_id.is_some() {
             bail!("prelude must name at most one of profile_id and grant_id");
@@ -479,13 +517,14 @@ struct SharedV6State {
 
 impl SharedV6State {
     fn encrypt_frame(&mut self, direction: u8, plaintext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        validate_plaintext_frame_len(plaintext.len())?;
         let cipher_state = match direction {
             DIRECTION_C2D => &mut self.c2d,
             DIRECTION_D2C => &mut self.d2c,
             other => bail!("unknown IPC v6 frame direction {other}"),
         };
         let counter = cipher_state.send_counter;
-        cipher_state.send_counter = cipher_state
+        let next_counter = cipher_state
             .send_counter
             .checked_add(1)
             .context("IPC v6 frame counter overflow")?;
@@ -505,6 +544,11 @@ impl SharedV6State {
                 )
                 .map_err(|_| anyhow::anyhow!("IPC v6 frame encryption failed"))?,
         );
+        validate_ciphertext_frame_len(ciphertext.len())?;
+        // A nonce/counter becomes consumed exactly when its complete
+        // ciphertext has been produced. Any pre-encryption failure leaves the
+        // state unchanged; the stream adapter then poisons the connection.
+        cipher_state.send_counter = next_counter;
         Ok(ciphertext)
     }
 
@@ -514,6 +558,7 @@ impl SharedV6State {
         ciphertext: &[u8],
         expected_counter: u64,
     ) -> Result<Zeroizing<Vec<u8>>> {
+        validate_ciphertext_frame_len(ciphertext.len())?;
         let cipher_state = match direction {
             DIRECTION_C2D => &self.c2d,
             DIRECTION_D2C => &self.d2c,
@@ -665,10 +710,13 @@ pub struct V6ServerSession<S> {
 // the server additionally enforces the root-request commitment (hash + kind)
 // on the first frame it decrypts.
 
-/// Bytes buffered on the write side before being flushed as one AEAD frame.
-const V6_ADAPTER_FLUSH_THRESHOLD: usize = 64 * 1024;
-/// Maximum plaintext of one adapted frame; mirrors the transport data cap.
-const V6_ADAPTER_MAX_FRAME: usize = V6_MAX_DATA_FRAME;
+/// Maximum plaintext of one adapted frame. The encrypted body (plaintext plus
+/// the Poly1305 tag) must remain within `V6_MAX_DATA_FRAME` on both peers.
+const V6_ADAPTER_MAX_FRAME: usize = V6_MAX_PLAINTEXT_FRAME;
+/// Bound synchronous progress in one task poll. A transport that repeatedly
+/// returns `Ready(partial)` is self-woken after this many advancing operations
+/// so large frames cannot starve unrelated tasks.
+const V6_ADAPTER_IO_BUDGET: usize = 64;
 
 pub struct V6ClientIo<S> {
     session: V6ClientSession<S>,
@@ -679,6 +727,7 @@ pub struct V6ClientIo<S> {
     recv_body: Option<(Vec<u8>, usize)>,
     read_buf: Vec<u8>,
     read_offset: usize,
+    poisoned: bool,
 }
 
 pub struct V6ServerIo<S> {
@@ -690,6 +739,7 @@ pub struct V6ServerIo<S> {
     recv_body: Option<(Vec<u8>, usize)>,
     read_buf: Vec<u8>,
     read_offset: usize,
+    poisoned: bool,
 }
 
 impl<S> V6ClientIo<S> {
@@ -703,6 +753,7 @@ impl<S> V6ClientIo<S> {
             recv_body: None,
             read_buf: Vec::new(),
             read_offset: 0,
+            poisoned: false,
         }
     }
 
@@ -722,6 +773,7 @@ impl<S> V6ServerIo<S> {
             recv_body: None,
             read_buf: Vec::new(),
             read_offset: 0,
+            poisoned: false,
         }
     }
 }
@@ -744,13 +796,25 @@ where
     ) -> std::task::Poll<std::io::Result<usize>>,
     W: FnMut(),
 {
+    let mut operations = 0_usize;
     loop {
+        if operations >= V6_ADAPTER_IO_BUDGET && (header.is_some() || body.is_some()) {
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
         if let Some((bytes, offset)) = header.as_mut() {
             match poll(stream.as_mut(), cx, &bytes[*offset..]) {
                 std::task::Poll::Ready(Ok(n)) => {
+                    if n == 0 {
+                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "IPC v6 transport wrote zero bytes",
+                        )));
+                    }
+                    operations += 1;
                     *offset += n;
                     if *offset < 4 {
-                        return std::task::Poll::Pending;
+                        continue;
                     }
                     *header = None;
                     write();
@@ -763,9 +827,16 @@ where
         if let Some((bytes, offset)) = body.as_mut() {
             match poll(stream.as_mut(), cx, &bytes[*offset..]) {
                 std::task::Poll::Ready(Ok(n)) => {
+                    if n == 0 {
+                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "IPC v6 transport wrote zero bytes",
+                        )));
+                    }
+                    operations += 1;
                     *offset += n;
                     if *offset < bytes.len() {
-                        return std::task::Poll::Pending;
+                        continue;
                     }
                     *body = None;
                     return std::task::Poll::Ready(Ok(()));
@@ -784,6 +855,35 @@ macro_rules! impl_v6_io {
         where
             S: AsyncRead + AsyncWrite + Unpin,
         {
+            fn poisoned_error() -> std::io::Error {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "IPC v6 adapter is poisoned",
+                )
+            }
+
+            fn zeroize_buffers(&mut self) {
+                self.write_buf.zeroize();
+                if let Some((body, _)) = self.send_body.as_mut() {
+                    body.zeroize();
+                }
+                if let Some((body, _)) = self.recv_body.as_mut() {
+                    body.zeroize();
+                }
+                self.read_buf.zeroize();
+                self.send_header = None;
+                self.send_body = None;
+                self.recv_header = None;
+                self.recv_body = None;
+                self.read_offset = 0;
+            }
+
+            fn poison(&mut self, error: std::io::Error) -> std::io::Error {
+                self.poisoned = true;
+                self.zeroize_buffers();
+                error
+            }
+
             fn arm_send(&mut self) -> std::io::Result<()> {
                 if self.send_header.is_some() || self.send_body.is_some() {
                     return Ok(());
@@ -791,8 +891,8 @@ macro_rules! impl_v6_io {
                 if self.write_buf.is_empty() {
                     return Ok(());
                 }
-                let plaintext = std::mem::take(&mut self.write_buf);
-                if plaintext.len() > V6_ADAPTER_MAX_FRAME + 4 {
+                let plaintext = Zeroizing::new(std::mem::take(&mut self.write_buf));
+                if plaintext.len() > V6_ADAPTER_MAX_FRAME {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "IPC v6 adapted frame exceeds its size cap",
@@ -835,23 +935,36 @@ macro_rules! impl_v6_io {
 
             fn poll_write_io(
                 mut self: Pin<&mut Self>,
-                _cx: &mut std::task::Context<'_>,
+                cx: &mut std::task::Context<'_>,
                 buf: &[u8],
             ) -> std::task::Poll<std::io::Result<usize>> {
-                if self.write_buf.len() + buf.len() > V6_ADAPTER_MAX_FRAME {
-                    return std::task::Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "IPC v6 adapted frame exceeds its size cap",
-                    )));
+                if self.poisoned {
+                    return std::task::Poll::Ready(Err(Self::poisoned_error()));
                 }
-                self.write_buf.extend_from_slice(buf);
-                // Keep long-lived raw streams (e.g. tunnel byte flows) moving
-                // without requiring the handler to flush explicitly.
-                if self.write_buf.len() >= V6_ADAPTER_FLUSH_THRESHOLD {
-                    if let Err(error) = self.arm_send() {
-                        return std::task::Poll::Ready(Err(error));
+                if self.send_header.is_some() || self.send_body.is_some() {
+                    match self.as_mut().poll_flush_io(cx) {
+                        std::task::Poll::Ready(Ok(())) => {}
+                        std::task::Poll::Ready(Err(error)) => {
+                            return std::task::Poll::Ready(Err(error))
+                        }
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
                     }
                 }
+                let Some(buffered) = self.write_buf.len().checked_add(buf.len()) else {
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "IPC v6 adapted frame exceeds its size cap",
+                    );
+                    return std::task::Poll::Ready(Err(self.poison(error)));
+                };
+                if buffered > V6_ADAPTER_MAX_FRAME {
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "IPC v6 adapted frame exceeds its size cap",
+                    );
+                    return std::task::Poll::Ready(Err(self.poison(error)));
+                }
+                self.write_buf.extend_from_slice(buf);
                 std::task::Poll::Ready(Ok(buf.len()))
             }
 
@@ -859,19 +972,29 @@ macro_rules! impl_v6_io {
                 mut self: Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<std::io::Result<()>> {
+                if self.poisoned {
+                    return std::task::Poll::Ready(Err(Self::poisoned_error()));
+                }
                 if let Err(error) = self.arm_send() {
+                    let error = self.poison(error);
                     return std::task::Poll::Ready(Err(error));
                 }
                 let this = self.get_mut();
                 let stream = Pin::new(&mut this.session.stream);
-                poll_send_parts(
+                let result = poll_send_parts(
                     stream,
                     cx,
                     &mut this.send_header,
                     &mut this.send_body,
                     |stream, cx, bytes| stream.poll_write(cx, bytes),
                     || {},
-                )
+                );
+                match result {
+                    std::task::Poll::Ready(Err(error)) => {
+                        std::task::Poll::Ready(Err(this.poison(error)))
+                    }
+                    other => other,
+                }
             }
 
             fn poll_shutdown_io(
@@ -886,7 +1009,12 @@ macro_rules! impl_v6_io {
                     std::task::Poll::Pending => return std::task::Poll::Pending,
                 }
                 let this = self.get_mut();
-                Pin::new(&mut this.session.stream).poll_shutdown(cx)
+                match Pin::new(&mut this.session.stream).poll_shutdown(cx) {
+                    std::task::Poll::Ready(Err(error)) => {
+                        std::task::Poll::Ready(Err(this.poison(error)))
+                    }
+                    other => other,
+                }
             }
 
             fn poll_read_io(
@@ -895,6 +1023,10 @@ macro_rules! impl_v6_io {
                 buf: &mut tokio::io::ReadBuf<'_>,
             ) -> std::task::Poll<std::io::Result<()>> {
                 let this = self.get_mut();
+                if this.poisoned {
+                    return std::task::Poll::Ready(Err(Self::poisoned_error()));
+                }
+                let mut operations = 0_usize;
                 loop {
                     // Serve the remaining plaintext of the current frame first.
                     if this.read_offset < this.read_buf.len() {
@@ -906,38 +1038,51 @@ macro_rules! impl_v6_io {
                         buf.put_slice(&this.read_buf[this.read_offset..end]);
                         this.read_offset = end;
                         if this.read_offset >= this.read_buf.len() {
-                            this.read_buf.clear();
+                            this.read_buf.zeroize();
                             this.read_offset = 0;
                         }
                         return std::task::Poll::Ready(Ok(()));
                     }
                     let mut stream = Pin::new(&mut this.session.stream);
                     loop {
+                        if operations >= V6_ADAPTER_IO_BUDGET {
+                            cx.waker().wake_by_ref();
+                            return std::task::Poll::Pending;
+                        }
                         if let Some((bytes, offset)) = this.recv_header.as_mut() {
                             let mut temp = tokio::io::ReadBuf::new(&mut bytes[*offset..]);
                             match stream.as_mut().poll_read(cx, &mut temp) {
                                 std::task::Poll::Ready(Ok(())) => {
                                     let n = temp.filled().len();
                                     if n == 0 {
-                                        return std::task::Poll::Ready(Ok(())); // EOF
+                                        if *offset == 0 {
+                                            return std::task::Poll::Ready(Ok(())); // EOF between frames
+                                        }
+                                        let error = std::io::Error::new(
+                                            std::io::ErrorKind::UnexpectedEof,
+                                            "IPC v6 transport ended during a frame header",
+                                        );
+                                        return std::task::Poll::Ready(Err(this.poison(error)));
                                     }
+                                    operations += 1;
                                     *offset += n;
                                     if *offset < 4 {
-                                        return std::task::Poll::Pending;
+                                        continue;
                                     }
                                     let len = u32::from_be_bytes(*bytes) as usize;
-                                    if len > V6_ADAPTER_MAX_FRAME {
-                                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                                    if let Err(error) = validate_ciphertext_frame_len(len) {
+                                        let error = std::io::Error::new(
                                             std::io::ErrorKind::InvalidData,
-                                            "IPC v6 frame exceeds its size cap",
-                                        )));
+                                            error,
+                                        );
+                                        return std::task::Poll::Ready(Err(this.poison(error)));
                                     }
                                     this.recv_header = None;
                                     this.recv_body = Some((vec![0_u8; len], 0));
                                     continue;
                                 }
                                 std::task::Poll::Ready(Err(error)) => {
-                                    return std::task::Poll::Ready(Err(error))
+                                    return std::task::Poll::Ready(Err(this.poison(error)))
                                 }
                                 std::task::Poll::Pending => return std::task::Poll::Pending,
                             }
@@ -948,11 +1093,16 @@ macro_rules! impl_v6_io {
                                 std::task::Poll::Ready(Ok(())) => {
                                     let n = temp.filled().len();
                                     if n == 0 {
-                                        return std::task::Poll::Ready(Ok(())); // EOF
+                                        let error = std::io::Error::new(
+                                            std::io::ErrorKind::UnexpectedEof,
+                                            "IPC v6 transport ended during a frame body",
+                                        );
+                                        return std::task::Poll::Ready(Err(this.poison(error)));
                                     }
+                                    operations += 1;
                                     *offset += n;
                                     if *offset < bytes.len() {
-                                        return std::task::Poll::Pending;
+                                        continue;
                                     }
                                     let (body, _) = this.recv_body.take().unwrap();
                                     let ciphertext = Zeroizing::new(body);
@@ -960,9 +1110,10 @@ macro_rules! impl_v6_io {
                                         match this.session.state.expect_next_counter($dir_recv) {
                                             Ok(counter) => counter,
                                             Err(error) => {
+                                                let error = std::io::Error::other(error);
                                                 return std::task::Poll::Ready(Err(
-                                                    std::io::Error::other(error),
-                                                ))
+                                                    this.poison(error),
+                                                ));
                                             }
                                         };
                                     let plaintext = match this.session.state.decrypt_frame(
@@ -972,24 +1123,24 @@ macro_rules! impl_v6_io {
                                     ) {
                                         Ok(plaintext) => plaintext,
                                         Err(error) => {
-                                            return std::task::Poll::Ready(Err(std::io::Error::other(
-                                                error,
-                                            )))
+                                            let error = std::io::Error::other(error);
+                                            return std::task::Poll::Ready(Err(this.poison(error)));
                                         }
                                     };
                                     if !this.session.root_ok_for_recv(&plaintext[4.min(plaintext.len())..])
                                     {
-                                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                                        let error = std::io::Error::new(
                                             std::io::ErrorKind::InvalidData,
                                             "IPC v6 root request does not match the handshake prelude",
-                                        )));
+                                        );
+                                        return std::task::Poll::Ready(Err(this.poison(error)));
                                     }
                                     this.read_buf = plaintext.to_vec();
                                     this.read_offset = 0;
                                     break;
                                 }
                                 std::task::Poll::Ready(Err(error)) => {
-                                    return std::task::Poll::Ready(Err(error))
+                                    return std::task::Poll::Ready(Err(this.poison(error)))
                                 }
                                 std::task::Poll::Pending => return std::task::Poll::Pending,
                             }
@@ -1137,10 +1288,7 @@ where
     .await
     .map_err(|_| anyhow::anyhow!("IPC v6 frame read timed out"))??;
     let Some(len) = len else { return Ok(None) };
-    ensure!(
-        len <= V6_MAX_DATA_FRAME,
-        "IPC v6 data frame exceeds its size cap"
-    );
+    validate_ciphertext_frame_len(len)?;
     let mut ciphertext = Zeroizing::new(vec![0_u8; len]);
     tokio::time::timeout_at(deadline, stream.read_exact(&mut ciphertext))
         .await
@@ -1456,7 +1604,67 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context as TaskContext, Poll};
     use std::time::Duration;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    struct OneByteIo<S> {
+        inner: S,
+    }
+
+    impl<S> OneByteIo<S> {
+        fn new(inner: S) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for OneByteIo<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if output.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let mut byte = [0_u8; 1];
+            let mut limited = ReadBuf::new(&mut byte);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut limited) {
+                Poll::Ready(Ok(())) => {
+                    output.put_slice(limited.filled());
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for OneByteIo<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            input: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let take = input.len().min(1);
+            Pin::new(&mut self.inner).poll_write(cx, &input[..take])
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(5)
@@ -1713,20 +1921,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_mismatch_fails_closed() {
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let secret = ActivationSecret::random();
-        let instance = InstanceId::random();
-        let request = exec_frame();
-        let mut prelude = prelude_for(&request);
-        prelude.protocol_version = IPC_PROTOCOL_VERSION_V6 + 1;
-        let d = deadline();
-        let (client_result, server_result) = tokio::join!(
-            v6_client_handshake(client, &secret, instance, prelude, d),
-            v6_server_handshake(server, &secret, instance, d),
-        );
-        assert!(client_result.is_err());
-        assert!(server_result.is_err());
+    async fn every_pre_v9_and_future_version_fails_before_root_dispatch() {
+        for version in (0..=IPC_PROTOCOL_VERSION_V8).chain([IPC_PROTOCOL_VERSION_V9 + 1, u16::MAX])
+        {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let secret = ActivationSecret::random();
+            let instance = InstanceId::random();
+            let request = exec_frame();
+            let mut prelude = prelude_for(&request);
+            prelude.protocol_version = version;
+            let dispatched = Arc::new(AtomicBool::new(false));
+            let server_dispatched = Arc::clone(&dispatched);
+            let d = deadline();
+            let server = async {
+                let result = v6_server_handshake(server, &secret, instance, d).await;
+                if result.is_ok() {
+                    server_dispatched.store(true, Ordering::Release);
+                }
+                result
+            };
+            let (client_result, server_result) = tokio::join!(
+                v6_client_handshake(client, &secret, instance, prelude, d),
+                server,
+            );
+            assert!(
+                client_result.is_err(),
+                "IPC v{version} client unexpectedly authenticated"
+            );
+            assert!(
+                server_result.is_err(),
+                "IPC v{version} server unexpectedly authenticated"
+            );
+            assert!(
+                !dispatched.load(Ordering::Acquire),
+                "IPC v{version} reached root dispatch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_non_v9_handshake_envelope_fails_before_key_derivation_or_dispatch() {
+        for version in (0..=IPC_PROTOCOL_VERSION_V8).chain([IPC_PROTOCOL_VERSION_V9 + 1, u16::MAX])
+        {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let secret = ActivationSecret::random();
+            let instance = InstanceId::random();
+            let hello = V6AuthFrame::Hello {
+                version,
+                instance_id: instance.0,
+                client_nonce: [0x42; 32],
+                prelude: prelude_for(&exec_frame()),
+            };
+            let encoded = serde_json::to_vec(&hello).unwrap();
+            let dispatched = Arc::new(AtomicBool::new(false));
+            let server_dispatched = Arc::clone(&dispatched);
+            let d = deadline();
+            let server = async {
+                let result = v6_server_handshake(server, &secret, instance, d).await;
+                if result.is_ok() {
+                    server_dispatched.store(true, Ordering::Release);
+                }
+                result
+            };
+            let client = async {
+                client
+                    .write_all(&u32::try_from(encoded.len()).unwrap().to_be_bytes())
+                    .await
+                    .unwrap();
+                client.write_all(&encoded).await.unwrap();
+                client.flush().await.unwrap();
+            };
+            let ((), server_result) = tokio::join!(client, server);
+            assert!(
+                server_result.is_err(),
+                "IPC v{version} handshake envelope unexpectedly authenticated"
+            );
+            assert!(
+                !dispatched.load(Ordering::Acquire),
+                "IPC v{version} handshake envelope reached root dispatch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_handshake_versions_fail_before_root_dispatch() {
+        for malformed in [
+            serde_json::json!("9"),
+            serde_json::json!(-1),
+            serde_json::json!(65536),
+            serde_json::Value::Null,
+        ] {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let secret = ActivationSecret::random();
+            let instance = InstanceId::random();
+            let request = exec_frame();
+            let prelude = prelude_for(&request);
+            let mut hello = serde_json::to_value(V6AuthFrame::Hello {
+                version: IPC_PROTOCOL_VERSION_V9,
+                instance_id: instance.0,
+                client_nonce: [0x41; 32],
+                prelude,
+            })
+            .unwrap();
+            hello["d"]["version"] = malformed;
+            let encoded = serde_json::to_vec(&hello).unwrap();
+            let dispatched = Arc::new(AtomicBool::new(false));
+            let server_dispatched = Arc::clone(&dispatched);
+            let d = deadline();
+            let server = async {
+                let result = v6_server_handshake(server, &secret, instance, d).await;
+                if result.is_ok() {
+                    server_dispatched.store(true, Ordering::Release);
+                }
+                result
+            };
+            let client = async {
+                client
+                    .write_all(&u32::try_from(encoded.len()).unwrap().to_be_bytes())
+                    .await
+                    .unwrap();
+                client.write_all(&encoded).await.unwrap();
+                client.flush().await.unwrap();
+            };
+            let ((), server_result) = tokio::join!(client, server);
+            assert!(server_result.is_err());
+            assert!(!dispatched.load(Ordering::Acquire));
+        }
     }
 
     #[tokio::test]
@@ -1757,6 +2077,22 @@ mod tests {
         assert_eq!(InstanceId::from_hex(&instance.as_hex()).unwrap(), instance);
         assert!(InstanceId::from_hex("xyz").is_err());
         assert!(InstanceId::from_hex("00").is_err());
+    }
+
+    #[test]
+    fn encrypted_data_frame_cap_accounts_for_exact_aead_tag_overhead() {
+        assert_eq!(
+            V6_MAX_PLAINTEXT_FRAME + V6_AEAD_TAG_BYTES,
+            V6_MAX_DATA_FRAME
+        );
+        assert!(validate_plaintext_frame_len(V6_MAX_PLAINTEXT_FRAME - 1).is_ok());
+        assert!(validate_plaintext_frame_len(V6_MAX_PLAINTEXT_FRAME).is_ok());
+        assert!(validate_plaintext_frame_len(V6_MAX_PLAINTEXT_FRAME + 1).is_err());
+        assert!(validate_ciphertext_frame_len(V6_AEAD_TAG_BYTES - 1).is_err());
+        assert!(validate_ciphertext_frame_len(V6_AEAD_TAG_BYTES).is_ok());
+        assert!(validate_ciphertext_frame_len(V6_MAX_DATA_FRAME - 1).is_ok());
+        assert!(validate_ciphertext_frame_len(V6_MAX_DATA_FRAME).is_ok());
+        assert!(validate_ciphertext_frame_len(V6_MAX_DATA_FRAME + 1).is_err());
     }
 
     #[tokio::test]
@@ -1821,5 +2157,123 @@ mod tests {
         )
         .await;
         assert!(recv_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn adapter_short_io_preserves_flush_boundaries_and_frame_counters() {
+        let (client, server) = tokio::io::duplex(8);
+        let client = OneByteIo::new(client);
+        let server = OneByteIo::new(server);
+        let secret = ActivationSecret::random();
+        let instance = InstanceId::random();
+        let request = exec_frame();
+        let prelude = prelude_for(&request);
+        let d = Instant::now() + Duration::from_secs(30);
+        let (client_result, server_result) = tokio::join!(
+            v6_client_handshake(client, &secret, instance, prelude, d),
+            v6_server_handshake(server, &secret, instance, d),
+        );
+        let client_io = V6ClientIo::new(client_result.unwrap());
+        let server_io = V6ServerIo::new(server_result.unwrap().0);
+        let (mut client_rd, mut client_wr) = tokio::io::split(client_io);
+        let (mut server_rd, mut server_wr) = tokio::io::split(server_io);
+
+        let (sent, received) = tokio::join!(
+            crate::write_frame_limited(&mut client_wr, &request, crate::MAX_REQUEST_FRAME),
+            crate::read_frame_limited(&mut server_rd, crate::MAX_REQUEST_FRAME),
+        );
+        sent.unwrap();
+        assert!(matches!(received.unwrap(), Some(Frame::Exec { .. })));
+
+        const OLD_THRESHOLD: usize = 64 * 1024;
+        let plaintext_sizes = [
+            5,
+            32 * 1024,
+            OLD_THRESHOLD - 1,
+            OLD_THRESHOLD,
+            OLD_THRESHOLD + 1,
+        ];
+        for (sequence, plaintext_len) in plaintext_sizes.into_iter().enumerate() {
+            let body_len = plaintext_len - 4;
+            let mut expected = vec![0_u8; plaintext_len];
+            expected[..4].copy_from_slice(&(body_len as u32).to_be_bytes());
+            for (index, byte) in expected[4..].iter_mut().enumerate() {
+                *byte = ((index + sequence * 17) % 251) as u8;
+            }
+            let mut observed = vec![0_u8; plaintext_len];
+            let (sent, received) = tokio::join!(
+                async {
+                    client_wr.write_all(&expected).await?;
+                    client_wr.flush().await
+                },
+                server_rd.read_exact(&mut observed),
+            );
+            sent.unwrap();
+            received.unwrap();
+            assert_eq!(observed, expected, "plaintext size {plaintext_len}");
+        }
+
+        // Exercise the opposite direction after several client frames. If one
+        // flush consumed more than one nonce/counter, this authentication fails.
+        let reverse_len = OLD_THRESHOLD + 1;
+        let reverse_body_len = reverse_len - 4;
+        let mut reverse = vec![0x5a; reverse_len];
+        reverse[..4].copy_from_slice(&(reverse_body_len as u32).to_be_bytes());
+        let mut reverse_observed = vec![0_u8; reverse_len];
+        let (sent, received) = tokio::join!(
+            async {
+                server_wr.write_all(&reverse).await?;
+                server_wr.flush().await
+            },
+            client_rd.read_exact(&mut reverse_observed),
+        );
+        sent.unwrap();
+        received.unwrap();
+        assert_eq!(reverse_observed, reverse);
+
+        client_wr.shutdown().await.unwrap();
+        let mut eof = [0_u8; 1];
+        assert_eq!(server_rd.read(&mut eof).await.unwrap(), 0);
+
+        let client_io = client_rd.unsplit(client_wr);
+        let server_io = server_rd.unsplit(server_wr);
+        assert_eq!(client_io.session.state.c2d.send_counter, 6);
+        assert_eq!(server_io.session.state.c2d_recv_counter, 6);
+        assert_eq!(server_io.session.state.d2c.send_counter, 1);
+        assert_eq!(client_io.session.state.d2c_recv_counter, 1);
+    }
+
+    #[tokio::test]
+    async fn adapter_error_poisoning_is_permanent_and_clears_buffers() {
+        let (client, server) = tokio::io::duplex(1024);
+        let secret = ActivationSecret::random();
+        let instance = InstanceId::random();
+        let request = exec_frame();
+        let prelude = prelude_for(&request);
+        let d = deadline();
+        let (client_result, server_result) = tokio::join!(
+            v6_client_handshake(client, &secret, instance, prelude, d),
+            v6_server_handshake(server, &secret, instance, d),
+        );
+        let mut client_io = V6ClientIo::new(client_result.unwrap());
+        drop(server_result.unwrap());
+
+        // Prefix declares two body bytes, but only one byte is buffered.
+        client_io.write_all(&[0, 0, 0, 2, 0xa5]).await.unwrap();
+        let first = client_io.flush().await.unwrap_err();
+        assert_eq!(first.kind(), io::ErrorKind::InvalidData);
+        assert!(client_io.poisoned);
+        assert!(client_io.write_buf.is_empty());
+        assert!(client_io.send_header.is_none());
+        assert!(client_io.send_body.is_none());
+        assert!(client_io.recv_header.is_none());
+        assert!(client_io.recv_body.is_none());
+        assert!(client_io.read_buf.is_empty());
+
+        let retry = client_io.write_all(&[0, 0, 0, 0]).await.unwrap_err();
+        assert_eq!(retry.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(client_io.flush().await.is_err());
+        let mut byte = [0_u8; 1];
+        assert!(client_io.read(&mut byte).await.is_err());
     }
 }

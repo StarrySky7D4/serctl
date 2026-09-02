@@ -40,17 +40,41 @@ pub const GRANT_MAX_OPERATIONS: usize = 32;
 /// Base64 length of one Ed25519 signature.
 pub const POP_SIGNATURE_B64_LEN: usize = 88;
 
-const POP_DOMAIN: &[u8] = b"serctl/ipc/v6/grant-pop/v1\0";
+const POP_DOMAIN: &[u8] = b"serctl/ipc/v9/grant-pop/v1\0";
+
+/// Exact vault identity captured when a grant is issued. Grouping these
+/// inseparable fields keeps constructors explicit without an error-prone list
+/// of adjacent id/generation arguments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GrantProfileIdentity {
+    pub profile_id: [u8; 16],
+    pub generation: u64,
+}
+
+impl GrantProfileIdentity {
+    pub const fn new(profile_id: [u8; 16], generation: u64) -> Self {
+        Self {
+            profile_id,
+            generation,
+        }
+    }
+}
 
 /// Wire/registry record of one issued grant. Never contains the agent's
 /// private key; `holder_key` is the agent's Ed25519 public key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationGrant {
     pub grant_id: [u8; 16],
     /// The profile this grant authorizes operations against.
     pub profile_name: String,
     /// Resolved at issuance; a replaced profile (new id) invalidates the grant.
     pub profile_id: [u8; 16],
+    /// Exact authenticated vault generation at issuance. Passphrase rotation,
+    /// recovery, and administrative replacement advance this value, so a
+    /// grant can never authorize a later key package that retained the same
+    /// stable profile id.
+    pub profile_generation: u64,
     /// Authorized `frame_kind` values, e.g. `exec`, `sftp.list-dir`.
     pub operations: Vec<String>,
     pub budget: u32,
@@ -62,7 +86,7 @@ pub struct OperationGrant {
 impl OperationGrant {
     pub fn new(
         profile_name: String,
-        profile_id: [u8; 16],
+        profile_identity: GrantProfileIdentity,
         operations: Vec<String>,
         budget: u32,
         holder_key: &VerifyingKey,
@@ -70,7 +94,7 @@ impl OperationGrant {
     ) -> Result<Self> {
         Self::new_with_ttl(
             profile_name,
-            profile_id,
+            profile_identity,
             operations,
             budget,
             holder_key,
@@ -81,7 +105,7 @@ impl OperationGrant {
 
     pub fn new_with_ttl(
         profile_name: String,
-        profile_id: [u8; 16],
+        profile_identity: GrantProfileIdentity,
         operations: Vec<String>,
         budget: u32,
         holder_key: &VerifyingKey,
@@ -95,6 +119,10 @@ impl OperationGrant {
                     .chars()
                     .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':')),
             "grant profile name must satisfy the vault profile-name rules"
+        );
+        ensure!(
+            profile_identity.generation > 0,
+            "grant profile generation must be non-zero"
         );
         ensure!(
             (1..=GRANT_BUDGET_CAP).contains(&budget),
@@ -122,7 +150,8 @@ impl OperationGrant {
         Ok(Self {
             grant_id,
             profile_name,
-            profile_id,
+            profile_id: profile_identity.profile_id,
+            profile_generation: profile_identity.generation,
             operations,
             budget,
             issued_unix_ms: now_unix_ms,
@@ -142,6 +171,10 @@ impl OperationGrant {
     /// Revalidate serialized grant metadata before using it for a monotonic
     /// registry deadline or accepting it from a protected grant file.
     pub fn policy_ttl(&self) -> Result<Duration> {
+        ensure!(
+            self.profile_generation > 0,
+            "grant profile generation must be non-zero"
+        );
         let millis = self
             .expires_unix_ms
             .checked_sub(self.issued_unix_ms)
@@ -272,7 +305,7 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let grant = OperationGrant::new(
             "prod".into(),
-            [9_u8; 16],
+            GrantProfileIdentity::new([9_u8; 16], 7),
             vec!["exec".into()],
             10,
             &key.verifying_key(),
@@ -340,7 +373,7 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let grant = OperationGrant::new(
             "prod".into(),
-            [9_u8; 16],
+            GrantProfileIdentity::new([9_u8; 16], 7),
             vec!["exec".into()],
             5,
             &key.verifying_key(),
@@ -368,7 +401,7 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         assert!(OperationGrant::new(
             "prod".into(),
-            [9_u8; 16],
+            GrantProfileIdentity::new([9_u8; 16], 7),
             Vec::new(),
             5,
             &key.verifying_key(),
@@ -377,7 +410,16 @@ mod tests {
         .is_err());
         assert!(OperationGrant::new(
             "prod".into(),
-            [9_u8; 16],
+            GrantProfileIdentity::new([9_u8; 16], 0),
+            vec!["exec".into()],
+            1,
+            &key.verifying_key(),
+            1_000,
+        )
+        .is_err());
+        assert!(OperationGrant::new(
+            "prod".into(),
+            GrantProfileIdentity::new([9_u8; 16], 7),
             vec!["exec".into()],
             GRANT_BUDGET_CAP + 1,
             &key.verifying_key(),
@@ -392,7 +434,7 @@ mod tests {
         for expected_ttl in [GRANT_MIN_TTL, GRANT_DEFAULT_TTL, GRANT_MAX_TTL] {
             let grant = OperationGrant::new_with_ttl(
                 "prod".into(),
-                [9_u8; 16],
+                GrantProfileIdentity::new([9_u8; 16], 7),
                 vec!["exec".into()],
                 1,
                 &key.verifying_key(),
@@ -412,11 +454,20 @@ mod tests {
             assert_eq!(decoded.issued_unix_ms, grant.issued_unix_ms);
             assert_eq!(decoded.expires_unix_ms, grant.expires_unix_ms);
             assert_eq!(decoded.grant_id, grant.grant_id);
+            assert_eq!(decoded.profile_generation, 7);
+
+            let mut missing_generation: serde_json::Value =
+                serde_json::from_slice(&encoded).unwrap();
+            missing_generation
+                .as_object_mut()
+                .unwrap()
+                .remove("profile_generation");
+            assert!(serde_json::from_value::<OperationGrant>(missing_generation).is_err());
         }
 
         let default_grant = OperationGrant::new(
             "prod".into(),
-            [9_u8; 16],
+            GrantProfileIdentity::new([9_u8; 16], 7),
             vec!["exec".into()],
             1,
             &key.verifying_key(),
@@ -435,7 +486,7 @@ mod tests {
         ] {
             assert!(OperationGrant::new_with_ttl(
                 "prod".into(),
-                [9_u8; 16],
+                GrantProfileIdentity::new([9_u8; 16], 7),
                 vec!["exec".into()],
                 1,
                 &key.verifying_key(),
@@ -447,7 +498,7 @@ mod tests {
 
         assert!(OperationGrant::new_with_ttl(
             "prod".into(),
-            [9_u8; 16],
+            GrantProfileIdentity::new([9_u8; 16], 7),
             vec!["exec".into()],
             1,
             &key.verifying_key(),
@@ -462,7 +513,7 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let grant = OperationGrant::new_with_ttl(
             "prod".into(),
-            [9_u8; 16],
+            GrantProfileIdentity::new([9_u8; 16], 7),
             vec!["exec".into()],
             1,
             &key.verifying_key(),

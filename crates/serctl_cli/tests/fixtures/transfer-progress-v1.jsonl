@@ -1,0 +1,1 @@
+{"schema_version":1,"event":"progress","transfer_id":"00000000000000000000000000000001","direction":"push","stage":"transferring","total_bytes":1048576,"confirmed_bytes":262144,"durable_bytes":262144,"window_bps":131072.0,"average_bps":65536.0,"eta_ms":12000,"backend":"sftp_fallback","chunk_bytes":2048,"window_bytes":2048,"updated_unix_ms":1700000000000}

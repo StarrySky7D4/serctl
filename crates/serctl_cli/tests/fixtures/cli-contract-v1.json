@@ -1,0 +1,39 @@
+{
+  "contract_version": 1,
+  "defaults": {
+    "add_port": 22,
+    "command_without_subcommand": "ui",
+    "download_timeout_secs": 300,
+    "exec_timeout_secs": 300,
+    "grant_budget": 32,
+    "grant_ttl_minutes": 30,
+    "transfer_backend": "auto",
+    "transfer_deadline_secs": null,
+    "transfer_idle_timeout_secs": 30,
+    "transfer_progress": "auto",
+    "transfer_resume": "never",
+    "tunnel_max_connections": 32,
+    "tunnel_port": 0,
+    "upload_timeout_secs": 300
+  },
+  "error_categories": [
+    "agent.invalid_request",
+    "agent.operation_failed",
+    "agent.schema_unsupported",
+    "agent.scope_denied"
+  ],
+  "exit_codes": {
+    "clap_help": 0,
+    "clap_invalid_usage": 2,
+    "local_failure": 1,
+    "unix_remote_7": 7,
+    "unix_remote_out_of_range": 1,
+    "windows_remote_nonzero": 1
+  },
+  "schemas": {
+    "agent_jsonl": 1,
+    "audit_checkpoint": 1,
+    "ipc": 9,
+    "transfer_progress_ndjson": 1
+  }
+}

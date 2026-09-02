@@ -28,6 +28,11 @@ pub const MAX_REQUEST_FRAME: usize = 512 * 1024;
 pub const MAX_UPLOAD_FRAME: usize = 128 * 1024;
 pub const MAX_SHELL_FRAME: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME: usize = 16 * 1024 * 1024;
+/// Largest file-data payload carried by one local IPC frame for the native
+/// transfer backend. This is deliberately independent from the much smaller
+/// SFTP safety cap: native frames have their own bounded parser, per-chunk
+/// digest, and cumulative helper acknowledgement.
+pub const NATIVE_IPC_CHUNK_BYTES: usize = 32 * 1024;
 pub const MAX_COMMAND_OUTPUT: usize = 8 * 1024 * 1024;
 pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 pub const MAX_EXEC_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
@@ -35,7 +40,12 @@ pub const DEFAULT_SFTP_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 pub const MAX_SFTP_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 pub const DEFAULT_TRANSFER_IDLE_TIMEOUT_MS: u64 = 30 * 1000;
 pub const TRANSFER_PROGRESS_SCHEMA_VERSION: u16 = 1;
+pub const TUNNEL_STATUS_SCHEMA_VERSION: u16 = 1;
 pub const SFTP_SAFE_CHUNK_BYTES: usize = 2 * 1024;
+pub const NATIVE_HELPER_BINARY_NAME: &str = "serctl-xfer";
+pub const NATIVE_HELPER_PROTOCOL_VERSION: u16 = 1;
+pub const MAX_NATIVE_HELPER_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_NATIVE_HELPER_VERSION_BYTES: usize = 256;
 
 fn default_exec_timeout_ms() -> u64 {
     DEFAULT_EXEC_TIMEOUT_MS
@@ -49,12 +59,67 @@ fn default_transfer_idle_timeout_ms() -> u64 {
     DEFAULT_TRANSFER_IDLE_TIMEOUT_MS
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 /// Opaque, random identifier for one transfer. It is deliberately unrelated
 /// to a path, profile name, or credential so progress snapshots can be shown
 /// without disclosing sensitive request fields.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct TransferId(String);
+
+impl<'de> Deserialize<'de> for TransferId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Opaque daemon-authenticated binding for one accepted operation. The value
+/// is derived by the daemon from a private per-boot key and canonical request,
+/// profile, connection-attempt, and object material; callers may only echo it
+/// back for scoped status/cancellation requests.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct OperationContextId(String);
+
+impl<'de> Deserialize<'de> for OperationContextId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl OperationContextId {
+    pub fn parse(value: &str) -> Result<Self> {
+        ensure!(
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "operation context id must contain 64 lowercase hex characters"
+        );
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Zeroize for OperationContextId {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl TransferId {
     pub fn random() -> Self {
@@ -73,6 +138,45 @@ impl TransferId {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
             "transfer id must contain 32 lowercase hex characters"
+        );
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Opaque daemon-instance-local identifier for one managed tunnel. It never
+/// contains a profile name, endpoint, or credential-derived material.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct TunnelId(String);
+
+impl<'de> Deserialize<'de> for TunnelId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl TunnelId {
+    pub fn random() -> Self {
+        let mut bytes = [0_u8; 16];
+        OsRng.fill_bytes(&mut bytes);
+        Self(hex::encode(bytes))
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        ensure!(
+            value.len() == 32
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "tunnel id must contain 32 lowercase hex characters"
         );
         Ok(Self(value.to_owned()))
     }
@@ -114,6 +218,84 @@ pub enum TransferBackend {
     SftpFallback,
 }
 
+/// Exact public identity expected from the fixed Linux native-transfer helper.
+///
+/// This record is part of the authenticated transfer root request. Formal
+/// runners may populate it only from the verified downloaded Linux platform
+/// provenance; it is never a path from which the daemon reads bytes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedNativeHelperIdentity {
+    pub name: String,
+    pub binary_size: u64,
+    pub sha256: String,
+    pub version: String,
+}
+
+impl ExpectedNativeHelperIdentity {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.name == NATIVE_HELPER_BINARY_NAME,
+            "expected native helper name mismatch"
+        );
+        ensure!(
+            (1..=MAX_NATIVE_HELPER_BINARY_BYTES).contains(&self.binary_size),
+            "expected native helper binary size is invalid"
+        );
+        ensure!(
+            self.sha256.len() == 64
+                && self
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "expected native helper SHA-256 must contain 64 lowercase hex characters"
+        );
+        ensure!(
+            !self.version.is_empty()
+                && self.version.len() <= MAX_NATIVE_HELPER_VERSION_BYTES
+                && self.version.is_ascii()
+                && !self.version.bytes().any(|byte| byte.is_ascii_control()),
+            "expected native helper version identity is invalid"
+        );
+        let prefix = format!("{NATIVE_HELPER_BINARY_NAME} ");
+        let suffix = format!("; transfer protocol v{NATIVE_HELPER_PROTOCOL_VERSION})");
+        let body = self
+            .version
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(&suffix))
+            .context("expected native helper version identity grammar mismatch")?;
+        let (release_version, commit) = body
+            .split_once(" (git ")
+            .context("expected native helper version identity grammar mismatch")?;
+        ensure!(
+            !release_version.is_empty()
+                && release_version.len() <= 64
+                && release_version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')),
+            "expected native helper release version is invalid"
+        );
+        let commit_hex = commit.strip_suffix("-dirty").unwrap_or(commit);
+        ensure!(
+            commit_hex.len() == 12
+                && commit_hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "expected native helper commit identity is invalid"
+        );
+        Ok(())
+    }
+}
+
+impl Zeroize for ExpectedNativeHelperIdentity {
+    fn zeroize(&mut self) {
+        self.name.zeroize();
+        self.binary_size.zeroize();
+        self.sha256.zeroize();
+        self.version.zeroize();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferResumeMode {
@@ -131,6 +313,14 @@ pub struct TransferProgress {
     pub schema_version: u16,
     pub event: String,
     pub transfer_id: TransferId,
+    /// Present for Grant-backed operations after the daemon has accepted the
+    /// root intent against an authenticated SSH transport. Direct interactive
+    /// profile operations intentionally remain compatible with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_context_id: Option<OperationContextId>,
+    /// Daemon-owned monotonic revision of this retained transfer snapshot.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub revision: u64,
     pub direction: TransferDirection,
     pub stage: TransferStage,
     pub total_bytes: u64,
@@ -160,6 +350,10 @@ impl TransferProgress {
         ensure!(
             self.durable_bytes <= self.confirmed_bytes,
             "durable bytes exceed confirmed"
+        );
+        ensure!(
+            self.operation_context_id.is_none() || self.revision > 0,
+            "context-bound transfer progress requires a positive revision"
         );
         ensure!(
             self.window_bps.is_finite() && self.window_bps >= 0.0,
@@ -282,6 +476,95 @@ pub struct TunnelReady {
     pub mode: TunnelMode,
     pub bind_host: String,
     pub bind_port: u16,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelStage {
+    Ready,
+    Cancelling,
+    Closed,
+    Unknown,
+}
+
+/// Sanitized snapshot for a daemon-managed tunnel. Both exposed endpoints are
+/// mechanically restricted to IPv4 loopback; no remote host or profile name
+/// is carried in a status response.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelStatus {
+    pub schema_version: u16,
+    pub tunnel_id: TunnelId,
+    pub profile_id: String,
+    pub profile_generation: u64,
+    pub mode: TunnelMode,
+    pub bind_host: String,
+    pub bind_port: u16,
+    pub target_host: Option<String>,
+    pub target_port: u16,
+    pub deadline_unix_ms: u64,
+    pub stage: TunnelStage,
+    pub updated_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_context_id: Option<OperationContextId>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub revision: u64,
+}
+
+impl TunnelStatus {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema_version == TUNNEL_STATUS_SCHEMA_VERSION,
+            "unsupported tunnel status schema version"
+        );
+        TunnelId::parse(self.tunnel_id.as_str())?;
+        ensure!(
+            self.profile_id.len() == 32
+                && self
+                    .profile_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "tunnel profile id must contain 32 lowercase hex characters"
+        );
+        ensure!(
+            self.profile_generation > 0,
+            "tunnel profile generation is invalid"
+        );
+        ensure!(
+            self.bind_host == "127.0.0.1",
+            "tunnel bind host must be IPv4 loopback"
+        );
+        ensure!(self.bind_port > 0, "tunnel bind port must be non-zero");
+        match self.mode {
+            TunnelMode::Local | TunnelMode::Remote => {
+                ensure!(
+                    self.target_host.as_deref() == Some("127.0.0.1"),
+                    "fixed tunnel target host must be IPv4 loopback"
+                );
+                ensure!(
+                    self.target_port > 0,
+                    "fixed tunnel target port must be non-zero"
+                );
+            }
+            TunnelMode::Dynamic => {
+                ensure!(
+                    self.target_host.is_none(),
+                    "dynamic tunnel has no fixed target host"
+                );
+                ensure!(
+                    self.target_port == 0,
+                    "dynamic tunnel has no fixed target port"
+                );
+            }
+        }
+        ensure!(self.deadline_unix_ms > 0, "tunnel deadline is invalid");
+        ensure!(self.updated_unix_ms > 0, "tunnel update time is invalid");
+        ensure!(
+            self.operation_context_id.is_some() == (self.revision > 0),
+            "tunnel operation context and revision must appear together"
+        );
+        Ok(())
+    }
 }
 
 /// One directory listing entry transferred over the IPC wire.
@@ -743,8 +1026,78 @@ pub struct WireProfile {
     pub profile_id: String,
 }
 
+pub const MAX_SSH_SERVER_IDENTIFICATION_BYTES: usize = 128;
+
+/// Closed, bounded identity of one authenticated SSH transport. This type
+/// intentionally has no endpoint, username, path, pre-banner, or raw-banner
+/// field.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SshConnectionIdentity {
+    pub profile_id: [u8; 16],
+    pub profile_generation: u64,
+    pub observed_host_key_sha256: String,
+    pub pin_match: bool,
+    pub server_identification: String,
+    pub transport_attempt_id: String,
+    /// Present only for a Grant-backed accepted root operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_context_id: Option<OperationContextId>,
+    /// Daemon-owned revision of this one-shot result. It is `1` when the
+    /// operation context is present and `0` on the ordinary CLI path.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub revision: u64,
+}
+
+impl SshConnectionIdentity {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.profile_generation > 0,
+            "SSH connection identity profile generation must be positive"
+        );
+        let fingerprint = self
+            .observed_host_key_sha256
+            .strip_prefix("SHA256:")
+            .context("SSH connection identity host key must start with SHA256:")?;
+        ensure!(
+            fingerprint.len() == 43
+                && fingerprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/')),
+            "SSH connection identity host key must be canonical SHA256 Base64"
+        );
+        ensure!(
+            self.pin_match,
+            "SSH connection identity must represent a matching host-key pin"
+        );
+        ensure!(
+            self.operation_context_id.is_some() == (self.revision > 0),
+            "SSH connection identity context and revision are inconsistent"
+        );
+        ensure!(
+            self.server_identification.len() <= MAX_SSH_SERVER_IDENTIFICATION_BYTES
+                && (self.server_identification.starts_with("SSH-2.0-")
+                    || self.server_identification.starts_with("SSH-1.99-"))
+                && self
+                    .server_identification
+                    .bytes()
+                    .all(|byte| matches!(byte, 0x21..=0x7e)),
+            "SSH connection identity server identification is unsafe or oversized"
+        );
+        ensure!(
+            self.transport_attempt_id.len() == 32
+                && self
+                    .transport_attempt_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F')),
+            "SSH connection identity transport attempt id must be 32 uppercase hex characters"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "t", content = "d")]
+#[serde(tag = "t", content = "d", deny_unknown_fields)]
 pub enum Frame {
     // client -> daemon
     AuthHello {
@@ -805,6 +1158,10 @@ pub enum Frame {
     /// v6 response: the issued grant id and its absolute expiry.
     GrantIssued {
         grant_id: String,
+        /// Exact vault generation captured by the daemon from the bound pool
+        /// entry. The client must persist this value rather than a catalog
+        /// snapshot taken before unlock.
+        profile_generation: u64,
         issued_unix_ms: u64,
         expires_unix_ms: u64,
     },
@@ -821,6 +1178,12 @@ pub enum Frame {
     Download {
         transfer_id: TransferId,
         path: String,
+        /// SHA-256 commitment to the caller-selected local destination.
+        /// The raw local path never crosses IPC, but a grant proof binds this
+        /// download to one exact local target instead of only the remote
+        /// source. Legacy/profile-passphrase clients may omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_target_sha256: Option<String>,
         backend: TransferBackend,
         resume: TransferResumeMode,
         /// Locally durable prefix requested for native pull resume.
@@ -828,6 +1191,8 @@ pub enum Frame {
         /// Prior remote identity proof from the protected download journal.
         expected_size: Option<u64>,
         expected_sha256: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_helper_identity: Option<Box<ExpectedNativeHelperIdentity>>,
         #[serde(default = "default_transfer_idle_timeout_ms")]
         idle_timeout_ms: u64,
         deadline_ms: Option<u64>,
@@ -844,6 +1209,8 @@ pub enum Frame {
         /// `resume=auto`; it is protected by the IPC AEAD and never persisted
         /// by the daemon or remote helper in recoverable form.
         resume_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_helper_identity: Option<Box<ExpectedNativeHelperIdentity>>,
         #[serde(default = "default_transfer_idle_timeout_ms")]
         idle_timeout_ms: u64,
         deadline_ms: Option<u64>,
@@ -855,14 +1222,36 @@ pub enum Frame {
     UploadEnd,
     TransferStatus {
         transfer_id: Option<TransferId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_context_id: Option<OperationContextId>,
     },
     TransferCancel {
         transfer_id: TransferId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_context_id: Option<OperationContextId>,
     },
     TunnelOpen {
         spec: TunnelSpec,
     },
     TunnelStop,
+    ManagedTunnelOpen {
+        spec: TunnelSpec,
+        deadline_unix_ms: u64,
+    },
+    ManagedTunnelStatus {
+        tunnel_id: Option<TunnelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_context_id: Option<OperationContextId>,
+    },
+    ManagedTunnelCancel {
+        tunnel_id: TunnelId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_context_id: Option<OperationContextId>,
+    },
+    ConnectionIdentity {
+        profile_id: [u8; 16],
+        profile_generation: u64,
+    },
     // daemon -> client
     AuthChallenge {
         version: u16,
@@ -882,6 +1271,10 @@ pub enum Frame {
     },
     ExecExit {
         code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_context_id: Option<OperationContextId>,
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        revision: u64,
     },
     ShellOut {
         #[serde(with = "base64_bytes")]
@@ -897,8 +1290,18 @@ pub enum Frame {
         host: String,
         user: String,
         started_unix: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_context_id: Option<OperationContextId>,
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        revision: u64,
     },
     Ack,
+    CreateDirAccepted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_context_id: Option<OperationContextId>,
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        revision: u64,
+    },
     /// Client-to-daemon cumulative acknowledgement for native downloads.
     /// `confirmed_bytes` means the bytes were accepted by the stable local
     /// handle; `durable_bytes` advances only after local sync and journal
@@ -910,6 +1313,10 @@ pub enum Frame {
     DirList {
         path: String,
         entries: Vec<RemoteEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_context_id: Option<OperationContextId>,
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        revision: u64,
     },
     FileChunk {
         #[serde(with = "base64_bytes")]
@@ -928,10 +1335,25 @@ pub enum Frame {
     TransferStatusInfo {
         transfers: Vec<TransferProgress>,
     },
+    TransferCancelAccepted {
+        progress: TransferProgress,
+    },
     TunnelReady {
         ready: TunnelReady,
     },
     TunnelClosed,
+    ManagedTunnelOpened {
+        status: TunnelStatus,
+    },
+    ManagedTunnelStatusInfo {
+        tunnels: Vec<TunnelStatus>,
+    },
+    ManagedTunnelTerminal {
+        status: TunnelStatus,
+    },
+    ConnectionIdentityInfo {
+        identity: SshConnectionIdentity,
+    },
     Error {
         msg: String,
     },
@@ -976,24 +1398,49 @@ impl Zeroize for Frame {
             Frame::ListDir { path, .. } | Frame::CreateDir { path, .. } => path.zeroize(),
             Frame::Download {
                 path,
+                local_target_sha256,
                 expected_sha256,
+                expected_helper_identity,
                 ..
             } => {
                 path.zeroize();
+                local_target_sha256.zeroize();
                 expected_sha256.zeroize();
+                if let Some(mut expected) = expected_helper_identity.take() {
+                    expected.zeroize();
+                }
             }
             Frame::UploadBegin {
                 path,
                 sha256,
                 resume_token,
+                expected_helper_identity,
                 ..
             } => {
                 path.zeroize();
                 sha256.zeroize();
                 resume_token.zeroize();
+                if let Some(mut expected) = expected_helper_identity.take() {
+                    expected.zeroize();
+                }
             }
             Frame::TransferDigest { sha256, .. } => sha256.zeroize(),
             Frame::TunnelReady { ready } => ready.bind_host.zeroize(),
+            Frame::ManagedTunnelOpened { status } | Frame::ManagedTunnelTerminal { status } => {
+                status.profile_id.zeroize();
+                status.bind_host.zeroize();
+                status.target_host.zeroize();
+                status.operation_context_id.zeroize();
+            }
+            Frame::ManagedTunnelStatusInfo { tunnels } => {
+                for status in tunnels.iter_mut() {
+                    status.profile_id.zeroize();
+                    status.bind_host.zeroize();
+                    status.target_host.zeroize();
+                    status.operation_context_id.zeroize();
+                }
+                tunnels.clear();
+            }
             Frame::AuthChallenge {
                 server_nonce,
                 server_proof,
@@ -1008,19 +1455,27 @@ impl Zeroize for Frame {
                 profile,
                 host,
                 user,
+                operation_context_id,
                 ..
             } => {
                 profile.zeroize();
                 host.zeroize();
                 user.zeroize();
+                operation_context_id.zeroize();
             }
-            Frame::DirList { path, entries } => {
+            Frame::DirList {
+                path,
+                entries,
+                operation_context_id,
+                ..
+            } => {
                 path.zeroize();
                 for entry in entries.iter_mut() {
                     entry.name.zeroize();
                     entry.path.zeroize();
                 }
                 entries.clear();
+                operation_context_id.zeroize();
             }
             Frame::Error { msg } => msg.zeroize(),
             Frame::Unlock { passphrase } | Frame::Shutdown { passphrase } => passphrase.zeroize(),
@@ -1035,6 +1490,22 @@ impl Zeroize for Frame {
                 holder_key.zeroize();
             }
             Frame::GrantIssued { grant_id, .. } => grant_id.zeroize(),
+            Frame::TransferStatus {
+                operation_context_id,
+                ..
+            }
+            | Frame::TransferCancel {
+                operation_context_id,
+                ..
+            }
+            | Frame::ManagedTunnelStatus {
+                operation_context_id,
+                ..
+            }
+            | Frame::ManagedTunnelCancel {
+                operation_context_id,
+                ..
+            } => operation_context_id.zeroize(),
             Frame::ProfileList { profiles } => {
                 for entry in profiles.iter_mut() {
                     entry.name.zeroize();
@@ -1046,21 +1517,38 @@ impl Zeroize for Frame {
             Frame::TransferStatusInfo { transfers } => {
                 for transfer in transfers.iter_mut() {
                     transfer.event.zeroize();
+                    transfer.operation_context_id.zeroize();
                 }
                 transfers.clear();
             }
-            Frame::TransferProgress { progress } => progress.event.zeroize(),
+            Frame::TransferProgress { progress } | Frame::TransferCancelAccepted { progress } => {
+                progress.event.zeroize();
+                progress.operation_context_id.zeroize();
+            }
+            Frame::ConnectionIdentityInfo { identity } => {
+                identity.observed_host_key_sha256.zeroize();
+                identity.server_identification.zeroize();
+                identity.transport_attempt_id.zeroize();
+                identity.operation_context_id.zeroize();
+            }
+            Frame::ExecExit {
+                operation_context_id,
+                ..
+            }
+            | Frame::CreateDirAccepted {
+                operation_context_id,
+                ..
+            } => operation_context_id.zeroize(),
             Frame::Shell { .. }
             | Frame::TunnelOpen { .. }
+            | Frame::ManagedTunnelOpen { .. }
             | Frame::AuthAccepted
             | Frame::Status
             | Frame::ListProfiles
             | Frame::UploadEnd
-            | Frame::TransferStatus { .. }
-            | Frame::TransferCancel { .. }
             | Frame::TunnelStop
             | Frame::TunnelClosed
-            | Frame::ExecExit { .. }
+            | Frame::ConnectionIdentity { .. }
             | Frame::ShellClosed
             | Frame::Ack
             | Frame::TransferAck { .. }
@@ -1123,6 +1611,23 @@ fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn update_expected_native_helper_identity(
+    digest: &mut Sha256,
+    expected: Option<&ExpectedNativeHelperIdentity>,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        digest.update([0]);
+        return Ok(());
+    };
+    expected.validate()?;
+    digest.update([1]);
+    update_length_prefixed(digest, expected.name.as_bytes())?;
+    digest.update(expected.binary_size.to_be_bytes());
+    update_length_prefixed(digest, expected.sha256.as_bytes())?;
+    update_length_prefixed(digest, expected.version.as_bytes())?;
+    Ok(())
+}
+
 /// Hash only complete root requests. Streaming continuation and response
 /// frames can inherit an already-authorized root operation but can never be
 /// authorized independently.
@@ -1164,23 +1669,36 @@ fn canonical_request_digest(frame: &Frame) -> Result<Zeroizing<[u8; 32]>> {
         Frame::Download {
             transfer_id,
             path,
+            local_target_sha256,
             backend,
             resume,
             resume_offset,
             expected_size,
             expected_sha256,
+            expected_helper_identity,
             idle_timeout_ms,
             deadline_ms,
         } => {
             digest.update([7]);
             update_length_prefixed(&mut digest, transfer_id.as_str().as_bytes())?;
             update_length_prefixed(&mut digest, path.as_bytes())?;
+            update_length_prefixed(
+                &mut digest,
+                local_target_sha256
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            )?;
             digest.update([*backend as u8, *resume as u8]);
             digest.update(resume_offset.to_be_bytes());
             digest.update(expected_size.unwrap_or(0).to_be_bytes());
             update_length_prefixed(
                 &mut digest,
                 expected_sha256.as_deref().unwrap_or_default().as_bytes(),
+            )?;
+            update_expected_native_helper_identity(
+                &mut digest,
+                expected_helper_identity.as_deref(),
             )?;
             digest.update(idle_timeout_ms.to_be_bytes());
             digest.update(deadline_ms.unwrap_or(0).to_be_bytes());
@@ -1193,6 +1711,7 @@ fn canonical_request_digest(frame: &Frame) -> Result<Zeroizing<[u8; 32]>> {
             backend,
             resume,
             resume_token,
+            expected_helper_identity,
             idle_timeout_ms,
             deadline_ms,
         } => {
@@ -1205,6 +1724,10 @@ fn canonical_request_digest(frame: &Frame) -> Result<Zeroizing<[u8; 32]>> {
             update_length_prefixed(
                 &mut digest,
                 resume_token.as_deref().unwrap_or_default().as_bytes(),
+            )?;
+            update_expected_native_helper_identity(
+                &mut digest,
+                expected_helper_identity.as_deref(),
             )?;
             digest.update(idle_timeout_ms.to_be_bytes());
             digest.update(deadline_ms.unwrap_or(0).to_be_bytes());
@@ -1220,17 +1743,93 @@ fn canonical_request_digest(frame: &Frame) -> Result<Zeroizing<[u8; 32]>> {
             digest.update(spec.target_port.to_be_bytes());
             digest.update(spec.max_connections.to_be_bytes());
         }
-        Frame::TransferStatus { transfer_id } => {
+        Frame::TransferStatus {
+            transfer_id,
+            operation_context_id,
+        } => {
             digest.update([12]);
             if let Some(transfer_id) = transfer_id {
                 update_length_prefixed(&mut digest, transfer_id.as_str().as_bytes())?;
             } else {
                 update_length_prefixed(&mut digest, &[])?;
             }
+            if let Some(operation_context_id) = operation_context_id {
+                update_length_prefixed(&mut digest, operation_context_id.as_str().as_bytes())?;
+            } else {
+                update_length_prefixed(&mut digest, &[])?;
+            }
         }
-        Frame::TransferCancel { transfer_id } => {
+        Frame::TransferCancel {
+            transfer_id,
+            operation_context_id,
+        } => {
             digest.update([13]);
             update_length_prefixed(&mut digest, transfer_id.as_str().as_bytes())?;
+            if let Some(operation_context_id) = operation_context_id {
+                update_length_prefixed(&mut digest, operation_context_id.as_str().as_bytes())?;
+            } else {
+                update_length_prefixed(&mut digest, &[])?;
+            }
+        }
+        Frame::ManagedTunnelOpen {
+            spec,
+            deadline_unix_ms,
+        } => {
+            digest.update([14]);
+            digest.update([match spec.mode {
+                TunnelMode::Local => 1,
+                TunnelMode::Remote => 2,
+                TunnelMode::Dynamic => 3,
+            }]);
+            digest.update(spec.bind_port.to_be_bytes());
+            digest.update(spec.target_port.to_be_bytes());
+            digest.update(spec.max_connections.to_be_bytes());
+            digest.update(deadline_unix_ms.to_be_bytes());
+        }
+        Frame::ManagedTunnelStatus {
+            tunnel_id,
+            operation_context_id,
+        } => {
+            digest.update([15]);
+            update_length_prefixed(
+                &mut digest,
+                tunnel_id
+                    .as_ref()
+                    .map(TunnelId::as_str)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            )?;
+            update_length_prefixed(
+                &mut digest,
+                operation_context_id
+                    .as_ref()
+                    .map(OperationContextId::as_str)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            )?;
+        }
+        Frame::ManagedTunnelCancel {
+            tunnel_id,
+            operation_context_id,
+        } => {
+            digest.update([16]);
+            update_length_prefixed(&mut digest, tunnel_id.as_str().as_bytes())?;
+            update_length_prefixed(
+                &mut digest,
+                operation_context_id
+                    .as_ref()
+                    .map(OperationContextId::as_str)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            )?;
+        }
+        Frame::ConnectionIdentity {
+            profile_id,
+            profile_generation,
+        } => {
+            digest.update([17]);
+            digest.update(profile_id);
+            digest.update(profile_generation.to_be_bytes());
         }
         _ => bail!("IPC frame is not an authorizable root request"),
     }
@@ -1846,6 +2445,363 @@ mod tests {
         [0xa5_u8; 32]
     }
 
+    fn expected_native_helper_identity() -> ExpectedNativeHelperIdentity {
+        ExpectedNativeHelperIdentity {
+            name: NATIVE_HELPER_BINARY_NAME.to_owned(),
+            binary_size: 123,
+            sha256: "ab".repeat(32),
+            version: "serctl-xfer 1.0.0-beta (git 0123456789ab; transfer protocol v1)".to_owned(),
+        }
+    }
+
+    #[test]
+    fn expected_native_helper_identity_is_closed_bounded_and_canonical() {
+        expected_native_helper_identity().validate().unwrap();
+        for mut invalid in [
+            {
+                let mut value = expected_native_helper_identity();
+                value.name = "serctl-xfer.exe".to_owned();
+                value
+            },
+            {
+                let mut value = expected_native_helper_identity();
+                value.binary_size = 0;
+                value
+            },
+            {
+                let mut value = expected_native_helper_identity();
+                value.sha256 = "AB".repeat(32);
+                value
+            },
+            {
+                let mut value = expected_native_helper_identity();
+                value.version = value.version.replace("0123456789ab", "0123456789AB");
+                value
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+            invalid.zeroize();
+        }
+        for json in [
+            format!(
+                r#"{{"name":"serctl-xfer","binary_size":123,"sha256":"{}","version":"serctl-xfer 1.0.0-beta (git 0123456789ab; transfer protocol v1)","future":true}}"#,
+                "ab".repeat(32)
+            ),
+            format!(
+                r#"{{"name":"serctl-xfer","binary_size":"123","sha256":"{}","version":"serctl-xfer 1.0.0-beta (git 0123456789ab; transfer protocol v1)"}}"#,
+                "ab".repeat(32)
+            ),
+        ] {
+            assert!(serde_json::from_str::<ExpectedNativeHelperIdentity>(&json).is_err());
+        }
+    }
+
+    fn connection_identity(server_identification: &str, attempt: &str) -> SshConnectionIdentity {
+        SshConnectionIdentity {
+            profile_id: [7_u8; 16],
+            profile_generation: 9,
+            observed_host_key_sha256: format!("SHA256:{}", "A".repeat(43)),
+            pin_match: true,
+            server_identification: server_identification.to_owned(),
+            transport_attempt_id: attempt.to_owned(),
+            operation_context_id: None,
+            revision: 0,
+        }
+    }
+
+    #[test]
+    fn ssh_connection_identity_wire_is_closed_bounded_and_sanitized() {
+        for server in ["SSH-2.0-OpenSSH_9.6p1", "SSH-2.0-dropbear_2024.85"] {
+            let identity = connection_identity(server, &"A".repeat(32));
+            identity.validate().unwrap();
+            let frame = Frame::ConnectionIdentityInfo { identity };
+            assert!(encoded_frame_len_limited(&frame, MAX_CONTROL_FRAME).is_ok());
+            let json = serde_json::to_string(&frame).unwrap();
+            for forbidden in ["host\"", "user", "password", "path", "raw_banner"] {
+                assert!(!json.contains(forbidden));
+            }
+        }
+
+        for invalid in [
+            connection_identity("SSH-2.0-OpenSSH_9.6p1\nraw", &"A".repeat(32)),
+            connection_identity(&format!("SSH-2.0-{}", "x".repeat(121)), &"A".repeat(32)),
+            connection_identity("SSH-2.0-OpenSSH_9.6p1", &"a".repeat(32)),
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+        let mut mismatch = connection_identity("SSH-2.0-OpenSSH_9.6p1", &"A".repeat(32));
+        mismatch.pin_match = false;
+        assert!(mismatch.validate().is_err());
+
+        let mut context_bound = connection_identity("SSH-2.0-OpenSSH_9.6p1", &"A".repeat(32));
+        context_bound.operation_context_id =
+            Some(OperationContextId::parse(&"ab".repeat(32)).unwrap());
+        context_bound.revision = 1;
+        context_bound.validate().unwrap();
+        let encoded = serde_json::to_string(&Frame::ConnectionIdentityInfo {
+            identity: context_bound.clone(),
+        })
+        .unwrap();
+        assert!(encoded.contains(&format!("\"operation_context_id\":\"{}\"", "ab".repeat(32))));
+        assert!(encoded.contains("\"revision\":1"));
+        context_bound.revision = 0;
+        assert!(context_bound.validate().is_err());
+        context_bound.operation_context_id = None;
+        context_bound.revision = 1;
+        assert!(context_bound.validate().is_err());
+
+        let mut value = serde_json::to_value(Frame::ConnectionIdentityInfo {
+            identity: connection_identity("SSH-2.0-OpenSSH_9.6p1", &"A".repeat(32)),
+        })
+        .unwrap();
+        value["d"]["identity"]["raw_banner"] = serde_json::json!("secret");
+        assert!(serde_json::from_value::<Frame>(value).is_err());
+    }
+
+    #[test]
+    fn ssh_connection_identity_intent_binds_profile_generation_and_attempt_changes() {
+        let key = test_call_key();
+        let request = Frame::ConnectionIdentity {
+            profile_id: [7_u8; 16],
+            profile_generation: 9,
+        };
+        assert_eq!(v6::frame_kind(&request), "ssh.connection-identity");
+        let commitment = request_intent_commitment(&key, &request).unwrap();
+        for substituted in [
+            Frame::ConnectionIdentity {
+                profile_id: [8_u8; 16],
+                profile_generation: 9,
+            },
+            Frame::ConnectionIdentity {
+                profile_id: [7_u8; 16],
+                profile_generation: 10,
+            },
+        ] {
+            assert_ne!(
+                commitment.as_ref(),
+                request_intent_commitment(&key, &substituted)
+                    .unwrap()
+                    .as_ref()
+            );
+        }
+
+        let first = connection_identity("SSH-2.0-OpenSSH_9.6p1", &"A".repeat(32));
+        let reconnected = connection_identity("SSH-2.0-OpenSSH_9.6p1", &"B".repeat(32));
+        first.validate().unwrap();
+        reconnected.validate().unwrap();
+        assert_ne!(first.transport_attempt_id, reconnected.transport_attempt_id);
+    }
+
+    #[test]
+    fn operation_context_is_canonical_and_transfer_control_intent_bound() {
+        let context = OperationContextId::parse(&"ab".repeat(32)).unwrap();
+        for invalid in ["", &"AB".repeat(32), &"ab".repeat(31), &"gg".repeat(32)] {
+            assert!(OperationContextId::parse(invalid).is_err());
+        }
+        let transfer_id = TransferId::parse("01".repeat(16).as_str()).unwrap();
+        let status_without = Frame::TransferStatus {
+            transfer_id: Some(transfer_id.clone()),
+            operation_context_id: None,
+        };
+        let status_with = Frame::TransferStatus {
+            transfer_id: Some(transfer_id.clone()),
+            operation_context_id: Some(context.clone()),
+        };
+        assert_ne!(
+            v6::root_request_hash(&status_without).unwrap(),
+            v6::root_request_hash(&status_with).unwrap()
+        );
+        let cancel = Frame::TransferCancel {
+            transfer_id,
+            operation_context_id: Some(context),
+        };
+        assert_ne!(
+            v6::root_request_hash(&status_with).unwrap(),
+            v6::root_request_hash(&cancel).unwrap()
+        );
+    }
+
+    #[test]
+    fn transfer_id_deserialization_enforces_canonical_shape() {
+        let valid: TransferId =
+            serde_json::from_str("\"00000000000000000000000000000001\"").unwrap();
+        assert_eq!(valid.as_str(), "00000000000000000000000000000001");
+        for invalid in [
+            "\"short\"",
+            "\"0000000000000000000000000000000A\"",
+            "\"0000000000000000000000000000000g\"",
+        ] {
+            assert!(serde_json::from_str::<TransferId>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn managed_tunnel_id_status_and_operation_scope_are_closed_and_loopback_only() {
+        let tunnel_id = TunnelId::parse("00112233445566778899aabbccddeeff").unwrap();
+        for invalid in [
+            "short",
+            "00112233445566778899AABBCCDDEEFF",
+            "00112233445566778899aabbccddee/g",
+        ] {
+            assert!(TunnelId::parse(invalid).is_err());
+        }
+
+        let status = TunnelStatus {
+            schema_version: TUNNEL_STATUS_SCHEMA_VERSION,
+            tunnel_id: tunnel_id.clone(),
+            profile_id: "11223344556677889900aabbccddeeff".into(),
+            profile_generation: 3,
+            mode: TunnelMode::Local,
+            bind_host: "127.0.0.1".into(),
+            bind_port: 8080,
+            target_host: Some("127.0.0.1".into()),
+            target_port: 22,
+            deadline_unix_ms: 1_900_000_000_000,
+            stage: TunnelStage::Ready,
+            updated_unix_ms: 1_800_000_000_000,
+            operation_context_id: Some(OperationContextId::parse(&"ab".repeat(32)).unwrap()),
+            revision: 1,
+        };
+        status.validate().unwrap();
+        let mut exposed = status.clone();
+        exposed.bind_host = "0.0.0.0".into();
+        assert!(exposed.validate().is_err());
+        let mut remote_target = status.clone();
+        remote_target.target_host = Some("192.0.2.1".into());
+        assert!(remote_target.validate().is_err());
+        let mut missing_context = status.clone();
+        missing_context.operation_context_id = None;
+        assert!(missing_context.validate().is_err());
+        let mut missing_revision = status.clone();
+        missing_revision.revision = 0;
+        assert!(missing_revision.validate().is_err());
+
+        for (spec, expected) in [
+            (TunnelSpec::local(8080, 22), "forward.local/open"),
+            (TunnelSpec::remote(8080, 22), "forward.remote/open"),
+            (TunnelSpec::dynamic(8080), "forward.dynamic/open"),
+        ] {
+            assert_eq!(
+                v6::frame_kind(&Frame::ManagedTunnelOpen {
+                    spec,
+                    deadline_unix_ms: status.deadline_unix_ms,
+                }),
+                expected
+            );
+        }
+        assert_eq!(
+            v6::frame_kind(&Frame::ManagedTunnelStatus {
+                tunnel_id: Some(tunnel_id.clone()),
+                operation_context_id: None,
+            }),
+            "forward.status"
+        );
+        assert_eq!(
+            v6::frame_kind(&Frame::ManagedTunnelCancel {
+                tunnel_id,
+                operation_context_id: None,
+            }),
+            "forward.cancel"
+        );
+    }
+
+    #[test]
+    fn managed_tunnel_intent_binds_mode_deadline_and_identifier() {
+        let key = test_call_key();
+        let first = Frame::ManagedTunnelOpen {
+            spec: TunnelSpec::local(8080, 22),
+            deadline_unix_ms: 1_900_000_000_000,
+        };
+        let changed_deadline = Frame::ManagedTunnelOpen {
+            spec: TunnelSpec::local(8080, 22),
+            deadline_unix_ms: 1_900_000_000_001,
+        };
+        let changed_mode = Frame::ManagedTunnelOpen {
+            spec: TunnelSpec::remote(8080, 22),
+            deadline_unix_ms: 1_900_000_000_000,
+        };
+        let baseline = request_intent_commitment(&key, &first).unwrap();
+        assert_ne!(
+            baseline.as_ref(),
+            request_intent_commitment(&key, &changed_deadline)
+                .unwrap()
+                .as_ref()
+        );
+        assert_ne!(
+            baseline.as_ref(),
+            request_intent_commitment(&key, &changed_mode)
+                .unwrap()
+                .as_ref()
+        );
+
+        let left = Frame::ManagedTunnelCancel {
+            tunnel_id: TunnelId::parse("00000000000000000000000000000001").unwrap(),
+            operation_context_id: Some(OperationContextId::parse(&"ab".repeat(32)).unwrap()),
+        };
+        let right = Frame::ManagedTunnelCancel {
+            tunnel_id: TunnelId::parse("00000000000000000000000000000002").unwrap(),
+            operation_context_id: Some(OperationContextId::parse(&"ab".repeat(32)).unwrap()),
+        };
+        assert_ne!(
+            request_intent_commitment(&key, &left).unwrap().as_ref(),
+            request_intent_commitment(&key, &right).unwrap().as_ref()
+        );
+
+        let forged_context = Frame::ManagedTunnelCancel {
+            tunnel_id: TunnelId::parse("00000000000000000000000000000001").unwrap(),
+            operation_context_id: Some(OperationContextId::parse(&"cd".repeat(32)).unwrap()),
+        };
+        assert_ne!(
+            request_intent_commitment(&key, &left).unwrap().as_ref(),
+            request_intent_commitment(&key, &forged_context)
+                .unwrap()
+                .as_ref()
+        );
+
+        let status_discovery = Frame::ManagedTunnelStatus {
+            tunnel_id: Some(TunnelId::parse("00000000000000000000000000000001").unwrap()),
+            operation_context_id: None,
+        };
+        let status_bound = Frame::ManagedTunnelStatus {
+            tunnel_id: Some(TunnelId::parse("00000000000000000000000000000001").unwrap()),
+            operation_context_id: Some(OperationContextId::parse(&"ab".repeat(32)).unwrap()),
+        };
+        assert_ne!(
+            request_intent_commitment(&key, &status_discovery)
+                .unwrap()
+                .as_ref(),
+            request_intent_commitment(&key, &status_bound)
+                .unwrap()
+                .as_ref()
+        );
+    }
+
+    #[test]
+    fn managed_tunnel_status_all_is_bounded_for_daemon_registry_caps() {
+        let tunnels = (0..24)
+            .map(|index| TunnelStatus {
+                schema_version: TUNNEL_STATUS_SCHEMA_VERSION,
+                tunnel_id: TunnelId::parse(&format!("{index:032x}")).unwrap(),
+                profile_id: "11223344556677889900aabbccddeeff".into(),
+                profile_generation: u64::MAX,
+                mode: TunnelMode::Remote,
+                bind_host: "127.0.0.1".into(),
+                bind_port: u16::MAX,
+                target_host: Some("127.0.0.1".into()),
+                target_port: u16::MAX,
+                deadline_unix_ms: u64::MAX,
+                stage: TunnelStage::Unknown,
+                updated_unix_ms: u64::MAX,
+                operation_context_id: Some(
+                    OperationContextId::parse(&format!("{index:064x}")).unwrap(),
+                ),
+                revision: u64::MAX,
+            })
+            .collect();
+        let frame = Frame::ManagedTunnelStatusInfo { tunnels };
+        assert!(serialize_frame_bounded(&frame, MAX_CONTROL_FRAME).is_ok());
+    }
+
     #[tokio::test]
     async fn v5_token_only_mutual_authentication_completes() {
         let (mut client, mut server) = tokio::io::duplex(8 * 1024);
@@ -2029,6 +2985,7 @@ mod tests {
             backend: TransferBackend::Sftp,
             resume: TransferResumeMode::Never,
             resume_token: None,
+            expected_helper_identity: None,
             idle_timeout_ms: 5_000,
             deadline_ms: Some(10_000),
         };
@@ -2040,6 +2997,7 @@ mod tests {
             backend: TransferBackend::Sftp,
             resume: TransferResumeMode::Never,
             resume_token: None,
+            expected_helper_identity: None,
             idle_timeout_ms: 5_000,
             deadline_ms: Some(10_000),
         };
@@ -2051,12 +3009,45 @@ mod tests {
             backend: TransferBackend::Sftp,
             resume: TransferResumeMode::Never,
             resume_token: None,
+            expected_helper_identity: None,
             idle_timeout_ms: 5_001,
             deadline_ms: Some(10_000),
         };
         assert_ne!(
             request_intent_commitment(&key, &first).unwrap().as_ref(),
             request_intent_commitment(&key, &changed_size)
+                .unwrap()
+                .as_ref()
+        );
+        let mut helper_bound = first.clone();
+        let Frame::UploadBegin {
+            expected_helper_identity,
+            ..
+        } = &mut helper_bound
+        else {
+            unreachable!()
+        };
+        *expected_helper_identity = Some(Box::new(expected_native_helper_identity()));
+        assert_ne!(
+            request_intent_commitment(&key, &first).unwrap().as_ref(),
+            request_intent_commitment(&key, &helper_bound)
+                .unwrap()
+                .as_ref()
+        );
+        let mut helper_hash_drift = helper_bound.clone();
+        let Frame::UploadBegin {
+            expected_helper_identity: Some(expected),
+            ..
+        } = &mut helper_hash_drift
+        else {
+            unreachable!()
+        };
+        expected.sha256 = "cd".repeat(32);
+        assert_ne!(
+            request_intent_commitment(&key, &helper_bound)
+                .unwrap()
+                .as_ref(),
+            request_intent_commitment(&key, &helper_hash_drift)
                 .unwrap()
                 .as_ref()
         );
@@ -2126,11 +3117,13 @@ mod tests {
         let download_with = |resume_offset, expected_size, expected_sha256: &str| Frame::Download {
             transfer_id: TransferId::parse("00000000000000000000000000000002").unwrap(),
             path: "/tmp/source".into(),
+            local_target_sha256: Some("33".repeat(32)),
             backend: TransferBackend::Native,
             resume: TransferResumeMode::Auto,
             resume_offset,
             expected_size: Some(expected_size),
             expected_sha256: Some(expected_sha256.repeat(32)),
+            expected_helper_identity: None,
             idle_timeout_ms: 5_000,
             deadline_ms: Some(10_000),
         };
@@ -2146,6 +3139,21 @@ mod tests {
                 request_intent_commitment(&key, &changed).unwrap().as_ref(),
             );
         }
+        let mut changed_local_target = download_with(4_096, 8_192, "11");
+        let Frame::Download {
+            local_target_sha256,
+            ..
+        } = &mut changed_local_target
+        else {
+            unreachable!()
+        };
+        *local_target_sha256 = Some("44".repeat(32));
+        assert_ne!(
+            download_commitment.as_ref(),
+            request_intent_commitment(&key, &changed_local_target)
+                .unwrap()
+                .as_ref(),
+        );
     }
 
     #[test]
@@ -2154,6 +3162,8 @@ mod tests {
             schema_version: TRANSFER_PROGRESS_SCHEMA_VERSION,
             event: "progress".into(),
             transfer_id: TransferId::parse("00000000000000000000000000000001").unwrap(),
+            operation_context_id: Some(OperationContextId::parse(&"ab".repeat(32)).unwrap()),
+            revision: 1,
             direction: TransferDirection::Push,
             stage: TransferStage::Transferring,
             total_bytes: 1024,
@@ -2730,13 +3740,19 @@ mod tests {
 
     #[test]
     fn binary_payloads_use_canonical_base64_and_fit_wire_limits() {
-        let transfer_payload = vec![0xff; 64 * 1024];
+        let transfer_payload = vec![0xff; NATIVE_IPC_CHUNK_BYTES];
         for (frame, maximum) in [
             (
                 Frame::UploadChunk {
                     data: transfer_payload.clone(),
                 },
                 MAX_UPLOAD_FRAME,
+            ),
+            (
+                Frame::FileChunk {
+                    data: transfer_payload.clone(),
+                },
+                MAX_RESPONSE_FRAME,
             ),
             (
                 Frame::ShellInput {
@@ -2749,7 +3765,9 @@ mod tests {
             assert!(encoded.len() <= maximum);
             let decoded: Frame = serde_json::from_slice(&encoded).unwrap();
             let data = match decoded {
-                Frame::UploadChunk { data } | Frame::ShellInput { data } => data,
+                Frame::UploadChunk { data }
+                | Frame::FileChunk { data }
+                | Frame::ShellInput { data } => data,
                 _ => panic!("binary frame changed variant during roundtrip"),
             };
             assert_eq!(data, transfer_payload);
@@ -2777,12 +3795,26 @@ mod tests {
     }
 
     #[test]
+    fn ipc_frame_rejects_unknown_authorization_fields() {
+        assert!(serde_json::from_str::<Frame>(
+            r#"{"t":"Exec","d":{"cmd":"id","timeout_ms":1000,"timeout_mz":999999}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<Frame>(
+            r#"{"t":"IssueGrant","d":{"profile":"prod","operations":["ssh.exec"],"budget":1,"ttl_secs":60,"holder_key":"key","future_scope":"admin"}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn worst_case_valid_status_metadata_fits_control_not_auth_limit() {
         let status = Frame::StatusInfo {
             profile: "p".repeat(128),
             host: "\"".repeat(1024),
             user: "\\".repeat(1024),
             started_unix: i64::MIN,
+            operation_context_id: Some(OperationContextId::parse(&"ab".repeat(32)).unwrap()),
+            revision: u64::MAX,
         };
         let encoded = serialize_frame_bounded(&status, MAX_CONTROL_FRAME).unwrap();
         assert!(encoded.len() > MAX_AUTH_FRAME);

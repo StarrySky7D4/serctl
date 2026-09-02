@@ -3,7 +3,9 @@
 //! Encrypted credential vault + long-lived connection daemon + local IPC so
 //! every `exec`/`shell` reuses one authenticated SSH session without re-exposing
 //! the password on the command line.
+mod audit_recovery;
 mod client;
+mod inherited_io;
 mod launcher;
 mod ui;
 use serctl_core::security;
@@ -31,7 +33,7 @@ const BUILD_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (git ",
     env!("SERCTL_BUILD_COMMIT"),
-    ")"
+    "; vault-storage read=v4..=v5 write=v5)"
 );
 
 #[derive(Parser)]
@@ -86,6 +88,11 @@ enum Cmd {
         #[command(subcommand)]
         command: RecoveryCommand,
     },
+    /// Inspect or explicitly recover this profile's authenticated audit ledger.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
     /// Start the global broker in the foreground; profiles unlock per request.
     Up { name: Option<String> },
     /// Run a remote command through the on-demand global broker.
@@ -125,6 +132,9 @@ enum Cmd {
     /// Run a loopback-only SSH TCP tunnel in the foreground until Ctrl+C.
     Tunnel {
         name: String,
+        /// Read the profile passphrase once from an inherited HANDLE/fd.
+        #[arg(long, value_name = "HANDLE_OR_FD")]
+        profile_passphrase_handle: Option<String>,
         #[command(subcommand)]
         tunnel: TunnelCommand,
     },
@@ -136,7 +146,10 @@ enum Cmd {
     GrantIssue {
         name: String,
         /// Comma-separated protocol operation kinds, such as ssh.exec,
-        /// sftp.list, sftp.write (create-dir only), or transfer.write.
+        /// sftp.list, sftp.write (create-dir only), transfer.read, transfer.write,
+        /// transfer.status, transfer.cancel, forward.local/open,
+        /// forward.remote/open, forward.dynamic/open, forward.status,
+        /// forward.cancel, or ssh.connection-identity.
         #[arg(long, value_delimiter = ',')]
         operations: Vec<String>,
         /// Maximum number of relayed operations (1..=1000).
@@ -149,16 +162,45 @@ enum Cmd {
             value_parser = clap::value_parser!(u32).range(1..=40)
         )]
         ttl_minutes: u32,
-        /// File to write the grant plus its agent private key to.
-        #[arg(long, value_name = "FILE")]
-        output: PathBuf,
+        /// Read the profile passphrase once from an inherited HANDLE/fd.
+        #[arg(long, value_name = "HANDLE_OR_FD")]
+        profile_passphrase_handle: Option<String>,
+        /// Create a protected file and write the grant plus private key to it.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "output_handle",
+            conflicts_with = "output_handle"
+        )]
+        output: Option<PathBuf>,
+        /// Write to a caller-created, empty protected file HANDLE/fd, then close it.
+        #[arg(
+            long,
+            value_name = "HANDLE_OR_FD",
+            required_unless_present = "output",
+            conflicts_with = "output"
+        )]
+        output_handle: Option<String>,
     },
     /// Run the agent stdio gateway: JSONL requests on stdin, JSONL relay
     /// results on stdout, authenticated by an issued OperationGrant.
     Agent {
         /// Grant file previously written by `grant-issue`.
-        #[arg(long, value_name = "FILE")]
-        grant: PathBuf,
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "grant_handle",
+            conflicts_with = "grant_handle"
+        )]
+        grant: Option<PathBuf>,
+        /// Read the grant once from an inherited HANDLE/fd, then close it.
+        #[arg(
+            long,
+            value_name = "HANDLE_OR_FD",
+            required_unless_present = "grant",
+            conflicts_with = "grant"
+        )]
+        grant_handle: Option<String>,
     },
 }
 
@@ -179,6 +221,39 @@ enum TransferCommand {
     },
     /// Cancel one active transfer owned by this profile.
     Cancel { name: String, transfer_id: String },
+}
+
+#[derive(Subcommand)]
+enum AuditCommand {
+    /// Verify the ledger and report pending operations without changing it.
+    Status {
+        name: String,
+        /// Optional previously exported checkpoint used as a rollback anchor.
+        #[arg(long, value_name = "FILE")]
+        anchor: Option<PathBuf>,
+        /// Write the current authenticated checkpoint to a new file.
+        #[arg(long, value_name = "NEW_FILE")]
+        anchor_output: Option<PathBuf>,
+        /// Emit one stable JSON object instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append Unknown outcomes for all authenticated pending Intents.
+    ResolveUnknown {
+        name: String,
+        /// Optional previously exported checkpoint used as a rollback anchor.
+        #[arg(long, value_name = "FILE")]
+        anchor: Option<PathBuf>,
+        /// Write the post-recovery authenticated checkpoint to a new file.
+        #[arg(long, value_name = "NEW_FILE")]
+        anchor_output: Option<PathBuf>,
+        /// Acknowledge that no remote success/failure is being inferred.
+        #[arg(long, required = true)]
+        acknowledge_unknown_outcome: bool,
+        /// Emit one stable JSON object instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args)]
@@ -333,6 +408,7 @@ fn transfer_backend_name(backend: serctl_protocol::TransferBackend) -> &'static 
 fn transfer_client_options(options: &TransferCliOptions) -> client::TransferOptions {
     client::TransferOptions {
         backend: options.backend.into(),
+        expected_helper_identity: None,
         resume: options.resume.into(),
         idle_timeout: std::time::Duration::from_secs(options.idle_timeout_secs),
         deadline: options.deadline_secs.map(std::time::Duration::from_secs),
@@ -818,7 +894,8 @@ impl StartupSecrets {
             | Cmd::Remove { .. }
             | Cmd::Status { .. }
             | Cmd::Down { .. }
-            | Cmd::GrantIssue { .. } => Self {
+            | Cmd::GrantIssue { .. }
+            | Cmd::Audit { .. } => Self {
                 profile_passphrase,
                 ..Self::default()
             },
@@ -968,6 +1045,23 @@ fn required_profile_passphrase(supplied: Option<Zeroizing<String>>) -> Result<Ze
         bail!("profile passphrase is required");
     }
     Ok(passphrase)
+}
+
+fn required_profile_passphrase_from_handle(
+    supplied: Option<Zeroizing<String>>,
+    inherited: Option<String>,
+) -> Result<Zeroizing<String>> {
+    match inherited {
+        Some(identifier) => {
+            if supplied.is_some() {
+                bail!(
+                    "profile passphrase sources are mutually exclusive; unset SERCTL_PROFILE_PASS and SERCTL_MASTER when using an inherited handle"
+                );
+            }
+            inherited_io::read_profile_passphrase(&identifier)
+        }
+        None => required_profile_passphrase(supplied),
+    }
 }
 
 fn required_legacy_master(supplied: Option<Zeroizing<String>>) -> Result<Zeroizing<String>> {
@@ -1183,6 +1277,19 @@ fn grant_issued_message(
         ttl_minutes,
         expires_unix_ms,
         terminal_safe_field(&output.display().to_string())
+    )
+}
+
+fn grant_issued_to_inherited_handle_message(
+    grant_id: &str,
+    ttl_minutes: u32,
+    expires_unix_ms: u64,
+) -> String {
+    format!(
+        "grant {} issued with TTL {} minutes (expires_unix_ms={}); agent credentials written to inherited output",
+        terminal_safe_field(grant_id),
+        ttl_minutes,
+        expires_unix_ms,
     )
 }
 
@@ -1709,6 +1816,75 @@ async fn run_cli(cmd: Cmd, mut secrets: StartupSecrets) -> Result<()> {
             run_profile_password_command(name, command, &mut secrets)?
         }
         Cmd::Recovery { command } => run_recovery_command(command, &mut secrets)?,
+        Cmd::Audit { command } => match command {
+            AuditCommand::Status {
+                name,
+                anchor,
+                anchor_output,
+                json,
+            } => {
+                let passphrase = required_profile_passphrase(secrets.profile_passphrase.take())?;
+                let status = audit_recovery::inspect_profile_audit(
+                    &name,
+                    &passphrase,
+                    anchor.as_deref(),
+                    anchor_output.as_deref(),
+                )?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "schema_version": 1,
+                            "pending_intents": status.pending_intents,
+                            "checkpoint": &status.checkpoint,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "audit verified: profile_id={} generation={} sequence={} pending={}",
+                        status.checkpoint.profile_id,
+                        status.checkpoint.profile_generation,
+                        status.checkpoint.sequence,
+                        status.pending_intents,
+                    );
+                }
+            }
+            AuditCommand::ResolveUnknown {
+                name,
+                anchor,
+                anchor_output,
+                acknowledge_unknown_outcome,
+                json,
+            } => {
+                let passphrase = required_profile_passphrase(secrets.profile_passphrase.take())?;
+                let resolution = audit_recovery::resolve_profile_audit_as_unknown(
+                    &name,
+                    &passphrase,
+                    anchor.as_deref(),
+                    anchor_output.as_deref(),
+                    acknowledge_unknown_outcome,
+                )?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "schema_version": 1,
+                            "decision": "unknown",
+                            "resolved": resolution.resolved_as_unknown,
+                            "pending_intents": resolution.status.pending_intents,
+                            "checkpoint": &resolution.status.checkpoint,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "audit recovery appended {} Unknown outcome(s); sequence={} pending={}",
+                        resolution.resolved_as_unknown,
+                        resolution.status.checkpoint.sequence,
+                        resolution.status.pending_intents,
+                    );
+                }
+            }
+        },
         Cmd::Up { name } => {
             // The broker is per-user/per-vault global; the legacy per-profile
             // argument is accepted for compatibility but no longer scopes the
@@ -1874,8 +2050,15 @@ async fn run_cli(cmd: Cmd, mut secrets: StartupSecrets) -> Result<()> {
             let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
             client::shell_with_master(&nm(name), Some(master)).await?;
         }
-        Cmd::Tunnel { name, tunnel } => {
-            let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
+        Cmd::Tunnel {
+            name,
+            profile_passphrase_handle,
+            tunnel,
+        } => {
+            let master = required_profile_passphrase_from_handle(
+                secrets.profile_passphrase.take(),
+                profile_passphrase_handle,
+            )?;
             client::tunnel_with_master(&name, tunnel.into_spec(), master).await?;
         }
         Cmd::Status { name } => {
@@ -1893,31 +2076,59 @@ async fn run_cli(cmd: Cmd, mut secrets: StartupSecrets) -> Result<()> {
             operations,
             budget,
             ttl_minutes,
+            profile_passphrase_handle,
             output,
+            output_handle,
         } => {
-            let master = required_profile_passphrase(secrets.profile_passphrase.take())?;
-            let grant = client::issue_grant_with_ttl_until(
-                &name,
-                &master,
-                operations,
-                budget,
-                Duration::from_secs(u64::from(ttl_minutes).saturating_mul(60)),
-                &output,
-            )
-            .await?;
-            println!(
-                "{}",
-                grant_issued_message(
-                    &grant.grant_id_hex(),
-                    ttl_minutes,
-                    grant.expires_unix_ms,
-                    &output,
-                )
-            );
+            let master = required_profile_passphrase_from_handle(
+                secrets.profile_passphrase.take(),
+                profile_passphrase_handle,
+            )?;
+            let ttl = Duration::from_secs(u64::from(ttl_minutes).saturating_mul(60));
+            match (output, output_handle) {
+                (Some(output), None) => {
+                    let grant = client::issue_grant_with_ttl_until(
+                        &name, &master, operations, budget, ttl, &output,
+                    )
+                    .await?;
+                    println!(
+                        "{}",
+                        grant_issued_message(
+                            &grant.grant_id_hex(),
+                            ttl_minutes,
+                            grant.expires_unix_ms,
+                            &output,
+                        )
+                    );
+                }
+                (None, Some(identifier)) => {
+                    let output = inherited_io::take_output_file(&identifier)?;
+                    let grant = client::issue_grant_with_ttl_to_file_until(
+                        &name, &master, operations, budget, ttl, output,
+                    )
+                    .await?;
+                    println!(
+                        "{}",
+                        grant_issued_to_inherited_handle_message(
+                            &grant.grant_id_hex(),
+                            ttl_minutes,
+                            grant.expires_unix_ms,
+                        )
+                    );
+                }
+                _ => unreachable!("clap enforces exactly one grant output"),
+            }
         }
-        Cmd::Agent { grant } => {
-            client::agent_stdio_loop(&grant).await?;
-        }
+        Cmd::Agent {
+            grant,
+            grant_handle,
+        } => match (grant, grant_handle) {
+            (Some(path), None) => client::agent_stdio_loop(&path).await?,
+            (None, Some(identifier)) => {
+                client::agent_stdio_loop_from_inherited_handle(&identifier).await?
+            }
+            _ => unreachable!("clap enforces exactly one agent grant source"),
+        },
     }
     Ok(())
 }
@@ -1931,14 +2142,29 @@ mod cli_tests {
         download_success_message, enter_linux_admin_target_for_command, local_exit_code,
         missing_profile_message, persist_generated_profile_passphrase, persist_new_recovery_media,
         read_recovery_media, removed_profile_message, required_profile_passphrase,
-        saved_profile_message, take_supported_secret_envs_from, terminal_safe_clap_diagnostic,
-        terminal_safe_error, terminal_safe_field, transfer_backend_name, unix_exit_code,
-        upload_success_message, AdminCommand, Cli, Cmd, ProfilePasswordCommand, RecoveryCommand,
-        SecretEnvAccess, StartupSecrets, SupportedSecretEnvs, TransferCommand,
-        CLI_FAILURE_EXIT_CODE, MAX_RECOVERY_MEDIA_BYTES,
+        required_profile_passphrase_from_handle, saved_profile_message,
+        take_supported_secret_envs_from, terminal_safe_clap_diagnostic, terminal_safe_error,
+        terminal_safe_field, transfer_backend_name, unix_exit_code, upload_success_message,
+        AdminCommand, AuditCommand, Cli, CliProgressMode, CliResumeMode, CliTransferBackend, Cmd,
+        ProfilePasswordCommand, RecoveryCommand, SecretEnvAccess, StartupSecrets,
+        SupportedSecretEnvs, TransferCommand, BUILD_VERSION, CLI_FAILURE_EXIT_CODE,
+        MAX_RECOVERY_MEDIA_BYTES,
     };
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use std::{collections::BTreeMap, ffi::OsString, path::Path};
+
+    #[test]
+    fn version_reports_exact_vault_storage_read_and_write_contract() {
+        assert_eq!(
+            BUILD_VERSION,
+            format!(
+                "{} (git {}; {})",
+                env!("CARGO_PKG_VERSION"),
+                env!("SERCTL_BUILD_COMMIT"),
+                serctl_core::vault::VAULT_STORAGE_VERSION_CONTRACT
+            )
+        );
+    }
 
     #[derive(Default)]
     struct MemorySecretEnv {
@@ -1957,6 +2183,39 @@ mod cli_tests {
             transfer_backend_name(TransferBackend::SftpFallback),
             "sftp_fallback"
         );
+    }
+
+    #[test]
+    fn transfer_progress_ndjson_matches_the_v1_golden_fixture() {
+        let progress = serctl_protocol::TransferProgress {
+            schema_version: serctl_protocol::TRANSFER_PROGRESS_SCHEMA_VERSION,
+            event: "progress".into(),
+            transfer_id: serctl_protocol::TransferId::parse("00000000000000000000000000000001")
+                .unwrap(),
+            operation_context_id: None,
+            revision: 0,
+            direction: serctl_protocol::TransferDirection::Push,
+            stage: serctl_protocol::TransferStage::Transferring,
+            total_bytes: 1_048_576,
+            confirmed_bytes: 262_144,
+            durable_bytes: 262_144,
+            window_bps: 131_072.0,
+            average_bps: 65_536.0,
+            eta_ms: Some(12_000),
+            backend: serctl_protocol::TransferBackend::SftpFallback,
+            chunk_bytes: 2_048,
+            window_bytes: 2_048,
+            updated_unix_ms: 1_700_000_000_000,
+        };
+        progress.validate().unwrap();
+        let actual = format!("{}\n", serde_json::to_string(&progress).unwrap());
+
+        assert_eq!(
+            actual.replace("\r\n", "\n"),
+            include_str!("../tests/fixtures/transfer-progress-v1.jsonl").replace("\r\n", "\n")
+        );
+        assert_eq!(actual.lines().count(), 1);
+        assert!(!actual.contains('\u{1b}'));
     }
 
     impl SecretEnvAccess for MemorySecretEnv {
@@ -1987,8 +2246,28 @@ mod cli_tests {
             .join(format!("{label}-{}-{unique}", std::process::id()))
     }
 
+    struct ExternalSecretPathTestHome;
+
+    impl ExternalSecretPathTestHome {
+        fn isolated(label: &str) -> Self {
+            // These path-only tests must not depend on the ACL or lifecycle of
+            // the operator's real vault directory. The configured test home
+            // need not exist: the validator deliberately handles a missing
+            // vault directory without creating or weakening it.
+            super::vault::set_test_home(Some(unique_test_path(label)));
+            Self
+        }
+    }
+
+    impl Drop for ExternalSecretPathTestHome {
+        fn drop(&mut self) {
+            super::vault::set_test_home(None);
+        }
+    }
+
     #[test]
     fn recovery_media_is_bounded_verified_and_never_overwritten() {
+        let _vault_home = ExternalSecretPathTestHome::isolated("cli-recovery-vault-home");
         let directory = unique_test_path("cli-recovery-media");
         std::fs::create_dir_all(&directory).unwrap();
         let media = directory.join("vault.srrec");
@@ -2020,6 +2299,7 @@ mod cli_tests {
 
     #[test]
     fn generated_passphrase_is_verified_before_commit_and_never_overwritten() {
+        let _vault_home = ExternalSecretPathTestHome::isolated("cli-passphrase-vault-home");
         let directory = unique_test_path("cli-random-passphrase");
         std::fs::create_dir_all(&directory).unwrap();
         let output = directory.join("profile-passphrase.txt");
@@ -2130,6 +2410,53 @@ mod cli_tests {
     }
 
     #[test]
+    fn audit_recovery_requires_explicit_unknown_acknowledgement() {
+        let status = Cli::try_parse_from([
+            "serctl",
+            "audit",
+            "status",
+            "prod",
+            "--anchor",
+            "prior-anchor.json",
+            "--anchor-output",
+            "new-anchor.json",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            status.cmd,
+            Some(Cmd::Audit {
+                command: AuditCommand::Status {
+                    json: true,
+                    anchor: Some(_),
+                    anchor_output: Some(_),
+                    ..
+                }
+            })
+        ));
+
+        let missing_ack = Cli::try_parse_from(["serctl", "audit", "resolve-unknown", "prod"]);
+        assert!(missing_ack.is_err());
+        let acknowledged = Cli::try_parse_from([
+            "serctl",
+            "audit",
+            "resolve-unknown",
+            "prod",
+            "--acknowledge-unknown-outcome",
+        ])
+        .unwrap();
+        assert!(matches!(
+            acknowledged.cmd,
+            Some(Cmd::Audit {
+                command: AuditCommand::ResolveUnknown {
+                    acknowledge_unknown_outcome: true,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
     fn grant_ttl_cli_accepts_forty_minutes_and_rejects_policy_overflow() {
         let parsed = Cli::try_parse_from([
             "serctl",
@@ -2165,6 +2492,112 @@ mod cli_tests {
             ])
             .is_err());
         }
+    }
+
+    #[test]
+    fn inherited_secret_and_grant_object_options_are_narrow_and_exclusive() {
+        let inherited_output = Cli::try_parse_from([
+            "serctl",
+            "grant-issue",
+            "prod",
+            "--operations",
+            "ssh.exec",
+            "--profile-passphrase-handle",
+            "44",
+            "--output-handle",
+            "45",
+        ])
+        .unwrap();
+        assert!(matches!(
+            inherited_output.cmd,
+            Some(Cmd::GrantIssue {
+                profile_passphrase_handle: Some(_),
+                output: None,
+                output_handle: Some(_),
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["serctl", "grant-issue", "prod", "--operations", "ssh.exec"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "serctl",
+            "grant-issue",
+            "prod",
+            "--operations",
+            "ssh.exec",
+            "--output",
+            "grant.json",
+            "--output-handle",
+            "45"
+        ])
+        .is_err());
+
+        assert!(matches!(
+            Cli::try_parse_from(["serctl", "agent", "--grant-handle", "46"])
+                .unwrap()
+                .cmd,
+            Some(Cmd::Agent {
+                grant: None,
+                grant_handle: Some(_)
+            })
+        ));
+        assert!(Cli::try_parse_from(["serctl", "agent"]).is_err());
+        assert!(Cli::try_parse_from([
+            "serctl",
+            "agent",
+            "--grant",
+            "grant.json",
+            "--grant-handle",
+            "46"
+        ])
+        .is_err());
+
+        assert!(matches!(
+            Cli::try_parse_from([
+                "serctl",
+                "tunnel",
+                "prod",
+                "--profile-passphrase-handle",
+                "47",
+                "dynamic"
+            ])
+            .unwrap()
+            .cmd,
+            Some(Cmd::Tunnel {
+                profile_passphrase_handle: Some(_),
+                ..
+            })
+        ));
+        let exec = Cli::try_parse_from([
+            "serctl",
+            "exec",
+            "prod",
+            "--profile-passphrase-handle",
+            "47",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        assert!(matches!(
+            exec.cmd,
+            Some(Cmd::Exec { cmd, .. }) if cmd.first().is_some_and(|arg| arg == "--profile-passphrase-handle")
+        ));
+    }
+
+    #[test]
+    fn inherited_profile_source_rejects_environment_source_before_opening_handle() {
+        let identifier = "999999999999999999";
+        let error = required_profile_passphrase_from_handle(
+            Some(zeroize::Zeroizing::new("environment secret".to_owned())),
+            Some(identifier.to_owned()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("mutually exclusive"));
+        assert!(!error.contains("environment secret"));
+        assert!(!error.contains(identifier));
     }
 
     #[test]
@@ -2436,11 +2869,20 @@ mod cli_tests {
             },
             Cmd::Tunnel {
                 name: "prod".into(),
+                profile_passphrase_handle: None,
                 tunnel: super::TunnelCommand::Dynamic {
                     common: super::TunnelCommonArgs {
                         port: 0,
                         max_connections: 32,
                     },
+                },
+            },
+            Cmd::Audit {
+                command: AuditCommand::Status {
+                    name: "prod".into(),
+                    anchor: None,
+                    anchor_output: None,
+                    json: false,
                 },
             },
         ] {
@@ -2721,5 +3163,238 @@ mod cli_tests {
         assert_eq!(help.exit_code, 0);
         assert!(help.text.contains('\n'));
         assert!(!clap_diagnostic_without_trailing_line_endings(&help.text).ends_with(['\r', '\n']));
+    }
+
+    #[test]
+    fn v1_cli_help_and_contract_match_golden_fixtures() {
+        fn normalized(value: &str) -> String {
+            value.replace("\r\n", "\n").trim_end().to_owned()
+        }
+
+        let help = Cli::try_parse_from(["serctl_cli", "--help"])
+            .err()
+            .expect("--help must return clap's display-help diagnostic");
+        assert_eq!(help.exit_code(), 0);
+        assert_eq!(
+            normalized(&help.to_string()),
+            normalized(include_str!("../tests/fixtures/cli-help-v1.txt"))
+        );
+
+        let no_command = Cli::try_parse_from(["serctl_cli"]).unwrap();
+        assert!(no_command.cmd.is_none());
+
+        let add = Cli::try_parse_from(["serctl_cli", "add"]).unwrap();
+        let Cmd::Add { port: add_port, .. } = add.cmd.unwrap() else {
+            panic!("add command did not parse as Cmd::Add");
+        };
+
+        let exec = Cli::try_parse_from(["serctl_cli", "exec", "prod", "--", "true"]).unwrap();
+        let Cmd::Exec {
+            timeout_secs: exec_timeout_secs,
+            ..
+        } = exec.cmd.unwrap()
+        else {
+            panic!("exec command did not parse as Cmd::Exec");
+        };
+
+        let upload =
+            Cli::try_parse_from(["serctl_cli", "upload", "prod", "local", "/remote"]).unwrap();
+        let Cmd::Upload {
+            timeout_secs: upload_timeout_secs,
+            ..
+        } = upload.cmd.unwrap()
+        else {
+            panic!("upload command did not parse as Cmd::Upload");
+        };
+
+        let download =
+            Cli::try_parse_from(["serctl_cli", "download", "prod", "/remote", "local"]).unwrap();
+        let Cmd::Download {
+            timeout_secs: download_timeout_secs,
+            ..
+        } = download.cmd.unwrap()
+        else {
+            panic!("download command did not parse as Cmd::Download");
+        };
+
+        let grant = Cli::try_parse_from([
+            "serctl_cli",
+            "grant-issue",
+            "prod",
+            "--operations",
+            "ssh.exec",
+            "--output",
+            "agent.grant",
+        ])
+        .unwrap();
+        let Cmd::GrantIssue {
+            budget: grant_budget,
+            ttl_minutes: grant_ttl_minutes,
+            ..
+        } = grant.cmd.unwrap()
+        else {
+            panic!("grant-issue command did not parse as Cmd::GrantIssue");
+        };
+
+        let transfer =
+            Cli::try_parse_from(["serctl_cli", "transfer", "push", "prod", "local", "/remote"])
+                .unwrap();
+        let Cmd::Transfer {
+            command: TransferCommand::Push(transfer),
+        } = transfer.cmd.unwrap()
+        else {
+            panic!("transfer push did not parse as TransferCommand::Push");
+        };
+
+        let tunnel = Cli::try_parse_from(["serctl_cli", "tunnel", "prod", "dynamic"]).unwrap();
+        let Cmd::Tunnel {
+            tunnel: super::TunnelCommand::Dynamic { common },
+            ..
+        } = tunnel.cmd.unwrap()
+        else {
+            panic!("tunnel dynamic did not parse as TunnelCommand::Dynamic");
+        };
+
+        let missing_ack = Cli::try_parse_from(["serctl_cli", "audit", "resolve-unknown", "prod"])
+            .err()
+            .expect("resolve-unknown without acknowledgement must fail parsing");
+
+        let actual = serde_json::json!({
+            "contract_version": 1,
+            "defaults": {
+                "add_port": add_port,
+                "command_without_subcommand": "ui",
+                "download_timeout_secs": download_timeout_secs,
+                "exec_timeout_secs": exec_timeout_secs,
+                "grant_budget": grant_budget,
+                "grant_ttl_minutes": grant_ttl_minutes,
+                "transfer_backend": match transfer.options.backend {
+                    CliTransferBackend::Auto => "auto",
+                    CliTransferBackend::Native => "native",
+                    CliTransferBackend::Sftp => "sftp",
+                },
+                "transfer_deadline_secs": transfer.options.deadline_secs,
+                "transfer_idle_timeout_secs": transfer.options.idle_timeout_secs,
+                "transfer_progress": match transfer.options.progress {
+                    CliProgressMode::Auto => "auto",
+                    CliProgressMode::Tty => "tty",
+                    CliProgressMode::Json => "json",
+                    CliProgressMode::Quiet => "quiet",
+                },
+                "transfer_resume": match transfer.options.resume {
+                    CliResumeMode::Auto => "auto",
+                    CliResumeMode::Never => "never",
+                },
+                "tunnel_max_connections": common.max_connections,
+                "tunnel_port": common.port,
+                "upload_timeout_secs": upload_timeout_secs,
+            },
+            "error_categories": super::client::AGENT_ERROR_CODES,
+            "exit_codes": {
+                "clap_help": help.exit_code(),
+                "clap_invalid_usage": missing_ack.exit_code(),
+                "local_failure": CLI_FAILURE_EXIT_CODE,
+                "unix_remote_7": unix_exit_code(7),
+                "unix_remote_out_of_range": unix_exit_code(256),
+                "windows_remote_nonzero": CLI_FAILURE_EXIT_CODE,
+            },
+            "schemas": {
+                "agent_jsonl": super::client::AGENT_SCHEMA_VERSION,
+                "audit_checkpoint": serctl_core::audit::AUDIT_SCHEMA_VERSION,
+                "ipc": serctl_protocol::v6::IPC_PROTOCOL_VERSION_V6,
+                "transfer_progress_ndjson": serctl_protocol::TRANSFER_PROGRESS_SCHEMA_VERSION,
+            },
+        });
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/cli-contract-v1.json")).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    fn collect_recursive_cli_contract(
+        mut command: clap::Command,
+        path: String,
+        help_tree: &mut String,
+        command_contracts: &mut Vec<serde_json::Value>,
+    ) {
+        command.build();
+        let children = command
+            .get_subcommands()
+            .filter(|child| child.get_name() != "help")
+            .cloned()
+            .collect::<Vec<_>>();
+        let required = command
+            .get_arguments()
+            .filter(|argument| argument.is_required_set())
+            .map(|argument| argument.get_id().to_string())
+            .collect::<Vec<_>>();
+        let defaults = command
+            .get_arguments()
+            .filter_map(|argument| {
+                let values = argument
+                    .get_default_values()
+                    .iter()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                (!values.is_empty()).then(|| (argument.get_id().to_string(), values))
+            })
+            .collect::<BTreeMap<_, _>>();
+        command_contracts.push(serde_json::json!({
+            "path": path,
+            "subcommand_required": command.is_subcommand_required_set(),
+            "required": required,
+            "defaults": defaults,
+        }));
+
+        help_tree.push_str("===== ");
+        help_tree.push_str(&path);
+        help_tree.push_str(" =====\n");
+        let rendered_help = command.render_long_help().to_string().replace("\r\n", "\n");
+        for (line_index, line) in rendered_help.trim_end().lines().enumerate() {
+            if line_index > 0 {
+                help_tree.push('\n');
+            }
+            help_tree.push_str(line.trim_end());
+        }
+        help_tree.push_str("\n\n");
+
+        let mut children = children;
+        children.sort_by(|left, right| left.get_name().cmp(right.get_name()));
+        for child in children {
+            let child_path = format!("{path} {}", child.get_name());
+            collect_recursive_cli_contract(child, child_path, help_tree, command_contracts);
+        }
+    }
+
+    #[test]
+    fn v1_recursive_cli_help_defaults_and_required_args_match_golden_fixtures() {
+        let mut help_tree = String::new();
+        let mut commands = Vec::new();
+        collect_recursive_cli_contract(
+            Cli::command(),
+            "serctl_cli".to_owned(),
+            &mut help_tree,
+            &mut commands,
+        );
+        let command_contract = serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "commands": commands,
+        }))
+        .unwrap()
+            + "\n";
+
+        let expected_help = include_str!("../tests/fixtures/cli-help-tree-v1.txt");
+        if expected_help.is_empty() {
+            panic!("recursive CLI help fixture is empty; generated fixture follows:\n{help_tree}");
+        }
+        let normalized_help = expected_help.replace("\r\n", "\n");
+        assert_eq!(help_tree.trim_end(), normalized_help.trim_end());
+
+        let expected_contract = include_str!("../tests/fixtures/cli-command-tree-v1.json");
+        if expected_contract.is_empty() {
+            panic!(
+                "recursive CLI command fixture is empty; generated fixture follows:\n{command_contract}"
+            );
+        }
+        assert_eq!(command_contract, expected_contract.replace("\r\n", "\n"));
     }
 }

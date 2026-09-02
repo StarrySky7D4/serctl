@@ -3244,6 +3244,7 @@ impl SerctlApp {
                 &remote,
                 client::TransferOptions {
                     backend: serctl_protocol::TransferBackend::Auto,
+                    expected_helper_identity: None,
                     resume,
                     idle_timeout: Duration::from_millis(
                         serctl_protocol::DEFAULT_TRANSFER_IDLE_TIMEOUT_MS,
@@ -3324,6 +3325,7 @@ impl SerctlApp {
                 &local,
                 client::TransferOptions {
                     backend: serctl_protocol::TransferBackend::Auto,
+                    expected_helper_identity: None,
                     resume,
                     idle_timeout: Duration::from_millis(
                         serctl_protocol::DEFAULT_TRANSFER_IDLE_TIMEOUT_MS,
@@ -7568,6 +7570,8 @@ mod tests {
                 stdout: b"late remote secret".to_vec(),
                 stderr: Vec::new(),
                 code: Some(0),
+                operation_context_id: None,
+                revision: 0,
             }),
         })
         .expect("queue late command result");
@@ -8358,6 +8362,8 @@ mod tests {
                 stdout: b"alpha secret".to_vec(),
                 stderr: Vec::new(),
                 code: Some(0),
+                operation_context_id: None,
+                revision: 0,
             }),
         })
         .expect("queue stale command result");
