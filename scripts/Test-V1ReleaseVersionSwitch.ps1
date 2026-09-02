@@ -127,7 +127,8 @@ function New-Fixture {
     Invoke-GitFixture $root @('config', 'user.name', 'serctl fixture') | Out-Null
     Invoke-GitFixture $root @('config', 'user.email', 'fixture@example.invalid') | Out-Null
     if ($installedCurrentTools) {
-        Invoke-GitFixture $root @('add', '--', $toolPaths) | Out-Null
+        $addArguments = @('add', '--') + $toolPaths
+        Invoke-GitFixture $root $addArguments | Out-Null
         Invoke-GitFixture $root @('commit', '-m', 'install current release replay tools') | Out-Null
     }
     foreach ($relative in $toolPaths) {
