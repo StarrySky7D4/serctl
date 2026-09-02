@@ -43,6 +43,20 @@ function Invoke-ExpectedScriptFailure {
     Assert-TestCondition $failed "$Description unexpectedly succeeded"
 }
 
+function Invoke-CheckedChildScript {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $global:LASTEXITCODE = 0
+    & $Path
+    $childExitCode = $global:LASTEXITCODE
+    Assert-TestCondition ($childExitCode -eq 0) (
+        "$Description exited with code $childExitCode"
+    )
+}
+
 function Assert-NativeMatrixJob {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
@@ -371,7 +385,31 @@ Assert-TestCondition (
 Assert-TestCondition (
     Test-Path -LiteralPath $releaseVersionSwitchSelfTestScript -PathType Leaf
 ) 'controlled v1 release version switch self-test is missing'
-& $releaseVersionSwitchSelfTestScript
+$checkedChildProbe = Join-Path $repositoryRoot (
+    'target/release-governance-child-exit-' + [Guid]::NewGuid().ToString('N') + '.ps1'
+)
+try {
+    [System.IO.File]::WriteAllText(
+        $checkedChildProbe,
+        "`$global:LASTEXITCODE = 37`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    Invoke-ExpectedScriptFailure `
+        -Description 'checked governance child with a nonzero native exit code' `
+        -Action {
+            Invoke-CheckedChildScript `
+                -Path $checkedChildProbe `
+                -Description 'intentional nonzero child probe'
+        }
+}
+finally {
+    if (Test-Path -LiteralPath $checkedChildProbe -PathType Leaf) {
+        [System.IO.File]::Delete($checkedChildProbe)
+    }
+}
+Invoke-CheckedChildScript `
+    -Path $releaseVersionSwitchSelfTestScript `
+    -Description 'controlled v1 release version switch self-test'
 Assert-TestCondition (
     Test-Path -LiteralPath $isolatedCandidateScript -PathType Leaf
 ) 'isolated candidate builder is missing'

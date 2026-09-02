@@ -10,6 +10,18 @@ $Cargo = (Get-Command cargo -CommandType Application | Select-Object -First 1).S
 $SourceRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $TestRoot = Join-Path $SourceRoot ('target/version-switch-selftest-' + [Guid]::NewGuid().ToString('N'))
 $OwnerToken = [Guid]::NewGuid().ToString('N')
+$IdentityFiles = @(
+    'Cargo.toml',
+    'Cargo.lock',
+    'CHANGELOG.md',
+    'README.md',
+    'docs/serctl-user-guide.md',
+    'docs/serctl-architecture-security.html',
+    'docs/v1-beta-release-contract.md',
+    'docs/v1-beta-agent-jsonl.md',
+    'docs/v1-beta-acceptance-matrix.md',
+    'SECURITY.md'
+)
 
 function Assert-Test {
     param(
@@ -65,38 +77,149 @@ function Invoke-GitFixture {
 }
 
 function New-Fixture {
-    param([Parameter(Mandatory = $true)][string]$Name)
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Commit
+    )
     $root = Join-Path $script:TestRoot $Name
-    [System.IO.Directory]::CreateDirectory($root) | Out-Null
-    foreach ($relative in @(git -C $script:SourceRoot ls-files)) {
-        $source = Join-Path $script:SourceRoot ([string]$relative)
-        $destination = Join-Path $root ([string]$relative)
-        $parent = [System.IO.Path]::GetDirectoryName($destination)
-        [System.IO.Directory]::CreateDirectory($parent) | Out-Null
-        Copy-Item -LiteralPath $source -Destination $destination
+    Assert-Test (-not (Test-Path -LiteralPath $root)) "fixture root already exists: $Name"
+    $savedPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $cloneOutput = @(& $script:Git clone --quiet --local --no-hardlinks --no-tags --no-checkout -- $script:SourceRoot $root 2>&1)
+        $cloneExitCode = $LASTEXITCODE
     }
-    foreach ($relative in @(
-        'README.md',
-        'docs/serctl-user-guide.md',
-        'docs/serctl-architecture-security.html',
-        'docs/v1-beta-release-contract.md',
-        'docs/v1-beta-agent-jsonl.md',
-        'docs/v1-beta-acceptance-matrix.md',
-        'SECURITY.md',
+    finally {
+        $ErrorActionPreference = $savedPreference
+    }
+    Assert-Test ($cloneExitCode -eq 0) (
+        "local no-hardlink clone failed: $($cloneOutput -join ' ')"
+    )
+    Assert-Test (
+        -not (Test-Path -LiteralPath (Join-Path $root '.git/objects/info/alternates'))
+    ) 'local clone unexpectedly depends on source object alternates'
+    Invoke-GitFixture $root @('checkout', '--quiet', '--detach', $Commit) | Out-Null
+    Assert-Test (
+        ([string](Invoke-GitFixture $root @('rev-parse', 'HEAD'))).Trim() -ceq $Commit
+    ) 'fixture did not check out the exact requested commit'
+    Assert-Test (
+        @(Invoke-GitFixture $root @('status', '--porcelain=v1', '--untracked-files=all')).Count -eq 0
+    ) 'fresh local clone checkout is not clean'
+    $toolPaths = @(
+        'scripts/Set-V1ReleaseVersion.ps1',
+        'scripts/Verify-ReleaseConsistency.ps1',
         'scripts/Test-V1BetaDocumentation.ps1'
-    )) {
+    )
+    $installedCurrentTools = $false
+    foreach ($relative in $toolPaths) {
+        $fixturePath = Join-Path $root $relative
+        $sourcePath = Join-Path $script:SourceRoot $relative
+        if ((Get-FileHash -LiteralPath $fixturePath -Algorithm SHA256).Hash -cne
+            (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash) {
+            Copy-Item -LiteralPath $sourcePath -Destination $fixturePath
+            $installedCurrentTools = $true
+        }
+    }
+    Invoke-GitFixture $root @('config', 'user.name', 'serctl fixture') | Out-Null
+    Invoke-GitFixture $root @('config', 'user.email', 'fixture@example.invalid') | Out-Null
+    if ($installedCurrentTools) {
+        Invoke-GitFixture $root @('add', '--', $toolPaths) | Out-Null
+        Invoke-GitFixture $root @('commit', '-m', 'install current release replay tools') | Out-Null
+    }
+    foreach ($relative in $toolPaths) {
         Assert-Test (
             (Get-FileHash -LiteralPath (Join-Path $root $relative) -Algorithm SHA256).Hash -ceq
                 (Get-FileHash -LiteralPath (Join-Path $script:SourceRoot $relative) -Algorithm SHA256).Hash
-        ) "fixture did not copy the real source bytes for $relative"
+        ) "fixture does not contain the current $relative bytes"
     }
-    Write-Utf8 (Join-Path $root '.serctl-version-switch-test-fixture') "SERCTL_VERSION_SWITCH_TEST_FIXTURE_V1`n"
-    Invoke-GitFixture $root @('init') | Out-Null
-    Invoke-GitFixture $root @('config', 'user.name', 'serctl fixture') | Out-Null
-    Invoke-GitFixture $root @('config', 'user.email', 'fixture@example.invalid') | Out-Null
-    Invoke-GitFixture $root @('add', '--all') | Out-Null
-    Invoke-GitFixture $root @('commit', '-m', 'fixture baseline') | Out-Null
+    Assert-Test (
+        @(Invoke-GitFixture $root @('status', '--porcelain=v1', '--untracked-files=all')).Count -eq 0
+    ) 'fixture is not clean after installing current replay tools'
     return $root
+}
+
+function Get-WorkspaceVersion {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $savedPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $metadataJson = & $script:Cargo metadata --quiet --locked --no-deps --format-version 1 `
+            --manifest-path (Join-Path $Root 'Cargo.toml') 2>$null
+        $metadataExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $savedPreference
+    }
+    Assert-Test ($metadataExitCode -eq 0) 'cargo metadata failed for version-switch fixture'
+    $metadata = $metadataJson | ConvertFrom-Json
+    $packages = @($metadata.packages | Where-Object { $metadata.workspace_members -contains $_.id })
+    $versions = @($packages | ForEach-Object { [string]$_.version } | Sort-Object -Unique)
+    Assert-Test ($packages.Count -gt 0 -and $versions.Count -eq 1) (
+        'workspace packages do not expose one common version'
+    )
+    return [string]$versions[0]
+}
+
+function Get-WorkspaceVersionAtCommit {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Commit
+    )
+    Assert-Test ($Commit -match '^[0-9a-f]{40}$') 'manifest commit is not canonical'
+    $manifest = @(Invoke-GitFixture $Root @('show', "${Commit}:Cargo.toml")) -join "`n"
+    $match = [regex]::Match(
+        $manifest,
+        '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"(?<version>[^"]+)"\s*$'
+    )
+    if (-not $match.Success) {
+        return $null
+    }
+    return [string]$match.Groups['version'].Value
+}
+
+function Get-NextBetaVersion {
+    param([Parameter(Mandatory = $true)][string]$Version)
+    $match = [regex]::Match($Version, '^1\.0\.0-beta(?:\.(?<ordinal>[1-9][0-9]*))?$')
+    Assert-Test $match.Success "version is not a canonical v1 beta: $Version"
+    $ordinal = if ($match.Groups['ordinal'].Success) {
+        [System.Numerics.BigInteger]::Parse(
+            $match.Groups['ordinal'].Value,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+    }
+    else { [System.Numerics.BigInteger]::Zero }
+    $nextOrdinal = $ordinal + [System.Numerics.BigInteger]::One
+    return '1.0.0-beta.' + $nextOrdinal.ToString(
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+}
+
+function Test-NextTransition {
+    param(
+        [Parameter(Mandatory = $true)][string]$Prior,
+        [Parameter(Mandatory = $true)][string]$Current
+    )
+    $priorV03 = [regex]::IsMatch(
+        $Prior,
+        '^0\.3\.(?:0|[1-9][0-9]*)(?:-(?:alpha|beta|rc)(?:\.(?:0|[1-9][0-9]*))?)?$'
+    )
+    if ($priorV03) {
+        return $Current -ceq '1.0.0-beta'
+    }
+    if (-not [regex]::IsMatch($Prior, '^1\.0\.0-beta(?:\.[1-9][0-9]*)?$')) {
+        return $false
+    }
+    return (Get-NextBetaVersion $Prior) -ceq $Current
+}
+
+function Assert-NextTransition {
+    param(
+        [Parameter(Mandatory = $true)][string]$Prior,
+        [Parameter(Mandatory = $true)][string]$Current
+    )
+    Assert-Test (Test-NextTransition $Prior $Current) (
+        "first parent '$Prior' is not the immediate predecessor of '$Current'"
+    )
 }
 
 function Get-ReadmeCurrentStateNeutralDocument {
@@ -326,7 +449,7 @@ function Assert-VersionSwitchRejected {
     $rejected = $false
     try {
         & (Join-Path $Root 'scripts/Set-V1ReleaseVersion.ps1') `
-            -Version $Version -WhatIf -ReleaseDate 2026-09-02 -TestFixture | Out-Null
+            -Version $Version -WhatIf -ReleaseDate 2026-09-02 | Out-Null
     }
     catch { $rejected = $true }
     Assert-Test $rejected "$Description was accepted"
@@ -409,7 +532,95 @@ function Get-TrackedHashes {
 [System.IO.Directory]::CreateDirectory($TestRoot) | Out-Null
 Write-Utf8 (Join-Path $TestRoot 'owner-token') $OwnerToken
 try {
-    $success = New-Fixture 'success'
+    $sourceHead = ([string](Invoke-GitFixture $SourceRoot @('rev-parse', 'HEAD'))).Trim().ToLowerInvariant()
+    $sourceStatus = @(Invoke-GitFixture $SourceRoot @('status', '--porcelain=v1', '--untracked-files=all'))
+    Assert-Test ($sourceHead -match '^[0-9a-f]{40}$') 'source HEAD is not canonical'
+    Assert-Test ($sourceStatus.Count -eq 0) 'source checkout must be clean'
+    $currentVersion = Get-WorkspaceVersion $SourceRoot
+    $currentTag = "v$currentVersion"
+    Assert-Test ([regex]::IsMatch(
+        $currentVersion,
+        '^1\.0\.0-beta(?:\.[1-9][0-9]*)?$'
+    )) 'source version is not a canonical v1 beta'
+    $sourceChangelog = [IO.File]::ReadAllText(
+        (Join-Path $SourceRoot 'CHANGELOG.md'),
+        $Utf8NoBom
+    )
+    $dateMatch = [regex]::Match(
+        $sourceChangelog,
+        '(?m)^## ' + [regex]::Escape($currentTag) + ' - (?<date>\d{4}-\d{2}-\d{2})$'
+    )
+    Assert-Test ($dateMatch.Success -and [regex]::Matches(
+        $sourceChangelog,
+        '(?m)^## ' + [regex]::Escape($currentTag) + ' - \d{4}-\d{2}-\d{2}$'
+    ).Count -eq 1) 'source CHANGELOG lacks one dated current release heading'
+    $currentReleaseDate = [string]$dateMatch.Groups['date'].Value
+    $parsedReleaseDate = [DateTime]::MinValue
+    Assert-Test ([DateTime]::TryParseExact(
+        $currentReleaseDate,
+        'yyyy-MM-dd',
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::None,
+        [ref]$parsedReleaseDate
+    )) 'current CHANGELOG release date is not canonical'
+
+    $releaseTransitions = [System.Collections.Generic.List[object]]::new()
+    foreach ($candidateCommit in @(Invoke-GitFixture $SourceRoot @(
+        'log', '--first-parent', '--format=%H', '--', 'Cargo.toml'
+    ))) {
+        $candidateCommit = ([string]$candidateCommit).Trim().ToLowerInvariant()
+        Assert-Test ($candidateCommit -match '^[0-9a-f]{40}$') (
+            'Cargo.toml history contains a noncanonical commit'
+        )
+        if ((Get-WorkspaceVersionAtCommit $SourceRoot $candidateCommit) -cne $currentVersion) {
+            continue
+        }
+        $candidateParentLine = ([string](Invoke-GitFixture $SourceRoot @(
+            'rev-list', '--parents', '-n', '1', $candidateCommit
+        ))).Trim()
+        $candidateParentFields = @($candidateParentLine -split ' ')
+        if ($candidateParentFields.Count -ne 2 -or
+            $candidateParentFields[0] -cne $candidateCommit -or
+            $candidateParentFields[1] -notmatch '^[0-9a-f]{40}$') {
+            continue
+        }
+        $candidateParent = [string]$candidateParentFields[1]
+        $candidateParentVersion = Get-WorkspaceVersionAtCommit $SourceRoot $candidateParent
+        if (Test-NextTransition $candidateParentVersion $currentVersion) {
+            $releaseTransitions.Add([pscustomobject]@{
+                Commit = $candidateCommit
+                Parent = $candidateParent
+                ParentVersion = $candidateParentVersion
+            })
+        }
+    }
+    Assert-Test ($releaseTransitions.Count -eq 1) (
+        "first-parent Cargo.toml history contains $($releaseTransitions.Count) legal transitions into '$currentVersion', expected one"
+    )
+    $releaseCommit = [string]$releaseTransitions[0].Commit
+    $parentCommit = [string]$releaseTransitions[0].Parent
+    $identityDrift = @(Invoke-GitFixture $SourceRoot @(
+        'diff', '--name-only', $releaseCommit, $sourceHead, '--'
+    ) | ForEach-Object { ([string]$_).Replace('\', '/') } | Where-Object {
+        $IdentityFiles -ccontains $_
+    })
+    Assert-Test ($identityDrift.Count -eq 0) (
+        'approved release identity outputs drifted after the current release commit'
+    )
+
+    $releaseChanged = @(Invoke-GitFixture $SourceRoot @(
+        'diff', '--name-only', '--diff-filter=ACMRTUXB', $parentCommit, $releaseCommit, '--'
+    ) | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
+    Assert-Test ($releaseChanged.Count -gt 0) 'release commit has no identity changes'
+    foreach ($relative in $releaseChanged) {
+        Assert-Test ($IdentityFiles -ccontains $relative) (
+            "release commit changed non-identity path '$relative'"
+        )
+    }
+
+    $success = New-Fixture 'success' $parentCommit
+    $parentVersion = Get-WorkspaceVersion $success
+    Assert-NextTransition $parentVersion $currentVersion
     $baselineHead = ([string](Invoke-GitFixture $success @('rev-parse', 'HEAD'))).Trim()
     $baselineTree = ([string](Invoke-GitFixture $success @('rev-parse', 'HEAD^{tree}'))).Trim()
     $neutralReadme = Get-ReadmeCurrentStateNeutralDocument $success
@@ -428,14 +639,16 @@ try {
     $neutralSecurity = Get-CurrentSecurityLineNeutralDocument $success
     $rollbackPredecessorLine = '| `v0.3.0-beta.2` | Rollback predecessor during the v1 beta compatibility window; critical fixes only until the v1 beta line is superseded. |'
 
-    & (Join-Path $success 'scripts/Set-V1ReleaseVersion.ps1') -Version 1.0.0-beta -WhatIf -ReleaseDate 2026-09-01 -TestFixture | Out-Null
+    & (Join-Path $success 'scripts/Set-V1ReleaseVersion.ps1') `
+        -Version $currentVersion -WhatIf -ReleaseDate $currentReleaseDate | Out-Null
     Assert-Test (@(Invoke-GitFixture $success @('status', '--porcelain=v1', '--untracked-files=all')).Count -eq 0) 'WhatIf changed the fixture'
 
-    & (Join-Path $success 'scripts/Set-V1ReleaseVersion.ps1') -Version 1.0.0-beta -Apply -ReleaseDate 2026-09-01 -TestFixture | Out-Null
-    & (Join-Path $success 'scripts/Verify-ReleaseConsistency.ps1') -Tag v1.0.0-beta | Out-Null
+    & (Join-Path $success 'scripts/Set-V1ReleaseVersion.ps1') `
+        -Version $currentVersion -Apply -ReleaseDate $currentReleaseDate | Out-Null
+    & (Join-Path $success 'scripts/Verify-ReleaseConsistency.ps1') -Tag $currentTag | Out-Null
     Assert-Test ($LASTEXITCODE -eq 0) 'post-Apply Verify-ReleaseConsistency failed'
     Invoke-RealDocumentationGate $success
-    Assert-CurrentReleaseBindings $success 'v1.0.0-beta' '1.0.0-beta' '2026-09-01'
+    Assert-CurrentReleaseBindings $success $currentTag $currentVersion $currentReleaseDate
     Assert-Test (
         (Get-ReadmeCurrentStateNeutralDocument $success) -ceq $neutralReadme
     ) 'initial beta transition changed README outside its explicit current-state regions'
@@ -464,114 +677,115 @@ try {
     Assert-Test (([string](Invoke-GitFixture $success @('rev-parse', 'HEAD'))).Trim() -ceq $baselineHead) 'Apply changed HEAD'
     Assert-Test (([string](Invoke-GitFixture $success @('rev-parse', 'HEAD^{tree}'))).Trim() -ceq $baselineTree) 'Apply changed HEAD tree'
     $successStatus = @(Invoke-GitFixture $success @('status', '--porcelain=v1', '--untracked-files=all'))
-    Assert-Test ($successStatus.Count -eq 6) 'Apply did not leave the exact six changed source files'
-    Invoke-GitFixture $success @('add', '--all') | Out-Null
-    Invoke-GitFixture $success @('commit', '-m', 'freeze initial beta') | Out-Null
-
-    $betaHistory = ([IO.File]::ReadAllText(
-        (Join-Path $success 'CHANGELOG.md'), $Utf8NoBom
-    ) -split '(?m)(?=^## v1\.0\.0-beta - )', 2)[1]
-    Prepare-NextBetaFixture $success 'v1.0.0-beta' 'v1.0.0-beta.1'
-    Invoke-GitFixture $success @('add', '--all') | Out-Null
-    Invoke-GitFixture $success @('commit', '-m', 'prepare beta one') | Out-Null
-    $betaOneChangelogEntry = Get-CurrentChangelogEntryNeutralDocument $success
-    & (Join-Path $success 'scripts/Set-V1ReleaseVersion.ps1') `
-        -Version 1.0.0-beta.1 -Apply -ReleaseDate 2026-09-02 -TestFixture | Out-Null
-    & (Join-Path $success 'scripts/Verify-ReleaseConsistency.ps1') `
-        -Tag v1.0.0-beta.1 | Out-Null
-    Assert-Test ($LASTEXITCODE -eq 0) 'beta -> beta.1 consistency verification failed'
-    Invoke-RealDocumentationGate $success
-    Assert-CurrentReleaseBindings $success 'v1.0.0-beta.1' '1.0.0-beta.1' '2026-09-02'
-    Assert-Test (
-        (Get-ReadmeCurrentStateNeutralDocument $success) -ceq $neutralReadme
-    ) 'beta -> beta.1 changed README outside its explicit current-state regions'
-    Assert-Test (
-        (Get-GuideCurrentStateNeutralDocument $success) -ceq $neutralGuide
-    ) 'beta -> beta.1 changed the user guide outside its explicit current-state regions'
-    Assert-Test (
-        (Get-ArchitectureCurrentStateNeutralDocument $success) -ceq $neutralArchitecture
-    ) 'beta -> beta.1 changed architecture outside its explicit current-state bindings'
-    Assert-Test (
-        (Get-CurrentChangelogEntryNeutralDocument $success) -ceq $betaOneChangelogEntry
-    ) 'beta -> beta.1 changed CHANGELOG detail outside its heading/current-state prefix'
-    $afterBetaOne = [IO.File]::ReadAllText((Join-Path $success 'CHANGELOG.md'), $Utf8NoBom)
-    Assert-Test ($afterBetaOne.EndsWith($betaHistory)) (
-        'beta -> beta.1 modified the prior dated release record'
+    $successPaths = @($successStatus | ForEach-Object {
+        ([string]$_).Substring(3).Replace('\', '/')
+    } | Sort-Object -Unique)
+    Assert-Test (($successPaths -join "`n") -ceq ($releaseChanged -join "`n")) (
+        'replayed Apply changed a different path set than the release commit'
     )
-    foreach ($binding in @(
-        @('docs/v1-beta-release-contract.md', 'release-tag'),
-        @('docs/v1-beta-agent-jsonl.md', 'target-release'),
-        @('docs/v1-beta-acceptance-matrix.md', 'normative-release')
-    )) {
-        Assert-Test (
-            (Get-GovernanceCurrentStateNeutralDocument $success $binding[0] $binding[1]) -ceq
-                [string]$neutralGovernance[[string]$binding[0]]
-        ) "beta -> beta.1 modified historical prose in $($binding[0])"
+    foreach ($relative in $IdentityFiles) {
+        $fixtureBytes = [IO.File]::ReadAllBytes((Join-Path $success $relative))
+        $sourceBytes = [IO.File]::ReadAllBytes((Join-Path $SourceRoot $relative))
+        Assert-Test ([System.Linq.Enumerable]::SequenceEqual(
+            [byte[]]$fixtureBytes,
+            [byte[]]$sourceBytes
+        )) "replayed identity output differs byte-for-byte for $relative"
     }
-    $betaOneSecurity = [IO.File]::ReadAllText(
-        (Join-Path $success 'SECURITY.md'), $Utf8NoBom
-    )
-    Assert-Test (
-        (Get-CurrentSecurityLineNeutralDocument $success) -ceq $neutralSecurity -and
-        $betaOneSecurity.Contains($rollbackPredecessorLine)
-    ) 'beta -> beta.1 modified SECURITY history or its rollback predecessor'
-    Assert-Test (
-        @(Invoke-GitFixture $success @('status', '--porcelain=v1', '--untracked-files=all')).Count -eq 10
-    ) 'beta -> beta.1 did not leave the exact ten approved identity changes'
     Invoke-GitFixture $success @('add', '--all') | Out-Null
-    Invoke-GitFixture $success @('commit', '-m', 'freeze beta one') | Out-Null
+    Invoke-GitFixture $success @('commit', '-m', 'replayed current release identity') | Out-Null
 
-    $betaOneHistory = ($afterBetaOne -split '(?m)(?=^## v1\.0\.0-beta\.1 - )', 2)[1]
-    Prepare-NextBetaFixture $success 'v1.0.0-beta.1' 'v1.0.0-beta.2'
-    Invoke-GitFixture $success @('add', '--all') | Out-Null
-    Invoke-GitFixture $success @('commit', '-m', 'prepare beta two') | Out-Null
-    $betaTwoChangelogEntry = Get-CurrentChangelogEntryNeutralDocument $success
-    & (Join-Path $success 'scripts/Set-V1ReleaseVersion.ps1') `
-        -Version 1.0.0-beta.2 -Apply -ReleaseDate 2026-09-03 -TestFixture | Out-Null
-    & (Join-Path $success 'scripts/Verify-ReleaseConsistency.ps1') `
-        -Tag v1.0.0-beta.2 | Out-Null
-    Assert-Test ($LASTEXITCODE -eq 0) 'beta.N -> beta.(N+1) consistency verification failed'
-    Invoke-RealDocumentationGate $success
-    Assert-CurrentReleaseBindings $success 'v1.0.0-beta.2' '1.0.0-beta.2' '2026-09-03'
-    Assert-Test (
-        (Get-ReadmeCurrentStateNeutralDocument $success) -ceq $neutralReadme
-    ) 'beta.N transition changed README outside its explicit current-state regions'
-    Assert-Test (
-        (Get-GuideCurrentStateNeutralDocument $success) -ceq $neutralGuide
-    ) 'beta.N transition changed the user guide outside its explicit current-state regions'
-    Assert-Test (
-        (Get-ArchitectureCurrentStateNeutralDocument $success) -ceq $neutralArchitecture
-    ) 'beta.N transition changed architecture outside its explicit current-state bindings'
-    Assert-Test (
-        (Get-CurrentChangelogEntryNeutralDocument $success) -ceq $betaTwoChangelogEntry
-    ) 'beta.N transition changed CHANGELOG detail outside its heading/current-state prefix'
-    $afterBetaTwo = [IO.File]::ReadAllText((Join-Path $success 'CHANGELOG.md'), $Utf8NoBom)
-    Assert-Test ($afterBetaTwo.EndsWith($betaOneHistory)) (
-        'beta.N -> beta.(N+1) modified an earlier release record'
-    )
-    foreach ($binding in @(
-        @('docs/v1-beta-release-contract.md', 'release-tag'),
-        @('docs/v1-beta-agent-jsonl.md', 'target-release'),
-        @('docs/v1-beta-acceptance-matrix.md', 'normative-release')
-    )) {
+    $fixtureVersion = $currentVersion
+    $fixtureDate = $parsedReleaseDate
+    $completedVersions = [System.Collections.Generic.List[string]]::new()
+    $completedVersions.Add($currentVersion)
+    for ($step = 1; $step -le 2; $step++) {
+        $priorChangelog = [IO.File]::ReadAllText(
+            (Join-Path $success 'CHANGELOG.md'),
+            $Utf8NoBom
+        )
+        $priorHistoryStart = [regex]::Match($priorChangelog, '(?m)^## ')
+        Assert-Test $priorHistoryStart.Success 'prior CHANGELOG has no dated release history'
+        $priorHistory = $priorChangelog.Substring($priorHistoryStart.Index)
+        $targetVersion = Get-NextBetaVersion $fixtureVersion
+        $targetTag = "v$targetVersion"
+        $targetDate = $fixtureDate.AddDays(1).ToString(
+            'yyyy-MM-dd',
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        Prepare-NextBetaFixture $success "v$fixtureVersion" $targetTag
+        Invoke-GitFixture $success @('add', '--all') | Out-Null
+        Invoke-GitFixture $success @('commit', '-m', "prepare $targetTag") | Out-Null
+        $preparedChangelogEntry = Get-CurrentChangelogEntryNeutralDocument $success
+
+        & (Join-Path $success 'scripts/Set-V1ReleaseVersion.ps1') `
+            -Version $targetVersion -Apply -ReleaseDate $targetDate | Out-Null
+        & (Join-Path $success 'scripts/Verify-ReleaseConsistency.ps1') `
+            -Tag $targetTag | Out-Null
+        Assert-Test ($LASTEXITCODE -eq 0) "verification failed for $targetTag"
+        Invoke-RealDocumentationGate $success
+        Assert-CurrentReleaseBindings $success $targetTag $targetVersion $targetDate
         Assert-Test (
-            (Get-GovernanceCurrentStateNeutralDocument $success $binding[0] $binding[1]) -ceq
-                [string]$neutralGovernance[[string]$binding[0]]
-        ) "beta.N transition modified historical prose in $($binding[0])"
+            (Get-ReadmeCurrentStateNeutralDocument $success) -ceq $neutralReadme
+        ) "$targetTag changed README outside current-state regions"
+        Assert-Test (
+            (Get-GuideCurrentStateNeutralDocument $success) -ceq $neutralGuide
+        ) "$targetTag changed the user guide outside current-state regions"
+        Assert-Test (
+            (Get-ArchitectureCurrentStateNeutralDocument $success) -ceq $neutralArchitecture
+        ) "$targetTag changed architecture outside current-state regions"
+        Assert-Test (
+            (Get-CurrentChangelogEntryNeutralDocument $success) -ceq $preparedChangelogEntry
+        ) "$targetTag changed CHANGELOG outside its heading/current-state prefix"
+        $afterChangelog = [IO.File]::ReadAllText(
+            (Join-Path $success 'CHANGELOG.md'),
+            $Utf8NoBom
+        )
+        Assert-Test ($afterChangelog.EndsWith($priorHistory)) (
+            "$targetTag modified prior dated CHANGELOG history"
+        )
+        foreach ($binding in @(
+            @('docs/v1-beta-release-contract.md', 'release-tag'),
+            @('docs/v1-beta-agent-jsonl.md', 'target-release'),
+            @('docs/v1-beta-acceptance-matrix.md', 'normative-release')
+        )) {
+            Assert-Test (
+                (Get-GovernanceCurrentStateNeutralDocument $success $binding[0] $binding[1]) -ceq
+                    [string]$neutralGovernance[[string]$binding[0]]
+            ) "$targetTag modified historical prose in $($binding[0])"
+        }
+        $security = [IO.File]::ReadAllText(
+            (Join-Path $success 'SECURITY.md'),
+            $Utf8NoBom
+        )
+        Assert-Test (
+            (Get-CurrentSecurityLineNeutralDocument $success) -ceq $neutralSecurity -and
+            $security.Contains($rollbackPredecessorLine)
+        ) "$targetTag modified SECURITY history or its rollback predecessor"
+        $transitionStatus = @(Invoke-GitFixture $success @(
+            'status', '--porcelain=v1', '--untracked-files=all'
+        ))
+        $transitionPaths = @($transitionStatus | ForEach-Object {
+            ([string]$_).Substring(3).Replace('\', '/')
+        } | Sort-Object -Unique)
+        Assert-Test (($transitionPaths -join "`n") -ceq (($IdentityFiles | Sort-Object) -join "`n")) (
+            "$targetTag did not leave the exact approved identity path set"
+        )
+        Invoke-GitFixture $success @('add', '--all') | Out-Null
+        Invoke-GitFixture $success @('commit', '-m', "freeze $targetTag") | Out-Null
+        $fixtureVersion = $targetVersion
+        $fixtureDate = [DateTime]::ParseExact(
+            $targetDate,
+            'yyyy-MM-dd',
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        $completedVersions.Add($targetVersion)
     }
-    $betaTwoSecurity = [IO.File]::ReadAllText(
-        (Join-Path $success 'SECURITY.md'), $Utf8NoBom
-    )
-    Assert-Test (
-        (Get-CurrentSecurityLineNeutralDocument $success) -ceq $neutralSecurity -and
-        $betaTwoSecurity.Contains($rollbackPredecessorLine)
-    ) 'beta.N transition modified SECURITY history or its rollback predecessor'
-    Invoke-GitFixture $success @('add', '--all') | Out-Null
-    Invoke-GitFixture $success @('commit', '-m', 'freeze beta two') | Out-Null
 
-    Assert-VersionSwitchRejected $success '1.0.0-beta.2' 'same beta version'
-    Assert-VersionSwitchRejected $success '1.0.0-beta.1' 'beta downgrade'
-    Assert-VersionSwitchRejected $success '1.0.0-beta.4' 'beta ordinal jump'
+    $previousVersion = [string]$completedVersions[$completedVersions.Count - 2]
+    $jumpVersion = Get-NextBetaVersion (Get-NextBetaVersion $fixtureVersion)
+    Assert-VersionSwitchRejected $success $fixtureVersion 'same beta version'
+    Assert-VersionSwitchRejected $success $previousVersion 'beta downgrade'
+    Assert-VersionSwitchRejected $success $jumpVersion 'beta ordinal jump'
     Assert-VersionSwitchRejected $success '1.0.0-beta.0' 'beta zero ordinal'
     Assert-VersionSwitchRejected $success '1.0.0-beta.03' 'beta leading-zero ordinal'
     $verifyBetaZeroRejected = $false
@@ -582,14 +796,23 @@ try {
     catch { $verifyBetaZeroRejected = $true }
     Assert-Test $verifyBetaZeroRejected 'release verifier accepted beta.0'
 
-    $initialSkip = New-Fixture 'initial-skip'
-    Assert-VersionSwitchRejected $initialSkip '1.0.0-beta.1' '0.3 to beta.1 skip'
+    $initialSkip = New-Fixture 'initial-skip' $parentCommit
+    Assert-VersionSwitchRejected $initialSkip (Get-NextBetaVersion $currentVersion) (
+        'first-parent immediate-transition skip'
+    )
 
-    $failure = New-Fixture 'failure'
+    $failure = New-Fixture 'failure' $parentCommit
+    Write-Utf8 (Join-Path $failure '.serctl-version-switch-test-fixture') (
+        "SERCTL_VERSION_SWITCH_TEST_FIXTURE_V1`n"
+    )
+    Invoke-GitFixture $failure @('add', '--all') | Out-Null
+    Invoke-GitFixture $failure @('commit', '-m', 'enable fixture-only failure injection') | Out-Null
     $failureHashes = Get-TrackedHashes $failure
     $failed = $false
     try {
-        & (Join-Path $failure 'scripts/Set-V1ReleaseVersion.ps1') -Version 1.0.0-beta -Apply -ReleaseDate 2026-09-01 -TestFixture -InjectFailureAfterWrites 3 | Out-Null
+        & (Join-Path $failure 'scripts/Set-V1ReleaseVersion.ps1') `
+            -Version $currentVersion -Apply -ReleaseDate $currentReleaseDate `
+            -TestFixture -InjectFailureAfterWrites 3 | Out-Null
     }
     catch {
         $failed = $true
@@ -602,19 +825,34 @@ try {
         Assert-Test ([string]$restoredHashes[$relative] -ceq [string]$failureHashes[$relative]) "rollback changed bytes for $relative"
     }
 
-    Add-Content -LiteralPath (Join-Path $failure 'README.md') -Value '<!-- release-marker: v0.3.0-beta.2 -->' -Encoding utf8
+    [IO.File]::AppendAllText(
+        (Join-Path $failure 'README.md'),
+        "`n<!-- release-marker: v$parentVersion -->`n",
+        $Utf8NoBom
+    )
     Invoke-GitFixture $failure @('add', 'README.md') | Out-Null
     Invoke-GitFixture $failure @('commit', '-m', 'duplicate marker fixture') | Out-Null
     $duplicateRejected = $false
     try {
-        & (Join-Path $failure 'scripts/Set-V1ReleaseVersion.ps1') -Version 1.0.0-beta -WhatIf -ReleaseDate 2026-09-01 -TestFixture | Out-Null
+        & (Join-Path $failure 'scripts/Set-V1ReleaseVersion.ps1') `
+            -Version $currentVersion -WhatIf -ReleaseDate $currentReleaseDate -TestFixture | Out-Null
     }
     catch {
         $duplicateRejected = $true
     }
     Assert-Test $duplicateRejected 'duplicate old current marker was not rejected'
 
-    Write-Output 'V1 release version switch synthetic self-test: PASS'
+    $sourceHeadAfter = ([string](Invoke-GitFixture $SourceRoot @('rev-parse', 'HEAD'))).Trim().ToLowerInvariant()
+    $sourceStatusAfter = @(Invoke-GitFixture $SourceRoot @(
+        'status', '--porcelain=v1', '--untracked-files=all'
+    ))
+    Assert-Test ($sourceHeadAfter -ceq $sourceHead) 'source HEAD changed during local-clone replay'
+    Assert-Test ($sourceStatusAfter.Count -eq 0) 'source checkout changed during local-clone replay'
+
+    Write-Output (
+        "V1 release version switch local-clone replay self-test: PASS " +
+        "($parentVersion -> $currentVersion -> $($completedVersions[1]) -> $($completedVersions[2]))"
+    )
 }
 finally {
     if (Test-Path -LiteralPath $TestRoot -PathType Container) {
