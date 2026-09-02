@@ -163,6 +163,27 @@ $cliContractFixture = Read-RequiredStrictUtf8Text 'crates/serctl_cli/tests/fixtu
 $cliHelpTreeFixture = Read-RequiredText 'crates/serctl_cli/tests/fixtures/cli-help-tree-v1.txt'
 $cliCommandTreeFixture = Read-RequiredStrictUtf8Text 'crates/serctl_cli/tests/fixtures/cli-command-tree-v1.json'
 $agentResultFixture = Read-RequiredStrictUtf8Text 'crates/serctl_cli/tests/fixtures/agent-result-v1.jsonl'
+
+$machineReleaseTags = @()
+foreach ($binding in @(
+    @('release contract', $releaseContract, 'release-tag'),
+    @('Agent contract', $agentContract, 'target-release'),
+    @('acceptance matrix', $matrix, 'normative-release')
+)) {
+    $matches = @([regex]::Matches(
+        [string]$binding[1],
+        '<!--\s*' + [regex]::Escape([string]$binding[2]) +
+            ':\s*(?<tag>v1\.0\.0-beta(?:\.[1-9][0-9]*)?)\s*-->'
+    ))
+    Assert-DocumentationCondition ($matches.Count -eq 1) (
+        "$($binding[0]) does not contain exactly one canonical machine release marker"
+    )
+    $machineReleaseTags += $matches[0].Groups['tag'].Value
+}
+Assert-DocumentationCondition (
+    @($machineReleaseTags | Sort-Object -Unique).Count -eq 1
+) 'release contract, Agent contract and acceptance matrix machine markers disagree'
+$machineReleaseTag = [string]$machineReleaseTags[0]
 $transferProgressFixture = Read-RequiredStrictUtf8Text 'crates/serctl_cli/tests/fixtures/transfer-progress-v1.jsonl'
 
 Assert-DocumentationCondition ($client -match '(?m)^pub const AGENT_SCHEMA_VERSION: u16 = 1;\s*$') (
@@ -961,7 +982,7 @@ foreach ($document in @(
 }
 
 Assert-DocumentationCondition (
-    $architecture.Contains('data-release-candidate="v1.0.0-beta"') -and
+    $architecture.Contains("data-release-candidate=`"$machineReleaseTag`"") -and
     $architecture.Contains('data-release-predecessor="v0.3.0-beta.2"') -and
     $architecture.Contains('<code>v0.3.0-beta.2</code> / IPC v8')
 ) 'architecture does not distinguish the v1/IPC v9 candidate from the v0.3/IPC v8 predecessor'

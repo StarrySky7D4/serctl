@@ -136,9 +136,17 @@ The v1.0.0-beta capability does not rewrite current v0.3.0-beta.2.
 <span data-release-predecessor="v0.3.0-beta.2">Predecessor: <code>v0.3.0-beta.2</code></span>
 </body></html>
 '@
-    Write-Utf8 (Join-Path $root 'docs/v1-beta-release-contract.md') "Release tag: ``v1.0.0-beta```n"
-    Write-Utf8 (Join-Path $root 'docs/v1-beta-agent-jsonl.md') "Target release: ``v1.0.0-beta```n"
-    Write-Utf8 (Join-Path $root 'docs/v1-beta-acceptance-matrix.md') "This matrix is normative for ``v1.0.0-beta``.`n"
+    # Copy the actual document shapes.  These contain many historical beta
+    # references; only their unique HTML machine marker may advance.
+    foreach ($document in @(
+        'docs/v1-beta-release-contract.md',
+        'docs/v1-beta-agent-jsonl.md',
+        'docs/v1-beta-acceptance-matrix.md'
+    )) {
+        Copy-Item `
+            -LiteralPath (Join-Path $script:SourceRoot $document) `
+            -Destination (Join-Path $root $document)
+    }
     Write-Utf8 (Join-Path $root 'SECURITY.md') "| ``v1.0.0-beta`` | supported prerelease |`n"
     Write-Utf8 (Join-Path $root 'scripts/Test-V1BetaDocumentation.ps1') "Set-StrictMode -Version Latest`n`$ErrorActionPreference = 'Stop'`nWrite-Output 'fixture docs PASS'`n"
     Copy-Item -LiteralPath (Join-Path $script:SourceRoot 'scripts/Set-V1ReleaseVersion.ps1') -Destination (Join-Path $root 'scripts/Set-V1ReleaseVersion.ps1')
@@ -229,6 +237,19 @@ function Assert-VersionSwitchRejected {
     Assert-Test $rejected "$Description was accepted"
 }
 
+function Get-MachineMarkerNeutralDocument {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [Parameter(Mandatory = $true)][string]$MarkerName
+    )
+    $text = [IO.File]::ReadAllText((Join-Path $Root $RelativePath), $script:Utf8NoBom)
+    $pattern = '<!--\s*' + [regex]::Escape($MarkerName) + ':\s*[^\s]+\s*-->'
+    $matches = [regex]::Matches($text, $pattern)
+    Assert-Test ($matches.Count -eq 1) "$RelativePath lacks one machine marker"
+    return [regex]::Replace($text, $pattern, "<!-- ${MarkerName}: __VERSION__ -->")
+}
+
 function Get-TrackedHashes {
     param([Parameter(Mandatory = $true)][string]$Root)
     $result = @{}
@@ -259,6 +280,16 @@ try {
     Invoke-GitFixture $success @('add', '--all') | Out-Null
     Invoke-GitFixture $success @('commit', '-m', 'freeze initial beta') | Out-Null
 
+    $neutralGovernance = [ordered]@{}
+    foreach ($binding in @(
+        @('docs/v1-beta-release-contract.md', 'release-tag'),
+        @('docs/v1-beta-agent-jsonl.md', 'target-release'),
+        @('docs/v1-beta-acceptance-matrix.md', 'normative-release')
+    )) {
+        $neutralGovernance[[string]$binding[0]] = Get-MachineMarkerNeutralDocument `
+            $success ([string]$binding[0]) ([string]$binding[1])
+    }
+
     $betaHistory = ([IO.File]::ReadAllText(
         (Join-Path $success 'CHANGELOG.md'), $Utf8NoBom
     ) -split '(?m)(?=^## v1\.0\.0-beta - )', 2)[1]
@@ -274,6 +305,16 @@ try {
     Assert-Test ($afterBetaOne.EndsWith($betaHistory)) (
         'beta -> beta.1 modified the prior dated release record'
     )
+    foreach ($binding in @(
+        @('docs/v1-beta-release-contract.md', 'release-tag'),
+        @('docs/v1-beta-agent-jsonl.md', 'target-release'),
+        @('docs/v1-beta-acceptance-matrix.md', 'normative-release')
+    )) {
+        Assert-Test (
+            (Get-MachineMarkerNeutralDocument $success $binding[0] $binding[1]) -ceq
+                [string]$neutralGovernance[[string]$binding[0]]
+        ) "beta -> beta.1 modified historical prose in $($binding[0])"
+    }
     Assert-Test (
         @(Invoke-GitFixture $success @('status', '--porcelain=v1', '--untracked-files=all')).Count -eq 10
     ) 'beta -> beta.1 did not leave the exact ten approved identity changes'
@@ -293,6 +334,16 @@ try {
     Assert-Test ($afterBetaTwo.EndsWith($betaOneHistory)) (
         'beta.N -> beta.(N+1) modified an earlier release record'
     )
+    foreach ($binding in @(
+        @('docs/v1-beta-release-contract.md', 'release-tag'),
+        @('docs/v1-beta-agent-jsonl.md', 'target-release'),
+        @('docs/v1-beta-acceptance-matrix.md', 'normative-release')
+    )) {
+        Assert-Test (
+            (Get-MachineMarkerNeutralDocument $success $binding[0] $binding[1]) -ceq
+                [string]$neutralGovernance[[string]$binding[0]]
+        ) "beta.N transition modified historical prose in $($binding[0])"
+    }
     Invoke-GitFixture $success @('add', '--all') | Out-Null
     Invoke-GitFixture $success @('commit', '-m', 'freeze beta two') | Out-Null
 

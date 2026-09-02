@@ -1,5 +1,7 @@
 # serctl v1 beta release and compatibility contract
 
+<!-- release-tag: v1.0.0-beta -->
+
 Initial release tag: `v1.0.0-beta`; an immutable failed candidate is repaired
 only as a new canonical SemVer prerelease such as `v1.0.0-beta.1`.
 

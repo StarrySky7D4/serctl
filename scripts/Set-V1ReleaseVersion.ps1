@@ -298,9 +298,9 @@ function New-TransformationPlan {
     # immutable beta tag, so advance each exact binding once without touching
     # historical prose or accepting a third identity.
     foreach ($binding in @(
-        @('docs/v1-beta-release-contract.md', "Release tag: ``$oldTag``", "Release tag: ``$TargetTag``", 'release contract'),
-        @('docs/v1-beta-agent-jsonl.md', "Target release: ``$oldTag``", "Target release: ``$TargetTag``", 'Agent contract'),
-        @('docs/v1-beta-acceptance-matrix.md', "normative for ``$oldTag``", "normative for ``$TargetTag``", 'acceptance matrix'),
+        @('docs/v1-beta-release-contract.md', "<!-- release-tag: $oldTag -->", "<!-- release-tag: $TargetTag -->", 'release contract machine marker'),
+        @('docs/v1-beta-agent-jsonl.md', "<!-- target-release: $oldTag -->", "<!-- target-release: $TargetTag -->", 'Agent contract machine marker'),
+        @('docs/v1-beta-acceptance-matrix.md', "<!-- normative-release: $oldTag -->", "<!-- normative-release: $TargetTag -->", 'acceptance matrix machine marker'),
         @('SECURITY.md', "| ``$oldTag`` |", "| ``$TargetTag`` |", 'security support table')
     )) {
         $relative = [string]$binding[0]

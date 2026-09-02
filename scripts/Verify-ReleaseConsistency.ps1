@@ -350,17 +350,23 @@ try {
         $contract = Get-Content -LiteralPath (
             Join-Path $repositoryRoot 'docs/v1-beta-release-contract.md'
         ) -Raw -Encoding utf8
-        $releaseContractMarker = 'Release tag: `v{0}`' -f $releaseVersion
+        $releaseContractMarker = '<!-- release-tag: v{0} -->' -f $releaseVersion
         Assert-ReleaseCondition ($contract.Contains($releaseContractMarker)) (
             "v1 beta release contract is not bound to v$releaseVersion"
         )
+        Assert-ReleaseCondition (
+            ([regex]::Matches($contract, '<!--\s*release-tag:\s*[^\s]+\s*-->')).Count -eq 1
+        ) 'v1 beta release contract must contain exactly one machine release tag marker'
         $agentContract = Get-Content -LiteralPath (
             Join-Path $repositoryRoot 'docs/v1-beta-agent-jsonl.md'
         ) -Raw -Encoding utf8
-        $agentContractMarker = 'Target release: `v{0}`' -f $releaseVersion
+        $agentContractMarker = '<!-- target-release: v{0} -->' -f $releaseVersion
         Assert-ReleaseCondition ($agentContract.Contains($agentContractMarker)) (
             "v1 beta Agent contract is not bound to v$releaseVersion"
         )
+        Assert-ReleaseCondition (
+            ([regex]::Matches($agentContract, '<!--\s*target-release:\s*[^\s]+\s*-->')).Count -eq 1
+        ) 'v1 beta Agent contract must contain exactly one machine target release marker'
         $securityPolicy = Get-Content -LiteralPath (
             Join-Path $repositoryRoot 'SECURITY.md'
         ) -Raw -Encoding utf8
@@ -371,10 +377,13 @@ try {
         $acceptanceMatrix = Get-Content -LiteralPath (
             Join-Path $repositoryRoot 'docs/v1-beta-acceptance-matrix.md'
         ) -Raw -Encoding utf8
-        $acceptanceMarker = 'normative for `v{0}`' -f $releaseVersion
+        $acceptanceMarker = '<!-- normative-release: v{0} -->' -f $releaseVersion
         Assert-ReleaseCondition ($acceptanceMatrix.Contains($acceptanceMarker)) (
             "v1 beta acceptance matrix is not bound to v$releaseVersion"
         )
+        Assert-ReleaseCondition (
+            ([regex]::Matches($acceptanceMatrix, '<!--\s*normative-release:\s*[^\s]+\s*-->')).Count -eq 1
+        ) 'v1 beta acceptance matrix must contain exactly one normative release marker'
         & (Join-Path $repositoryRoot 'scripts/Test-V1BetaDocumentation.ps1')
     }
 

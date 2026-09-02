@@ -1,5 +1,7 @@
 # serctl v1 beta acceptance matrix
 
+<!-- normative-release: v1.0.0-beta -->
+
 This matrix is normative for `v1.0.0-beta`. A checkbox is evidence-backed only when its result is attached to the exact tag commit. Historical local tests, another tag, a dirty build, or a source-only platform check cannot close it.
 
 ## A. Release identity and source quality

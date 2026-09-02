@@ -1,5 +1,7 @@
 # serctl v1 beta Agent JSONL contract
 
+<!-- target-release: v1.0.0-beta -->
+
 Target release: `v1.0.0-beta` (candidate, not accepted or published)
 
 Agent transfer/tunnel/connection-identity source readiness: `implemented-unreleased`
