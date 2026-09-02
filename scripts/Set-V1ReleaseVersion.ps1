@@ -55,6 +55,11 @@ function Assert-Condition {
     }
 }
 
+function Expand-AsciiUnicode {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    return [regex]::Unescape($Value)
+}
+
 function Resolve-Application {
     param([Parameter(Mandatory = $true)][string]$Name)
     Assert-Condition ($Name -match '^[A-Za-z0-9._-]+$') 'application name contains wildcard or path syntax'
@@ -116,6 +121,34 @@ function Replace-ExactLiteral {
     )).Count
     Assert-Condition ($count -eq $ExpectedCount) "$Description count is $count, expected $ExpectedCount"
     return $Content.Replace($Old, $New)
+}
+
+function Replace-ExactLiteralOrAssertTarget {
+    param(
+        [Parameter(Mandatory = $true)][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Old,
+        [Parameter(Mandatory = $true)][string]$New,
+        [Parameter(Mandatory = $true)][int]$ExpectedCount,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+    Assert-Condition ($Old -cne $New) "$Description old and target bindings are identical"
+    $oldCount = ([regex]::Matches(
+        $Content,
+        [regex]::Escape($Old),
+        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )).Count
+    $newCount = ([regex]::Matches(
+        $Content,
+        [regex]::Escape($New),
+        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )).Count
+    if ($oldCount -eq $ExpectedCount -and $newCount -eq 0) {
+        return $Content.Replace($Old, $New)
+    }
+    Assert-Condition (
+        $oldCount -eq 0 -and $newCount -eq $ExpectedCount
+    ) "$Description is not bound exactly $ExpectedCount time(s) to either the prior or target value"
+    return $Content
 }
 
 function Replace-ExactRegex {
@@ -242,55 +275,119 @@ function New-TransformationPlan {
     $changelogPath = Join-Path $RepositoryRoot 'CHANGELOG.md'
     $changelog = Read-Text $changelogPath
     $changelog = Replace-ExactLiteral $changelog "## $TargetTag - Unreleased" "## $TargetTag - $ReleaseDate" 1 'v1 Unreleased heading'
-    $changelogStatusPattern = (
-        '^(?<targetHeading>## ' + [regex]::Escape($TargetTag) +
-        ' - ' + [regex]::Escape($ReleaseDate) + '\r?\n\r?\n)> \*\*[^\r\n]+\*\*[^\r\n]*' +
-        [regex]::Escape($oldTag) + '[^\r\n]*$'
-    )
-    $changelog = Replace-ExactRegex $changelog $changelogStatusPattern (
-        '${targetHeading}' +
-        "> **Release state**: workspace and prerelease markers are synchronized to ``$TargetTag``; publication still requires exact-tag CI, controlled runtime acceptance, and repository-governance gates."
-    ) 1 'CHANGELOG current-version statement'
+    $changelogOldStatus = (Expand-AsciiUnicode (
+        '> **\u5019\u9009\u72B6\u6001\uFF08\u5C1A\u672A\u9A8C\u6536/\u53D1\u5E03\uFF09**\uFF1A' +
+        '\u5F53\u524D workspace \u4E0E\u6B63\u5F0F\u53D1\u5E03\u6807\u8BB0\u4ECD\u4FDD\u6301 `{0}`\uFF0C' +
+        '\u5F85 Rust \u96C6\u6210\u3001exact-tag CI\u3001\u53D7\u63A7\u5B9E\u673A\u548C\u4ED3\u5E93' +
+        '\u6CBB\u7406\u95E8\u7981\u5168\u90E8\u901A\u8FC7\u540E\u518D\u7EDF\u4E00\u5207\u6362\u3002'
+    )) -f $oldTag
+    $changelogTargetStatus = (Expand-AsciiUnicode (
+        '> **\u5019\u9009\u72B6\u6001\uFF08\u5C1A\u672A\u9A8C\u6536/\u53D1\u5E03\uFF09**\uFF1A' +
+        '\u5F53\u524D workspace \u4E0E\u9884\u53D1\u5E03\u6807\u8BB0\u5DF2\u540C\u6B65\u4E3A `{0}`\uFF1B' +
+        'exact-tag CI\u3001\u53D7\u63A7\u5B9E\u673A\u548C\u4ED3\u5E93\u6CBB\u7406\u95E8\u7981' +
+        '\u4ECD\u987B\u901A\u8FC7\u540E\u65B9\u53EF\u53D1\u5E03\u3002'
+    )) -f $TargetTag
+    $changelog = Replace-ExactLiteral `
+        $changelog $changelogOldStatus $changelogTargetStatus 1 'CHANGELOG current-state prefix'
     $plan['CHANGELOG.md'] = $changelog
 
     $readmePath = Join-Path $RepositoryRoot 'README.md'
     $readme = Read-Text $readmePath
-    $readmeVisiblePattern = '^[^\r\n]*\*\*' + [regex]::Escape($oldTag) + '\*\*[^\r\n]*$'
+    $readmeVisiblePattern = '^(?<prefix>[^\r\n]*\*\*)' +
+        [regex]::Escape($oldTag) + '(?<suffix>\*\*[^\r\n]*V1[^\r\n]*)$'
     $readme = Replace-ExactRegex $readme $readmeVisiblePattern (
-        "Current prerelease marker: **$TargetTag**. The historical main baseline remains on the V1 branch."
+        '${prefix}' + $TargetTag + '${suffix}'
     ) 1 'README visible current version'
     $readme = Replace-ExactLiteral $readme "<!-- release-marker: $oldTag -->" "<!-- release-marker: $TargetTag -->" 1 'README release marker'
-    $readmeCandidatePattern = '^> [^\r\n]*\*\*' + [regex]::Escape($TargetTag) + '[^\r\n]*' + [regex]::Escape($oldTag) + '[^\r\n]*$'
-    $readme = Replace-ExactRegex $readme $readmeCandidatePattern (
-        "> The current prerelease marker is **$TargetTag**. Publication still requires the exact clean tag, CI provenance, and external acceptance evidence; predecessor statements remain historical rollback evidence."
-    ) 1 'README candidate-state paragraph'
-    $readmeFrozenPattern = '^[^\r\n]*`' + [regex]::Escape($oldTag) + '`[^\r\n]*`' + [regex]::Escape($TargetTag) + '`[^\r\n]*$'
-    $readme = Replace-ExactRegex $readme $readmeFrozenPattern (
-        "Current prerelease marker: ``$TargetTag``. Publication still accepts only the exact clean tag and its CI evidence."
-    ) 1 'README frozen-current statement'
+    $readmeCandidateOld = (Expand-AsciiUnicode '> \u5DE5\u4F5C\u6811\u4E2D\u7684 **{0} \u5019\u9009\u5C1A\u672A\u9A8C\u6536\u6216\u53D1\u5E03**\u3002') -f $oldTag
+    $readmeCandidateTarget = (Expand-AsciiUnicode '> \u5DE5\u4F5C\u6811\u4E2D\u7684 **{0} \u5019\u9009\u5C1A\u672A\u9A8C\u6536\u6216\u53D1\u5E03**\u3002') -f $TargetTag
+    $readme = Replace-ExactLiteralOrAssertTarget `
+        $readme $readmeCandidateOld $readmeCandidateTarget 1 'README candidate identity'
+    $readmeStatusOld = (
+        (Expand-AsciiUnicode '\u5F53\u524D\u7248\u672C\u6807\u8BB0\u5728 Cargo\u3001lockfile\u3001CHANGELOG\u3001README\u3001\u7528\u6237\u6307\u5357\u548C\u67B6\u6784\u9875\u7EDF\u4E00\u5207\u6362\u524D\u4ECD\u4FDD\u6301 {0}') -f $oldTag
+    )
+    if ($oldTag -match '^v1\.0\.0-beta') {
+        $readmeStatusOld = (Expand-AsciiUnicode '\u5F53\u524D workspace \u4E0E\u9884\u53D1\u5E03\u6807\u8BB0\u5DF2\u540C\u6B65\u4E3A {0}') -f $oldTag
+    }
+    $readmeStatusTarget = (Expand-AsciiUnicode '\u5F53\u524D workspace \u4E0E\u9884\u53D1\u5E03\u6807\u8BB0\u5DF2\u540C\u6B65\u4E3A {0}') -f $TargetTag
+    $readme = Replace-ExactLiteral `
+        $readme $readmeStatusOld $readmeStatusTarget 1 'README current-state clause'
+    $readmeBoundaryOld = if ($oldTag -match '^v1\.0\.0-beta') {
+        (Expand-AsciiUnicode '\u5F53\u524D\u9884\u53D1\u5E03\u7248\u672C\u6807\u8BB0\u4E3A `{0}`\uFF1B\u8BE5\u7248\u672C\u4ECD\u662F\u672A\u53D1\u5E03\u5019\u9009\u3002') -f $oldTag
+    }
+    else {
+        (Expand-AsciiUnicode '\u5F53\u524D\u6B63\u5F0F\u7248\u672C\u6807\u8BB0\u4ECD\u51BB\u7ED3\u4E3A `{0}`\uFF1B\u5DE5\u4F5C\u6811\u4E2D\u7684 `{1}` \u53EA\u662F\u672A\u53D1\u5E03\u5019\u9009\u3002') -f $oldTag, $TargetTag
+    }
+    $readmeBoundaryTarget = (Expand-AsciiUnicode '\u5F53\u524D\u9884\u53D1\u5E03\u7248\u672C\u6807\u8BB0\u4E3A `{0}`\uFF1B\u8BE5\u7248\u672C\u4ECD\u662F\u672A\u53D1\u5E03\u5019\u9009\u3002') -f $TargetTag
+    $readme = Replace-ExactLiteral `
+        $readme $readmeBoundaryOld $readmeBoundaryTarget 1 'README release-boundary prefix'
+    $readmeWorkflowOld = (Expand-AsciiUnicode '\u6B63\u5F0F\u9884\u53D1\u5E03\u4EC5\u7531 exact annotated tag `{0}` \u89E6\u53D1\u4E13\u7528 workflow') -f $oldTag
+    $readmeWorkflowTarget = (Expand-AsciiUnicode '\u6B63\u5F0F\u9884\u53D1\u5E03\u4EC5\u7531 exact annotated tag `{0}` \u89E6\u53D1\u4E13\u7528 workflow') -f $TargetTag
+    $readme = Replace-ExactLiteralOrAssertTarget `
+        $readme $readmeWorkflowOld $readmeWorkflowTarget 1 'README workflow tag binding'
     $plan['README.md'] = $readme
 
     $guidePath = Join-Path $RepositoryRoot 'docs/serctl-user-guide.md'
     $guide = Read-Text $guidePath
-    $guideHeaderPattern = '\A(# [^\r\n]+\r?\n\r?\n)[^\r\n]*`' + [regex]::Escape($oldTag) + '`[^\r\n]*'
-    $guide = Replace-ExactRegex $guide $guideHeaderPattern ('${1}' + "Applicable version: ``$TargetTag`` (prerelease)") 1 'user-guide visible version'
+    $guideHeaderPattern = '\A(?<heading># [^\r\n]+\r?\n\r?\n)(?<prefix>[^\r\n]*`)' +
+        [regex]::Escape($oldTag) + '(?<suffix>`[^\r\n]*)'
+    $guide = Replace-ExactRegex $guide $guideHeaderPattern (
+        '${heading}${prefix}' + $TargetTag + '${suffix}'
+    ) 1 'user-guide visible version'
     $guide = Replace-ExactLiteral $guide "<!-- applicable-version: $oldTag -->" "<!-- applicable-version: $TargetTag -->" 1 'user-guide version marker'
-    $guideCurrentPattern = '^> [^\r\n]*' + [regex]::Escape($oldTag) + '[^\r\n]*' + [regex]::Escape($TargetTag) + '[^\r\n]*$'
-    $guide = Replace-ExactRegex $guide $guideCurrentPattern (
-        "> Current prerelease marker: $TargetTag. Publication still requires the exact clean tag plus matching CI and external acceptance evidence."
-    ) 1 'user-guide current-version note'
-    $guideCapabilityPattern = '^[^\r\n]*' + [regex]::Escape($TargetTag) + '[^\r\n]*' + [regex]::Escape($oldTag) + '[^\r\n]*$'
-    $guide = Replace-ExactRegex $guide $guideCapabilityPattern (
-        "These candidate capabilities are included in the current $TargetTag prerelease marker; final publication remains subject to exact-tag acceptance."
-    ) 1 'user-guide candidate capability marker'
+    $guideStatusOld = if ($oldTag -match '^v1\.0\.0-beta') {
+        (Expand-AsciiUnicode '> \u5F53\u524D\u9884\u53D1\u5E03\u6807\u8BB0\u5DF2\u540C\u6B65\u4E3A {0}\uFF1B\u8BE5\u5019\u9009\u5C1A\u672A\u9A8C\u6536\u6216\u53D1\u5E03\u3002') -f $oldTag
+    }
+    else {
+        (Expand-AsciiUnicode '> \u5F53\u524D\u53D1\u5E03\u6807\u8BB0\u4ECD\u4E3A {0}\uFF1B\u5DE5\u4F5C\u6811\u4E2D\u7684 {1} \u5019\u9009\u5C1A\u672A\u9A8C\u6536\u6216\u53D1\u5E03\u3002') -f $oldTag, $TargetTag
+    }
+    $guideStatusTarget = (Expand-AsciiUnicode '> \u5F53\u524D\u9884\u53D1\u5E03\u6807\u8BB0\u5DF2\u540C\u6B65\u4E3A {0}\uFF1B\u8BE5\u5019\u9009\u5C1A\u672A\u9A8C\u6536\u6216\u53D1\u5E03\u3002') -f $TargetTag
+    $guide = Replace-ExactLiteral `
+        $guide $guideStatusOld $guideStatusTarget 1 'user-guide current-state prefix'
+    $guideCapabilityOld = (Expand-AsciiUnicode '\u4EE5\u4E0A\u65B0\u589E schema/error/transfer/tunnel/connection-identity \u884C\u4E3A\u5C5E\u4E8E {0} \u5019\u9009') -f $oldTag
+    $guideCapabilityTarget = (Expand-AsciiUnicode '\u4EE5\u4E0A\u65B0\u589E schema/error/transfer/tunnel/connection-identity \u884C\u4E3A\u5C5E\u4E8E {0} \u5019\u9009') -f $TargetTag
+    $guide = Replace-ExactLiteralOrAssertTarget `
+        $guide $guideCapabilityOld $guideCapabilityTarget 1 'user-guide capability candidate identity'
+    $guideTailOld = if ($oldTag -match '^v1\.0\.0-beta') {
+        (Expand-AsciiUnicode '\u5F53\u524D\u9884\u53D1\u5E03\u6807\u8BB0\u5DF2\u540C\u6B65\u4E3A {0}\uFF0C\u4F46\u4E0D\u56E0\u6B64\u89C6\u4E3A\u5DF2\u9A8C\u6536\u3002') -f $oldTag
+    }
+    else {
+        (Expand-AsciiUnicode '\u5F53\u524D {0} \u53D1\u5E03\u6807\u8BB0\u4E0D\u56E0\u6B64\u88AB\u6539\u5199\u3002') -f $oldTag
+    }
+    $guideTailTarget = (Expand-AsciiUnicode '\u5F53\u524D\u9884\u53D1\u5E03\u6807\u8BB0\u5DF2\u540C\u6B65\u4E3A {0}\uFF0C\u4F46\u4E0D\u56E0\u6B64\u89C6\u4E3A\u5DF2\u9A8C\u6536\u3002') -f $TargetTag
+    $guide = Replace-ExactLiteral `
+        $guide $guideTailOld $guideTailTarget 1 'user-guide capability acceptance boundary'
     $plan['docs/serctl-user-guide.md'] = $guide
 
     $architecturePath = Join-Path $RepositoryRoot 'docs/serctl-architecture-security.html'
     $architecture = Read-Text $architecturePath
-    $architectureMarkerPattern = 'data-release-candidate="' + [regex]::Escape($TargetTag) + '">[^<]*<code>' + [regex]::Escape($TargetTag) + '</code>[^<]*'
-    $architecture = Replace-ExactRegex $architecture $architectureMarkerPattern (
-        "data-release-candidate=`"$TargetTag`">Current prerelease: <code>$TargetTag</code> (formal source remains the exact clean tag and CI provenance)"
-    ) 1 'architecture current candidate marker'
+    $architectureOldPattern = '(?<prefix>data-release-candidate=")' +
+        [regex]::Escape($oldTag) + '(?<middle>">[^<]*<code>)' +
+        [regex]::Escape($oldTag) + '(?<suffix></code>)'
+    $architectureTargetPattern = 'data-release-candidate="' +
+        [regex]::Escape($TargetTag) + '">[^<]*<code>' +
+        [regex]::Escape($TargetTag) + '</code>'
+    $architectureOldCount = ([regex]::Matches($architecture, $architectureOldPattern)).Count
+    $architectureTargetCount = ([regex]::Matches($architecture, $architectureTargetPattern)).Count
+    if ($architectureOldCount -eq 1 -and $architectureTargetCount -eq 0) {
+        $architecture = Replace-ExactRegex $architecture $architectureOldPattern (
+            '${prefix}' + $TargetTag + '${middle}' + $TargetTag + '${suffix}'
+        ) 1 'architecture current candidate marker'
+    }
+    else {
+        Assert-Condition (
+            $architectureOldCount -eq 0 -and $architectureTargetCount -eq 1
+        ) 'architecture current candidate marker is not bound exactly once to either the prior or target tag'
+    }
+    foreach ($binding in @(
+        @(((Expand-AsciiUnicode '<strong>{0} \u5019\u9009\uFF0C\u5C1A\u672A\u9A8C\u6536</strong>') -f $oldTag), ((Expand-AsciiUnicode '<strong>{0} \u5019\u9009\uFF0C\u5C1A\u672A\u9A8C\u6536</strong>') -f $TargetTag), 'architecture status-card tag'),
+        @(((Expand-AsciiUnicode '\u53EA\u6709 exact annotated clean tag <code>{0}</code> \u4E0A') -f $oldTag), ((Expand-AsciiUnicode '\u53EA\u6709 exact annotated clean tag <code>{0}</code> \u4E0A') -f $TargetTag), 'architecture artifact-boundary tag'),
+        @(((Expand-AsciiUnicode 'v1 beta \u53D1\u5E03\u94FE\u53EA\u54CD\u5E94\u89C4\u8303 annotated tag <code>{0}</code>') -f $oldTag), ((Expand-AsciiUnicode 'v1 beta \u53D1\u5E03\u94FE\u53EA\u54CD\u5E94\u89C4\u8303 annotated tag <code>{0}</code>') -f $TargetTag), 'architecture workflow tag'),
+        @(((Expand-AsciiUnicode '\u7684 <code>{0}</code> \u5019\u9009\u3001vault-storage') -f $oldTag), ((Expand-AsciiUnicode '\u7684 <code>{0}</code> \u5019\u9009\u3001vault-storage') -f $TargetTag), 'architecture footer tag')
+    )) {
+        $architecture = Replace-ExactLiteralOrAssertTarget `
+            $architecture ([string]$binding[0]) ([string]$binding[1]) 1 ([string]$binding[2])
+    }
     $plan['docs/serctl-architecture-security.html'] = $architecture
 
     # On the initial 0.3 -> v1 beta transition these governance documents are
@@ -317,8 +414,43 @@ function New-TransformationPlan {
             Assert-Condition ($oldCount -eq 0 -and $targetCount -eq 1) (
                 "$($binding[3]) is not bound exactly once to either the prior or target tag"
             )
+            $plan[$relative] = $content
         }
     }
+    $releaseContract = [string]$plan['docs/v1-beta-release-contract.md']
+    $releaseContract = Replace-ExactLiteralOrAssertTarget `
+        $releaseContract "  `"tag`": `"$oldTag`"," "  `"tag`": `"$TargetTag`"," 2 'release-contract JSON tag examples'
+    $releaseContract = Replace-ExactLiteralOrAssertTarget `
+        $releaseContract "scripts/New-IsolatedCandidate.ps1 -Version $OldVersion" "scripts/New-IsolatedCandidate.ps1 -Version $Version" 1 'release-contract candidate command'
+    $releaseContract = Replace-ExactLiteralOrAssertTarget `
+        $releaseContract "target/candidates/$oldTag-<12-character-HEAD>" "target/candidates/$TargetTag-<12-character-HEAD>" 1 'release-contract candidate path'
+    $plan['docs/v1-beta-release-contract.md'] = $releaseContract
+
+    $agentContract = [string]$plan['docs/v1-beta-agent-jsonl.md']
+    $agentContract = Replace-ExactLiteralOrAssertTarget `
+        $agentContract "Target release: ``$oldTag`` (candidate, not accepted or published)" "Target release: ``$TargetTag`` (candidate, not accepted or published)" 1 'Agent contract target release'
+    $agentStatusOld = if ($oldTag -match '^v1\.0\.0-beta') {
+        "The current workspace/release marker is ``$oldTag``; exact-tag acceptance gates still control support and publication."
+    }
+    else {
+        "The current workspace/release marker remains ``$oldTag`` until the exact-tag acceptance gates pass."
+    }
+    $agentStatusTarget = "The current workspace/release marker is ``$TargetTag``; exact-tag acceptance gates still control support and publication."
+    $agentContract = Replace-ExactLiteral `
+        $agentContract $agentStatusOld $agentStatusTarget 1 'Agent contract current-state sentence'
+    $plan['docs/v1-beta-agent-jsonl.md'] = $agentContract
+
+    $acceptanceMatrix = [string]$plan['docs/v1-beta-acceptance-matrix.md']
+    foreach ($binding in @(
+        @("This matrix is normative for ``$oldTag``.", "This matrix is normative for ``$TargetTag``.", 'acceptance-matrix normative tag'),
+        @("- [ ] ``scripts/Verify-ReleaseConsistency.ps1 -Tag $oldTag -RequireGitTag``", "- [ ] ``scripts/Verify-ReleaseConsistency.ps1 -Tag $TargetTag -RequireGitTag``", 'acceptance-matrix verifier tag'),
+        @("all name ``$OldVersion`` consistently", "all name ``$Version`` consistently", 'acceptance-matrix version tuple'),
+        @("scripts/New-IsolatedCandidate.ps1``, at the new path ``target/candidates/$oldTag-<12-character-HEAD>``", "scripts/New-IsolatedCandidate.ps1``, at the new path ``target/candidates/$TargetTag-<12-character-HEAD>``", 'acceptance-matrix candidate path')
+    )) {
+        $acceptanceMatrix = Replace-ExactLiteralOrAssertTarget `
+            $acceptanceMatrix ([string]$binding[0]) ([string]$binding[1]) 1 ([string]$binding[2])
+    }
+    $plan['docs/v1-beta-acceptance-matrix.md'] = $acceptanceMatrix
     $securityPath = Join-Path $RepositoryRoot 'SECURITY.md'
     $security = Read-Text $securityPath
     $supportSuffix = ' | Supported after its tagged acceptance workflow publishes the attested prerelease; fixes are delivered as a new immutable prerelease tag. |'
@@ -532,8 +664,15 @@ try {
     $after = Get-RepositoryIdentity
     Assert-Condition ($after.Head -ceq $before.Head -and $after.Tree -ceq $before.Tree) 'HEAD/tree changed during mutation'
     $actualChanged = @($after.Status | ForEach-Object { ([string]$_).Substring(3).Replace('\', '/') } | Sort-Object -Unique)
-    $expectedChanged = @($plan.Keys | Sort-Object -Unique)
-    Assert-Condition (($actualChanged -join "`n") -ceq ($expectedChanged -join "`n")) 'post-switch Git status differs from the exact approved file set'
+    $expectedChanged = @($plan.Keys | Where-Object {
+        -not [System.Linq.Enumerable]::SequenceEqual(
+            [byte[]]$snapshots[[string]$_].Bytes,
+            [byte[]][System.IO.File]::ReadAllBytes((Join-Path $RepositoryRoot ([string]$_)))
+        )
+    } | Sort-Object -Unique)
+    Assert-Condition (($actualChanged -join "`n") -ceq ($expectedChanged -join "`n")) (
+        "post-switch Git status differs from the exact approved file set; actual=[$($actualChanged -join ', ')]; expected=[$($expectedChanged -join ', ')]"
+    )
 
     & (Join-Path $RepositoryRoot 'scripts/Verify-ReleaseConsistency.ps1') -Tag $TargetTag
     Assert-Condition ($LASTEXITCODE -eq 0) 'Verify-ReleaseConsistency rejected the switched source'
