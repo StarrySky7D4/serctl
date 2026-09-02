@@ -220,7 +220,7 @@ try {
     $fuzzManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'fuzz/Cargo.toml') -Raw -Encoding utf8
     $fuzzWorkspaceNames = @([regex]::Matches(
         $fuzzManifest,
-        '(?m)^(?<name>serctl-[a-z0-9-]+)\s*=\s*\{[^\r\n]*\bpath\s*=',
+        '(?m)^(?<name>[A-Za-z0-9_-]+)\s*=\s*\{[^\r\n]*\bpath\s*=',
         [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
     ) | ForEach-Object { $_.Groups['name'].Value } | Sort-Object -Unique)
     Assert-ReleaseCondition ($fuzzWorkspaceNames.Count -gt 0) 'fuzz/Cargo.toml has no internal path dependencies'
