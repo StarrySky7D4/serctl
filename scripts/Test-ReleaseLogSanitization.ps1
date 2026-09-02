@@ -16,14 +16,19 @@ $absolutePosix = "/private/$secret/bundle.tar.gz"
 $unc = "\\server\share\$secret\acl.txt"
 $control = "bad`r`n$secret.json"
 $cases = @(
-    @{ Path = $absoluteWindows; Fallback = 'download'; Expected = 'receipt.json' },
-    @{ Path = $absolutePosix; Fallback = 'bundle'; Expected = 'bundle.tar.gz' },
-    @{ Path = $unc; Fallback = 'acl'; Expected = 'acl.txt' },
-    @{ Path = $control; Fallback = 'redacted'; Expected = 'redacted' }
+    @{ Name = 'windows-absolute'; Path = $absoluteWindows; Fallback = 'download'; Expected = 'receipt.json' },
+    @{ Name = 'posix-absolute'; Path = $absolutePosix; Fallback = 'bundle'; Expected = 'bundle.tar.gz' },
+    @{ Name = 'unc'; Path = $unc; Fallback = 'acl'; Expected = 'acl.txt' },
+    @{ Name = 'mixed-separator'; Path = 'mixed\directory/file.txt'; Fallback = 'mixed'; Expected = 'file.txt' },
+    @{ Name = 'trailing-separator'; Path = 'trailing\directory\'; Fallback = 'trailing'; Expected = 'trailing' },
+    @{ Name = 'bare-leaf'; Path = 'manifest.json'; Fallback = 'manifest'; Expected = 'manifest.json' },
+    @{ Name = 'control-character'; Path = $control; Fallback = 'redacted'; Expected = 'redacted' }
 )
 foreach ($case in $cases) {
     $leaf = Get-ReleaseLogLeafName -Path $case.Path -Fallback $case.Fallback
-    Assert-LogSelfTest ($leaf -ceq $case.Expected) 'leaf-name policy mismatch'
+    Assert-LogSelfTest ($leaf -ceq $case.Expected) (
+        "leaf-name policy mismatch for $($case.Name)"
+    )
     $success = Format-ReleaseLogRecord -Category release_step_completed -LeafName $leaf -Bytes 17
     $failure = Format-ReleaseLogRecord -Category release_step_failed -LeafName $leaf -Bytes 23
     foreach ($output in @($success, $failure)) {
@@ -74,7 +79,7 @@ function Invoke-SanitizedFailureProbe {
         $combined = ($stdout + $stderr).Trim()
         Assert-LogSelfTest ($process.ExitCode -eq 1) 'failure probe did not exit 1'
         Assert-LogSelfTest ($combined -ceq $Expected) (
-            "failure probe did not emit exactly one sanitized record: '$combined'"
+            'failure probe did not emit exactly one sanitized record'
         )
         foreach ($canary in @(
             $secret, 'C:\private\', '/private/', '\\server\share\', "`r", "`n"

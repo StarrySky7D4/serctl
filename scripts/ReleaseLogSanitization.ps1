@@ -8,8 +8,11 @@ function Get-ReleaseLogLeafName {
         [string]$Fallback
     )
 
-    try { $leaf = [System.IO.Path]::GetFileName([string]$Path) }
-    catch { return $Fallback }
+    # Release inputs may originate on a different operating system than the
+    # runner validating them. Treat both slash forms as separators so an
+    # absolute Windows or UNC path can never become a log-visible leaf on Unix.
+    $segments = ([string]$Path) -split '[\\/]'
+    $leaf = $segments[-1]
     if ([string]::IsNullOrWhiteSpace($leaf) -or
         $leaf.Length -gt 128 -or
         $leaf -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {

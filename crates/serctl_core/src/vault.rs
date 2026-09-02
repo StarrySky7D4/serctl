@@ -4731,13 +4731,19 @@ mod tests {
     #[test]
     fn audit_record_format_blocks_beta2_destructive_writer_before_callback() {
         let passphrase = "independent-profile-passphrase";
-        let (recovery, local_share, _media) = crate::recovery::generate_recovery().unwrap();
-        let admin = seal_admin_policy(
-            "independent-administrator-passphrase",
-            &recovery,
-            &local_share,
-        )
-        .unwrap();
+        #[cfg(windows)]
+        let (recovery, admin) = {
+            let (recovery, local_share, _media) = crate::recovery::generate_recovery().unwrap();
+            let admin = seal_admin_policy(
+                "independent-administrator-passphrase",
+                &recovery,
+                &local_share,
+            )
+            .unwrap();
+            (Some(recovery), Some(admin))
+        };
+        #[cfg(not(windows))]
+        let (recovery, admin) = (None, None);
         let mut package = new_key_package([0x76_u8; 16], 14);
         package.audit_initialized = true;
         let encrypted = wrap_profile_v3(
@@ -4745,14 +4751,14 @@ mod tests {
             &sample_creds(),
             passphrase,
             &package,
-            Some(&recovery),
+            recovery.as_ref(),
         )
         .unwrap();
         assert_eq!(encrypted.format, PROFILE_FORMAT_AUDIT_ENVELOPE);
         let mut vault = VaultFile {
             version: VAULT_FORMAT,
-            admin: Some(admin),
-            recovery: Some(recovery),
+            admin,
+            recovery,
             ..VaultFile::default()
         };
         vault.profiles.insert("guarded".to_owned(), encrypted);
