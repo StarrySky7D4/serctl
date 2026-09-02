@@ -1084,6 +1084,51 @@ jobs:
             -Directory $publishDirectory `
             -Version $env:RELEASE_VERSION `
             -SnapshotPath $publishSnapshot
+
+          # Close the remote-reference TOCTOU window immediately before the
+          # one-shot release mutation. None of the lengthy protected-copy,
+          # checksum, or attestation checks above authorizes stale refs.
+          $finalRemoteMain = & gh api --method GET `
+            "repos/$env:GITHUB_REPOSITORY/git/ref/heads/main" `
+            --jq '.object.type + " " + .object.sha'
+          if ($LASTEXITCODE -ne 0) {
+            throw 'cannot re-read the final remote main ref before publication'
+          }
+          if (($finalRemoteMain | Out-String).Trim().ToLowerInvariant() -cne
+              "commit $($env:RELEASE_COMMIT.ToLowerInvariant())") {
+            throw 'final remote main no longer equals the exact release commit'
+          }
+          $finalRemoteTag = & gh api --method GET `
+            "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" `
+            --jq '.object.type + " " + .object.sha'
+          if ($LASTEXITCODE -ne 0) {
+            throw "cannot re-read final remote tag $env:RELEASE_TAG"
+          }
+          if (($finalRemoteTag | Out-String).Trim() -cne
+              "tag $env:RELEASE_TAG_OBJECT") {
+            throw 'final remote tag object no longer equals the preflight object'
+          }
+          $finalRemoteTagTarget = & gh api --method GET `
+            "repos/$env:GITHUB_REPOSITORY/git/tags/$env:RELEASE_TAG_OBJECT" `
+            --jq '.object.type + " " + .object.sha'
+          if ($LASTEXITCODE -ne 0) {
+            throw "cannot peel final remote annotated tag object $env:RELEASE_TAG_OBJECT"
+          }
+          if (($finalRemoteTagTarget | Out-String).Trim() -cne
+              "commit $env:RELEASE_COMMIT") {
+            throw 'final remote annotated tag object no longer peels to the release commit'
+          }
+          $finalReleaseProbe = Invoke-WebRequest `
+            -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" `
+            -Headers $headers `
+            -MaximumRedirection 0 `
+            -SkipHttpErrorCheck
+          if ([int]$finalReleaseProbe.StatusCode -eq 200) {
+            throw "release $env:RELEASE_TAG appeared during verification; refusing mutation"
+          }
+          if ([int]$finalReleaseProbe.StatusCode -ne 404) {
+            throw "cannot finally prove release absence; GitHub returned HTTP $([int]$finalReleaseProbe.StatusCode)"
+          }
           $assets = @(
             $expectedSubjects |
               ForEach-Object { (Join-Path $publishDirectory $_) }

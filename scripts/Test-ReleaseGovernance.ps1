@@ -837,6 +837,10 @@ foreach ($required in @(
     '-MaxBytes 8388608',
     'external evidence artifact SHA-256 mismatch',
     'remote annotated tag object no longer peels to the preflight commit',
+    'final remote main no longer equals the exact release commit',
+    'final remote tag object no longer equals the preflight object',
+    'final remote annotated tag object no longer peels to the release commit',
+    'cannot finally prove release absence',
     'cannot prove release absence',
     'publish allowlist contains $($expectedSubjects.Count) files, expected 14',
     '-p serctl-xfer --bin serctl-xfer',
@@ -1106,12 +1110,35 @@ $externalEvidenceIndex = $workflow.IndexOf(
     [StringComparison]::Ordinal
 )
 $releaseCreateIndex = $workflow.IndexOf('gh release create', [StringComparison]::Ordinal)
+$finalRemoteMainIndex = $workflow.IndexOf(
+    'final remote main no longer equals the exact release commit',
+    [StringComparison]::Ordinal
+)
+$finalRemoteTagIndex = $workflow.IndexOf(
+    'final remote tag object no longer equals the preflight object',
+    [StringComparison]::Ordinal
+)
+$finalRemoteTargetIndex = $workflow.IndexOf(
+    'final remote annotated tag object no longer peels to the release commit',
+    [StringComparison]::Ordinal
+)
+$finalReleaseAbsenceIndex = $workflow.IndexOf(
+    'cannot finally prove release absence',
+    [StringComparison]::Ordinal
+)
 Assert-TestCondition (
     $publishVerifierIndex -ge 0 -and
     $attestationVerifierIndex -gt $publishVerifierIndex -and
     $externalEvidenceIndex -gt $attestationVerifierIndex -and
     $releaseCreateIndex -gt $externalEvidenceIndex
 ) 'publication gates must reverify artifacts, attestations and external evidence before release creation'
+Assert-TestCondition (
+    $finalRemoteMainIndex -gt $externalEvidenceIndex -and
+    $finalRemoteTagIndex -gt $finalRemoteMainIndex -and
+    $finalRemoteTargetIndex -gt $finalRemoteTagIndex -and
+    $finalReleaseAbsenceIndex -gt $finalRemoteTargetIndex -and
+    $releaseCreateIndex -gt $finalReleaseAbsenceIndex
+) 'publish must recheck remote main, tag, peeled commit, and release absence immediately before creation'
 Assert-TestCondition (
     ([regex]::Matches($workflow, '(?m)^\s*contents:\s*write\s*$')).Count -eq 1
 ) 'release workflow must grant contents:write only to the publish job'
