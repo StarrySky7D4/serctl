@@ -168,6 +168,7 @@ $fixtureSource = Join-Path $toolsDirectory 'fixture-binary.rs'
 $fixtureBinary = Join-Path $toolsDirectory "fixture-binary$executableSuffix"
 $fakeCargo = Join-Path $toolsDirectory "fixture-cargo$executableSuffix"
 $fakeRustc = Join-Path $toolsDirectory "rustc$executableSuffix"
+$fakeRustdoc = Join-Path $toolsDirectory "rustdoc$executableSuffix"
 $buildCount = Join-Path $toolsDirectory 'build-count.txt'
 $builder = Join-Path $PSScriptRoot 'New-IsolatedCandidate.ps1'
 $version = '1.0.0-beta'
@@ -235,6 +236,14 @@ $savedExpectedCwd = [System.Environment]::GetEnvironmentVariable(
     'SERCTL_FIXTURE_EXPECTED_CWD',
     'Process'
 )
+$savedExpectedRustc = [System.Environment]::GetEnvironmentVariable(
+    'SERCTL_FIXTURE_EXPECTED_RUSTC',
+    'Process'
+)
+$savedExpectedRustdoc = [System.Environment]::GetEnvironmentVariable(
+    'SERCTL_FIXTURE_EXPECTED_RUSTDOC',
+    'Process'
+)
 $savedMutateSource = [System.Environment]::GetEnvironmentVariable(
     'SERCTL_FIXTURE_MUTATE_SOURCE',
     'Process'
@@ -258,6 +267,9 @@ members = []
 version = "$version"
 edition = "2021"
 "@
+    Write-Utf8NoBom `
+        -Path (Join-Path $script:Repository 'rust-toolchain.toml') `
+        -Content "[toolchain]`nchannel = `"1.99.0`"`nprofile = `"minimal`"`n"
 
     Invoke-FixtureGit @('init', '--quiet')
     Invoke-FixtureGit @('config', 'user.name', 'serctl-self-test')
@@ -288,8 +300,11 @@ fn main() {
         .to_owned();
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     if name == "fixture-cargo" {
-        if arguments == ["--version"] {
+        if arguments == ["--version", "--verbose"] {
             println!("cargo 1.99.0 (isolated-candidate-fixture)");
+            println!("release: 1.99.0");
+            println!("commit-hash: 1111111111111111111111111111111111111111");
+            println!("host: x86_64-pc-windows-msvc");
             return;
         }
         if arguments.first().map(String::as_str) != Some("build") {
@@ -298,6 +313,12 @@ fn main() {
         let expected_cwd = required("SERCTL_FIXTURE_EXPECTED_CWD");
         if env::current_dir().unwrap() != Path::new(&expected_cwd) {
             std::process::exit(12);
+        }
+        if env::var("RUSTC") != Ok(required("SERCTL_FIXTURE_EXPECTED_RUSTC")) {
+            std::process::exit(16);
+        }
+        if env::var("RUSTDOC") != Ok(required("SERCTL_FIXTURE_EXPECTED_RUSTDOC")) {
+            std::process::exit(17);
         }
         let manifest_index = arguments.iter().position(|item| item == "--manifest-path")
             .unwrap_or_else(|| std::process::exit(13));
@@ -345,11 +366,22 @@ fn main() {
     if name == "rustc" {
         if arguments == ["--version", "--verbose"] {
             println!("rustc 1.99.0 (isolated-candidate-fixture 2026-01-01)");
+            println!("commit-hash: 2222222222222222222222222222222222222222");
             println!("host: x86_64-pc-windows-msvc");
             println!("release: 1.99.0");
             return;
         }
         std::process::exit(5);
+    }
+    if name == "rustdoc" {
+        if arguments == ["--version", "--verbose"] {
+            println!("rustdoc 1.99.0 (isolated-candidate-fixture 2026-01-01)");
+            println!("commit-hash: 2222222222222222222222222222222222222222");
+            println!("host: x86_64-pc-windows-msvc");
+            println!("release: 1.99.0");
+            return;
+        }
+        std::process::exit(6);
     }
     if arguments != ["--version"] {
         std::process::exit(2);
@@ -381,6 +413,7 @@ fn main() {
     )
     [System.IO.File]::Copy($fixtureBinary, $fakeCargo, $false)
     [System.IO.File]::Copy($fixtureBinary, $fakeRustc, $false)
+    [System.IO.File]::Copy($fixtureBinary, $fakeRustdoc, $false)
 
     [System.IO.Directory]::CreateDirectory(
         [System.IO.Path]::GetDirectoryName($releaseSentinel)
@@ -427,6 +460,12 @@ fn main() {
         'SERCTL_FIXTURE_EXPECTED_CWD', $script:Repository, 'Process'
     )
     [System.Environment]::SetEnvironmentVariable(
+        'SERCTL_FIXTURE_EXPECTED_RUSTC', $fakeRustc, 'Process'
+    )
+    [System.Environment]::SetEnvironmentVariable(
+        'SERCTL_FIXTURE_EXPECTED_RUSTDOC', $fakeRustdoc, 'Process'
+    )
+    [System.Environment]::SetEnvironmentVariable(
         'SERCTL_FIXTURE_MUTATE_SOURCE', '0', 'Process'
     )
     [System.Environment]::SetEnvironmentVariable(
@@ -458,6 +497,9 @@ fn main() {
     )
     Assert-SelfTestCondition (-not (Test-Path -LiteralPath Env:RUSTC)) (
         'builder left RUSTC set after the isolated build'
+    )
+    Assert-SelfTestCondition (-not (Test-Path -LiteralPath Env:RUSTDOC)) (
+        'builder left RUSTDOC set after the isolated build'
     )
     Assert-SubsequentCargoWorks -Description 'absent CARGO_TARGET_DIR restoration'
 
@@ -516,7 +558,7 @@ fn main() {
         [string]$manifest.build.manifest_absolute_path -match
             'target[\\/]candidate-sources[\\/].*[\\/]Cargo.toml$'
     ) 'manifest does not bind Cargo cwd and detached manifest path'
-    foreach ($toolName in @('git', 'cargo', 'rustc')) {
+    foreach ($toolName in @('git', 'cargo', 'rustc', 'rustdoc')) {
         $tool = $manifest.tools.$toolName
         Assert-SelfTestCondition (
             [System.IO.Path]::IsPathRooted([string]$tool.absolute_path) -and
@@ -534,6 +576,18 @@ fn main() {
         [string]$manifest.build.rustc_executable_sha256 -cmatch '^[0-9a-f]{64}$' -and
         [string]$manifest.build.rustc_version_verbose -match '^rustc 1\.99\.0 '
     ) 'manifest does not bind the exact rustc toolchain executable'
+    Assert-SelfTestCondition (
+        [string]$manifest.build.rustdoc_executable_absolute_path -ceq $fakeRustdoc -and
+        [string]$manifest.build.rustdoc_executable_file_identity -cmatch
+            '^win:[0-9a-f]{8}:[0-9a-f]{16}$' -and
+        [long]$manifest.build.rustdoc_executable_size_bytes -gt 0 -and
+        [string]$manifest.build.rustdoc_executable_sha256 -cmatch '^[0-9a-f]{64}$' -and
+        [string]$manifest.build.rustdoc_version_verbose -match '^rustdoc 1\.99\.0 ' -and
+        [string]$manifest.build.toolchain_channel -ceq '1.99.0' -and
+        [string]$manifest.build.toolchain_host -ceq 'x86_64-pc-windows-msvc' -and
+        [string]$manifest.build.toolchain_manifest_sha256 -cmatch '^[0-9a-f]{64}$' -and
+        [string]$manifest.build.linker_binding -ceq 'ambient-unbound'
+    ) 'manifest does not bind rustdoc and the pinned toolchain contract'
     Assert-SelfTestCondition (
         [string]$manifest.contracts.ipc -ceq 'IPC v9..=v9' -and
         [string]$manifest.contracts.transfer -ceq 'transfer protocol v1' -and
@@ -1010,6 +1064,12 @@ finally {
     Restore-ProcessEnvironmentVariable `
         -Name 'SERCTL_FIXTURE_EXPECTED_CWD' `
         -Value $savedExpectedCwd
+    Restore-ProcessEnvironmentVariable `
+        -Name 'SERCTL_FIXTURE_EXPECTED_RUSTC' `
+        -Value $savedExpectedRustc
+    Restore-ProcessEnvironmentVariable `
+        -Name 'SERCTL_FIXTURE_EXPECTED_RUSTDOC' `
+        -Value $savedExpectedRustdoc
     Restore-ProcessEnvironmentVariable `
         -Name 'SERCTL_FIXTURE_MUTATE_SOURCE' `
         -Value $savedMutateSource

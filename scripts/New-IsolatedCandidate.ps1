@@ -16,6 +16,9 @@ param(
     [string]$RustcExecutable,
 
     [Parameter(Mandatory = $false)]
+    [string]$RustdocExecutable,
+
+    [Parameter(Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
     [string]$GitExecutable = 'git',
 
@@ -585,6 +588,47 @@ function Invoke-CapturedCommand {
     }
     Assert-CandidateCondition ($exitCode -eq 0) "$Description failed"
     return @($output | ForEach-Object { $_.ToString() })
+}
+
+function Get-VerboseToolIdentity {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Lines,
+        [Parameter(Mandatory = $true)][string]$Tool
+    )
+
+    Assert-CandidateCondition ($Lines.Count -ge 1) "$Tool verbose version is empty"
+    $headline = [regex]::Match(
+        [string]$Lines[0],
+        ('^' + [regex]::Escape($Tool) + ' (?<version>[^ ]+) ')
+    )
+    Assert-CandidateCondition $headline.Success "$Tool verbose version headline is invalid"
+    $fields = @{}
+    foreach ($line in $Lines) {
+        $field = [regex]::Match([string]$line, '^(?<name>[a-z0-9-]+): (?<value>.+)$')
+        if ($field.Success) {
+            Assert-CandidateCondition (-not $fields.ContainsKey($field.Groups['name'].Value)) (
+                "$Tool verbose version repeats '$($field.Groups['name'].Value)'"
+            )
+            $fields[$field.Groups['name'].Value] = $field.Groups['value'].Value
+        }
+    }
+    foreach ($required in @('release', 'host')) {
+        Assert-CandidateCondition ($fields.ContainsKey($required)) (
+            "$Tool verbose version lacks '$required'"
+        )
+    }
+    return [pscustomobject]@{
+        Version = $headline.Groups['version'].Value
+        Release = [string]$fields['release']
+        Host = [string]$fields['host']
+        CommitHash = if ($fields.ContainsKey('commit-hash')) {
+            [string]$fields['commit-hash']
+        }
+        else {
+            $null
+        }
+        Text = $Lines -join "`n"
+    }
 }
 
 function Invoke-CargoBuild {
@@ -1418,13 +1462,11 @@ $cargoPath = $cargoTool.Path
 $cargoVersionOutput = @(
     Invoke-CapturedCommand `
         -FilePath $cargoPath `
-        -Arguments @('--version') `
-        -Description 'cargo --version'
+        -Arguments @('--version', '--verbose') `
+        -Description 'cargo --version --verbose'
 )
-Assert-CandidateCondition ($cargoVersionOutput.Count -eq 1) (
-    'cargo --version did not return exactly one line'
-)
-$cargoVersion = [string]$cargoVersionOutput[0]
+$cargoIdentity = Get-VerboseToolIdentity -Lines $cargoVersionOutput -Tool 'cargo'
+$cargoVersion = $cargoIdentity.Text
 $rustcCommand = if ([string]::IsNullOrWhiteSpace($RustcExecutable)) {
     Join-Path `
         ([System.IO.Path]::GetDirectoryName($cargoPath)) `
@@ -1444,24 +1486,75 @@ $rustcVersionOutput = @(
         -Arguments @('--version', '--verbose') `
         -Description 'rustc --version --verbose'
 )
-Assert-CandidateCondition ($rustcVersionOutput.Count -ge 1) (
-    'rustc --version --verbose did not return a version line'
+$rustcIdentity = Get-VerboseToolIdentity -Lines $rustcVersionOutput -Tool 'rustc'
+$rustcVersion = $rustcIdentity.Text
+$rustdocCommand = if ([string]::IsNullOrWhiteSpace($RustdocExecutable)) {
+    Join-Path `
+        ([System.IO.Path]::GetDirectoryName($cargoPath)) `
+        $(if ($hostIsWindows) { 'rustdoc.exe' } else { 'rustdoc' })
+}
+else {
+    $RustdocExecutable
+}
+$rustdocTool = Resolve-StrictApplication `
+    -Name $rustdocCommand `
+    -Label 'rustdoc' `
+    -Repository $repository
+$rustdocPath = $rustdocTool.Path
+$rustdocVersionOutput = @(
+    Invoke-CapturedCommand `
+        -FilePath $rustdocPath `
+        -Arguments @('--version', '--verbose') `
+        -Description 'rustdoc --version --verbose'
 )
-$rustcVersion = $rustcVersionOutput -join "`n"
-$cargoVersionMatch = [regex]::Match(
-    $cargoVersion,
-    '^cargo (?<version>[^ ]+) '
-)
-$rustcVersionMatch = [regex]::Match(
-    [string]$rustcVersionOutput[0],
-    '^rustc (?<version>[^ ]+) '
-)
+$rustdocIdentity = Get-VerboseToolIdentity -Lines $rustdocVersionOutput -Tool 'rustdoc'
+$rustdocVersion = $rustdocIdentity.Text
+$toolDirectory = [System.IO.Path]::GetDirectoryName($cargoPath)
 Assert-CandidateCondition (
-    $cargoVersionMatch.Success -and
-    $rustcVersionMatch.Success -and
-    $cargoVersionMatch.Groups['version'].Value -ceq
-        $rustcVersionMatch.Groups['version'].Value
-) 'cargo and rustc do not report the same toolchain version'
+    [System.IO.Path]::GetDirectoryName($rustcPath).Equals(
+        $toolDirectory,
+        $pathComparison
+    ) -and
+    [System.IO.Path]::GetDirectoryName($rustdocPath).Equals(
+        $toolDirectory,
+        $pathComparison
+    )
+) 'cargo, rustc, and rustdoc must be regular files in one toolchain directory'
+Assert-CandidateCondition (
+    $cargoTool.FileIdentity -cne $rustcTool.FileIdentity -and
+    $cargoTool.FileIdentity -cne $rustdocTool.FileIdentity -and
+    $rustcTool.FileIdentity -cne $rustdocTool.FileIdentity
+) 'cargo, rustc, and rustdoc must have distinct file identities'
+$toolchainManifestPath = Join-Path $repository 'rust-toolchain.toml'
+$toolchainManifest = Get-PinnedRegularFileDigest -Path $toolchainManifestPath
+$toolchainManifestText = [System.IO.File]::ReadAllText(
+    $toolchainManifestPath,
+    [System.Text.UTF8Encoding]::new($false, $true)
+)
+$toolchainChannelMatch = [regex]::Match(
+    $toolchainManifestText,
+    '(?ms)^\[toolchain\]\s*.*?^channel\s*=\s*"(?<channel>[^"]+)"\s*$'
+)
+Assert-CandidateCondition $toolchainChannelMatch.Success (
+    'rust-toolchain.toml has no canonical toolchain channel'
+)
+$toolchainChannel = $toolchainChannelMatch.Groups['channel'].Value
+Assert-CandidateCondition (
+    $cargoIdentity.Version -ceq $toolchainChannel -and
+    $cargoIdentity.Release -ceq $toolchainChannel -and
+    $rustcIdentity.Version -ceq $toolchainChannel -and
+    $rustcIdentity.Release -ceq $toolchainChannel -and
+    $rustdocIdentity.Version -ceq $toolchainChannel -and
+    $rustdocIdentity.Release -ceq $toolchainChannel
+) 'cargo, rustc, and rustdoc do not match the pinned rust-toolchain channel'
+Assert-CandidateCondition (
+    $cargoIdentity.Host -ceq $rustcIdentity.Host -and
+    $rustcIdentity.Host -ceq $rustdocIdentity.Host
+) 'cargo, rustc, and rustdoc do not report one host triple'
+Assert-CandidateCondition (
+    $rustcIdentity.CommitHash -cmatch '^[0-9a-f]{40}$' -and
+    $rustcIdentity.CommitHash -ceq $rustdocIdentity.CommitHash
+) 'rustc and rustdoc do not report one compiler commit'
 $chmodTool = $null
 $chmodVersion = $null
 if (-not $hostIsWindows) {
@@ -1508,11 +1601,13 @@ $previousCargoTarget = [System.Environment]::GetEnvironmentVariable(
     'Process'
 )
 $previousRustc = [System.Environment]::GetEnvironmentVariable('RUSTC', 'Process')
+$previousRustdoc = [System.Environment]::GetEnvironmentVariable('RUSTDOC', 'Process')
 $published = $false
 $buildCleaned = $false
 $sourceCleaned = $false
 $cargoEnvironmentRestored = $false
 $rustcEnvironmentRestored = $false
+$rustdocEnvironmentRestored = $false
 $buildState = $null
 $stageState = $null
 $sourceState = $null
@@ -1565,6 +1660,7 @@ try {
         'Process'
     )
     [System.Environment]::SetEnvironmentVariable('RUSTC', $rustcPath, 'Process')
+    [System.Environment]::SetEnvironmentVariable('RUSTDOC', $rustdocPath, 'Process')
     $buildArguments = @(
         'build',
         '--locked',
@@ -1605,6 +1701,8 @@ try {
     $cargoEnvironmentRestored = $true
     Restore-CandidateEnvironmentVariable -Name 'RUSTC' -Value $previousRustc
     $rustcEnvironmentRestored = $true
+    Restore-CandidateEnvironmentVariable -Name 'RUSTDOC' -Value $previousRustdoc
+    $rustdocEnvironmentRestored = $true
 
     Assert-OwnedDirectoryState -State $buildState -ParentState $buildParentState
     Assert-OwnedDirectoryState -State $stageState -ParentState $stagingParentState
@@ -1725,6 +1823,18 @@ try {
             rustc_executable_size_bytes = [long]$rustcTool.Size
             rustc_executable_sha256 = $rustcTool.Sha256
             rustc_version_verbose = $rustcVersion
+            rustdoc_executable_absolute_path = $rustdocPath
+            rustdoc_executable_file_identity = $rustdocTool.FileIdentity
+            rustdoc_executable_size_bytes = [long]$rustdocTool.Size
+            rustdoc_executable_sha256 = $rustdocTool.Sha256
+            rustdoc_version_verbose = $rustdocVersion
+            toolchain_channel = $toolchainChannel
+            toolchain_host = $rustcIdentity.Host
+            toolchain_manifest_absolute_path = $toolchainManifestPath
+            toolchain_manifest_file_identity = $toolchainManifest.Identity
+            toolchain_manifest_size_bytes = [long]$toolchainManifest.Size
+            toolchain_manifest_sha256 = $toolchainManifest.Sha256
+            linker_binding = 'ambient-unbound'
             cargo_arguments = $buildArguments
             cargo_target_separate_from_candidate_set = $true
         }
@@ -1749,6 +1859,13 @@ try {
                 size_bytes = [long]$rustcTool.Size
                 sha256 = $rustcTool.Sha256
                 version_line = $rustcVersion
+            }
+            rustdoc = [ordered]@{
+                absolute_path = $rustdocTool.Path
+                file_identity = $rustdocTool.FileIdentity
+                size_bytes = [long]$rustdocTool.Size
+                sha256 = $rustdocTool.Sha256
+                version_line = $rustdocVersion
             }
             chmod = if ($null -eq $chmodTool) {
                 $null
@@ -1848,6 +1965,14 @@ try {
         -Path $rustcTool.Path `
         -Expected $rustcTool `
         -Label 'rustc Application'
+    Assert-RegularFileDigestUnchanged `
+        -Path $rustdocTool.Path `
+        -Expected $rustdocTool `
+        -Label 'rustdoc Application'
+    Assert-RegularFileDigestUnchanged `
+        -Path $toolchainManifestPath `
+        -Expected $toolchainManifest `
+        -Label 'rust-toolchain.toml'
     if ($null -ne $chmodTool) {
         Assert-RegularFileDigestUnchanged `
             -Path $chmodTool.Path `
@@ -1942,6 +2067,9 @@ finally {
     }
     if (-not $rustcEnvironmentRestored) {
         Restore-CandidateEnvironmentVariable -Name 'RUSTC' -Value $previousRustc
+    }
+    if (-not $rustdocEnvironmentRestored) {
+        Restore-CandidateEnvironmentVariable -Name 'RUSTDOC' -Value $previousRustdoc
     }
     if (-not $sourceCleaned) {
         Remove-OwnedDetachedWorktree `
