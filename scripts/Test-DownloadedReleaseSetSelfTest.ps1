@@ -1222,4 +1222,5 @@ finally {
     }
 }
 
+$global:LASTEXITCODE = 0
 Write-Host 'Downloaded release set self-tests passed.'
