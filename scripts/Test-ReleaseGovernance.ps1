@@ -638,6 +638,10 @@ foreach ($candidateBoundary in @(
     'command contains wildcard characters',
     'command is shadowed from inside the source repository',
     'cargo_executable_sha256 = $cargoTool.Sha256',
+    "compiler override '`$name' must be unset",
+    "[System.Environment]::SetEnvironmentVariable('RUSTC', `$rustcPath, 'Process')",
+    'rustc_executable_sha256 = $rustcTool.Sha256',
+    "-Label 'rustc Application'",
     'working_directory_absolute_path = $repository',
     'this PowerShell runtime cannot read Unix file mode; refusing to claim 0755',
     '($mode -band 4095) -eq 493',
@@ -690,6 +694,7 @@ foreach ($candidateCounterexample in @(
     'tracked source changed and restored during build',
     'source-mutation detached worktree parent',
     'manifest does not bind Cargo cwd and detached manifest path',
+    'manifest does not bind the exact rustc toolchain executable',
     'manifest tool identity mismatch',
     'SERCTL_FIXTURE_IGNORED_EVENT_STORM',
     'ignored target event storm leaked its private build root'

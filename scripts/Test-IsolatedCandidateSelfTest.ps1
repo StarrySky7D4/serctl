@@ -167,6 +167,7 @@ $toolsDirectory = Join-Path $script:SelfTestRoot 't'
 $fixtureSource = Join-Path $toolsDirectory 'fixture-binary.rs'
 $fixtureBinary = Join-Path $toolsDirectory "fixture-binary$executableSuffix"
 $fakeCargo = Join-Path $toolsDirectory "fixture-cargo$executableSuffix"
+$fakeRustc = Join-Path $toolsDirectory "rustc$executableSuffix"
 $buildCount = Join-Path $toolsDirectory 'build-count.txt'
 $builder = Join-Path $PSScriptRoot 'New-IsolatedCandidate.ps1'
 $version = '1.0.0-beta'
@@ -341,6 +342,15 @@ fn main() {
         }
         return;
     }
+    if name == "rustc" {
+        if arguments == ["--version", "--verbose"] {
+            println!("rustc 1.99.0 (isolated-candidate-fixture 2026-01-01)");
+            println!("host: x86_64-pc-windows-msvc");
+            println!("release: 1.99.0");
+            return;
+        }
+        std::process::exit(5);
+    }
     if arguments != ["--version"] {
         std::process::exit(2);
     }
@@ -370,6 +380,7 @@ fn main() {
         'fixture binary was not produced'
     )
     [System.IO.File]::Copy($fixtureBinary, $fakeCargo, $false)
+    [System.IO.File]::Copy($fixtureBinary, $fakeRustc, $false)
 
     [System.IO.Directory]::CreateDirectory(
         [System.IO.Path]::GetDirectoryName($releaseSentinel)
@@ -445,6 +456,9 @@ fn main() {
     Assert-SelfTestCondition (-not (Test-Path -LiteralPath Env:CARGO_TARGET_DIR)) (
         'builder left an empty CARGO_TARGET_DIR after a null original value'
     )
+    Assert-SelfTestCondition (-not (Test-Path -LiteralPath Env:RUSTC)) (
+        'builder left RUSTC set after the isolated build'
+    )
     Assert-SubsequentCargoWorks -Description 'absent CARGO_TARGET_DIR restoration'
 
     $identity = "v$version-$($firstHead.Substring(0, 12))"
@@ -502,7 +516,7 @@ fn main() {
         [string]$manifest.build.manifest_absolute_path -match
             'target[\\/]candidate-sources[\\/].*[\\/]Cargo.toml$'
     ) 'manifest does not bind Cargo cwd and detached manifest path'
-    foreach ($toolName in @('git', 'cargo')) {
+    foreach ($toolName in @('git', 'cargo', 'rustc')) {
         $tool = $manifest.tools.$toolName
         Assert-SelfTestCondition (
             [System.IO.Path]::IsPathRooted([string]$tool.absolute_path) -and
@@ -512,6 +526,14 @@ fn main() {
             -not [string]::IsNullOrWhiteSpace([string]$tool.version_line)
         ) "manifest tool identity mismatch for '$toolName'"
     }
+    Assert-SelfTestCondition (
+        [string]$manifest.build.rustc_executable_absolute_path -ceq $fakeRustc -and
+        [string]$manifest.build.rustc_executable_file_identity -cmatch
+            '^win:[0-9a-f]{8}:[0-9a-f]{16}$' -and
+        [long]$manifest.build.rustc_executable_size_bytes -gt 0 -and
+        [string]$manifest.build.rustc_executable_sha256 -cmatch '^[0-9a-f]{64}$' -and
+        [string]$manifest.build.rustc_version_verbose -match '^rustc 1\.99\.0 '
+    ) 'manifest does not bind the exact rustc toolchain executable'
     Assert-SelfTestCondition (
         [string]$manifest.contracts.ipc -ceq 'IPC v9..=v9' -and
         [string]$manifest.contracts.transfer -ceq 'transfer protocol v1' -and

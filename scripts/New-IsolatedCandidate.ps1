@@ -13,6 +13,9 @@ param(
     [string]$CargoExecutable = 'cargo',
 
     [Parameter(Mandatory = $false)]
+    [string]$RustcExecutable,
+
+    [Parameter(Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
     [string]$GitExecutable = 'git',
 
@@ -49,6 +52,23 @@ $gitOverrideVariables = @(
     'GIT_CONFIG_NOSYSTEM',
     'GIT_NO_REPLACE_OBJECTS',
     'GIT_CONFIG_PARAMETERS'
+)
+$compilerOverrideVariables = @(
+    'RUSTC',
+    'RUSTC_WRAPPER',
+    'RUSTC_WORKSPACE_WRAPPER',
+    'RUSTC_BOOTSTRAP',
+    'RUSTDOC',
+    'RUSTDOCFLAGS',
+    'RUSTUP_TOOLCHAIN',
+    'RUSTFLAGS',
+    'CARGO_ENCODED_RUSTFLAGS',
+    'CARGO_BUILD_RUSTC',
+    'CARGO_BUILD_RUSTC_WRAPPER',
+    'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER',
+    'CARGO_BUILD_RUSTFLAGS',
+    'CARGO_BUILD_RUSTDOC',
+    'CARGO_BUILD_RUSTDOCFLAGS'
 )
 $hostIsWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
@@ -1255,6 +1275,11 @@ foreach ($name in $gitOverrideVariables) {
         [System.Environment]::GetEnvironmentVariable($name, 'Process')
     )) "Git repository override '$name' must be unset"
 }
+foreach ($name in $compilerOverrideVariables) {
+    Assert-CandidateCondition ([string]::IsNullOrEmpty(
+        [System.Environment]::GetEnvironmentVariable($name, 'Process')
+    )) "compiler override '$name' must be unset"
+}
 $gitConfigCountRaw = [System.Environment]::GetEnvironmentVariable(
     'GIT_CONFIG_COUNT',
     'Process'
@@ -1400,6 +1425,43 @@ Assert-CandidateCondition ($cargoVersionOutput.Count -eq 1) (
     'cargo --version did not return exactly one line'
 )
 $cargoVersion = [string]$cargoVersionOutput[0]
+$rustcCommand = if ([string]::IsNullOrWhiteSpace($RustcExecutable)) {
+    Join-Path `
+        ([System.IO.Path]::GetDirectoryName($cargoPath)) `
+        $(if ($hostIsWindows) { 'rustc.exe' } else { 'rustc' })
+}
+else {
+    $RustcExecutable
+}
+$rustcTool = Resolve-StrictApplication `
+    -Name $rustcCommand `
+    -Label 'rustc' `
+    -Repository $repository
+$rustcPath = $rustcTool.Path
+$rustcVersionOutput = @(
+    Invoke-CapturedCommand `
+        -FilePath $rustcPath `
+        -Arguments @('--version', '--verbose') `
+        -Description 'rustc --version --verbose'
+)
+Assert-CandidateCondition ($rustcVersionOutput.Count -ge 1) (
+    'rustc --version --verbose did not return a version line'
+)
+$rustcVersion = $rustcVersionOutput -join "`n"
+$cargoVersionMatch = [regex]::Match(
+    $cargoVersion,
+    '^cargo (?<version>[^ ]+) '
+)
+$rustcVersionMatch = [regex]::Match(
+    [string]$rustcVersionOutput[0],
+    '^rustc (?<version>[^ ]+) '
+)
+Assert-CandidateCondition (
+    $cargoVersionMatch.Success -and
+    $rustcVersionMatch.Success -and
+    $cargoVersionMatch.Groups['version'].Value -ceq
+        $rustcVersionMatch.Groups['version'].Value
+) 'cargo and rustc do not report the same toolchain version'
 $chmodTool = $null
 $chmodVersion = $null
 if (-not $hostIsWindows) {
@@ -1445,10 +1507,12 @@ $previousCargoTarget = [System.Environment]::GetEnvironmentVariable(
     'CARGO_TARGET_DIR',
     'Process'
 )
+$previousRustc = [System.Environment]::GetEnvironmentVariable('RUSTC', 'Process')
 $published = $false
 $buildCleaned = $false
 $sourceCleaned = $false
 $cargoEnvironmentRestored = $false
+$rustcEnvironmentRestored = $false
 $buildState = $null
 $stageState = $null
 $sourceState = $null
@@ -1500,6 +1564,7 @@ try {
         $buildRoot,
         'Process'
     )
+    [System.Environment]::SetEnvironmentVariable('RUSTC', $rustcPath, 'Process')
     $buildArguments = @(
         'build',
         '--locked',
@@ -1538,6 +1603,8 @@ try {
         -Name 'CARGO_TARGET_DIR' `
         -Value $previousCargoTarget
     $cargoEnvironmentRestored = $true
+    Restore-CandidateEnvironmentVariable -Name 'RUSTC' -Value $previousRustc
+    $rustcEnvironmentRestored = $true
 
     Assert-OwnedDirectoryState -State $buildState -ParentState $buildParentState
     Assert-OwnedDirectoryState -State $stageState -ParentState $stagingParentState
@@ -1653,6 +1720,11 @@ try {
             cargo_executable_size_bytes = [long]$cargoTool.Size
             cargo_executable_sha256 = $cargoTool.Sha256
             cargo_version_line = $cargoVersion
+            rustc_executable_absolute_path = $rustcPath
+            rustc_executable_file_identity = $rustcTool.FileIdentity
+            rustc_executable_size_bytes = [long]$rustcTool.Size
+            rustc_executable_sha256 = $rustcTool.Sha256
+            rustc_version_verbose = $rustcVersion
             cargo_arguments = $buildArguments
             cargo_target_separate_from_candidate_set = $true
         }
@@ -1670,6 +1742,13 @@ try {
                 size_bytes = [long]$cargoTool.Size
                 sha256 = $cargoTool.Sha256
                 version_line = $cargoVersion
+            }
+            rustc = [ordered]@{
+                absolute_path = $rustcTool.Path
+                file_identity = $rustcTool.FileIdentity
+                size_bytes = [long]$rustcTool.Size
+                sha256 = $rustcTool.Sha256
+                version_line = $rustcVersion
             }
             chmod = if ($null -eq $chmodTool) {
                 $null
@@ -1765,6 +1844,10 @@ try {
         -Path $cargoTool.Path `
         -Expected $cargoTool `
         -Label 'cargo Application'
+    Assert-RegularFileDigestUnchanged `
+        -Path $rustcTool.Path `
+        -Expected $rustcTool `
+        -Label 'rustc Application'
     if ($null -ne $chmodTool) {
         Assert-RegularFileDigestUnchanged `
             -Path $chmodTool.Path `
@@ -1856,6 +1939,9 @@ finally {
         Restore-CandidateEnvironmentVariable `
             -Name 'CARGO_TARGET_DIR' `
             -Value $previousCargoTarget
+    }
+    if (-not $rustcEnvironmentRestored) {
+        Restore-CandidateEnvironmentVariable -Name 'RUSTC' -Value $previousRustc
     }
     if (-not $sourceCleaned) {
         Remove-OwnedDetachedWorktree `
