@@ -2,6 +2,16 @@
 
 本文件记录面向使用者、运维人员和安全审计人员的重要变化。项目仍处于预发布阶段，正式发布前可能继续调整命令、存储格式和协议。
 
+## v1.0.0-beta.1 - Unreleased
+
+> **候选状态（尚未验收/发布）**：当前 workspace 与正式发布标记仍保持 `v1.0.0-beta`，待 Rust 集成、exact-tag CI、受控实机和仓库治理门禁全部通过后再统一切换。候选 wire 为 IPC v9，并拒绝 v8 或 direct-connect downgrade；Agent JSONL 固定 `schema_version=1` 和稳定 `error_code`。普通 `main` CI 不产生正式发行物。
+
+### 发布门禁修正
+
+- 将独立 fuzz workspace 的 `Cargo.lock` 纳入受控版本切换、回滚与一致性校验，避免主 workspace 已升级而 fuzz 路径依赖仍锁定旧版本。
+- 普通 CI 与 exact-tag quality 作业固定获取完整 Git 历史，使版本身份重放能够验证真实 first-parent 发布转换；浅克隆现在以明确错误失败关闭。
+- 本地 V1 beta gate 新增独立 fuzz lock 的 `cargo metadata --locked`，避免只验证根 workspace 而产生假绿。
+
 ## v1.0.0-beta - 2026-09-03
 
 > **候选状态（尚未验收/发布）**：当前 workspace 与预发布标记已同步为 `v1.0.0-beta`；exact-tag CI、受控实机和仓库治理门禁仍须通过后方可发布。候选 wire 为 IPC v9，并拒绝 v8 或 direct-connect downgrade；Agent JSONL 固定 `schema_version=1` 和稳定 `error_code`。普通 `main` CI 不产生正式发行物。
