@@ -92,6 +92,9 @@ jobs:
       - name: Reject whitespace errors in the tagged diff
         run: git diff --check HEAD^
 
+      - name: Fetch locked dependencies for offline governance fixtures
+        run: cargo fetch --locked --manifest-path Cargo.toml
+
       - name: Test release governance scripts and invariants
         shell: pwsh
         run: ./scripts/Test-ReleaseGovernance.ps1
