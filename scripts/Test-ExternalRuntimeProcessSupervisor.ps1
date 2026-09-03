@@ -46,6 +46,99 @@ Assert-SupervisorTest (
 ) 'supervisor script is missing'
 . $supervisorScript
 
+function Assert-SupervisorStaticContract {
+    $supervisorSource = [System.IO.File]::ReadAllText($supervisorScript)
+    $formalReceiptContractPath = Join-Path `
+        $PSScriptRoot `
+        'ExternalTransferRuntimeReceiptContract.ps1'
+    Assert-SupervisorTest (
+        Test-Path -LiteralPath $formalReceiptContractPath -PathType Leaf
+    ) 'formal receipt contract fixture is missing'
+    $formalReceiptContractSource = [System.IO.File]::ReadAllText(
+        $formalReceiptContractPath
+    )
+    Assert-SupervisorTest (
+        -not $formalReceiptContractSource.Contains(
+            'Invoke-ExternalRuntimeProcessCaptureInternal'
+        )
+    ) 'internal capture function was exported through the formal receipt contract'
+    Assert-SupervisorTest ($supervisorSource.Contains('posix_spawn(')) (
+        'Unix launcher does not use posix_spawn'
+    )
+    Assert-SupervisorTest ($supervisorSource.Contains('POSIX_SPAWN_SETPGROUP')) (
+        'Unix launcher does not atomically request a process group'
+    )
+    Assert-SupervisorTest (
+        $supervisorSource.Contains('posix_spawn_file_actions_addclosefrom_np')
+    ) 'Linux launcher does not close all unlisted inherited descriptors'
+    foreach ($mapping in @(
+        @('grant_input', 4),
+        @('profile_passphrase_input', 5),
+        @('grant_output', 6),
+        @('receipt_output', 7)
+    )) {
+        Assert-SupervisorTest (
+            (Get-ExternalRuntimeInheritedChildFdInternal -Purpose $mapping[0]) -eq
+                [int]$mapping[1]
+        ) "internal purpose mapping drifted for '$($mapping[0])'"
+    }
+    Invoke-SupervisorExpectedFailure `
+        -Message 'caller selected an unknown inherited child-fd purpose' `
+        -Action {
+            Get-ExternalRuntimeInheritedChildFdInternal -Purpose 'caller_selected_fd_9'
+        }
+    foreach ($linuxHandleBoundary in @(
+        'statx(fd, "", AT_EMPTY_PATH_LINUX | AT_STATX_DONT_SYNC_LINUX',
+        'mode != S_IFREG_LINUX && mode != S_IFIFO_LINUX',
+        'F_DUPFD_CLOEXEC_LINUX',
+        'inheritedCopies[i], childFd',
+        'for (int childFd = 4; childFd <= 7; childFd++)',
+        'posix_spawn_file_actions_addclosefrom_np(actions, 8)',
+        'inheritedHandlePurposes.Length != allowedInheritedHandles.Length'
+    )) {
+        Assert-SupervisorTest ($supervisorSource.Contains($linuxHandleBoundary)) (
+            "Linux inherited-handle boundary is missing '$linuxHandleBoundary'"
+        )
+    }
+    Assert-SupervisorTest (
+        -not $supervisorSource.Contains(
+            'explicit Unix handle inheritance is not implemented'
+        )
+    ) 'Linux inherited-handle implementation remains hard-disabled'
+    Assert-SupervisorTest ($supervisorSource.Contains('"/proc/self/fd/3"')) (
+        'Linux launcher does not execute the already-pinned file descriptor'
+    )
+    Assert-SupervisorTest (
+        $supervisorSource.Contains('posix_spawn_file_actions_addchdir_np')
+    ) 'Linux launcher does not atomically set its bounded working directory'
+    Assert-SupervisorTest (
+        $supervisorSource.Contains(
+            'posix_spawn_file_actions_adddup2(actions, stdinPipe[0], 0)'
+        )
+    ) 'Linux launcher does not replace inherited stdin with a bounded EOF pipe'
+    Assert-SupervisorTest (-not $supervisorSource.Contains('setpgid(')) (
+        'Unix launcher retained the post-start setpgid race'
+    )
+    Assert-SupervisorTest (-not $supervisorSource.Contains('Process.Start(psi)')) (
+        'Unix launcher retained the Process.Start race'
+    )
+    Assert-SupervisorTest (
+        $supervisorSource.Contains('atomic Unix launcher unavailable on this platform')
+    ) 'non-Linux Unix platforms do not explicitly fail closed'
+}
+
+Assert-SupervisorStaticContract
+$hostIsWindows = [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [Runtime.InteropServices.OSPlatform]::Windows
+)
+if (-not $hostIsWindows) {
+    Write-Host (
+        'External runtime process supervisor static contract self-test passed; ' +
+        'Windows runtime fixture skipped on non-Windows host.'
+    )
+    return
+}
+
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $fixtureRoot = Join-Path `
     (Join-Path $repositoryRoot 'target') `
@@ -182,85 +275,6 @@ public static class SupervisorFixture {
     Assert-SupervisorTest (Test-Path -LiteralPath $helperPath -PathType Leaf) (
         'synthetic helper did not compile'
     )
-
-    $supervisorSource = [System.IO.File]::ReadAllText($supervisorScript)
-    $formalReceiptContractPath = Join-Path `
-        $PSScriptRoot `
-        'ExternalTransferRuntimeReceiptContract.ps1'
-    Assert-SupervisorTest (
-        Test-Path -LiteralPath $formalReceiptContractPath -PathType Leaf
-    ) 'formal receipt contract fixture is missing'
-    $formalReceiptContractSource = [System.IO.File]::ReadAllText(
-        $formalReceiptContractPath
-    )
-    Assert-SupervisorTest (
-        -not $formalReceiptContractSource.Contains(
-            'Invoke-ExternalRuntimeProcessCaptureInternal'
-        )
-    ) 'internal capture function was exported through the formal receipt contract'
-    Assert-SupervisorTest ($supervisorSource.Contains('posix_spawn(')) (
-        'Unix launcher does not use posix_spawn'
-    )
-    Assert-SupervisorTest ($supervisorSource.Contains('POSIX_SPAWN_SETPGROUP')) (
-        'Unix launcher does not atomically request a process group'
-    )
-    Assert-SupervisorTest (
-        $supervisorSource.Contains('posix_spawn_file_actions_addclosefrom_np')
-    ) 'Linux launcher does not close all unlisted inherited descriptors'
-    foreach ($mapping in @(
-        @('grant_input', 4),
-        @('profile_passphrase_input', 5),
-        @('grant_output', 6),
-        @('receipt_output', 7)
-    )) {
-        Assert-SupervisorTest (
-            (Get-ExternalRuntimeInheritedChildFdInternal -Purpose $mapping[0]) -eq
-                [int]$mapping[1]
-        ) "internal purpose mapping drifted for '$($mapping[0])'"
-    }
-    Invoke-SupervisorExpectedFailure `
-        -Message 'caller selected an unknown inherited child-fd purpose' `
-        -Action {
-            Get-ExternalRuntimeInheritedChildFdInternal -Purpose 'caller_selected_fd_9'
-        }
-    foreach ($linuxHandleBoundary in @(
-        'statx(fd, "", AT_EMPTY_PATH_LINUX | AT_STATX_DONT_SYNC_LINUX',
-        'mode != S_IFREG_LINUX && mode != S_IFIFO_LINUX',
-        'F_DUPFD_CLOEXEC_LINUX',
-        'inheritedCopies[i], childFd',
-        'for (int childFd = 4; childFd <= 7; childFd++)',
-        'posix_spawn_file_actions_addclosefrom_np(actions, 8)',
-        'inheritedHandlePurposes.Length != allowedInheritedHandles.Length'
-    )) {
-        Assert-SupervisorTest ($supervisorSource.Contains($linuxHandleBoundary)) (
-            "Linux inherited-handle boundary is missing '$linuxHandleBoundary'"
-        )
-    }
-    Assert-SupervisorTest (
-        -not $supervisorSource.Contains(
-            'explicit Unix handle inheritance is not implemented'
-        )
-    ) 'Linux inherited-handle implementation remains hard-disabled'
-    Assert-SupervisorTest ($supervisorSource.Contains('"/proc/self/fd/3"')) (
-        'Linux launcher does not execute the already-pinned file descriptor'
-    )
-    Assert-SupervisorTest (
-        $supervisorSource.Contains('posix_spawn_file_actions_addchdir_np')
-    ) 'Linux launcher does not atomically set its bounded working directory'
-    Assert-SupervisorTest (
-        $supervisorSource.Contains(
-            'posix_spawn_file_actions_adddup2(actions, stdinPipe[0], 0)'
-        )
-    ) 'Linux launcher does not replace inherited stdin with a bounded EOF pipe'
-    Assert-SupervisorTest (-not $supervisorSource.Contains('setpgid(')) (
-        'Unix launcher retained the post-start setpgid race'
-    )
-    Assert-SupervisorTest (-not $supervisorSource.Contains('Process.Start(psi)')) (
-        'Unix launcher retained the Process.Start race'
-    )
-    Assert-SupervisorTest (
-        $supervisorSource.Contains('atomic Unix launcher unavailable on this platform')
-    ) 'non-Linux Unix platforms do not explicitly fail closed'
 
     $receipt = Invoke-ExternalRuntimeProcess `
         -ApplicationPath $helperPath `

@@ -41,6 +41,17 @@ Assert-NativeOwnerTest (
     }).Count -eq 0)
 ) 'owner exposes caller-controlled evidence input'
 
+$hostIsWindows = [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [Runtime.InteropServices.OSPlatform]::Windows
+)
+if (-not $hostIsWindows) {
+    Write-Host (
+        'native fault/registry/performance actual-capture static contract self-test: PASS; ' +
+        'Windows runtime fixture skipped on non-Windows host.'
+    )
+    return
+}
+
 $testRoot = Join-Path (
     Join-Path ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))) 'target'
 ) ('native-fixture-owner-selftest-' + [Guid]::NewGuid().ToString('N'))

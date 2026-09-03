@@ -61,6 +61,17 @@ foreach ($forbidden in @(
     )
 }
 
+$hostIsWindows = [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [Runtime.InteropServices.OSPlatform]::Windows
+)
+if (-not $hostIsWindows) {
+    Write-Host (
+        'Isolated external transfer formal owner static contract self-test passed; ' +
+        'Windows runtime fixture skipped on non-Windows host.'
+    )
+    return
+}
+
 . $launcherPath
 
 $fixtureRoot = Join-Path (

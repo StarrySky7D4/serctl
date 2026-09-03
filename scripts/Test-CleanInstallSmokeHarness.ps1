@@ -124,6 +124,14 @@ foreach ($marker in @(
     )
 }
 
-& $harnessPath -SelfTest
+$hostIsWindows = [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [Runtime.InteropServices.OSPlatform]::Windows
+)
+if ($hostIsWindows) {
+    & $harnessPath -SelfTest
+}
+else {
+    Write-Output 'Clean-install Windows runtime fixture skipped on non-Windows host.'
+}
 
 Write-Output 'Clean-install smoke harness contract self-test passed.'

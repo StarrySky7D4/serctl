@@ -239,6 +239,10 @@ Assert-Rejected `
 # Exercise the repository-fixed four-script local capture chain once.  Its
 # receipt is admitted only as an explicitly unsealable parser projection; it
 # must leave all twenty real-host cases blocked.
+$hostIsWindows = [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [Runtime.InteropServices.OSPlatform]::Windows
+)
+if ($hostIsWindows) {
 $nativeOwnerPath = Join-Path ([IO.Path]::GetTempPath()) (
     'serctl-native-fixture-owner-' + [Guid]::NewGuid().ToString('N') + '.json'
 )
@@ -379,6 +383,13 @@ Assert-Rejected `
 [Array]::Clear($nativeProjectionBytes, 0, $nativeProjectionBytes.Length)
 [Array]::Clear($nativeProjectionAgain, 0, $nativeProjectionAgain.Length)
 [Array]::Clear($nativeOwnerBytes, 0, $nativeOwnerBytes.Length)
+}
+else {
+    Write-Host (
+        'Native actual-capture receipt import fixture skipped on non-Windows host; ' +
+        'portable receipt contract checks remain active.'
+    )
+}
 
 $fixtureComponents = [pscustomobject][ordered]@{
     cli = [pscustomobject][ordered]@{

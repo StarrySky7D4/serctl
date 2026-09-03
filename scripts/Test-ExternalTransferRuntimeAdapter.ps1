@@ -94,6 +94,17 @@ foreach ($ownerEntry in @(
     }
 }
 
+$hostIsWindows = [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [Runtime.InteropServices.OSPlatform]::Windows
+)
+if (-not $hostIsWindows) {
+    Write-Host (
+        'External transfer runtime adapter static contract self-test passed; ' +
+        'Windows runtime fixture skipped on non-Windows host.'
+    )
+    return
+}
+
 $fixtureRoot = Join-Path (
     Join-Path ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))) 'target'
 ) ('external-transfer-adapter-selftest-' + [Guid]::NewGuid().ToString('N'))

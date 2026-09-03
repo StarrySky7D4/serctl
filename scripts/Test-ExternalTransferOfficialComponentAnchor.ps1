@@ -1,9 +1,17 @@
 [CmdletBinding()]param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
-. (Join-Path $PSScriptRoot 'ExternalTransferOfficialComponentAnchor.ps1')
+$anchorScript = Join-Path $PSScriptRoot 'ExternalTransferOfficialComponentAnchor.ps1'
 function Assert-AnchorTest([bool]$Condition,[string]$Message){if(-not $Condition){throw "official anchor self-test failed: $Message"}}
 function Get-TestHash([byte[]]$Bytes){$s=[Security.Cryptography.SHA256]::Create();try{([BitConverter]::ToString($s.ComputeHash($Bytes))).Replace('-','')}finally{$s.Dispose()}}
+$tokens=$null;$errors=$null
+[void][Management.Automation.Language.Parser]::ParseFile($anchorScript,[ref]$tokens,[ref]$errors)
+Assert-AnchorTest (@($errors).Count -eq 0) 'official anchor script does not parse'
+$anchorSource=[IO.File]::ReadAllText($anchorScript)
+foreach($marker in @('function New-ExternalTransferOfficialComponentAnchorInternal','five distinct handles','[IO.FileMode]::CreateNew','synthetic_fixture')){Assert-AnchorTest $anchorSource.Contains($marker) "official anchor script omits '$marker'"}
+$hostIsWindows=[Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([Runtime.InteropServices.OSPlatform]::Windows)
+if(-not $hostIsWindows){Write-Host 'Official component anchor static contract self-test passed; Windows runtime fixture skipped on non-Windows host.';return}
+. $anchorScript
 $root=Join-Path (Join-Path ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))) 'target') ('official-anchor-selftest-'+[Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($root)|Out-Null
 try {
