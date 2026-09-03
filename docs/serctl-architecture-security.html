@@ -156,7 +156,7 @@
     <div class="meta-row">
       <span class="meta"><span class="dot"></span>vault-storage read=v4..=v5 write=v5 / IPC v9：v1 候选对旧版本失败关闭</span>
       <span class="meta">最新门禁与外部验证边界见 CHANGELOG</span>
-      <span class="meta" data-release-candidate="v1.0.0-beta.2">预发布候选：<code>v1.0.0-beta.2</code>（尚未验收；来源以最终 clean tag/CI 为准）</span>
+      <span class="meta" data-release-candidate="v1.0.0-beta.3">预发布候选：<code>v1.0.0-beta.3</code>（尚未验收；来源以最终 clean tag/CI 为准）</span>
       <span class="meta" data-release-predecessor="v0.3.0-beta.2">前驱发布标记：<code>v0.3.0-beta.2</code> / IPC v8（仅历史证据）</span>
       <span class="meta">文档日期：2026-08-31</span>
       <span class="meta"><a href="serctl-design-roadmap.md">目标架构与演进路线（规划）</a></span>
@@ -764,7 +764,7 @@ target\release\serctl_cli.exe --version
         <div class="grid three">
           <div class="card"><h3>clean 来源基线</h3><p><code>94fb37118f4b</code></p><p class="small">体积优化已提交并推送；当前功能工作树建立于此。</p></div>
           <div class="card"><h3>beta-2 冻结前门禁</h3><p><strong>365 通过 / 0 失败 / 1 忽略</strong></p><p class="small">2026-08-31 workspace 串行测试、strict Clippy 与独立 staging Release 三件套构建通过；该数字仅属于历史快照。</p></div>
-          <div class="card"><h3>当前发布状态</h3><p><strong>v1.0.0-beta.2 候选，尚未验收</strong></p><p class="small"><code>v0.3.0-beta.2</code> / IPC v8 是前驱历史证据；v1 只接受 exact clean tag 与对应 CI 摘要。</p></div>
+          <div class="card"><h3>当前发布状态</h3><p><strong>v1.0.0-beta.3 候选，尚未验收</strong></p><p class="small"><code>v0.3.0-beta.2</code> / IPC v8 是前驱历史证据；v1 只接受 exact clean tag 与对应 CI 摘要。</p></div>
         </div>
         <h3>Release 体积优化</h3>
         <p>正式 Release 采用体积优先且保持可移植性的 profile：</p>
@@ -788,9 +788,9 @@ strip = "symbols"</code></pre>
         <div class="callout warn"><strong>历史 artifact，不是当前制品：</strong>优化提交前的标准路径测量为 EXE <strong>10,723,840 B</strong>、SHA-256 <code>68F571F7FDAD09986C8E5E6E23F8AE229B8E0043654298F3C349A0B99490F601</code>，PDB <strong>2,748,416 B</strong>。源码随后才以 <code>94fb371</code> clean commit 推送，所以不能把旧摘要重新标成该 commit 的 clean artifact；它也不包含当前 storage v5 修改。</div>
         <div class="callout warn"><strong>上一轮 IPC v4 dirty 构建：</strong>标准 release 曾为 <strong>11,273,216 B</strong>，SHA-256 <code>A464F57EE7D60ACB583C0300D399E183F1BCB328C60B88CE6498D4C46592DE53</code>；这里只保留为历史对照，不描述当前 v9 文件。</div>
         <div class="callout"><strong>v0.3.0-beta.2 冻结边界：</strong>冻结前源码与文档证据来自 dirty 工作树；最终 build 大小、哈希与 Fresh 结果应记录在 clean tag 对应的 CI/release metadata 或仓库外交付记录中，不把自引用制品信息写回受 <code>build.rs</code> 监控的文档。</div>
-        <div class="callout warn"><strong>正式制品边界：</strong>只有 exact annotated clean tag <code>v1.0.0-beta.2</code> 上、通过 quality/test/RustSec 与治理门禁后由发布作业生成并附带来源、SHA-256、SBOM、provenance 与 OIDC attestation 的工件，才可作为正式发布候选。annotated tag 对象本身在 Git 中并非不可移动；组织侧 tag ruleset 与 immutable releases 必须作为仓库外部治理门禁启用并另行核验，workflow 的重复发布拒绝与发布前远端 tag 复核不能替代它们。运行时仅发布 Windows x86_64 的匹配 CLI + daemon，以及 Linux x86_64 的 <code>serctl-xfer</code>；macOS 只在测试矩阵内，不产出 runtime。<code>serctl-remote</code>、jobs、remote protocol 与 policy engine 均属 source-only experimental/unshipped，不得进入资产、runtime manifest、symbol 包或 SBOM。</div>
+        <div class="callout warn"><strong>正式制品边界：</strong>只有 exact annotated clean tag <code>v1.0.0-beta.3</code> 上、通过 quality/test/RustSec 与治理门禁后由发布作业生成并附带来源、SHA-256、SBOM、provenance 与 OIDC attestation 的工件，才可作为正式发布候选。annotated tag 对象本身在 Git 中并非不可移动；组织侧 tag ruleset 与 immutable releases 必须作为仓库外部治理门禁启用并另行核验，workflow 的重复发布拒绝与发布前远端 tag 复核不能替代它们。运行时仅发布 Windows x86_64 的匹配 CLI + daemon，以及 Linux x86_64 的 <code>serctl-xfer</code>；macOS 只在测试矩阵内，不产出 runtime。<code>serctl-remote</code>、jobs、remote protocol 与 policy engine 均属 source-only experimental/unshipped，不得进入资产、runtime manifest、symbol 包或 SBOM。</div>
         <p>CLI、daemon 与 helper 的 <code>build.rs</code> wrapper 共享 <a href="../build_support/git_provenance.rs"><code>build_support/git_provenance.rs</code></a>。共享实现移除所有可重定向 repository/work-tree/index/object/config/replace refs 的继承 Git 环境，禁用 system/global config，只从 manifest 祖先的文件系统发现真实 <code>.git</code>；Windows 去除 <code>\\?\</code> 前缀，canonical root 必须包含 manifest。查询固定 <code>--work-tree</code>，设置 <code>GIT_NO_REPLACE_OBJECTS=1</code>，关闭 fsmonitor/untracked cache。它解析 index stage-0 的 mode/OID/path，并用 <code>git hash-object --no-filters</code> 计算原始工作树 blob OID，使 clean/smudge filter 不能掩盖变更；任何关键查询失败都 fail-dirty。</p>
-        <p>v1 beta 发布链只响应规范 annotated tag <code>v1.0.0-beta.2</code>，不会把普通 <code>main</code> CI 当作正式发布。preflight 验证远端/本地 tag object 与 peeled commit、workspace/crate/internal path dependency 版本、Cargo.lock 及文档标记一致；Windows/Linux/macOS 运行 locked all-target/all-feature tests，quality 运行严格 Clippy、四个 build-script fixtures（含 source-only <code>serctl-remote</code>）、cargo-deny 与在线 RustSec（warnings 即失败）。从专用空 staging 构建 Windows CLI + daemon 匹配包及 Linux x86_64 <code>serctl-xfer</code>，分离调试符号，生成 CycloneDX 1.5 XML/JSON SBOM、SHA-256 manifest 与 build environment/provenance，并用最小权限 GitHub OIDC attestation。发布前再次核对远端 annotated tag object；已有 release 一律拒绝覆盖。远端复核与 workflow 拒绝只能发现发布时冲突，真正限制 tag/release 后续改写仍依赖平台侧 tag ruleset 与 immutable releases。source-only experimental/unshipped 组件只参加源码质量门禁，不构建到发布 runtime。</p>
+        <p>v1 beta 发布链只响应规范 annotated tag <code>v1.0.0-beta.3</code>，不会把普通 <code>main</code> CI 当作正式发布。preflight 验证远端/本地 tag object 与 peeled commit、workspace/crate/internal path dependency 版本、Cargo.lock 及文档标记一致；Windows/Linux/macOS 运行 locked all-target/all-feature tests，quality 运行严格 Clippy、四个 build-script fixtures（含 source-only <code>serctl-remote</code>）、cargo-deny 与在线 RustSec（warnings 即失败）。从专用空 staging 构建 Windows CLI + daemon 匹配包及 Linux x86_64 <code>serctl-xfer</code>，分离调试符号，生成 CycloneDX 1.5 XML/JSON SBOM、SHA-256 manifest 与 build environment/provenance，并用最小权限 GitHub OIDC attestation。发布前再次核对远端 annotated tag object；已有 release 一律拒绝覆盖。远端复核与 workflow 拒绝只能发现发布时冲突，真正限制 tag/release 后续改写仍依赖平台侧 tag ruleset 与 immutable releases。source-only experimental/unshipped 组件只参加源码质量门禁，不构建到发布 runtime。</p>
         <ul>
           <li>三处 wrapper 监听共享 provenance 实现、tracked 文件、Git HEAD/index/packed-refs/symbolic ref、config/config.worktree、<code>info/exclude</code> 与 <code>info/attributes</code>；mode <code>160000</code> gitlink 直接 fail-dirty，不把 submodule 当普通 blob 跳过。</li>
           <li><code>git ls-files -v -z --cached</code> 发现 assume-unchanged 小写 tag 或 skip-worktree <code>S</code> 就强制 dirty；replace refs 不能改写所嵌 commit/工作树视图。</li>
@@ -830,7 +830,7 @@ Get-FileHash target\release\serctl_cli.exe -Algorithm SHA256</code></pre>
           <li><a href="../.gitattributes">.gitattributes</a> — 仓库文本规范化与 LF 策略</li>
           <li><a href="serctl-design-roadmap.md">docs/serctl-design-roadmap.md</a> — 尚未发布的目标架构、决策、里程碑与验收矩阵</li>
         </ul>
-        <p class="small">本文为静态、无脚本、无外部样式依赖的 UTF-8 HTML，可离线打开或打印。内容更新至 2026-08-31 的 <code>v1.0.0-beta.2</code> 候选、vault-storage read=v4..=v5 write=v5、IPC v9 全局 broker、profile proof、OperationGrant、UI 分层限时授权、可恢复 transfer 与 loopback-only tunnel；<code>v0.3.0-beta.2</code> / IPC v8 仅保留为前驱历史证据。最终制品身份以 exact clean tag/commit 对应的 CI/release metadata 为准；source-only experimental/unshipped remote、jobs、remote protocol 与 policy engine 不属于发布或支持面。</p>
+        <p class="small">本文为静态、无脚本、无外部样式依赖的 UTF-8 HTML，可离线打开或打印。内容更新至 2026-08-31 的 <code>v1.0.0-beta.3</code> 候选、vault-storage read=v4..=v5 write=v5、IPC v9 全局 broker、profile proof、OperationGrant、UI 分层限时授权、可恢复 transfer 与 loopback-only tunnel；<code>v0.3.0-beta.2</code> / IPC v8 仅保留为前驱历史证据。最终制品身份以 exact clean tag/commit 对应的 CI/release metadata 为准；source-only experimental/unshipped remote、jobs、remote protocol 与 policy engine 不属于发布或支持面。</p>
       </section>
     </main>
   </div>
