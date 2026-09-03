@@ -10,9 +10,8 @@
 
 面向操作者的安装、首次配置、UI/CLI、备份恢复和故障处理流程见 [serctl 使用手册](docs/serctl-user-guide.md)；当前实现的安全边界见 [架构、安全与运维说明](docs/serctl-architecture-security.html)；尚未发布的策略、审计、作业、IPC codec 与高速数据面方案见 [目标架构与演进路线](docs/serctl-design-roadmap.md)；版本变化见 [更新日志](CHANGELOG.md)。
 
-### 最近更新（2026-09-03）
+### 最近更新（2026-08-31）
 
-- 桌面文件页的目录/文件名统一左对齐，文件列表按窗体宽高铺满；Bash 页采用带 `$` 提示符、深色输出区和底部输入栏的终端式布局；命令页输出区也会随窗体宽高动态扩展。底层 Bash 仍是受保护的真实 PTY，不是本地文本模拟器。
 - 新增 `transfer push/pull/status/cancel`：进度只按远端确认量推进，区分 idle timeout 与可选总 deadline，并显示阶段、3 秒窗口速度、平均速度、ETA、实际 backend、chunk/window 和 transfer id。
 - 修复 SFTP 上传把本地 `write_all` 返回误当成远端确认的问题。fallback 现使用保守的 2 KiB chunk，并对每个 WRITE 等待匹配的远端 STATUS 后才推进 confirmed bytes。
 - Agent JSONL 候选面现有 14 个精确操作。push/pull 可预声明对象名 `transfer_id`；transfer 与受管隧道的对象终态/status 都携带 daemon 生成的 64 位 `operation_context_id` 和正数单调 `revision`；首次精确按 id 查询可发现 context，后续 status 与全部 cancel 必须回传它。成功的 `status`、`ssh-connection-identity`、`exec`、`list-dir` 与 `create-dir` 一次性终态也各有独立 context 和固定 `revision=1`，不能跨根操作替换。`daemon.status` 不建立 SSH 连接，使用明确的 no-SSH-transport 域标记而不伪造 transport attempt。formal runner 仍因缺少 exact-tag 组件、真实 Grant/远端、Linux/macOS 与 helper identity 实证而 BLOCKED；本地 parser/source tests 不是 E2E。`transfer-pull` 仍以 `transfer.read` 保持 terminal-only、redacted commitment、protected `CREATE_NEW` 与 no-overwrite；实时进度由独立 `transfer-status`/`transfer.status` 请求观察。

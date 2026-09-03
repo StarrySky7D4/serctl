@@ -158,7 +158,7 @@
       <span class="meta">最新门禁与外部验证边界见 CHANGELOG</span>
       <span class="meta" data-release-candidate="v1.0.0-beta.2">预发布候选：<code>v1.0.0-beta.2</code>（尚未验收；来源以最终 clean tag/CI 为准）</span>
       <span class="meta" data-release-predecessor="v0.3.0-beta.2">前驱发布标记：<code>v0.3.0-beta.2</code> / IPC v8（仅历史证据）</span>
-      <span class="meta">文档日期：2026-09-03</span>
+      <span class="meta">文档日期：2026-08-31</span>
       <span class="meta"><a href="serctl-design-roadmap.md">目标架构与演进路线（规划）</a></span>
       <span class="meta">dirty 制品：仅作本地验证，不作为正式发布</span>
     </div>
@@ -392,7 +392,6 @@ $randomReceipt = Join-Path $env:USERPROFILE 'Documents\serctl-prod-passphrase.tx
           <li>Windows 超管授权独立固定两分钟，不传入普通 SSH 操作；Linux 同一界面验证有效 UID 0。单项/全部撤销或到期会清零对应口令，关闭该 profile 的 shell/tunnel/transfer 与受保护 workspace；已运行 daemon 故意保留。</li>
           <li>Windows 新建主机在缺少超管授权时记录一个不含秘密的待保存续接标记，实际 SSH/profile 口令仍只留在编辑器。完成恢复策略初始化并授权后，UI 自动关闭安全窗口并继续原保存动作；轮转恢复介质撤销旧授权后需重新授权，再继续同一待办。手动关闭安全窗口只取消自动续接，编辑器内容仍保留。</li>
           <li>目录、文件传输、命令、Bash 与 tunnel 均通过后台 Tokio runtime 执行。profile refresh 使用一个 32 秒 absolute deadline，先读取 catalog，再只对有效 grant 分波执行最多 8 个 daemon status probe；Status 只读 daemon metadata，不触发 SSH reconnect。</li>
-          <li>文件页的目录/文件名左对齐，列表按窗体宽高动态铺满并继续虚拟化大型目录；命令输出区同时适配可用宽高；Bash 页使用深色终端输出区、<code>$</code> 提示符和底部输入栏，但底层仍是受保护的远端真实 PTY，而不是本地伪造命令结果。</li>
           <li>Windows 首次使用空的受支持 v4/v5 vault 时，必须先输入并确认新超管密码，把新 2-of-2 share 以 create-new 写入指定可移动介质；成功提交将顶层写为 storage v5，之后才允许创建 profile。Linux 不设置存储型超管密码。</li>
           <li>可用“安全操作”只有手动/随机轮转，以及 Windows 的超管 + 匹配介质 + 新口令保留式恢复。两类随机路径都先在 modal 暂存并一次性显示，明确标注“vault 尚未修改”；只有勾选“已安全保存”后提交按钮才启用。生成阶段无后台消息、网络或 vault 副作用；取消/关闭会清零暂存值。红色 destructive reset UI/CLI 对所有既有 profile 当前返回失败关闭，不能认证旧审计历史。</li>
           <li>恢复介质轮转要求旧介质与不存在的新绝对路径；先写新介质，再原子提交全部 profile envelope。v2 vault 显示阻断式迁移向导：旧 master、每 profile 新口令、Windows 新超管密码与新介质必须齐全，单次全量提交前所有网络功能禁用。Linux 迁移按钮禁用，提交入口也会在读取/搬移迁移 secret 前明确失败关闭。</li>
@@ -416,7 +415,7 @@ $randomReceipt = Join-Path $env:USERPROFILE 'Documents\serctl-prod-passphrase.tx
           <tbody>
             <tr><td>profile name / host / port / 128-bit profile_id / generation</td><td>明文 catalog</td><td>有意允许锁定 UI/<code>list</code> 读取；identity 与 generation 同时绑定 key、payload、recovery AAD，但不具备机密性</td></tr>
             <tr><td>profile salt / KDF</td><td>每 profile 独立明文参数</td><td>Argon2id 64 MiB / 3 iterations / p=1；读取有上下限；派生 KEK</td></tr>
-            <tr><td><code>{DEK, AuthSeed, AuditSeed, profile_id, generation}</code></td><td>profile 口令 KEK 下的 ChaCha20-Poly1305 envelope</td><td>AAD 绑定 domain/name/profile_id/host/port/generation；口令不保存且不可从 envelope 还原</td></tr>
+            <tr><td><code>{DEK, AuthSeed, profile_id, generation}</code></td><td>profile 口令 KEK 下的 ChaCha20-Poly1305 envelope</td><td>AAD 绑定 domain/name/profile_id/host/port/generation；口令不保存且不可从 envelope 还原</td></tr>
             <tr><td>username / SSH password / host-key pin</td><td>随机 DEK 下的 ChaCha20-Poly1305 payload</td><td>独立 nonce；AAD 绑定另一 domain/name/profile_id/host/port/generation</td></tr>
             <tr><td>recovery id / X25519 public key</td><td>vault-wide 明文公有配置</td><td>每 profile envelope 密封同一 KeyPackage；AuthSeed-HMAC tag 认证完整 canonical config，envelope 另绑定 name + profile_id + generation</td></tr>
             <tr><td>Windows admin policy</td><td>超管密码 KEK 下的 vault-local share + canonical recovery-config digest</td><td>只保护一半 recovery secret；digest 认证完整 id/public key；不包含 profile 口令、DEK 或完整恢复私钥</td></tr>
@@ -763,7 +762,7 @@ target\release\serctl_cli.exe --version
       <section id="release">
         <h2>16. 构建、发布与来源追踪</h2>
         <div class="grid three">
-          <div class="card"><h3>候选来源规则</h3><p><strong>exact annotated clean tag</strong></p><p class="small">当前来源必须由标签对象、peeled commit、锁文件、版本标记和 CI provenance 共同绑定；历史优化提交不再称为当前功能基线。</p></div>
+          <div class="card"><h3>clean 来源基线</h3><p><code>94fb37118f4b</code></p><p class="small">体积优化已提交并推送；当前功能工作树建立于此。</p></div>
           <div class="card"><h3>beta-2 冻结前门禁</h3><p><strong>365 通过 / 0 失败 / 1 忽略</strong></p><p class="small">2026-08-31 workspace 串行测试、strict Clippy 与独立 staging Release 三件套构建通过；该数字仅属于历史快照。</p></div>
           <div class="card"><h3>当前发布状态</h3><p><strong>v1.0.0-beta.2 候选，尚未验收</strong></p><p class="small"><code>v0.3.0-beta.2</code> / IPC v8 是前驱历史证据；v1 只接受 exact clean tag 与对应 CI 摘要。</p></div>
         </div>
@@ -801,7 +800,7 @@ strip = "symbols"</code></pre>
           <li>所有已知会影响二进制的根级文件 <code>Cargo.toml</code>、<code>Cargo.lock</code>、共享 provenance 实现与 <code>rust-toolchain.toml</code> 已 tracked/watched；正式 release 仍须以 clean status 做门禁。</li>
           <li>此前审计工作树连续第二次 debug build 报 <code>Fresh serctl</code>，说明 watcher 没有因 Git 查询或 target 输出形成永久重建循环；该历史证据不冒充当前功能工作树的最终来源身份。</li>
         </ul>
-        <div class="callout warn"><strong>v0.3 beta-2 前驱边界：</strong><code>v0.3.0-beta.2</code> 只作为回滚前驱与历史测试版本；可回滚来源必须是当时最终推送的唯一 clean tag/commit。冻结前带 <code>-dirty</code> 的 EXE/PDB 只能证明其构建时工作树。为避免自引用重建循环，最终制品大小与摘要不嵌入本文，必须记录在 clean tag/CI release metadata 或仓库外交付记录中。</div>
+        <div class="callout warn"><strong>beta-2 release 边界：</strong><code>v0.3.0-beta.2</code> 仍是预发布测试版本；可回滚来源必须是最终推送的唯一 clean tag/commit。冻结前带 <code>-dirty</code> 的 EXE/PDB 只能证明其构建时工作树。为避免自引用重建循环，最终制品大小与摘要不嵌入本文，必须记录在 clean tag/CI release metadata 或仓库外交付记录中。</div>
         <pre><code># 仅在功能修改已提交、工作树 clean、准备正式发布时执行
 cargo build --release --locked --offline -p serctl-cli -p serctl-daemon
 target\release\serctl_cli.exe --version
@@ -831,11 +830,11 @@ Get-FileHash target\release\serctl_cli.exe -Algorithm SHA256</code></pre>
           <li><a href="../.gitattributes">.gitattributes</a> — 仓库文本规范化与 LF 策略</li>
           <li><a href="serctl-design-roadmap.md">docs/serctl-design-roadmap.md</a> — 尚未发布的目标架构、决策、里程碑与验收矩阵</li>
         </ul>
-        <p class="small">本文为静态、无脚本、无外部样式依赖的 UTF-8 HTML，可离线打开或打印。内容更新至 2026-09-03 的 <code>v1.0.0-beta.2</code> 候选、vault-storage read=v4..=v5 write=v5、IPC v9 全局 broker、profile proof、OperationGrant、UI 分层限时授权与自适应工作区、可恢复 transfer 及 loopback-only tunnel；<code>v0.3.0-beta.2</code> / IPC v8 仅保留为前驱历史证据。最终制品身份以 exact clean tag/commit 对应的 CI/release metadata 为准；source-only experimental/unshipped remote、jobs、remote protocol 与 policy engine 不属于发布或支持面。</p>
+        <p class="small">本文为静态、无脚本、无外部样式依赖的 UTF-8 HTML，可离线打开或打印。内容更新至 2026-08-31 的 <code>v1.0.0-beta.2</code> 候选、vault-storage read=v4..=v5 write=v5、IPC v9 全局 broker、profile proof、OperationGrant、UI 分层限时授权、可恢复 transfer 与 loopback-only tunnel；<code>v0.3.0-beta.2</code> / IPC v8 仅保留为前驱历史证据。最终制品身份以 exact clean tag/commit 对应的 CI/release metadata 为准；source-only experimental/unshipped remote、jobs、remote protocol 与 policy engine 不属于发布或支持面。</p>
       </section>
     </main>
   </div>
 
-  <footer>serctl implementation review · repository evidence · Apache-2.0 · 2026-09-03</footer>
+  <footer>serctl implementation review · repository evidence · Apache-2.0 · 2026-08-31</footer>
 </body>
 </html>

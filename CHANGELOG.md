@@ -12,10 +12,6 @@
 - Bash 页改为终端式布局，使用深色输出区、`$` 提示符和底部输入栏；底层继续复用受保护的真实 PTY 会话，并让输出区随窗体宽高动态扩展。
 - 命令页输出区不再固定为 15 行，改为同时跟随可用宽度和高度铺满；新增确定性布局回归并保留 10,000 项目录虚拟化门禁。
 
-### 文档一致性
-
-- 同步 README、使用手册、架构页、路线图与验收矩阵：当前候选统一为 `v1.0.0-beta.2`、IPC v9；SFTP fallback 为 2 KiB 单 WRITE/STATUS，而 native 为 32 KiB 单 chunk/ACK。未来 Protobuf codec 必须使用新的 wire 版本，不能复用当前 JSON/AEAD IPC v9 标识。
-
 ## v1.0.0-beta.1 - 2026-09-03
 
 > **候选状态（尚未验收/发布）**：当前 workspace 与预发布标记已同步为 `v1.0.0-beta.1`；exact-tag CI、受控实机和仓库治理门禁仍须通过后方可发布。候选 wire 为 IPC v9，并拒绝 v8 或 direct-connect downgrade；Agent JSONL 固定 `schema_version=1` 和稳定 `error_code`。普通 `main` CI 不产生正式发行物。
