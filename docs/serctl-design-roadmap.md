@@ -177,7 +177,7 @@ Protobuf 是候选实现，不是既定性能结论。Rust 常用实现仍会为
 
 ### 8.3 发布方式
 
-先在测试/基准中做 JSON 与候选 codec 的 shadow parity，不改变 wire。真正切换时发布明确 IPC v9，并将 CLI、daemon 和 helper 作为匹配集合 staging/原子替换；v8/v9 半升级必须 fail closed。最多保留一个明确配置的兼容窗口，禁止静默 downgrade 或 direct fallback。
+先在测试/基准中做 JSON 与候选 codec 的 shadow parity，不改变 wire。真正切换时必须发布区别于当前 JSON/AEAD IPC v9 的新 wire 版本（路线图暂记 v10），并将 CLI、daemon 和 helper 作为匹配集合 staging/原子替换；v9/v10 半升级必须 fail closed。最多保留一个明确配置的兼容窗口，禁止静默 downgrade 或 direct fallback。
 
 ## 9. 审计证据链
 

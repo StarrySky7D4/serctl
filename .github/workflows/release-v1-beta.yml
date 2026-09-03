@@ -1004,7 +1004,6 @@ jobs:
             $subjectPath = Join-Path release-dist $subject
             gh attestation verify $subjectPath `
               --repo $env:RELEASE_REPOSITORY `
-              --signer-repo $env:RELEASE_REPOSITORY `
               --signer-workflow "$env:RELEASE_REPOSITORY/.github/workflows/release-v1-beta.yml" `
               --source-digest $env:RELEASE_COMMIT `
               --source-ref "refs/tags/$env:RELEASE_TAG"
@@ -1191,7 +1190,6 @@ jobs:
             $subjectPath = Join-Path $publishDirectory $subject
             gh attestation verify $subjectPath `
               --repo $env:RELEASE_REPOSITORY `
-              --signer-repo $env:RELEASE_REPOSITORY `
               --signer-workflow "$env:RELEASE_REPOSITORY/.github/workflows/release-v1-beta.yml" `
               --source-digest $env:RELEASE_COMMIT `
               --source-ref "refs/tags/$env:RELEASE_TAG"

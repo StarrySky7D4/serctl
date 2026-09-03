@@ -863,7 +863,6 @@ foreach ($required in @(
     'Join-Path release-dist $subject',
     'gh attestation verify $subjectPath',
     '--repo $env:RELEASE_REPOSITORY',
-    '--signer-repo $env:RELEASE_REPOSITORY',
     '--signer-workflow "$env:RELEASE_REPOSITORY/.github/workflows/release-v1-beta.yml"',
     '--source-digest $env:RELEASE_COMMIT',
     '--source-ref "refs/tags/$env:RELEASE_TAG"',
@@ -943,6 +942,9 @@ Assert-TestCondition (-not $workflow.Contains('refs/heads/main')) (
 )
 Assert-TestCondition (-not $workflow.Contains('workflow_dispatch:')) (
     'formal release workflow must not permit an unbound manual dispatch'
+)
+Assert-TestCondition (-not $workflow.Contains('--signer-repo $env:RELEASE_REPOSITORY')) (
+    'release attestation verification must not combine mutually exclusive signer-repo and signer-workflow selectors'
 )
 Assert-TestCondition (
     ([regex]::Matches(
