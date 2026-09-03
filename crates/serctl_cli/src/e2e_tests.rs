@@ -36,7 +36,7 @@ const E2E_ADMINISTRATOR_PASSPHRASE: &str = "e2e-administrator-passphrase";
 // Both end-to-end tests redirect the process-global test vault home. Keep
 // them serialized while still allowing their mock SSH and daemon tasks to run
 // concurrently inside each test.
-static E2E_TEST_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static TEST_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const GRANT_SUBPROCESS_TEST_NAME: &str = "e2e_tests::operation_grant_lifecycle_subprocess_helper";
 const GRANT_SUBPROCESS_ROLE_ENV: &str = "SERCTL_TEST_GRANT_SUBPROCESS_ROLE";
@@ -1706,7 +1706,7 @@ async fn assert_socks5_echo(bind_host: &str, bind_port: u16, target_port: u16) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
-    let _test_home_lock = E2E_TEST_HOME_LOCK.lock().await;
+    let _test_home_lock = TEST_HOME_LOCK.lock().await;
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -3873,7 +3873,7 @@ async fn spawn_published_test_global_daemon(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_loss_after_grant_exec_is_unknown_and_new_instance_never_replays_it() {
-    let _test_home_lock = E2E_TEST_HOME_LOCK.lock().await;
+    let _test_home_lock = TEST_HOME_LOCK.lock().await;
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -4041,7 +4041,7 @@ async fn daemon_loss_after_grant_exec_is_unknown_and_new_instance_never_replays_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn operation_grant_survives_issuer_exit_and_expires_across_processes() {
-    let _test_home_lock = E2E_TEST_HOME_LOCK.lock().await;
+    let _test_home_lock = TEST_HOME_LOCK.lock().await;
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

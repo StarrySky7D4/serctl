@@ -2265,8 +2265,9 @@ mod cli_tests {
         }
     }
 
-    #[test]
-    fn recovery_media_is_bounded_verified_and_never_overwritten() {
+    #[tokio::test]
+    async fn recovery_media_is_bounded_verified_and_never_overwritten() {
+        let _test_home_lock = crate::e2e_tests::TEST_HOME_LOCK.lock().await;
         let _vault_home = ExternalSecretPathTestHome::isolated("cli-recovery-vault-home");
         let directory = unique_test_path("cli-recovery-media");
         std::fs::create_dir_all(&directory).unwrap();
@@ -2297,8 +2298,9 @@ mod cli_tests {
         std::fs::remove_dir(directory).unwrap();
     }
 
-    #[test]
-    fn generated_passphrase_is_verified_before_commit_and_never_overwritten() {
+    #[tokio::test]
+    async fn generated_passphrase_is_verified_before_commit_and_never_overwritten() {
+        let _test_home_lock = crate::e2e_tests::TEST_HOME_LOCK.lock().await;
         let _vault_home = ExternalSecretPathTestHome::isolated("cli-passphrase-vault-home");
         let directory = unique_test_path("cli-random-passphrase");
         std::fs::create_dir_all(&directory).unwrap();

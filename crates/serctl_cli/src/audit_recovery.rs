@@ -916,8 +916,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn high_level_audit_recovery_contract_uses_only_isolated_state() {
+    #[tokio::test]
+    async fn high_level_audit_recovery_contract_uses_only_isolated_state() {
+        let _test_home_lock = crate::e2e_tests::TEST_HOME_LOCK.lock().await;
         let home = IsolatedAuditHome::new();
         let profile = "audit-recovery-contract";
         let passphrase = "isolated-profile-passphrase";
