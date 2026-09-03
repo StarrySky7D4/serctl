@@ -349,6 +349,28 @@ function Invoke-ProbeUser {
         -Wait `
         -PassThru
     if ($process.ExitCode -ne 0) {
+        $script:probeFailure = switch -CaseSensitive ($Mode) {
+            'reparse' {
+                if ($process.ExitCode -eq 41) { 'reparse_accepted' }
+                elseif ($process.ExitCode -eq 42) { 'reparse_cli_start_failed' }
+                elseif ($process.ExitCode -eq 50) { 'reparse_rejection_unproven' }
+                else { 'reparse_worker_failed' }
+            }
+            'owner' {
+                if ($process.ExitCode -eq 43) { 'owner_cli_failed' }
+                else { 'owner_worker_failed' }
+            }
+            'observer' {
+                if ($process.ExitCode -eq 44) { 'observer_vault_opened' }
+                elseif ($process.ExitCode -eq 45) { 'observer_parent_control_failed' }
+                elseif ($process.ExitCode -eq 46) { 'observer_vault_lock_readable' }
+                elseif ($process.ExitCode -eq 47) { 'observer_lock_denial_unclassified' }
+                elseif ($process.ExitCode -eq 48) { 'observer_vault_writable' }
+                elseif ($process.ExitCode -eq 49) { 'observer_write_denial_unclassified' }
+                else { 'observer_worker_failed' }
+            }
+            default { 'unknown_worker_failed' }
+        }
         $stdoutBytes = if (Test-Path -LiteralPath $stdout -PathType Leaf) {
             (Get-Item -LiteralPath $stdout -Force).Length
         }
@@ -367,6 +389,8 @@ function Invoke-ProbeUser {
 
 $safeCliLeaf = Get-ReleaseLogLeafName -Path $CliPath -Fallback 'serctl-cli'
 $safeCliBytes = [long]0
+$gatePhase = 'preflight'
+$probeFailure = 'none'
 try {
 if ($env:OS -cne 'Windows_NT') {
     throw 'Windows multi-account ACL gate must run on Windows'
@@ -448,6 +472,7 @@ $gateResult = $null
 $startedUtc = [DateTimeOffset]::UtcNow
 
 try {
+    $gatePhase = 'create_accounts'
     Assert-GateCondition (-not (Test-Path -LiteralPath $probeRoot)) (
         'probe root already exists; refusing to reuse it'
     )
@@ -463,6 +488,7 @@ try {
         -AccountNeverExpires `
         -PasswordNeverExpires | Out-Null
     $observerCreated = $true
+    $gatePhase = 'validate_accounts'
     $ownerSid = (Get-LocalUser -Name $ownerName).SID
     $observerSid = (Get-LocalUser -Name $observerName).SID
     Assert-GateCondition ($ownerSid.Value -cne $observerSid.Value) (
@@ -481,6 +507,7 @@ try {
         -not ($administratorMemberSids -contains $observerSid.Value)
     ) 'observer probe account is an administrator'
 
+    $gatePhase = 'prepare_fixture'
     [System.IO.Directory]::CreateDirectory($probeRoot) | Out-Null
     Set-ProbeRootAcl -Path $probeRoot -AccountSids @($ownerSid, $observerSid)
     Copy-Item -LiteralPath $resolvedCli -Destination $cliCopy
@@ -510,24 +537,65 @@ function Test-IsAccessDeniedError {
     param([Parameter(Mandatory = $true)]$ErrorRecord)
 
     $exception = $ErrorRecord.Exception
-    if ($exception -is [System.UnauthorizedAccessException]) { return $true }
-    return (
-        $exception -is [System.IO.IOException] -and
-        (($exception.HResult -band 0xffff) -eq 5)
-    )
+    for ($depth = 0; $depth -lt 8 -and $null -ne $exception; $depth++) {
+        if ($exception -is [System.UnauthorizedAccessException]) { return $true }
+        if (
+            ($exception -is [System.IO.IOException] -or
+                $exception -is [System.ComponentModel.Win32Exception]) -and
+            (($exception.HResult -band 0xffff) -eq 5)
+        ) { return $true }
+        $exception = $exception.InnerException
+    }
+    return $false
+}
+
+function Invoke-CliList {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $CliPath
+    $startInfo.Arguments = 'list'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            return [pscustomobject]@{
+                ExitCode = 42
+                ReparseRejected = $false
+            }
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        # Drain both pipes without forwarding profile metadata or error details.
+        $null = $stdoutTask.GetAwaiter().GetResult()
+        $stderrText = $stderrTask.GetAwaiter().GetResult()
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            ReparseRejected = $stderrText.Contains(
+                'protected directory path is not a non-reparse directory'
+            )
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
 }
 
 if ($Mode -eq 'owner') {
     [System.IO.Directory]::CreateDirectory($HomePath) | Out-Null
-    & $CliPath list *> $null
-    if ($LASTEXITCODE -ne 0) { throw "owner CLI list exited $LASTEXITCODE" }
+    if ((Invoke-CliList).ExitCode -ne 0) { exit 43 }
     exit 0
 }
 if ($Mode -eq 'reparse') {
-    & $CliPath list *> $null
-    if ($LASTEXITCODE -eq 0) {
-        throw 'CLI unexpectedly accepted a reparse-point vault directory'
+    $result = Invoke-CliList
+    if ($result.ExitCode -eq 0) {
+        exit 41
     }
+    if ($result.ExitCode -eq 42) { exit 42 }
+    if (-not $result.ReparseRejected) { exit 50 }
     exit 0
 }
 if ($Mode -ne 'observer') { throw 'unknown worker mode' }
@@ -536,13 +604,13 @@ if ($Mode -ne 'observer') { throw 'unknown worker mode' }
 # later denial therefore comes from serctl's protected child, not an
 # inaccessible test root or a failed secondary logon.
 $control = Join-Path $HomePath 'observer-parent-control.txt'
-[System.IO.File]::WriteAllText($control, 'control')
-[System.IO.File]::Delete($control)
-
-& $CliPath list *> $null
-if ($LASTEXITCODE -eq 0) {
-    throw 'observer CLI unexpectedly opened owner vault'
+try {
+    [System.IO.File]::WriteAllText($control, 'control')
+    [System.IO.File]::Delete($control)
 }
+catch { exit 45 }
+
+if ((Invoke-CliList).ExitCode -eq 0) { exit 44 }
 $vaultDirectory = Join-Path $HomePath '.serctl'
 $lockPath = Join-Path $vaultDirectory 'vault.lock'
 $readDenied = $false
@@ -559,11 +627,9 @@ catch {
     if (Test-IsAccessDeniedError -ErrorRecord $_) {
         $readDenied = $true
     }
-    else {
-        throw 'observer protected vault lock read failed with a non-access-denied error'
-    }
+    else { exit 47 }
 }
-if (-not $readDenied) { throw 'observer unexpectedly read protected vault lock' }
+if (-not $readDenied) { exit 46 }
 
 $createDenied = $false
 try {
@@ -579,11 +645,9 @@ catch {
     if (Test-IsAccessDeniedError -ErrorRecord $_) {
         $createDenied = $true
     }
-    else {
-        throw 'observer protected vault write failed with a non-access-denied error'
-    }
+    else { exit 49 }
 }
-if (-not $createDenied) { throw 'observer unexpectedly wrote protected vault directory' }
+if (-not $createDenied) { exit 48 }
 exit 0
 '@
     [System.IO.File]::WriteAllText(
@@ -592,15 +656,22 @@ exit 0
         [System.Text.UTF8Encoding]::new($false)
     )
 
+    $gatePhase = 'reparse_probe'
     $reparseHome = Join-Path $probeRoot 'reparse-home'
     $reparseTarget = Join-Path $probeRoot 'reparse-target'
+    $reparseSentinel = Join-Path $reparseTarget 'sentinel.txt'
     [System.IO.Directory]::CreateDirectory($reparseHome) | Out-Null
     [System.IO.Directory]::CreateDirectory($reparseTarget) | Out-Null
+    [System.IO.File]::WriteAllText($reparseSentinel, 'serctl-acl-reparse-sentinel')
     New-Item `
         -ItemType Junction `
         -Path (Join-Path $reparseHome '.serctl') `
         -Target $reparseTarget `
         -ErrorAction Stop | Out-Null
+    $reparseItem = Get-Item -LiteralPath (Join-Path $reparseHome '.serctl') -Force
+    Assert-GateCondition (
+        ($reparseItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    ) 'reparse fixture is not a reparse point'
     Invoke-ProbeUser `
         -UserName $ownerName `
         -Password $ownerPassword `
@@ -609,7 +680,16 @@ exit 0
         -WorkerPath $workerPath `
         -CliCopy $cliCopy `
         -ProbeRoot $probeRoot
+    $reparseEntries = @(Get-ChildItem -LiteralPath $reparseTarget -Force)
+    Assert-GateCondition ($reparseEntries.Count -eq 1) (
+        'reparse target was modified during rejection probe'
+    )
+    Assert-GateCondition (
+        [System.IO.File]::ReadAllText($reparseSentinel) -ceq
+            'serctl-acl-reparse-sentinel'
+    ) 'reparse target sentinel changed during rejection probe'
 
+    $gatePhase = 'owner_initialize'
     Invoke-ProbeUser `
         -UserName $ownerName `
         -Password $ownerPassword `
@@ -626,6 +706,7 @@ exit 0
     Assert-GateCondition (Test-Path -LiteralPath $vaultLock -PathType Leaf) (
         'owner CLI did not create the protected vault lock'
     )
+    $gatePhase = 'verify_owner_acl'
     Assert-SerctlProtectedAcl `
         -Path $vaultDirectory `
         -Label 'protected vault directory' `
@@ -637,6 +718,7 @@ exit 0
         -ExpectedOwner $ownerSid `
         -Directory $false
 
+    $gatePhase = 'observer_denial'
     Invoke-ProbeUser `
         -UserName $observerName `
         -Password $observerPassword `
@@ -645,6 +727,7 @@ exit 0
         -WorkerPath $workerPath `
         -CliCopy $cliCopy `
         -ProbeRoot $probeRoot
+    $gatePhase = 'owner_reopen'
     Invoke-ProbeUser `
         -UserName $ownerName `
         -Password $ownerPassword `
@@ -654,6 +737,7 @@ exit 0
         -CliCopy $cliCopy `
         -ProbeRoot $probeRoot
 
+    $gatePhase = 'complete'
     $gateResult = [ordered]@{
         runner = [ordered]@{
             label = 'windows-acl-gate'
@@ -728,6 +812,7 @@ finally {
         }
     }
     if ($cleanupFailures.Count -gt 0) {
+        $gatePhase = 'cleanup'
         throw (
             'Windows multi-account ACL gate cleanup failed closed: ' +
             ($cleanupFailures -join '; ')
@@ -749,7 +834,8 @@ catch {
         (Format-ReleaseLogRecord `
             -Category windows_acl_gate_failed `
             -LeafName $safeCliLeaf `
-            -Bytes $safeCliBytes)
+            -Bytes $safeCliBytes) +
+        "; phase=$gatePhase; probe=$probeFailure"
     )
     exit 1
 }

@@ -4761,7 +4761,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_first_kex_shutdown_without_stream_release_suppresses_retry() {
+    async fn server_identification_then_kex_stall_suppresses_retry_and_closes_socket() {
         let mut rng = CompatibleOsRng(OsRng);
         let key = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
         let fingerprint = key
@@ -4834,7 +4834,12 @@ mod tests {
         };
         let chain = format!("{error:#}");
         assert!(chain.contains("SSH attempt 1:"));
-        assert!(chain.contains("socket_shutdown_confirmed=true stream_released=false"));
+        assert!(chain.contains("peer_observation=ssh_identification_observed_no_host_key"));
+        assert!(chain.contains("server_identification_observed=true"));
+        assert!(chain.contains("host_key_observed=false"));
+        assert!(chain.contains("socket_shutdown_confirmed=true"));
+        assert!(chain.contains("failure=local_deadline"));
+        assert!(!chain.contains("failed after one pre-authentication reconnect"));
         assert!(tokio::time::Instant::now() < total_deadline);
         assert!(started.elapsed() >= MIN_FIRST_KEX_WINDOW);
         assert_eq!(connections.load(Ordering::Acquire), 1);

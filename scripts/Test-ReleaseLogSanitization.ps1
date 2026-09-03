@@ -122,6 +122,6 @@ Invoke-SanitizedFailureProbe `
 Invoke-SanitizedFailureProbe `
     -Script (Join-Path $PSScriptRoot 'Test-WindowsMultiAccountAcl.ps1') `
     -Arguments @('-CliPath', "$canaryRoot\serctl_cli.exe") `
-    -Expected "Windows multi-account ACL gate failed: category=windows_acl_gate_failed; file='serctl_cli.exe'; bytes=0"
+    -Expected "Windows multi-account ACL gate failed: category=windows_acl_gate_failed; file='serctl_cli.exe'; bytes=0; phase=preflight; probe=none"
 
 Write-Host 'Release log sanitization self-test passed.'
