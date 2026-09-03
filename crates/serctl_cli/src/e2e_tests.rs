@@ -2000,7 +2000,10 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         tofu_profile,
         "ok",
         Some(tofu_passphrase),
-        Duration::from_secs(3),
+        // This assertion is about replay-safe single reconnect behavior, not
+        // sub-three-second setup performance. The budget includes broker IPC,
+        // two TCP/KEX attempts, authentication, and command completion.
+        Duration::from_secs(10),
     )
     .await
     .expect("pre-authentication KEX disconnect did not reconnect once");
@@ -2034,7 +2037,7 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         kex_persistent_profile,
         "ok",
         Some(KEX_PERSISTENT_PROFILE_PASSPHRASE),
-        Duration::from_secs(3),
+        Duration::from_secs(10),
     )
     .await
     .unwrap_err();
