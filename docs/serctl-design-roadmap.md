@@ -1,6 +1,6 @@
 # serctl 目标架构与演进路线
 
-> 状态：设计草案（2026-08-31）
+> 状态：设计草案（2026-09-03）
 >
 > 适用范围：策略执行、作业生命周期、审计证据、IPC 编码与可选高速数据面
 > 重要说明：本文描述目标架构和验收门槛，不代表这些能力已经发布。当前实现事实仍以 `README.md`、使用手册、架构安全说明和对应源码为准。
@@ -41,13 +41,13 @@
 截至本文日期，当前基线是：
 
 - **已实现**：候选存储契约 `vault-storage read=v4..=v5 write=v5`，顶层 `VaultFile` 与外层 profile record 双层均读 v4/v5、只写 v5；从 v2 迁移或对 beta-2 v4 首次成功 mutation 时原子推进 v5；逐 profile 独立 Argon2id KDF、DEK/AuthSeed/AuditSeed、随机 `profile_id` 与 generation；Windows 超管密码 + 离线介质 2-of-2 恢复边界。
-- **已实现**：全局 broker、per-profile pool、IPC wire v8、握手 transcript、方向独立 AEAD、严格计数器、exact root intent、profile call-key 与 OperationGrant PoP/scope/budget。
-- **部分实现**：OperationGrant 显式 TTL 已进入 `v1.0.0-beta` 源码候选，默认 30 分钟、整分钟 `1..=40`，客户端与 daemon 双端校验；本地组合生命周期 E2E 覆盖“签发进程退出→等待→另进程首次/连续请求→到期拒绝并释放 idle reference”；仍需最终匹配 clean 制品与 exact-tag 证据。
+- **已实现**：全局 broker、per-profile pool、IPC wire v9、握手 transcript、方向独立 AEAD、严格计数器、exact root intent、profile call-key 与 OperationGrant PoP/scope/budget；旧 v8 及 direct-connect downgrade 均失败关闭。
+- **部分实现**：OperationGrant 显式 TTL 已进入 `v1.0.0-beta.2` 源码候选，默认 30 分钟、整分钟 `1..=40`，客户端与 daemon 双端校验；本地组合生命周期 E2E 覆盖“签发进程退出→等待→另进程首次/连续请求→到期拒绝并释放 idle reference”；仍需最终匹配 clean 制品与 exact-tag 证据。
 - **部分实现**：可观察的 SFTP ACK、transfer registry、status/cancel、protected journal、连续 durable-prefix resume、no-overwrite commit，以及仅在 Linux 生产启用的 `serctl-xfer serve --stdio` helper。
-- **部分实现**：原生传输协议采用有界 JSON 控制帧 + raw data frame；完整 russh exec/SFTP 服务端的 4/8/16/32 KiB 矩阵已经通过，2 KiB 根因继续收窄到现实 OpenSSH + helper 子进程 stdio 边界。当前 daemon 仍保守限制为 2 KiB，尚未达到外部吞吐门槛。
+- **部分实现**：原生传输协议采用有界 JSON 控制帧 + raw data frame；SFTP fallback 固定为 2 KiB、单 WRITE/STATUS 确认，native 则固定为 32 KiB、单 chunk/helper ACK lockstep。完整 russh exec/SFTP 服务端的 4/8/16/32 KiB 矩阵和 mock native E2E 已通过，但真实 OpenSSH + helper 子进程、实机哈希矩阵与同机 `scp` 吞吐门槛仍未验收。
 - **部分实现且范围专用**：transfer helper 的 schema 2 sidecar/committed receipt 绑定 token hash、transfer id、size、SHA-256、durable offset、partial identity 与状态，可供同一 id/token 的显式恢复请求对账；它没有消费 ACK/GC/保留策略，不等同于规划中的通用 job/audit receipt 与外部锚定。
 - **已实现但范围有限**：本机 `grant-audit.jsonl` 记录 Grant relay 接受/拒绝；它不是远端不可篡改审计系统。
-- **规划**：策略 DSL、typed remote operation helper、approval/break-glass certificate、远端 receipt/外部锚定、锁页 allocator、IPC v9 codec、QUIC fast lane。
+- **规划**：策略 DSL、typed remote operation helper、approval/break-glass certificate、远端 receipt/外部锚定、锁页 allocator、使用新 wire 版本协商的内部 Protobuf codec、QUIC fast lane。
 
 当前 IPC 的 JSON 位于受认证加密帧内；它是控制面性能候选，而不是已证明的系统瓶颈。外部 Agent JSONL 和 CLI `--json` 是稳定的人机/自动化边界，未来内部 codec 变化不得迫使调用方安装 Protobuf 工具链。
 
@@ -245,7 +245,7 @@ OperationGrant TTL 只决定“调用授权能持续多久”，不能替代远�
 
 ## 12. 版本与里程碑
 
-产品 SemVer、vault schema、IPC wire、transfer protocol 和 policy schema 必须分别编号。原先把产品 `v3.0/v3.1/v3.2` 与 IPC/数据面绑定，容易和 vault v4、IPC v8 混淆；以下采用可验收的产品路线：
+产品 SemVer、vault schema、IPC wire、transfer protocol 和 policy schema 必须分别编号。原先把产品 `v3.0/v3.1/v3.2` 与 IPC/数据面绑定，容易和 vault v4、IPC v9 混淆；以下采用可验收的产品路线：
 
 仅在本路线表中，传输阶段缩写定义为：M1 = 可观察且按远端确认推进的可靠 fallback；M2 = 连续 durable-prefix journal/resume 与端到端完整性；M3 = 原生 helper 的功能、部署与性能验收。当前工作树完成的是 M1/M2 及 M3 功能预览，不代表签名部署或吞吐验收完成。
 
@@ -253,12 +253,12 @@ OperationGrant TTL 只决定“调用授权能持续多久”，不能替代远�
 | --- | --- | --- |
 | `v0.2.1` | 仅在仍维护无 wire-break 的 v0.2 来源分支且确有热修需求时，回移 SFTP ACK/进度/idle timeout | 不从 IPC v8 工作树直接挑入 wire change；固定快照真实服务端通过 |
 | `v0.3.0-alpha → v0.3.0-beta.2` | IPC v8 + M1/M2 + Linux M3 功能预览、Grant 生命周期、resume/status/cancel 的前代预发布 | 只作 predecessor/回滚输入与历史证据；不把 v0.3 证据重标为 v1 通过 |
-| `v1.0.0-beta` | 当前 IPC v9、storage `read=v4..=v5 write=v5`、M1/M2 与 Linux M3 候选、Grant 生命周期、Agent transfer status/cancel、匹配集合预发布 | 全量门禁、exact clean tag 与外部 SSH 证据、签名 helper bootstrap、Ubuntu descriptor/linkat 故障注入、Local-Linux2 21 B/1.3 MB/64 MiB/1 GiB 哈希一致、unknown/cleanup 证据、同机 `scp` 吞吐达到 80% |
+| `v1.0.0-beta.2` | 当前 IPC v9、storage `read=v4..=v5 write=v5`、M1/M2 与 Linux M3 候选、Grant 生命周期、Agent transfer status/cancel、匹配集合预发布 | 全量门禁、exact clean tag 与外部 SSH 证据、签名 helper bootstrap、Ubuntu descriptor/linkat 故障注入、Local-Linux2 21 B/1.3 MB/64 MiB/1 GiB 哈希一致、unknown/cleanup 证据、同机 `scp` 吞吐达到 80% |
 | `v0.4.0` | 作业/receipt、远端/relay deadline 分离、锁页/no-dump 基础 | crash/restart/reconcile、receipt 恢复、锁页失败策略与平台测试 |
 | `v0.5.0` | typed capability、Policy IR、deny-only evaluator、`explain`/dry-run | parser/fuzz、不可放宽不变量、policy digest/grant invalidation、无 UI 的 enforcement E2E |
 | `v0.6.0` | 审计 v1、认证 checkpoint、外部锚定、quarantine/retire | 篡改/截断/重排/回滚、远端不可用、retention 与 unverified 状态矩阵 |
 | `v0.7.0` | 策略管理 UI、审批与 break-glass 流程 | UI 不可绕过 daemon；双端权限、撤销、竞态与可访问性测试 |
-| `v0.8.0` | 若基准成立则发布 IPC v9 codec | v8/v9 成对升级/半升级/回滚/禁止 downgrade；p99、分配和 CPU 有显著收益 |
+| `v0.8.0` | 若基准成立则发布使用新 wire 版本（暂记 v10）的内部 Protobuf codec | v9/v10 成对升级、半升级、回滚与禁止 downgrade；p99、分配和 CPU 有显著收益 |
 | `v0.9.0-experimental` | 可选、始终加密的 QUIC fast lane | 安全网络矩阵、外部基准、资源上限、resume/commit/cleanup 与回退证据 |
 | `v1.0.0` | 冻结受支持的 CLI/Agent、policy、audit、upgrade 与 transfer 契约 | 至少一个稳定兼容窗口和可回滚签名发布链 |
 
@@ -300,7 +300,7 @@ OperationGrant TTL 只决定“调用授权能持续多久”，不能替代远�
 2. typed remote helper 的部署身份、sudoers/service-manager 边界和路径解析 API。
 3. Job receipt 的 canonical transcript、持久化和恢复状态机。
 4. Audit MAC/signature、checkpoint、外部锚定和 retention/retire 模型。
-5. IPC v9 codec 与 raw sideband；只有基准通过才选择具体 Protobuf 实现。
+5. 新 IPC wire 的 Protobuf codec 与 raw sideband；只有基准通过才选择具体实现，且不得复用当前 JSON/AEAD IPC v9 的版本标识。
 6. QUIC fast lane 的身份绑定、密钥派生、helper 沙箱和显式 fallback。
 7. `LockedSecret` 的平台预算、失败策略和可测量的 no-dump 边界。
 
