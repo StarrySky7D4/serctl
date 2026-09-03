@@ -2,6 +2,15 @@
 
 本文件记录面向使用者、运维人员和安全审计人员的重要变化。项目仍处于预发布阶段，正式发布前可能继续调整命令、存储格式和协议。
 
+## v1.0.0-beta.3 - Unreleased
+
+> **候选状态（尚未验收/发布）**：当前 workspace 与正式发布标记仍保持 `v1.0.0-beta.2`，待 Rust 集成、exact-tag CI、受控实机和仓库治理门禁全部通过后再统一切换。
+
+### 发布验证与文档一致性
+
+- 修复正式发布工作流同时向 `gh attestation verify` 传入互斥的 `--signer-repo` 与 `--signer-workflow`、导致已签名发布对象在逐文件验证前被 CLI 拒绝的问题；继续使用精确 workflow、source digest 与 exact tag ref 绑定，并新增治理回归防止参数组合复发。
+- 修正协议演进路线中把未来 Protobuf codec 继续标为 IPC v9 的矛盾；当前 JSON/AEAD wire 保持 IPC v9，真正切换 codec 时必须使用新的 wire 版本（路线图暂记 v10）并执行成套升级与失败关闭。
+
 ## v1.0.0-beta.2 - 2026-09-03
 
 > **候选状态（尚未验收/发布）**：当前 workspace 与预发布标记已同步为 `v1.0.0-beta.2`；exact-tag CI、受控实机和仓库治理门禁仍须通过后方可发布。候选 wire 为 IPC v9，并拒绝 v8 或 direct-connect downgrade；Agent JSONL 固定 `schema_version=1` 和稳定 `error_code`。普通 `main` CI 不产生正式发行物。
