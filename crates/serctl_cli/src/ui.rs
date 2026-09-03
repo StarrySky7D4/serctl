@@ -6875,6 +6875,43 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    fn unique_test_path(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("{label}-{}-{unique}", std::process::id()))
+    }
+
+    struct ExternalSecretPathTestHome {
+        path: PathBuf,
+    }
+
+    impl ExternalSecretPathTestHome {
+        fn isolated(label: &str) -> Self {
+            let path = unique_test_path(label);
+            vault::set_test_home(Some(path.clone()));
+            Self { path }
+        }
+    }
+
+    impl Drop for ExternalSecretPathTestHome {
+        fn drop(&mut self) {
+            vault::set_test_home(None);
+            if let Err(error) = std::fs::remove_dir_all(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    panic!(
+                        "remove isolated UI external-secret test home {}: {error}",
+                        self.path.display()
+                    );
+                }
+            }
+        }
+    }
+
     fn test_app() -> (SerctlApp, UiMessageSender) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -7104,8 +7141,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recovery_media_io_is_bounded_verified_regular_and_never_overwritten() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_media_io_is_bounded_verified_regular_and_never_overwritten() {
+        let _test_home_lock = crate::e2e_tests::TEST_HOME_LOCK.lock().await;
+        let _vault_home = ExternalSecretPathTestHome::isolated("ui-recovery-media-vault-home");
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -7159,9 +7198,13 @@ mod tests {
         std::fs::remove_dir(directory).unwrap();
     }
 
-    #[test]
-    fn recovery_media_paths_inside_the_vault_directory_are_rejected() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_media_paths_inside_the_vault_directory_are_rejected() {
+        let _test_home_lock = crate::e2e_tests::TEST_HOME_LOCK.lock().await;
+        let _vault_home =
+            ExternalSecretPathTestHome::isolated("ui-recovery-containment-vault-home");
         let vault_directory = vault::home_dir().unwrap().join(".serctl");
+        std::fs::create_dir_all(&vault_directory).unwrap();
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -7176,15 +7219,10 @@ mod tests {
         assert!(!forbidden_output.exists());
         let input_error = read_recovery_media(&vault_directory).unwrap_err();
 
-        // If the configured directory already exists, both paths reach the
-        // shared CLI/UI containment check. If it does not, canonicalizing its
-        // parent/input still fails closed before any file can be created or read.
-        if vault_directory.exists() {
-            assert!(format!("{output_error:#}")
-                .contains("must not be stored inside the serctl vault directory"));
-            assert!(format!("{input_error:#}")
-                .contains("must not be stored inside the serctl vault directory"));
-        }
+        assert!(format!("{output_error:#}")
+            .contains("must not be stored inside the serctl vault directory"));
+        assert!(format!("{input_error:#}")
+            .contains("must not be stored inside the serctl vault directory"));
     }
 
     #[test]
@@ -7543,8 +7581,10 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn incomplete_v2_migration_never_schedules_a_partial_commit() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn incomplete_v2_migration_never_schedules_a_partial_commit() {
+        let _test_home_lock = crate::e2e_tests::TEST_HOME_LOCK.lock().await;
+        let _vault_home = ExternalSecretPathTestHome::isolated("ui-incomplete-migration-home");
         let (mut app, _) = test_app();
         app.migration
             .reset_profiles(vec!["alpha".into(), "beta".into()]);
@@ -7585,8 +7625,10 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn migration_rejects_an_existing_media_path_before_consuming_secrets() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn migration_rejects_an_existing_media_path_before_consuming_secrets() {
+        let _test_home_lock = crate::e2e_tests::TEST_HOME_LOCK.lock().await;
+        let _vault_home = ExternalSecretPathTestHome::isolated("ui-existing-media-home");
         let (mut app, _) = test_app();
         app.migration.reset_profiles(vec!["alpha".into()]);
         app.migration.old_master = "legacy-master-passphrase".into();
