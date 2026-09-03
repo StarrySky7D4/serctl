@@ -10181,14 +10181,58 @@ mod tests {
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
     }
 
+    fn is_transient_path_disappearance_error(error: &std::io::Error) -> bool {
+        #[cfg(windows)]
+        {
+            error.kind() == std::io::ErrorKind::PermissionDenied && error.raw_os_error() == Some(5)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = error;
+            false
+        }
+    }
+
     async fn wait_for_path_absent(path: &std::path::Path) {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while tokio::fs::try_exists(path).await.unwrap() {
+            loop {
+                match tokio::fs::try_exists(path).await {
+                    Ok(false) => break,
+                    Ok(true) => {}
+                    Err(error) if is_transient_path_disappearance_error(&error) => {
+                        // Windows may transiently report ERROR_ACCESS_DENIED
+                        // while the owned file is delete-pending. Keep polling;
+                        // the outer timeout still requires actual disappearance.
+                    }
+                    Err(error) => {
+                        panic!("failed to probe owned partial {}: {error}", path.display())
+                    }
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap_or_else(|_| panic!("owned partial was not removed: {}", path.display()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_disappearance_probe_retries_only_delete_pending_access_denied() {
+        assert!(is_transient_path_disappearance_error(
+            &std::io::Error::from_raw_os_error(5)
+        ));
+        assert!(!is_transient_path_disappearance_error(
+            &std::io::Error::from_raw_os_error(32)
+        ));
+        assert!(!is_transient_path_disappearance_error(
+            &std::io::Error::from_raw_os_error(33)
+        ));
+        assert!(!is_transient_path_disappearance_error(
+            &std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "persistent ACL denial"
+            )
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
