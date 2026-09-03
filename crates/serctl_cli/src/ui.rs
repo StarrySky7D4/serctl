@@ -35,6 +35,22 @@ const UI_ADMIN_AUTHORIZATION_TTL: Duration = Duration::from_secs(2 * 60);
 const UI_DIRECTORY_REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RECOVERY_MEDIA_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const PROFILE_HEADER_HEIGHT: f32 = 52.0;
+const MIN_WORKSPACE_BODY_HEIGHT: f32 = 96.0;
+const FILE_TRANSFER_CONTROLS_HEIGHT: f32 = 150.0;
+const FILE_TRANSFER_PROGRESS_HEIGHT: f32 = 72.0;
+// Includes the prompt row, the inter-row gap, and the terminal frame margins.
+const BASH_COMMAND_ROW_HEIGHT: f32 = 60.0;
+
+fn adaptive_workspace_height(available_height: f32, reserved_height: f32) -> f32 {
+    (available_height - reserved_height).max(MIN_WORKSPACE_BODY_HEIGHT)
+}
+
+fn adaptive_file_list_height(available_height: f32, visible_transfers: usize) -> f32 {
+    adaptive_workspace_height(
+        available_height,
+        FILE_TRANSFER_CONTROLS_HEIGHT + visible_transfers as f32 * FILE_TRANSFER_PROGRESS_HEIGHT,
+    )
+}
 
 /// Recovery media is intentionally portable, but it must still be created as
 /// a new regular, non-link object through a stable read/write handle. This is
@@ -4996,13 +5012,17 @@ impl SerctlApp {
                 self.exit_code = None;
             }
         });
-        add_ephemeral_text_edit(
+        let output_size = egui::vec2(
+            ui.available_width(),
+            adaptive_workspace_height(ui.available_height(), 0.0),
+        );
+        add_sized_ephemeral_text_edit(
             ui,
+            output_size,
             "command-output",
             TextEdit::multiline(&mut self.output)
                 .font(FontId::monospace(13.0))
                 .code_editor()
-                .desired_rows(15)
                 .desired_width(f32::INFINITY),
         );
     }
@@ -5054,6 +5074,12 @@ impl SerctlApp {
         });
         ui.add_space(6.0);
 
+        let visible_transfers = self
+            .pending_transfers
+            .values()
+            .filter(|transfer| transfer.progress.is_some())
+            .count();
+        let file_list_height = adaptive_file_list_height(ui.available_height(), visible_transfers);
         let mut navigate = None;
         let mut select = None;
         let row_height = ui.spacing().interact_size.y;
@@ -5068,7 +5094,9 @@ impl SerctlApp {
         ui.horizontal(|ui| {
             ui.add_sized(
                 [name_width, row_height],
-                egui::Label::new(RichText::new("名称").strong()).truncate(),
+                egui::Label::new(RichText::new("名称").strong())
+                    .halign(egui::Align::Min)
+                    .truncate(),
             );
             ui.add_sized(
                 [type_width, row_height],
@@ -5083,49 +5111,61 @@ impl SerctlApp {
         // clone or lay out the entire result on every frame: only materialize
         // the rows intersecting the scroll viewport and defer mutations until
         // the immutable directory-list borrow has ended.
-        egui::ScrollArea::vertical().max_height(245.0).show_rows(
-            ui,
-            row_height,
-            self.remote_entries.len(),
-            |ui, row_range| {
-                for index in row_range {
-                    let entry = &self.remote_entries[index];
-                    ui.horizontal(|ui| {
-                        let selected = self
-                            .selected_remote
-                            .as_ref()
-                            .is_some_and(|selected| selected.path == entry.path);
-                        let icon = if entry.is_dir { "▣" } else { "▤" };
-                        let mut label = format!("{icon}  {}", entry.name);
-                        let response = ui.add_sized(
-                            [name_width, row_height],
-                            egui::Button::selectable(selected, label.as_str()).truncate(),
-                        );
-                        label.zeroize();
-                        if response.clicked() {
-                            select = Some(entry.clone());
-                        }
-                        if !busy && response.double_clicked() && entry.is_dir {
-                            navigate = Some(entry.path.clone());
-                        }
-                        let kind = if entry.is_dir {
-                            "目录"
-                        } else if entry.is_symlink {
-                            "链接"
-                        } else {
-                            "文件"
-                        };
-                        ui.add_sized([type_width, row_height], egui::Label::new(kind).truncate());
-                        let size = if entry.is_dir {
-                            "—".into()
-                        } else {
-                            format_bytes(entry.size)
-                        };
-                        ui.add_sized([size_width, row_height], egui::Label::new(size).truncate());
-                    });
-                }
-            },
-        );
+        egui::ScrollArea::vertical()
+            .max_height(file_list_height)
+            .min_scrolled_height(file_list_height)
+            .auto_shrink([false, false])
+            .show_rows(
+                ui,
+                row_height,
+                self.remote_entries.len(),
+                |ui, row_range| {
+                    for index in row_range {
+                        let entry = &self.remote_entries[index];
+                        ui.horizontal(|ui| {
+                            let selected = self
+                                .selected_remote
+                                .as_ref()
+                                .is_some_and(|selected| selected.path == entry.path);
+                            let icon = if entry.is_dir { "▣" } else { "▤" };
+                            let mut label = format!("{icon}  {}", entry.name);
+                            let response = ui.add_sized(
+                                [name_width, row_height],
+                                egui::Button::selectable(selected, ())
+                                    .left_text(label.as_str())
+                                    .truncate(),
+                            );
+                            label.zeroize();
+                            if response.clicked() {
+                                select = Some(entry.clone());
+                            }
+                            if !busy && response.double_clicked() && entry.is_dir {
+                                navigate = Some(entry.path.clone());
+                            }
+                            let kind = if entry.is_dir {
+                                "目录"
+                            } else if entry.is_symlink {
+                                "链接"
+                            } else {
+                                "文件"
+                            };
+                            ui.add_sized(
+                                [type_width, row_height],
+                                egui::Label::new(kind).truncate(),
+                            );
+                            let size = if entry.is_dir {
+                                "—".into()
+                            } else {
+                                format_bytes(entry.size)
+                            };
+                            ui.add_sized(
+                                [size_width, row_height],
+                                egui::Label::new(size).truncate(),
+                            );
+                        });
+                    }
+                },
+            );
         if let Some(entry) = select {
             if !entry.is_dir && self.local_download.is_empty() {
                 self.local_download = entry.name.clone();
@@ -5279,37 +5319,68 @@ impl SerctlApp {
                 self.shell_output.zeroize();
             }
         });
-        add_ephemeral_text_edit(
-            ui,
-            "shell-output",
-            TextEdit::multiline(&mut self.shell_output)
-                .font(FontId::monospace(13.0))
-                .code_editor()
-                .interactive(false)
-                .desired_rows(16)
-                .desired_width(f32::INFINITY),
-        );
-        ui.horizontal(|ui| {
-            let response = add_sized_ephemeral_text_edit(
-                ui,
-                [ui.available_width() - 80.0, 32.0],
-                "shell-input",
-                TextEdit::singleline(&mut self.shell_input)
-                    .font(FontId::monospace(13.0))
-                    .hint_text("输入 Bash 命令并回车"),
-            );
-            let send = ui.add_enabled(active && !busy, egui::Button::new("发送"));
-            if (send.clicked()
-                || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))))
-                && active
-                && !busy
-            {
-                let mut bytes = std::mem::take(&mut self.shell_input).into_bytes();
-                bytes.push(b'\r');
-                self.send_shell_bytes(bytes);
-                response.request_focus();
-            }
-        });
+        ui.add_space(6.0);
+        let terminal_height =
+            adaptive_workspace_height(ui.available_height(), BASH_COMMAND_ROW_HEIGHT);
+        egui::Frame::new()
+            .fill(Color32::from_rgb(12, 16, 21))
+            .stroke(egui::Stroke::new(1.0, Color32::from_gray(55)))
+            .corner_radius(6.0)
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                add_sized_ephemeral_text_edit(
+                    ui,
+                    [ui.available_width(), terminal_height],
+                    "shell-output",
+                    TextEdit::multiline(&mut self.shell_output)
+                        .font(FontId::monospace(13.0))
+                        .code_editor()
+                        .interactive(false)
+                        .frame(egui::Frame::NONE)
+                        .background_color(Color32::TRANSPARENT)
+                        .text_color(Color32::from_rgb(210, 220, 230))
+                        .desired_width(f32::INFINITY),
+                );
+            });
+        ui.add_space(6.0);
+        egui::Frame::new()
+            .fill(Color32::from_rgb(12, 16, 21))
+            .stroke(egui::Stroke::new(1.0, Color32::from_gray(55)))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("$")
+                            .monospace()
+                            .strong()
+                            .color(Color32::from_rgb(76, 205, 140)),
+                    );
+                    let response = add_sized_ephemeral_text_edit(
+                        ui,
+                        [(ui.available_width() - 64.0).max(80.0), 30.0],
+                        "shell-input",
+                        TextEdit::singleline(&mut self.shell_input)
+                            .font(FontId::monospace(13.0))
+                            .frame(egui::Frame::NONE)
+                            .background_color(Color32::TRANSPARENT)
+                            .text_color(Color32::from_rgb(230, 235, 240))
+                            .hint_text("输入 Bash 命令并回车"),
+                    );
+                    let send = ui.add_enabled(active && !busy, egui::Button::new("发送"));
+                    if (send.clicked()
+                        || (response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))))
+                        && active
+                        && !busy
+                    {
+                        let mut bytes = std::mem::take(&mut self.shell_input).into_bytes();
+                        bytes.push(b'\r');
+                        self.send_shell_bytes(bytes);
+                        response.request_focus();
+                    }
+                });
+            });
     }
 
     fn tunnel_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, profile: &ProfileRow) {
@@ -6817,6 +6888,71 @@ mod tests {
     fn transfer_resume_is_explicitly_opt_in() {
         let (app, _) = test_app();
         assert!(!app.transfer_resume);
+    }
+
+    #[test]
+    fn workspace_body_heights_track_the_window_and_reserve_transfer_cards() {
+        assert_eq!(adaptive_workspace_height(620.0, 120.0), 500.0);
+        assert_eq!(adaptive_workspace_height(720.0, 120.0), 600.0);
+        assert_eq!(adaptive_workspace_height(80.0, 120.0), 96.0);
+
+        let without_transfer = adaptive_file_list_height(620.0, 0);
+        let with_two_transfers = adaptive_file_list_height(620.0, 2);
+        assert_eq!(without_transfer - with_two_transfers, 144.0);
+    }
+
+    fn workspace_output_size(bash: bool, width: f32, height: f32) -> egui::Vec2 {
+        let (mut app, _) = test_app();
+        add_test_profile(&mut app, "alpha", 1);
+        let profile = app.profiles[0].clone();
+        let ctx = egui::Context::default();
+        let mut output_size = None;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, height),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |_ui| {
+            let mut root = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new((
+                    "dynamic-workspace-layout-test",
+                    bash,
+                    width as u32,
+                    height as u32,
+                )),
+                egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+            );
+            let response_id = if bash {
+                app.bash_workspace(&mut root, &ctx, &profile);
+                sensitive_text_edit_id("shell-output")
+            } else {
+                app.command_workspace(&mut root, &ctx, &profile);
+                sensitive_text_edit_id("command-output")
+            };
+            output_size = ctx
+                .read_response(response_id)
+                .map(|response| response.rect.size());
+        });
+        output_size.expect("workspace output was not laid out")
+    }
+
+    #[test]
+    fn command_and_bash_outputs_expand_in_both_dimensions() {
+        let small_command = workspace_output_size(false, 520.0, 360.0);
+        let large_command = workspace_output_size(false, 900.0, 720.0);
+        assert!(large_command.x > small_command.x + 300.0);
+        assert!(large_command.y > small_command.y + 300.0);
+
+        let small_bash = workspace_output_size(true, 520.0, 360.0);
+        let large_bash = workspace_output_size(true, 900.0, 720.0);
+        assert!(large_bash.x > small_bash.x + 300.0);
+        assert!(large_bash.y > small_bash.y + 300.0);
     }
 
     fn test_identity(generation: u64) -> vault::ProfileIdentity {
