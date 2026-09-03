@@ -6255,6 +6255,17 @@ mod tests {
     #[tokio::test]
     async fn repeated_kex_deadlines_close_every_transport_connection() {
         const ATTEMPTS: usize = 100;
+        fn is_peer_closed(error: &std::io::Error) -> bool {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        }
+
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -6266,11 +6277,21 @@ mod tests {
                 let (mut peer, _) = listener.accept().await.unwrap();
                 let closed_tx = closed_tx.clone();
                 peers.spawn(async move {
-                    peer.write_all(b"SSH-2.0-serctl-kex-stall\r\n")
-                        .await
-                        .unwrap();
-                    let mut received = Vec::new();
-                    peer.read_to_end(&mut received).await.unwrap();
+                    match peer.write_all(b"SSH-2.0-serctl-kex-stall\r\n").await {
+                        Ok(()) => {
+                            let mut received = Vec::new();
+                            if let Err(error) = peer.read_to_end(&mut received).await {
+                                assert!(
+                                    is_peer_closed(&error),
+                                    "transport read failed without proving peer closure: {error}"
+                                );
+                            }
+                        }
+                        Err(error) => assert!(
+                            is_peer_closed(&error),
+                            "transport write failed without proving peer closure: {error}"
+                        ),
+                    }
                     closed_tx.send(()).await.unwrap();
                 });
             }
