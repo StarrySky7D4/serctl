@@ -2292,4 +2292,9 @@ foreach ($requiredStrictJsonNegative in @(
 & $glibcBaselineSelfTestScript
 & $upgradeRollbackHarnessTestScript
 
+# Expected-failure subprocess probes intentionally leave a nonzero native exit
+# code behind.  GitHub's Unix `pwsh` wrapper propagates that stale value even
+# after every PowerShell assertion has passed, so publish an explicit success
+# status without terminating callers that dot-source this governance suite.
+$global:LASTEXITCODE = 0
 Write-Host 'Release governance self-tests passed.'
