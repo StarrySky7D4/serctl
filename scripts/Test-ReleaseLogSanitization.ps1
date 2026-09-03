@@ -108,7 +108,7 @@ Invoke-SanitizedFailureProbe `
     -Script (Join-Path $PSScriptRoot 'Save-BoundedHttpsFile.ps1') `
     -Arguments @(
         '-Url', "http://example.invalid/$secret", '-Destination',
-        (Join-Path $canaryRoot 'receipt.json'), '-MaxBytes', '128'
+        "$canaryRoot\receipt.json", '-MaxBytes', '128'
     ) `
     -Expected "bounded HTTPS download failed: category=https_input_invalid; file='receipt.json'; bytes=0"
 Invoke-SanitizedFailureProbe `
@@ -116,12 +116,12 @@ Invoke-SanitizedFailureProbe `
     -Arguments @(
         '-Platform', 'windows-x86_64', '-Version', $secret,
         '-Commit', ('a' * 40), '-TagObject', ('b' * 40),
-        '-OutputDirectory', (Join-Path $canaryRoot 'release-output')
+        '-OutputDirectory', "$canaryRoot\release-output"
     ) `
     -Expected "release bundle failed: category=release_bundle_failed; file='release-bundle'; bytes=0"
 Invoke-SanitizedFailureProbe `
     -Script (Join-Path $PSScriptRoot 'Test-WindowsMultiAccountAcl.ps1') `
-    -Arguments @('-CliPath', (Join-Path $canaryRoot 'serctl_cli.exe')) `
+    -Arguments @('-CliPath', "$canaryRoot\serctl_cli.exe") `
     -Expected "Windows multi-account ACL gate failed: category=windows_acl_gate_failed; file='serctl_cli.exe'; bytes=0"
 
 Write-Host 'Release log sanitization self-test passed.'
