@@ -918,6 +918,16 @@ foreach ($required in @(
     'Test-RuntimeDependencyBoundary.ps1',
     'set -euo pipefail',
     'sbom_lock_sha=',
+    'workspace_package_dirs=(',
+    'assert_workspace_sbom_absent',
+    'capture_workspace_sboms',
+    'final_sbom_paths=(',
+    'owned_sbom_paths=(',
+    'cleanup_owned_sboms() {',
+    'trap cleanup_owned_sboms EXIT',
+    'trap - EXIT',
+    "grep -Fq -- 'x86_64-pc-windows-msvc'",
+    "grep -Fq -- 'x86_64-unknown-linux-gnu'",
     'expected_status=',
     'actual_status=',
     '$inputs.Count -ne 6',
@@ -1571,6 +1581,16 @@ foreach ($required in @(
     'cargo metadata --locked --all-features --format-version 1',
     'set -euo pipefail',
     'sbom_lock_sha=',
+    'workspace_package_dirs=(',
+    'assert_workspace_sbom_absent',
+    'capture_workspace_sboms',
+    'final_sbom_paths=(',
+    'owned_sbom_paths=(',
+    'cleanup_owned_sboms() {',
+    'trap cleanup_owned_sboms EXIT',
+    'trap - EXIT',
+    "grep -Fq -- 'x86_64-pc-windows-msvc'",
+    "grep -Fq -- 'x86_64-unknown-linux-gnu'",
     'expected_status=',
     'actual_status=',
     '--manifest-path crates/serctl_cli/Cargo.toml',
@@ -1580,6 +1600,25 @@ foreach ($required in @(
     Assert-TestCondition ($ciWorkflow.Contains($required)) (
         "ordinary CI omits Windows PowerShell 5.1 smoke marker '$required'"
     )
+}
+foreach ($sbomWorkflow in @(
+    [pscustomobject]@{ Label = 'formal release'; Source = $workflow },
+    [pscustomobject]@{ Label = 'ordinary CI'; Source = $ciWorkflow }
+)) {
+    foreach ($markerAndCount in @(
+        [pscustomobject]@{ Marker = 'cleanup_owned_sboms() {'; Count = 1 },
+        [pscustomobject]@{ Marker = 'trap cleanup_owned_sboms EXIT'; Count = 1 },
+        [pscustomobject]@{ Marker = 'trap - EXIT'; Count = 2 }
+    )) {
+        $actualCount = [regex]::Matches(
+            $sbomWorkflow.Source,
+            [regex]::Escape($markerAndCount.Marker)
+        ).Count
+        Assert-TestCondition ($actualCount -eq $markerAndCount.Count) (
+            "$($sbomWorkflow.Label) SBOM cleanup marker '$($markerAndCount.Marker)' " +
+            "count is $actualCount, expected $($markerAndCount.Count)"
+        )
+    }
 }
 foreach ($forbiddenRootEvidence in @(
     '> cargo-metadata.json',
@@ -2223,6 +2262,8 @@ foreach ($requiredBoundary in @(
     'Get-CargoPackageNameFromPurl',
     'cargo metadata contains an unknown dependency kind',
     'CycloneDX JSON metadata.tools.components',
+    'CycloneDX JSON metadata.tools legacy array is empty',
+    'CycloneDX JSON dependency dependsOn is not a JSON array',
     'DtdProcessing]::Prohibit',
     'MaxCharactersInDocument = 8388608'
 )) {
@@ -2243,6 +2284,13 @@ foreach ($requiredNegative in @(
     'metadata packages object was accepted as an array',
     'source-only metadata.component did not fail closed',
     'source-only metadata.tools.components entry did not fail closed',
+    'CycloneDX 1.5 legacy metadata.tools array was rejected',
+    'CycloneDX leaf dependency without dependsOn was rejected',
+    'legacy metadata.tools array accepted an unknown nested component field',
+    'empty legacy metadata.tools array was accepted',
+    'legacy metadata.tools entry without version was accepted',
+    'legacy metadata.tools entry with numeric vendor was accepted',
+    'non-array CycloneDX dependsOn was accepted',
     'source-only Cargo purl hidden behind a different name did not fail closed',
     'dangling source-only CycloneDX dependency reference did not fail closed',
     'CycloneDX components object was accepted as an array',

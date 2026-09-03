@@ -370,6 +370,142 @@ try {
         (Invoke-BoundaryFixture -Metadata $metadataPath -Sbom $hiddenToolJson) -ne 0
     ) 'source-only metadata.tools.components entry did not fail closed'
 
+    $legacyToolsJson = Join-Path $temporaryRoot 'legacy-tools.json'
+    Write-Utf8Fixture -Path $legacyToolsJson -Content (
+        @{
+            bomFormat = 'CycloneDX'
+            specVersion = '1.5'
+            version = 1
+            metadata = @{
+                tools = @(
+                    @{
+                        vendor = 'CycloneDX'
+                        name = 'cargo-cyclonedx'
+                        version = '0.5.9'
+                    }
+                )
+            }
+            components = @(@{ type = 'library'; name = 'serde' })
+        } | ConvertTo-Json -Depth 10
+    )
+    Assert-SelfTest (
+        (Invoke-BoundaryFixture -Metadata $metadataPath -Sbom $legacyToolsJson) -eq 0
+    ) 'CycloneDX 1.5 legacy metadata.tools array was rejected'
+
+    $leafDependencyJson = Join-Path $temporaryRoot 'leaf-dependency.json'
+    Write-Utf8Fixture -Path $leafDependencyJson -Content (
+        @{
+            bomFormat = 'CycloneDX'
+            specVersion = '1.5'
+            version = 1
+            components = @(
+                @{
+                    type = 'library'
+                    name = 'serde'
+                    'bom-ref' = 'pkg:cargo/serde@1.0.0'
+                }
+            )
+            dependencies = @(
+                @{ ref = 'pkg:cargo/serde@1.0.0' }
+            )
+        } | ConvertTo-Json -Depth 10
+    )
+    Assert-SelfTest (
+        (Invoke-BoundaryFixture -Metadata $metadataPath -Sbom $leafDependencyJson) -eq 0
+    ) 'CycloneDX leaf dependency without dependsOn was rejected'
+
+    $legacyToolComponentJson = Join-Path $temporaryRoot 'legacy-tool-component.json'
+    Write-Utf8Fixture -Path $legacyToolComponentJson -Content (
+        @{
+            bomFormat = 'CycloneDX'
+            specVersion = '1.5'
+            version = 1
+            metadata = @{
+                tools = @(
+                    @{
+                        name = 'cargo-cyclonedx'
+                        version = '0.5.9'
+                        component = @{ type = 'application'; name = 'serctl_remote' }
+                    }
+                )
+            }
+            components = @(@{ type = 'library'; name = 'serde' })
+        } | ConvertTo-Json -Depth 10
+    )
+    Assert-SelfTest (
+        (Invoke-BoundaryFixture -Metadata $metadataPath -Sbom $legacyToolComponentJson) -ne 0
+    ) 'legacy metadata.tools array accepted an unknown nested component field'
+
+    $emptyLegacyToolsJson = Join-Path $temporaryRoot 'empty-legacy-tools.json'
+    Write-Utf8Fixture -Path $emptyLegacyToolsJson -Content (
+        @{
+            bomFormat = 'CycloneDX'
+            specVersion = '1.5'
+            version = 1
+            metadata = @{ tools = @() }
+            components = @(@{ type = 'library'; name = 'serde' })
+        } | ConvertTo-Json -Depth 10
+    )
+    Assert-SelfTest (
+        (Invoke-BoundaryFixture -Metadata $metadataPath -Sbom $emptyLegacyToolsJson) -ne 0
+    ) 'empty legacy metadata.tools array was accepted'
+
+    $missingLegacyToolVersionJson = Join-Path $temporaryRoot 'missing-legacy-tool-version.json'
+    Write-Utf8Fixture -Path $missingLegacyToolVersionJson -Content (
+        @{
+            bomFormat = 'CycloneDX'
+            specVersion = '1.5'
+            version = 1
+            metadata = @{ tools = @(@{ name = 'cargo-cyclonedx'; vendor = 'CycloneDX' }) }
+            components = @(@{ type = 'library'; name = 'serde' })
+        } | ConvertTo-Json -Depth 10
+    )
+    Assert-SelfTest (
+        (Invoke-BoundaryFixture `
+            -Metadata $metadataPath `
+            -Sbom $missingLegacyToolVersionJson) -ne 0
+    ) 'legacy metadata.tools entry without version was accepted'
+
+    $numericLegacyToolVendorJson = Join-Path $temporaryRoot 'numeric-legacy-tool-vendor.json'
+    Write-Utf8Fixture -Path $numericLegacyToolVendorJson -Content (
+        @{
+            bomFormat = 'CycloneDX'
+            specVersion = '1.5'
+            version = 1
+            metadata = @{
+                tools = @(@{ name = 'cargo-cyclonedx'; version = '0.5.9'; vendor = 7 })
+            }
+            components = @(@{ type = 'library'; name = 'serde' })
+        } | ConvertTo-Json -Depth 10
+    )
+    Assert-SelfTest (
+        (Invoke-BoundaryFixture `
+            -Metadata $metadataPath `
+            -Sbom $numericLegacyToolVendorJson) -ne 0
+    ) 'legacy metadata.tools entry with numeric vendor was accepted'
+
+    $wrongDependsOnJson = Join-Path $temporaryRoot 'wrong-depends-on.json'
+    Write-Utf8Fixture -Path $wrongDependsOnJson -Content (
+        @{
+            bomFormat = 'CycloneDX'
+            specVersion = '1.5'
+            version = 1
+            components = @(
+                @{
+                    type = 'library'
+                    name = 'serde'
+                    'bom-ref' = 'pkg:cargo/serde@1.0.0'
+                }
+            )
+            dependencies = @(
+                @{ ref = 'pkg:cargo/serde@1.0.0'; dependsOn = @{} }
+            )
+        } | ConvertTo-Json -Depth 10
+    )
+    Assert-SelfTest (
+        (Invoke-BoundaryFixture -Metadata $metadataPath -Sbom $wrongDependsOnJson) -ne 0
+    ) 'non-array CycloneDX dependsOn was accepted'
+
     $purlMismatchJson = Join-Path $temporaryRoot 'purl-mismatch.json'
     Write-Utf8Fixture -Path $purlMismatchJson -Content (
         @{

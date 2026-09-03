@@ -84,12 +84,113 @@ jobs:
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           cargo metadata --locked --format-version 1 >/dev/null
           sbom_lock_sha="$(sha256sum Cargo.lock | cut -d ' ' -f 1)"
-          cargo cyclonedx --manifest-path crates/serctl_cli/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format xml --override-filename v1-beta-release-sbom
-          cargo cyclonedx --manifest-path crates/serctl_cli/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format json --override-filename v1-beta-release-sbom
-          cargo cyclonedx --manifest-path crates/serctl_daemon/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format xml --override-filename v1-beta-release-sbom
-          cargo cyclonedx --manifest-path crates/serctl_daemon/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format json --override-filename v1-beta-release-sbom
-          cargo cyclonedx --manifest-path crates/serctl_xfer/Cargo.toml --all-features --target x86_64-unknown-linux-gnu --spec-version 1.5 --format xml --override-filename v1-beta-release-sbom
-          cargo cyclonedx --manifest-path crates/serctl_xfer/Cargo.toml --all-features --target x86_64-unknown-linux-gnu --spec-version 1.5 --format json --override-filename v1-beta-release-sbom
+          final_sbom_paths=(
+            crates/serctl_cli/v1-beta-release-sbom.xml
+            crates/serctl_cli/v1-beta-release-sbom.json
+            crates/serctl_daemon/v1-beta-release-sbom.xml
+            crates/serctl_daemon/v1-beta-release-sbom.json
+            crates/serctl_xfer/v1-beta-release-sbom.xml
+            crates/serctl_xfer/v1-beta-release-sbom.json
+          )
+          for path in "${final_sbom_paths[@]}"; do
+            test ! -e "$path"
+            test ! -L "$path"
+          done
+          sbom_stage=target/ci-evidence/published-sboms
+          test ! -e "$sbom_stage"
+          test ! -L "$sbom_stage"
+          mkdir -p "$sbom_stage"
+          owned_sbom_paths=(
+            "$sbom_stage/cli.xml"
+            "$sbom_stage/cli.json"
+            "$sbom_stage/daemon.xml"
+            "$sbom_stage/daemon.json"
+            "$sbom_stage/xfer.xml"
+            "$sbom_stage/xfer.json"
+            "${final_sbom_paths[@]}"
+          )
+          cleanup_owned_sboms() {
+            cleanup_status="$?"
+            set +e
+            for owned_path in "${owned_sbom_paths[@]}"; do
+              if test -L "$owned_path" || test -d "$owned_path"; then
+                echo "refusing to clean unsafe SBOM path: $owned_path" >&2
+              elif test -e "$owned_path"; then
+                rm -- "$owned_path"
+              fi
+            done
+            if test -d "$sbom_stage" && test ! -L "$sbom_stage"; then
+              rmdir -- "$sbom_stage"
+            fi
+            trap - EXIT
+            exit "$cleanup_status"
+          }
+          trap cleanup_owned_sboms EXIT
+          workspace_package_dirs=(
+            crates/serctl_protocol
+            crates/serctl_core
+            crates/serctl_daemon
+            crates/serctl_cli
+            crates/serctl_transfer_protocol
+            crates/serctl_xfer
+            crates/serctl_policy
+            crates/serctl_remote_protocol
+            crates/serctl_jobs
+            crates/serctl_remote
+          )
+          assert_workspace_sbom_absent() {
+            generated_name="$1"
+            test -z "$(find crates -mindepth 2 -maxdepth 2 -name "$generated_name" -print -quit)"
+            for package_dir in "${workspace_package_dirs[@]}"; do
+              owned_sbom_paths+=("$package_dir/$generated_name")
+            done
+          }
+          capture_workspace_sboms() {
+            generated_name="$1"
+            shift
+            expected_paths=()
+            for package_dir in "${workspace_package_dirs[@]}"; do
+              expected_paths+=("$package_dir/$generated_name")
+            done
+            mapfile -t actual_paths < <(find crates -mindepth 2 -maxdepth 2 -name "$generated_name" -print | sort)
+            mapfile -t expected_paths < <(printf '%s\n' "${expected_paths[@]}" | sort)
+            test "$(printf '%s\n' "${actual_paths[@]}")" = "$(printf '%s\n' "${expected_paths[@]}")"
+            for generated_path in "${expected_paths[@]}"; do
+              test -f "$generated_path"
+              test ! -L "$generated_path"
+              test -s "$generated_path"
+            done
+            while test "$#" -gt 0; do
+              selected_path="$1"
+              staged_name="$2"
+              shift 2
+              test -f "$selected_path"
+              test ! -L "$selected_path"
+              test -s "$selected_path"
+              cp -- "$selected_path" "$sbom_stage/$staged_name"
+            done
+            for generated_path in "${expected_paths[@]}"; do
+              rm -- "$generated_path"
+            done
+          }
+          assert_workspace_sbom_absent v1-beta-release-sbom-windows-xml.xml
+          cargo cyclonedx --manifest-path crates/serctl_cli/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format xml --override-filename v1-beta-release-sbom-windows-xml
+          capture_workspace_sboms v1-beta-release-sbom-windows-xml.xml crates/serctl_cli/v1-beta-release-sbom-windows-xml.xml cli.xml crates/serctl_daemon/v1-beta-release-sbom-windows-xml.xml daemon.xml
+          assert_workspace_sbom_absent v1-beta-release-sbom-windows-json.json
+          cargo cyclonedx --manifest-path crates/serctl_daemon/Cargo.toml --all-features --target x86_64-pc-windows-msvc --spec-version 1.5 --format json --override-filename v1-beta-release-sbom-windows-json
+          capture_workspace_sboms v1-beta-release-sbom-windows-json.json crates/serctl_cli/v1-beta-release-sbom-windows-json.json cli.json crates/serctl_daemon/v1-beta-release-sbom-windows-json.json daemon.json
+          assert_workspace_sbom_absent v1-beta-release-sbom-linux-xml.xml
+          cargo cyclonedx --manifest-path crates/serctl_xfer/Cargo.toml --all-features --target x86_64-unknown-linux-gnu --spec-version 1.5 --format xml --override-filename v1-beta-release-sbom-linux-xml
+          capture_workspace_sboms v1-beta-release-sbom-linux-xml.xml crates/serctl_xfer/v1-beta-release-sbom-linux-xml.xml xfer.xml
+          assert_workspace_sbom_absent v1-beta-release-sbom-linux-json.json
+          cargo cyclonedx --manifest-path crates/serctl_xfer/Cargo.toml --all-features --target x86_64-unknown-linux-gnu --spec-version 1.5 --format json --override-filename v1-beta-release-sbom-linux-json
+          capture_workspace_sboms v1-beta-release-sbom-linux-json.json crates/serctl_xfer/v1-beta-release-sbom-linux-json.json xfer.json
+          cp -- "$sbom_stage/cli.xml" crates/serctl_cli/v1-beta-release-sbom.xml
+          cp -- "$sbom_stage/cli.json" crates/serctl_cli/v1-beta-release-sbom.json
+          cp -- "$sbom_stage/daemon.xml" crates/serctl_daemon/v1-beta-release-sbom.xml
+          cp -- "$sbom_stage/daemon.json" crates/serctl_daemon/v1-beta-release-sbom.json
+          cp -- "$sbom_stage/xfer.xml" crates/serctl_xfer/v1-beta-release-sbom.xml
+          cp -- "$sbom_stage/xfer.json" crates/serctl_xfer/v1-beta-release-sbom.json
           test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" = "$sbom_lock_sha"
           for path in \
             crates/serctl_cli/v1-beta-release-sbom.xml \
@@ -102,6 +203,18 @@ jobs:
             test ! -L "$path"
             test -s "$path"
           done
+          for path in \
+            crates/serctl_cli/v1-beta-release-sbom.xml \
+            crates/serctl_cli/v1-beta-release-sbom.json \
+            crates/serctl_daemon/v1-beta-release-sbom.xml \
+            crates/serctl_daemon/v1-beta-release-sbom.json; do
+            grep -Fq -- 'x86_64-pc-windows-msvc' "$path"
+          done
+          for path in \
+            crates/serctl_xfer/v1-beta-release-sbom.xml \
+            crates/serctl_xfer/v1-beta-release-sbom.json; do
+            grep -Fq -- 'x86_64-unknown-linux-gnu' "$path"
+          done
           expected_status="$(printf '%s\n' \
             '?? crates/serctl_cli/v1-beta-release-sbom.json' \
             '?? crates/serctl_cli/v1-beta-release-sbom.xml' \
@@ -111,6 +224,11 @@ jobs:
             '?? crates/serctl_xfer/v1-beta-release-sbom.xml')"
           actual_status="$(git status --porcelain=v1 --untracked-files=all)"
           test "$actual_status" = "$expected_status"
+          for staged_name in cli.xml cli.json daemon.xml daemon.json xfer.xml xfer.json; do
+            rm -- "$sbom_stage/$staged_name"
+          done
+          rmdir -- "$sbom_stage"
+          trap - EXIT
 
       - name: Reject source-only components from published-component SBOMs
         shell: pwsh

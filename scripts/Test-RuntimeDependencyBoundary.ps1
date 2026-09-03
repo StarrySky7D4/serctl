@@ -447,22 +447,67 @@ function Get-CycloneDxJsonComponentNames {
         }
         $toolsProperty = $Document.metadata.PSObject.Properties['tools']
         if ($null -ne $toolsProperty) {
-            if (-not (Test-StrictJsonObject $Document.metadata.tools)) {
-                throw 'CycloneDX JSON metadata.tools is not a JSON object'
-            }
-            $toolComponents = $Document.metadata.tools.PSObject.Properties['components']
-            if ($null -ne $toolComponents) {
-                if (-not (Test-StrictJsonArray $Document.metadata.tools.components)) {
-                    throw 'CycloneDX JSON metadata.tools.components is not a JSON array'
+            if (Test-StrictJsonArray $Document.metadata.tools) {
+                $legacyTools = @($Document.metadata.tools)
+                if ($legacyTools.Count -eq 0) {
+                    throw 'CycloneDX JSON metadata.tools legacy array is empty'
                 }
                 $index = 0
-                foreach ($component in @($Document.metadata.tools.components)) {
-                    Get-JsonComponentNames `
-                        -Value $component `
-                        -References $references `
-                        -Label "CycloneDX metadata.tools.components[$index]"
+                $allowedLegacyToolFields = [System.Collections.Generic.HashSet[string]]::new(
+                    [System.StringComparer]::Ordinal
+                )
+                foreach ($allowedToolField in @('vendor', 'name', 'version')) {
+                    [void]$allowedLegacyToolFields.Add($allowedToolField)
+                }
+                foreach ($tool in $legacyTools) {
+                    if (-not (Test-StrictJsonObject $tool)) {
+                        throw "CycloneDX JSON metadata.tools[$index] is not a JSON object"
+                    }
+                    foreach ($toolProperty in $tool.PSObject.Properties) {
+                        if (-not $allowedLegacyToolFields.Contains($toolProperty.Name)) {
+                            throw (
+                                "CycloneDX JSON metadata.tools[$index] has unsupported " +
+                                "legacy field $($toolProperty.Name)"
+                            )
+                        }
+                    }
+                    foreach ($requiredToolField in @('name', 'version')) {
+                        if ($null -eq $tool.PSObject.Properties[$requiredToolField] -or
+                            -not (Test-StrictJsonString $tool.$requiredToolField) -or
+                            [string]::IsNullOrWhiteSpace([string]$tool.$requiredToolField)) {
+                            throw (
+                                "CycloneDX JSON metadata.tools[$index] has no nonempty " +
+                                "string $requiredToolField field"
+                            )
+                        }
+                    }
+                    $vendorProperty = $tool.PSObject.Properties['vendor']
+                    if ($null -ne $vendorProperty -and
+                        (-not (Test-StrictJsonString $tool.vendor) -or
+                            [string]::IsNullOrWhiteSpace([string]$tool.vendor))) {
+                        throw "CycloneDX JSON metadata.tools[$index] has an invalid vendor"
+                    }
                     $index++
                 }
+            }
+            elseif (Test-StrictJsonObject $Document.metadata.tools) {
+                $toolComponents = $Document.metadata.tools.PSObject.Properties['components']
+                if ($null -ne $toolComponents) {
+                    if (-not (Test-StrictJsonArray $Document.metadata.tools.components)) {
+                        throw 'CycloneDX JSON metadata.tools.components is not a JSON array'
+                    }
+                    $index = 0
+                    foreach ($component in @($Document.metadata.tools.components)) {
+                        Get-JsonComponentNames `
+                            -Value $component `
+                            -References $references `
+                            -Label "CycloneDX metadata.tools.components[$index]"
+                        $index++
+                    }
+                }
+            }
+            else {
+                throw 'CycloneDX JSON metadata.tools is neither an object nor a legacy array'
             }
         }
     }
@@ -474,10 +519,13 @@ function Get-CycloneDxJsonComponentNames {
         foreach ($dependency in @($Document.dependencies)) {
             if (-not (Test-StrictJsonObject $dependency) -or
                 $null -eq $dependency.PSObject.Properties['ref'] -or
-                -not (Test-StrictJsonString $dependency.ref) -or
-                $null -eq $dependency.PSObject.Properties['dependsOn'] -or
-                -not (Test-StrictJsonArray $dependency.dependsOn)) {
+                -not (Test-StrictJsonString $dependency.ref)) {
                 throw 'CycloneDX JSON dependency has the wrong JSON shape'
+            }
+            $dependsOnProperty = $dependency.PSObject.Properties['dependsOn']
+            if ($null -ne $dependsOnProperty -and
+                -not (Test-StrictJsonArray $dependency.dependsOn)) {
+                throw 'CycloneDX JSON dependency dependsOn is not a JSON array'
             }
             $dependencyRef = [string]$dependency.ref
             $dependencyRefName = Get-CargoPackageNameFromPurl `
@@ -487,7 +535,13 @@ function Get-CycloneDxJsonComponentNames {
             if (-not $references.Contains($dependencyRef)) {
                 throw 'CycloneDX JSON dependency ref does not resolve to a component'
             }
-            foreach ($reference in @($dependency.dependsOn)) {
+            $dependencyReferences = if ($null -eq $dependsOnProperty) {
+                @()
+            }
+            else {
+                @($dependency.dependsOn)
+            }
+            foreach ($reference in $dependencyReferences) {
                 if (-not (Test-StrictJsonString $reference) -or
                     -not $references.Contains([string]$reference)) {
                     throw 'CycloneDX JSON dependsOn contains a non-string or unresolved reference'
