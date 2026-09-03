@@ -14,19 +14,19 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/StarrySky7D4/serctl"
 
 [workspace.dependencies]
-serctl-core = { version = "=1.0.0-beta.1", path = "crates/serctl_core" }
-serctl-daemon = { version = "=1.0.0-beta.1", path = "crates/serctl_daemon" }
-serctl-jobs = { version = "=1.0.0-beta.1", path = "crates/serctl_jobs" }
-serctl-policy = { version = "=1.0.0-beta.1", path = "crates/serctl_policy" }
-serctl-protocol = { version = "=1.0.0-beta.1", path = "crates/serctl_protocol" }
-serctl-remote-protocol = { version = "=1.0.0-beta.1", path = "crates/serctl_remote_protocol" }
-serctl-transfer-protocol = { version = "=1.0.0-beta.1", path = "crates/serctl_transfer_protocol" }
+serctl-core = { version = "=1.0.0-beta.2", path = "crates/serctl_core" }
+serctl-daemon = { version = "=1.0.0-beta.2", path = "crates/serctl_daemon" }
+serctl-jobs = { version = "=1.0.0-beta.2", path = "crates/serctl_jobs" }
+serctl-policy = { version = "=1.0.0-beta.2", path = "crates/serctl_policy" }
+serctl-protocol = { version = "=1.0.0-beta.2", path = "crates/serctl_protocol" }
+serctl-remote-protocol = { version = "=1.0.0-beta.2", path = "crates/serctl_remote_protocol" }
+serctl-transfer-protocol = { version = "=1.0.0-beta.2", path = "crates/serctl_transfer_protocol" }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
 russh = { version = "0.62.5", default-features = false, features = ["ring"] }

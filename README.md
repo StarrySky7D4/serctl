@@ -2,11 +2,11 @@
 
 `serctl` 是一个纯 Rust 的持久 SSH 控制工具，提供 Winit/Egui 桌面 UI 与完整 CLI。它复用 SSH 连接执行远端命令、浏览目录、执行可观察且可取消的文件传输、运行 Bash PTY，并支持本地（`-L`）、远程（`-R`）和动态 SOCKS5（`-D`）TCP 隧道。
 
-当前重写版标记为预发布测试版本 **v1.0.0-beta.1**；原 main 基线保存在远端 `V1` 分支。测试版本不应替代正式签名发行物。
-<!-- release-marker: v1.0.0-beta.1 -->
+当前重写版标记为预发布测试版本 **v1.0.0-beta.2**；原 main 基线保存在远端 `V1` 分支。测试版本不应替代正式签名发行物。
+<!-- release-marker: v1.0.0-beta.2 -->
 
 > [!IMPORTANT]
-> 工作树中的 **v1.0.0-beta.1 候选尚未验收或发布**。候选 wire 已升级为 IPC v9，并定义 Agent JSONL `schema_version=1`、稳定 `error_code` 及 14 个互不替代的精确 scope；只有对应 Agent handler、daemon 可签发列表与映射测试同时存在，能力才算源码实现。`serctl-remote`、jobs、remote protocol 与 policy 仍是 source-only experimental / unshipped 代码，v1 beta 不构建交付、不发布、不支持，`job.*` 也不属于 Agent/OperationGrant 能力面。当前 workspace 与预发布标记已同步为 v1.0.0-beta.1；真实 SSH/native、跨平台和发布证据未齐前不得把候选写成已验收。候选契约见 [Agent JSONL 契约](docs/v1-beta-agent-jsonl.md)、[发布兼容契约](docs/v1-beta-release-contract.md)和[验收矩阵](docs/v1-beta-acceptance-matrix.md)。
+> 工作树中的 **v1.0.0-beta.2 候选尚未验收或发布**。候选 wire 已升级为 IPC v9，并定义 Agent JSONL `schema_version=1`、稳定 `error_code` 及 14 个互不替代的精确 scope；只有对应 Agent handler、daemon 可签发列表与映射测试同时存在，能力才算源码实现。`serctl-remote`、jobs、remote protocol 与 policy 仍是 source-only experimental / unshipped 代码，v1 beta 不构建交付、不发布、不支持，`job.*` 也不属于 Agent/OperationGrant 能力面。当前 workspace 与预发布标记已同步为 v1.0.0-beta.2；真实 SSH/native、跨平台和发布证据未齐前不得把候选写成已验收。候选契约见 [Agent JSONL 契约](docs/v1-beta-agent-jsonl.md)、[发布兼容契约](docs/v1-beta-release-contract.md)和[验收矩阵](docs/v1-beta-acceptance-matrix.md)。
 
 面向操作者的安装、首次配置、UI/CLI、备份恢复和故障处理流程见 [serctl 使用手册](docs/serctl-user-guide.md)；当前实现的安全边界见 [架构、安全与运维说明](docs/serctl-architecture-security.html)；尚未发布的策略、审计、作业、IPC codec 与高速数据面方案见 [目标架构与演进路线](docs/serctl-design-roadmap.md)；版本变化见 [更新日志](CHANGELOG.md)。
 
@@ -313,7 +313,7 @@ target\release\serctl-xfer.exe --version
 
 存储兼容是单向的：`audit_seed directionally incompatible`。v1 可以读取缺少审计字段的 beta-2 KeyPackage，但首次认证初始化写入非零 `audit_seed` 与 marker 后，严格的 v8 reader 会在 unknown field 处失败关闭；`unknown fields must not be dropped`，禁止宽松读取后用旧结构回写丢字段。此后 `binary-only rollback is forbidden`，必须恢复 `exact pre-upgrade vault backup`、匹配的恢复介质以及原 ACL/owner metadata，不能只替换旧二进制、只恢复 vault 或只恢复介质。
 
-当前预发布版本标记为 `v1.0.0-beta.1`；该版本仍是未发布候选。v1 的可发布来源只能是 exact tag 指向、已推送至 `origin/main` 且通过远端门禁的 clean commit；冻结前 dirty staging、旧标签后的中间提交或本地测试结果都不能替代该来源与仓库外交付记录。
+当前预发布版本标记为 `v1.0.0-beta.2`；该版本仍是未发布候选。v1 的可发布来源只能是 exact tag 指向、已推送至 `origin/main` 且通过远端门禁的 clean commit；冻结前 dirty staging、旧标签后的中间提交或本地测试结果都不能替代该来源与仓库外交付记录。
 
 ### Release 体积策略
 
@@ -352,7 +352,7 @@ strip = "symbols"
 
 CLI、daemon 与 helper 的 `build.rs` 入口共享 [`build_support/git_provenance.rs`](build_support/git_provenance.rs)，将同一 12 位 Git commit 和 dirty 状态写入三件套版本字符串。共享实现先移除所有可重定向 repository/work-tree/index/object/config/replace refs 的继承 Git 环境，禁用 system/global config，只从 manifest 祖先的文件系统发现真实 `.git`；规范根必须包含 manifest，并以固定 `--work-tree`、`GIT_NO_REPLACE_OBJECTS=1`、关闭 fsmonitor/untracked cache 的 Git 查询证明来源。它解析 index 的 stage-0 mode/OID/path，并用 `git hash-object --no-filters` 计算工作树原始 blob OID，避免 clean/smudge filter 隐藏源码改动；mode `160000` gitlink 直接 fail-dirty。三处 wrapper 均在 CI 中执行共享 standalone fixtures；实现还监听 `.git/info/attributes` 以及 HEAD/index/ref/config/info/exclude 等元数据，`assume-unchanged` / `skip-worktree` 也强制 dirty。仓库通过 `.gitattributes` 的 `* text=auto eol=lf` 固定文本策略，并以 `core.autocrlf=true` clean checkout fixture 验证不会假 dirty。查询失败同样 fail-dirty。仓库根不作为 watcher，所以新根级 untracked 文件可能需其他受监听输入变化才触发重算；ignored/外部/动态构建输入仍是披露边界。正式 release 必须从 clean checkout 构建并记录 commit、lockfile、工具链、SHA-256 与签名。
 
-发布链固定 Rust 1.97.1，并配置三平台 locked all-target/all-feature CI、严格 Clippy、build-script fixtures、在线 RustSec（warnings 即失败）、cargo-deny 的 license/source/bans 策略、CycloneDX 1.5 XML/JSON SBOM 与 Dependabot。普通 `main` CI 只产生开发证据，不发布正式制品；正式预发布仅由 exact annotated tag `v1.0.0-beta.1` 触发专用 workflow。annotated tag 本身可以被有权限者移动或删除，因此发布前还必须由仓库 `v*` ruleset 禁止 force-update/deletion，并在 GitHub 支持时启用 immutable releases；这些是外部门禁。workflow 的远端 tag-object 二次核对和拒绝覆盖已有 release 只保护本次发布流程，不能替代仓库设置。正式 runtime 只包含 Windows x86_64 匹配 CLI + daemon 和通过实机门禁后的 Linux x86_64 `serctl-xfer`；macOS 仅测试。独立门禁遍历三个 runtime root 的 Cargo normal/build 传递依赖图，并解析每份 CycloneDX JSON/XML；任一路径或组件出现 source-only experimental `serctl-remote`、jobs、policy 或 remote protocol 都会失败关闭，dev-only 边不冒充 runtime 依赖。workflow 在 clean checkout 的独立 `target/v1-beta-release` 中成套构建，分离符号，生成 SHA-256、SBOM、环境/provenance，并通过 GitHub OIDC attestation；publish job 下载该集合后再次验证精确 14 文件、13 条非自哈希 checksum、全部摘要、聚合/平台 provenance 身份和 Linux GLIBC 不高于 2.35 / Windows MSVC x86_64 ABI，才允许创建 prerelease。是否验收必须以 exact tag commit 对应的远端记录为准，不能把本地门禁或前驱 staging 冒充发布证据。
+发布链固定 Rust 1.97.1，并配置三平台 locked all-target/all-feature CI、严格 Clippy、build-script fixtures、在线 RustSec（warnings 即失败）、cargo-deny 的 license/source/bans 策略、CycloneDX 1.5 XML/JSON SBOM 与 Dependabot。普通 `main` CI 只产生开发证据，不发布正式制品；正式预发布仅由 exact annotated tag `v1.0.0-beta.2` 触发专用 workflow。annotated tag 本身可以被有权限者移动或删除，因此发布前还必须由仓库 `v*` ruleset 禁止 force-update/deletion，并在 GitHub 支持时启用 immutable releases；这些是外部门禁。workflow 的远端 tag-object 二次核对和拒绝覆盖已有 release 只保护本次发布流程，不能替代仓库设置。正式 runtime 只包含 Windows x86_64 匹配 CLI + daemon 和通过实机门禁后的 Linux x86_64 `serctl-xfer`；macOS 仅测试。独立门禁遍历三个 runtime root 的 Cargo normal/build 传递依赖图，并解析每份 CycloneDX JSON/XML；任一路径或组件出现 source-only experimental `serctl-remote`、jobs、policy 或 remote protocol 都会失败关闭，dev-only 边不冒充 runtime 依赖。workflow 在 clean checkout 的独立 `target/v1-beta-release` 中成套构建，分离符号，生成 SHA-256、SBOM、环境/provenance，并通过 GitHub OIDC attestation；publish job 下载该集合后再次验证精确 14 文件、13 条非自哈希 checksum、全部摘要、聚合/平台 provenance 身份和 Linux GLIBC 不高于 2.35 / Windows MSVC x86_64 ABI，才允许创建 prerelease。是否验收必须以 exact tag commit 对应的远端记录为准，不能把本地门禁或前驱 staging 冒充发布证据。
 
 ## 已知边界
 

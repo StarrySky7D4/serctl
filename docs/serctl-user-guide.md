@@ -1,7 +1,7 @@
 # serctl 使用手册
 
-适用版本：`v1.0.0-beta.1`（预发布测试版）
-<!-- applicable-version: v1.0.0-beta.1 -->
+适用版本：`v1.0.0-beta.2`（预发布测试版）
+<!-- applicable-version: v1.0.0-beta.2 -->
 最后更新：2026-08-31
 
 > [!WARNING]
@@ -10,7 +10,7 @@
 > 当前源码的测试目录隔离仍在加固中。存有真实 `%USERPROFILE%\.serctl` 的 Windows 账户不得运行默认并行的 `cargo test`。开发测试必须使用专用操作系统账户，并严格使用 `-- --test-threads=1`。如果真实凭证库中出现 `v6test`、`e2e`、`prod`、`tester` 或 `127.0.0.1:22` 等测试数据，请立即停止 serctl 和测试，不要继续保存或初始化。
 
 > [!NOTE]
-> 当前预发布标记已同步为 v1.0.0-beta.1；该候选尚未验收或发布。候选本机 wire 已提升到 IPC v9，但仍使用现有 AEAD/JSON 帧；未来 Protobuf codec 不是当前能力。`serctl-remote`、jobs、remote protocol 与 policy 只有 source-only experimental / unshipped 基础，继续接受 workspace 质量检查但不进入 v1 beta 安装包、不发布、不支持；没有 `job.*` Agent 请求或 OperationGrant scope，也不能把普通 `ssh.exec` 解释成可恢复作业。远端透明日志、独立单调审计锚、完整策略 DSL 和 QUIC 高速通道也仍是目标设计。设计决策和验收路线见 [目标架构与演进路线](serctl-design-roadmap.md)；v1 候选的 Agent 契约见 [Agent JSONL 契约](v1-beta-agent-jsonl.md)。
+> 当前预发布标记已同步为 v1.0.0-beta.2；该候选尚未验收或发布。候选本机 wire 已提升到 IPC v9，但仍使用现有 AEAD/JSON 帧；未来 Protobuf codec 不是当前能力。`serctl-remote`、jobs、remote protocol 与 policy 只有 source-only experimental / unshipped 基础，继续接受 workspace 质量检查但不进入 v1 beta 安装包、不发布、不支持；没有 `job.*` Agent 请求或 OperationGrant scope，也不能把普通 `ssh.exec` 解释成可恢复作业。远端透明日志、独立单调审计锚、完整策略 DSL 和 QUIC 高速通道也仍是目标设计。设计决策和验收路线见 [目标架构与演进路线](serctl-design-roadmap.md)；v1 候选的 Agent 契约见 [Agent JSONL 契约](v1-beta-agent-jsonl.md)。
 
 ## 1. serctl 是什么
 
@@ -522,7 +522,7 @@ Agent 受管隧道请求名为 `forward-local-open`、`forward-remote-open`、`f
 
 `ssh-connection-identity` 没有请求专用字段，但它会认证、复用或重连目标 SSH transport，并非离线 metadata 查询。成功结果固定为 profile id/generation、观察到的 `SHA256:` host-key fingerprint、恒真的 `pin_match`、最长 128 字节且仅含安全可打印 ASCII 的 SSH server identification、不透明的 32 位大写十六进制 transport attempt id、daemon 生成的 64 位小写十六进制 `operation_context_id`，以及固定 `revision=1`；不含 host/port、用户名、路径、pre-banner/raw banner 或凭据。`exec` 与 `list-dir` 的成功终态同样追加 context 与 `revision=1`。认证前失败、未观察到 host key、pin 不匹配、server identification 不安全或 profile/generation 失配时不返回部分身份。
 
-以上新增 schema/error/transfer/tunnel/connection-identity 行为属于 v1.0.0-beta.1 候选，只有源码 handler、daemon 可签发列表、自动契约检查和 exact-tag 真实 OpenSSH/Dropbear E2E 同时通过后才成为已验收能力；当前预发布标记已同步为 v1.0.0-beta.1，但不因此视为已验收。
+以上新增 schema/error/transfer/tunnel/connection-identity 行为属于 v1.0.0-beta.2 候选，只有源码 handler、daemon 可签发列表、自动契约检查和 exact-tag 真实 OpenSSH/Dropbear E2E 同时通过后才成为已验收能力；当前预发布标记已同步为 v1.0.0-beta.2，但不因此视为已验收。
 
 外部验收工具已加入有界进程监管原语，约束未来 runtime adapter 只能以绝对可执行文件和参数数组启动固定进程，并对 stdout/stderr、deadline 与进程树退出设限。当前仅有 Windows PowerShell 合成测试；仓库仍没有能产生真实 native/interop 子 receipt 的受控 adapter，因此该原语不能被解释为跨平台、真实 SSH、native、性能或发布验收通过。
 
