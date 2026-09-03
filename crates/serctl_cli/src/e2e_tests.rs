@@ -238,6 +238,8 @@ impl TestState {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let changed = self.native_push_data_received.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
                 if self.native_push_frames.load(Ordering::SeqCst) >= minimum {
                     break;
                 }
@@ -251,6 +253,8 @@ impl TestState {
     async fn wait_for_native_push_ack_release(&self) {
         while self.native_push_ack_gate.load(Ordering::SeqCst) {
             let released = self.native_push_ack_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
             if !self.native_push_ack_gate.load(Ordering::SeqCst) {
                 break;
             }
@@ -262,6 +266,8 @@ impl TestState {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let changed = self.native_helper_finished.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
                 if self.native_helpers_finished.load(Ordering::SeqCst) >= minimum {
                     break;
                 }
@@ -2720,7 +2726,10 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
 
     // Withhold the first helper ACK. Confirmed progress must remain at zero,
     // the daemon must report a stall at the idle boundary, and no mock target
-    // may become visible because Commit was never reached.
+    // may become visible because Commit was never reached. Keep the idle
+    // window long enough for a cold CI runner to finish the native handshake
+    // and IPC handoff; the timeout under test starts before the first data
+    // frame, so a sub-second value tests scheduler speed instead of ACK stall.
     let idle_progress = Arc::new(StdMutex::new(Vec::new()));
     let idle_sink = Arc::clone(&idle_progress);
     let idle_progress_sink: client::TransferProgressSink =
@@ -2738,8 +2747,8 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
                 backend: ipc::TransferBackend::Native,
                 expected_helper_identity: Some(test_native_expected_identity()),
                 resume: ipc::TransferResumeMode::Never,
-                idle_timeout: Duration::from_millis(100),
-                deadline: Some(Duration::from_secs(3)),
+                idle_timeout: Duration::from_secs(5),
+                deadline: Some(Duration::from_secs(10)),
                 progress: Some(idle_progress_sink),
             },
             Some(Zeroizing::new(E2E_PROFILE_PASSPHRASE.to_owned())),
@@ -2751,9 +2760,11 @@ async fn authenticated_daemon_exec_timeout_and_transfer_e2e() {
         state
             .wait_for_native_push_frames(idle_frames_before + 1)
             .await,
-        "native idle test helper did not receive a push frame"
+        "native idle test helper did not receive a push frame; client_finished={}, progress={:?}",
+        idle_upload.is_finished(),
+        idle_progress.lock().unwrap()
     );
-    let idle_error = tokio::time::timeout(Duration::from_secs(3), idle_upload)
+    let idle_error = tokio::time::timeout(Duration::from_secs(10), idle_upload)
         .await
         .expect("native idle timeout did not terminate the client")
         .expect("native idle upload worker panicked")
