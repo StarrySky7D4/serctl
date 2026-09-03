@@ -1146,6 +1146,7 @@ mod tests {
         start.relay_deadline_unix_ms = now + 4_000;
         start.result_retention_unix_ms = now + 5_000;
         start.max_output_bytes = 1024;
+        start.input_digest = protocol::compute_start_input_digest(&start);
         let identity = JobIdentity {
             job_id,
             profile_id: start.profile_id,
