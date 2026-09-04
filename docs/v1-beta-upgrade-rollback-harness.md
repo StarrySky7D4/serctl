@@ -126,7 +126,7 @@ is an explicit bounded argument and its passphrase is supplied only through
   -TagObject 0123456789abcdef0123456789abcdef01234567 `
   -Commit fedcba9876543210fedcba9876543210fedcba98 `
   -ReleaseManifestSha256 ('A' * 64) `
-  -EvidenceOwner independent-runtime-owner
+  -EvidenceOwner StarrySky7D4
 ```
 
 The fixed in-process sequence opens the beta-2 fixture with the matched

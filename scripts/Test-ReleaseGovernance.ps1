@@ -871,7 +871,7 @@ foreach ($required in @(
     '-Repository $env:RELEASE_REPOSITORY',
     'git diff --check HEAD^',
     'SERCTL_REQUIRE_WINDOWS_REPARSE_TEST=1',
-    'environment: v1-beta-external-acceptance',
+    'environment: v1-beta-maintainer-acceptance',
     'V1_BETA_ACCEPTANCE_RECORD_URL',
     'V1_BETA_ACCEPTANCE_RECORD_SHA256',
     'Require empty release assembly staging',
@@ -945,6 +945,14 @@ Assert-TestCondition (-not $workflow.Contains('workflow_dispatch:')) (
 )
 Assert-TestCondition (-not $workflow.Contains('--signer-repo $env:RELEASE_REPOSITORY')) (
     'release attestation verification must not combine mutually exclusive signer-repo and signer-workflow selectors'
+)
+foreach ($policyBinding in @('-GovernanceMode single-maintainer', '-MaintainerLogin StarrySky7D4')) {
+    Assert-TestCondition (
+        ([regex]::Matches($workflow, [regex]::Escape($policyBinding))).Count -eq 3
+    ) 'both download phases and final evidence verification must pin the single-maintainer policy'
+}
+Assert-TestCondition (-not $workflow.Contains('environment: v1-beta-external-acceptance')) (
+    'new single-maintainer workflow must not reinterpret the immutable legacy approval environment'
 )
 Assert-TestCondition (
     ([regex]::Matches(
@@ -1376,6 +1384,9 @@ foreach ($evidenceBoundary in @(
     'Windows ACL candidate CLI SHA-256 is not the downloaded release CLI',
     'evidence category name is not in the exact required allowlist',
     'acceptance owner and evidence owner must be independent identities',
+    'evidence owner is not the pinned single maintainer',
+    'Assert-ExternalAcceptancePolicyConfiguration',
+    'Assert-ExternalAcceptanceRecordPolicy',
     'windows-x86_64',
     'linux-x86_64',
     'interop implementation is duplicated',
@@ -1542,7 +1553,10 @@ $externalEvidencePlanSource = Get-Content `
     -Encoding utf8
 foreach ($planBoundary in @(
     'acceptance record parsed bytes do not match the approved SHA-256',
-    '-EmitArtifactDownloadPlan'
+    '-EmitArtifactDownloadPlan',
+    'Assert-ExternalAcceptanceRecordPolicy',
+    '-GovernanceMode $GovernanceMode',
+    '-MaintainerLogin $MaintainerLogin'
 )) {
     Assert-TestCondition ($externalEvidencePlanSource.Contains($planBoundary)) (
         "external acceptance download plan lacks boundary '$planBoundary'"

@@ -12,7 +12,9 @@ param(
     [string]$Tag,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$Commit,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$TagObject,
-    [switch]$EmitArtifactDownloadPlan
+    [switch]$EmitArtifactDownloadPlan,
+    [ValidateSet('independent', 'single-maintainer')][string]$GovernanceMode = 'independent',
+    [string]$MaintainerLogin = ''
 )
 
 Set-StrictMode -Version Latest
@@ -20,6 +22,8 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'StrictJson.ps1')
 . (Join-Path $PSScriptRoot 'ReleaseAssetContract.ps1')
 . (Join-Path $PSScriptRoot 'ReleaseArchiveContract.ps1')
+. (Join-Path $PSScriptRoot 'ExternalAcceptancePolicy.ps1')
+Assert-ExternalAcceptancePolicyConfiguration $GovernanceMode $MaintainerLogin
 
 function Assert-EvidenceCondition {
     param(
@@ -1403,27 +1407,14 @@ $expectedReleaseComponents = $releaseBindings.components
 Assert-EvidenceCondition (
     (Get-FileHash -LiteralPath $recordPath -Algorithm SHA256).Hash -ceq $AcceptanceRecordSha256
 ) 'acceptance record SHA-256 mismatch'
-$recordFields = @(
-    'schema_version',
-    'accepted',
-    'tag',
-    'tag_object',
-    'commit',
-    'release_manifest_sha256',
-    'acceptance_owner',
-    'completed_utc',
-    'evidence_manifest_url',
-    'evidence_manifest_sha256'
-)
+$recordFields = @(Get-ExternalAcceptanceRecordFields $GovernanceMode $MaintainerLogin)
 $record = Get-ClosedJsonObject `
     -Path $recordPath `
     -Fields $recordFields `
     -MaximumBytes 65536 `
     -Label 'acceptance record' `
     -ExpectedSha256 $AcceptanceRecordSha256
-Assert-EvidenceCondition (
-    (Test-StrictJsonInteger $record.schema_version) -and $record.schema_version -eq 1
-) 'acceptance record schema_version is not integer 1'
+Assert-ExternalAcceptanceRecordPolicy $record $GovernanceMode $MaintainerLogin
 Assert-EvidenceCondition (
     (Test-StrictJsonBoolean $record.accepted) -and $record.accepted -eq $true
 ) (
@@ -1518,9 +1509,16 @@ Assert-EvidenceCondition (
     $null -ne $manifest.evidence_owner
 ) 'evidence manifest has no evidence owner'
 Assert-SafeEvidenceString $manifest.evidence_owner 'evidence manifest evidence_owner' 128
-Assert-EvidenceCondition (
-    [string]$record.acceptance_owner -cne [string]$manifest.evidence_owner
-) 'acceptance owner and evidence owner must be independent identities'
+if ($GovernanceMode -ceq 'single-maintainer') {
+    Assert-EvidenceCondition (
+        [string]$manifest.evidence_owner -ceq $MaintainerLogin
+    ) 'evidence owner is not the pinned single maintainer'
+}
+else {
+    Assert-EvidenceCondition (
+        [string]$record.acceptance_owner -cne [string]$manifest.evidence_owner
+    ) 'acceptance owner and evidence owner must be independent identities'
+}
 $manifestCompleted = Get-CanonicalTimestamp `
     -Value ([string]$manifest.completed_utc) `
     -Label 'evidence manifest completed_utc'

@@ -5,6 +5,8 @@
 当前重写版标记为预发布测试版本 **v1.0.0-beta.3**；原 main 基线保存在远端 `V1` 分支。测试版本不应替代正式签名发行物。
 <!-- release-marker: v1.0.0-beta.3 -->
 
+> 单人维护治理（2026-09-04，未发布变更）：由 `StarrySky7D4` 负责测试并手动批准预发布，不再要求第二个账号独立审核；五类实机验收、哈希绑定和 OIDC 仍为必需。新流程使用独立的 `v1-beta-maintainer-acceptance` 环境及明确标注 `single-maintainer` 的 schema v2 回执，必须通过新标签采用；现有 beta.3 标签和旧审批规则不变。
+
 > [!IMPORTANT]
 > 工作树中的 **v1.0.0-beta.3 候选尚未验收或发布**。候选 wire 已升级为 IPC v9，并定义 Agent JSONL `schema_version=1`、稳定 `error_code` 及 14 个互不替代的精确 scope；只有对应 Agent handler、daemon 可签发列表与映射测试同时存在，能力才算源码实现。`serctl-remote`、jobs、remote protocol 与 policy 仍是 source-only experimental / unshipped 代码，v1 beta 不构建交付、不发布、不支持，`job.*` 也不属于 Agent/OperationGrant 能力面。当前 workspace 与预发布标记已同步为 v1.0.0-beta.3；真实 SSH/native、跨平台和发布证据未齐前不得把候选写成已验收。候选契约见 [Agent JSONL 契约](docs/v1-beta-agent-jsonl.md)、[发布兼容契约](docs/v1-beta-release-contract.md)和[验收矩阵](docs/v1-beta-acceptance-matrix.md)。
 

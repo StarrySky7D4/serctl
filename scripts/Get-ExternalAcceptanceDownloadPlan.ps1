@@ -10,12 +10,16 @@ param(
     [Parameter(Mandatory = $true)][string]$ReleaseManifestPath,
     [Parameter(Mandatory = $true)][string]$Tag,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$Commit,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$TagObject
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$TagObject,
+    [ValidateSet('independent', 'single-maintainer')][string]$GovernanceMode = 'independent',
+    [string]$MaintainerLogin = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'StrictJson.ps1')
+. (Join-Path $PSScriptRoot 'ExternalAcceptancePolicy.ps1')
+Assert-ExternalAcceptancePolicyConfiguration $GovernanceMode $MaintainerLogin
 
 function Assert-PlanCondition {
     param([bool]$Condition, [string]$Message)
@@ -75,18 +79,12 @@ $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $recordJson = $strictUtf8.GetString($recordBytes)
 $record = ConvertFrom-StrictJson -Json $recordJson -Label 'acceptance record'
 Assert-PlanCondition (Test-StrictJsonObject $record) 'acceptance record is not a JSON object'
-$recordFields = @(
-    'schema_version', 'accepted', 'tag', 'tag_object', 'commit',
-    'release_manifest_sha256', 'acceptance_owner', 'completed_utc',
-    'evidence_manifest_url', 'evidence_manifest_sha256'
-) | Sort-Object
+$recordFields = @(Get-ExternalAcceptanceRecordFields $GovernanceMode $MaintainerLogin) | Sort-Object
 $actualRecordFields = @($record.PSObject.Properties.Name | Sort-Object)
 Assert-PlanCondition (
     ($actualRecordFields -join "`n") -ceq ($recordFields -join "`n")
 ) 'acceptance record does not use the exact closed schema'
-Assert-PlanCondition (
-    (Test-StrictJsonInteger $record.schema_version) -and $record.schema_version -eq 1
-) 'acceptance record schema_version is not integer 1'
+Assert-ExternalAcceptanceRecordPolicy $record $GovernanceMode $MaintainerLogin
 Assert-PlanCondition (
     (Test-StrictJsonBoolean $record.accepted) -and $record.accepted -eq $true
 ) (
@@ -162,4 +160,6 @@ $verifier = Join-Path $PSScriptRoot 'Test-ExternalAcceptanceEvidence.ps1'
     -Tag $Tag `
     -Commit $Commit `
     -TagObject $TagObject `
+    -GovernanceMode $GovernanceMode `
+    -MaintainerLogin $MaintainerLogin `
     -EmitArtifactDownloadPlan

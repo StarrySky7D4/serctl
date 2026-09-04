@@ -4,6 +4,7 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ReleaseAssetContract.ps1')
+. (Join-Path $PSScriptRoot 'StrictJson.ps1')
 . (Join-Path $PSScriptRoot 'ExternalTransferRuntimeReceiptContract.ps1')
 $script:receiptContractModule = @(
     Get-Module 'Serctl.ExternalTransferRuntimeReceiptContract' -All
@@ -47,6 +48,16 @@ function Write-JsonFixture {
         ($Value | ConvertTo-Json -Depth 12) + "`n",
         [System.Text.UTF8Encoding]::new($false)
     )
+}
+
+function ConvertFrom-FixtureJson {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true, ValueFromPipeline = $true)][string]$InputObject)
+    process {
+        # Preserve ISO timestamp strings on PS 7.5+; implicit DateTime coercion
+        # can make a negative fixture fail before reaching its intended assertion.
+        ConvertFrom-StrictJson -Json $InputObject -Label 'external acceptance test fixture'
+    }
 }
 
 function New-ExternalZipFixture {
@@ -290,7 +301,7 @@ function New-InteropLedgerProjectionFixture {
         [Parameter(Mandatory = $true)][string]$EvidenceContextSha256
     )
     $exactComponents = (
-        ($Components | ConvertTo-Json -Compress -Depth 8) | ConvertFrom-Json
+        ($Components | ConvertTo-Json -Compress -Depth 8) | ConvertFrom-FixtureJson
     )
     $ledger = New-ExternalTransferRuntimeLedger -Category 'openssh_dropbear_interop'
     & $script:receiptContractModule {
@@ -337,7 +348,7 @@ function New-InteropLedgerProjectionFixture {
     try {
         $projection = (
             [Text.UTF8Encoding]::new($false, $true).GetString($projectionBytes)
-        ).TrimEnd("`n") | ConvertFrom-Json
+        ).TrimEnd("`n") | ConvertFrom-FixtureJson
         Assert-SelfTestCondition (
             $projection.projection_contract -ceq
                 'serctl-openssh-dropbear-interop-details-projection-v1' -and
@@ -842,7 +853,7 @@ function Update-FixtureBindings {
         [Parameter(Mandatory = $true)][string]$Category
     )
     $manifest = Get-Content -LiteralPath $Fixture.EvidencePath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $entry = @($manifest.categories | Where-Object { $_.category -ceq $Category })
     Assert-SelfTestCondition ($entry.Count -eq 1) 'fixture category binding is ambiguous'
     $entry[0].artifact_sha256 = (
@@ -850,7 +861,7 @@ function Update-FixtureBindings {
     ).Hash
     Write-JsonFixture -Path $Fixture.EvidencePath -Value $manifest
     $record = Get-Content -LiteralPath $Fixture.RecordPath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $record.evidence_manifest_sha256 = (
         Get-FileHash -LiteralPath $Fixture.EvidencePath -Algorithm SHA256
     ).Hash
@@ -878,11 +889,11 @@ function Update-AllReleaseBindings {
     )
     foreach ($category in $categories) {
         $path = Join-Path $Fixture.Root "$category.evidence"
-        $document = Get-Content -LiteralPath $path -Raw -Encoding utf8 | ConvertFrom-Json
+        $document = Get-Content -LiteralPath $path -Raw -Encoding utf8 | ConvertFrom-FixtureJson
         $document.release_manifest_sha256 = $releaseHash
         Write-JsonFixture -Path $path -Value $document
     }
-    $manifest = Get-Content -LiteralPath $Fixture.EvidencePath -Raw -Encoding utf8 | ConvertFrom-Json
+    $manifest = Get-Content -LiteralPath $Fixture.EvidencePath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $manifest.release_manifest_sha256 = $releaseHash
     foreach ($entry in @($manifest.categories)) {
         $entry.artifact_sha256 = (
@@ -890,7 +901,7 @@ function Update-AllReleaseBindings {
         ).Hash
     }
     Write-JsonFixture -Path $Fixture.EvidencePath -Value $manifest
-    $record = Get-Content -LiteralPath $Fixture.RecordPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $record = Get-Content -LiteralPath $Fixture.RecordPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $record.release_manifest_sha256 = $releaseHash
     $record.evidence_manifest_sha256 = (
         Get-FileHash -LiteralPath $Fixture.EvidencePath -Algorithm SHA256
@@ -899,7 +910,11 @@ function Update-AllReleaseBindings {
 }
 
 function Invoke-Verifier {
-    param([Parameter(Mandatory = $true)]$Fixture)
+    param(
+        [Parameter(Mandatory = $true)]$Fixture,
+        [string]$GovernanceMode = 'independent',
+        [string]$MaintainerLogin = ''
+    )
 
     $recordHash = (Get-FileHash -LiteralPath $Fixture.RecordPath -Algorithm SHA256).Hash
     & $script:verifier `
@@ -911,17 +926,21 @@ function Invoke-Verifier {
         -ReleaseManifestPath $Fixture.ReleaseManifestPath `
         -Tag $script:tag `
         -Commit $script:commit `
-        -TagObject $script:tagObject *> $null
+        -TagObject $script:tagObject `
+        -GovernanceMode $GovernanceMode `
+        -MaintainerLogin $MaintainerLogin *> $null
 }
 
 function Assert-Rejected {
     param(
         [Parameter(Mandatory = $true)]$Fixture,
-        [Parameter(Mandatory = $true)][string]$Description
+        [Parameter(Mandatory = $true)][string]$Description,
+        [string]$GovernanceMode = 'independent',
+        [string]$MaintainerLogin = ''
     )
     $rejected = $false
     try {
-        Invoke-Verifier -Fixture $Fixture
+        Invoke-Verifier -Fixture $Fixture -GovernanceMode $GovernanceMode -MaintainerLogin $MaintainerLogin
     }
     catch {
         $rejected = $true
@@ -943,6 +962,96 @@ $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
 try {
     $baseline = New-FixtureSet -Root (Join-Path $temporaryRoot 'baseline')
     Invoke-Verifier -Fixture $baseline
+    $roundTrip = Copy-FixtureSet -Source $baseline.Root -Destination (Join-Path $temporaryRoot 'unchanged-json-roundtrip')
+    foreach ($jsonPath in @($roundTrip.RecordPath, $roundTrip.EvidencePath)) {
+        $document = Get-Content -LiteralPath $jsonPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
+        Assert-SelfTestCondition ($document.completed_utc -is [string]) 'fixture timestamp was coerced to DateTime'
+        Write-JsonFixture -Path $jsonPath -Value $document
+    }
+    Invoke-Verifier -Fixture $roundTrip
+
+    # Synthetic policy coverage only: this does not create a real acceptance receipt.
+    $single = Copy-FixtureSet -Source $baseline.Root -Destination (Join-Path $temporaryRoot 'single-maintainer')
+    $singlePolicy = @{ GovernanceMode = 'single-maintainer'; MaintainerLogin = 'StarrySky7D4' }
+    $singleManifest = Get-Content -LiteralPath $single.EvidencePath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
+    $singleManifest.evidence_owner = 'StarrySky7D4'
+    Write-JsonFixture -Path $single.EvidencePath -Value $singleManifest
+    foreach ($entry in @($singleManifest.categories)) {
+        $receiptPath = Join-Path $single.Root "$($entry.category).evidence"
+        $receipt = Get-Content -LiteralPath $receiptPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
+        $receipt.evidence_owner = 'StarrySky7D4'
+        Write-JsonFixture -Path $receiptPath -Value $receipt
+        Update-FixtureBindings -Fixture $single -Category $entry.category
+    }
+    $singleRecord = Get-Content -LiteralPath $single.RecordPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
+    $singleRecord.schema_version = 2
+    $singleRecord.acceptance_owner = 'StarrySky7D4'
+    $singleRecord | Add-Member -NotePropertyName governance_mode -NotePropertyValue 'single-maintainer'
+    Write-JsonFixture -Path $single.RecordPath -Value $singleRecord
+    Invoke-Verifier -Fixture $single @singlePolicy
+    Assert-Rejected -Fixture $single -Description 'single-maintainer record cannot select its own policy'
+    Assert-Rejected -Fixture $baseline @singlePolicy -Description 'legacy independent record cannot silently downgrade'
+    Assert-Rejected -Fixture $single -GovernanceMode single-maintainer -Description 'missing pinned maintainer'
+    Assert-Rejected -Fixture $single -GovernanceMode single-maintainer -MaintainerLogin OtherOwner -Description 'substituted pinned maintainer'
+    Assert-Rejected -Fixture $single -GovernanceMode SINGLE-MAINTAINER -MaintainerLogin StarrySky7D4 -Description 'noncanonical governance mode'
+    Assert-Rejected -Fixture $baseline -MaintainerLogin StarrySky7D4 -Description 'independent mode cannot use maintainer override'
+    foreach ($mutation in @('mode-missing', 'mode-unknown', 'mode-type', 'schema-downgrade', 'owner-drift', 'not-accepted', 'record-extra')) {
+        $mutated = Copy-FixtureSet -Source $single.Root -Destination (Join-Path $temporaryRoot "single-$mutation")
+        $record = Get-Content -LiteralPath $mutated.RecordPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
+        switch ($mutation) {
+            'mode-missing' { $record.PSObject.Properties.Remove('governance_mode') }
+            'mode-unknown' { $record.governance_mode = 'independent' }
+            'mode-type' { $record.governance_mode = @('single-maintainer') }
+            'schema-downgrade' { $record.schema_version = 1 }
+            'owner-drift' { $record.acceptance_owner = 'OtherOwner' }
+            'not-accepted' { $record.accepted = $false }
+            'record-extra' { $record | Add-Member -NotePropertyName bypass -NotePropertyValue $true }
+        }
+        Write-JsonFixture -Path $mutated.RecordPath -Value $record
+        Assert-Rejected -Fixture $mutated @singlePolicy -Description "single-maintainer $mutation"
+    }
+    foreach ($mutation in @('evidence-owner-drift', 'category-missing', 'duplicate-url')) {
+        $mutated = Copy-FixtureSet -Source $single.Root -Destination (Join-Path $temporaryRoot "single-$mutation")
+        $manifest = Get-Content -LiteralPath $mutated.EvidencePath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
+        switch ($mutation) {
+            'evidence-owner-drift' { $manifest.evidence_owner = 'OtherOwner' }
+            'category-missing' { $manifest.categories = @($manifest.categories | Select-Object -First 4) }
+            'duplicate-url' { $manifest.categories[1].artifact_url = $manifest.categories[0].artifact_url }
+        }
+        Write-JsonFixture -Path $mutated.EvidencePath -Value $manifest
+        $record = Get-Content -LiteralPath $mutated.RecordPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
+        $record.evidence_manifest_sha256 = (Get-FileHash -LiteralPath $mutated.EvidencePath -Algorithm SHA256).Hash
+        Write-JsonFixture -Path $mutated.RecordPath -Value $record
+        Assert-Rejected -Fixture $mutated @singlePolicy -Description "single-maintainer $mutation"
+    }
+    $mutated = Copy-FixtureSet -Source $single.Root -Destination (Join-Path $temporaryRoot 'single-artifact-tamper')
+    [IO.File]::AppendAllText((Join-Path $mutated.Root 'clean_install_smoke.evidence'), ' ')
+    Assert-Rejected -Fixture $mutated @singlePolicy -Description 'single-maintainer still rejects tampered evidence bytes'
+    foreach ($phase in @('manifest', 'artifacts')) {
+        $singlePlan = & $planScript -Phase $phase @singlePolicy `
+            -AcceptanceRecordPath $single.RecordPath `
+            -AcceptanceRecordSha256 (Get-FileHash -LiteralPath $single.RecordPath -Algorithm SHA256).Hash `
+            -AcceptanceRecordUrl $recordUrl -EvidenceManifestPath $single.EvidencePath `
+            -ReleaseManifestPath $single.ReleaseManifestPath -Tag $tag -Commit $commit -TagObject $tagObject |
+            ConvertFrom-FixtureJson
+        if ($phase -ceq 'manifest') {
+            Assert-SelfTestCondition ($singlePlan.manifest_url -ceq $evidenceUrl) 'single-maintainer manifest plan drift'
+        }
+        else {
+            Assert-SelfTestCondition (@($singlePlan.artifacts).Count -eq 5) 'single-maintainer artifact plan lost required cases'
+        }
+        $rejected = $false
+        try {
+            & $planScript -Phase $phase -GovernanceMode single-maintainer -MaintainerLogin OtherOwner `
+                -AcceptanceRecordPath $single.RecordPath `
+                -AcceptanceRecordSha256 (Get-FileHash -LiteralPath $single.RecordPath -Algorithm SHA256).Hash `
+                -AcceptanceRecordUrl $recordUrl -EvidenceManifestPath $single.EvidencePath `
+                -ReleaseManifestPath $single.ReleaseManifestPath -Tag $tag -Commit $commit -TagObject $tagObject *> $null
+        }
+        catch { $rejected = $true }
+        Assert-SelfTestCondition $rejected 'download plan accepted a substituted maintainer'
+    }
+    Write-Host 'Single-maintainer policy: explicit opt-in, legacy isolation and unchanged evidence boundaries passed (synthetic only).'
 
     $archiveByteDrift = Copy-FixtureSet `
         -Source $baseline.Root `
@@ -979,7 +1088,7 @@ try {
         -ReleaseManifestPath $baseline.ReleaseManifestPath `
         -Tag $tag `
         -Commit $commit `
-        -TagObject $tagObject | ConvertFrom-Json
+        -TagObject $tagObject | ConvertFrom-FixtureJson
     Assert-SelfTestCondition (
         [string]$manifestPlan.manifest_url -ceq $evidenceUrl -and
         [string]$manifestPlan.manifest_sha256 -ceq (
@@ -995,7 +1104,7 @@ try {
         -ReleaseManifestPath $baseline.ReleaseManifestPath `
         -Tag $tag `
         -Commit $commit `
-        -TagObject $tagObject | ConvertFrom-Json
+        -TagObject $tagObject | ConvertFrom-FixtureJson
     Assert-SelfTestCondition (@($artifactPlan.artifacts).Count -eq 5) (
         'strict artifact download plan did not return the exact category set'
     )
@@ -1004,7 +1113,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'string-boolean')
     $record = Get-Content -LiteralPath $stringBoolean.RecordPath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $record.accepted = 'true'
     Write-JsonFixture -Path $stringBoolean.RecordPath -Value $record
     Assert-Rejected -Fixture $stringBoolean -Description 'string acceptance boolean'
@@ -1022,11 +1131,11 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'missing-category')
     $manifest = Get-Content -LiteralPath $missingCategory.EvidencePath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $manifest.categories = @($manifest.categories | Select-Object -First 4)
     Write-JsonFixture -Path $missingCategory.EvidencePath -Value $manifest
     $record = Get-Content -LiteralPath $missingCategory.RecordPath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $record.evidence_manifest_sha256 = (
         Get-FileHash -LiteralPath $missingCategory.EvidencePath -Algorithm SHA256
     ).Hash
@@ -1037,11 +1146,11 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'category-path-traversal')
     $manifest = Get-Content -LiteralPath $categoryTraversal.EvidencePath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $manifest.categories[0].category = '..\outside'
     Write-JsonFixture -Path $categoryTraversal.EvidencePath -Value $manifest
     $record = Get-Content -LiteralPath $categoryTraversal.RecordPath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $record.evidence_manifest_sha256 = (
         Get-FileHash -LiteralPath $categoryTraversal.EvidencePath -Algorithm SHA256
     ).Hash
@@ -1056,7 +1165,7 @@ try {
     $record = Get-Content `
         -LiteralPath $unsafeAcceptanceOwner.RecordPath `
         -Raw `
-        -Encoding utf8 | ConvertFrom-Json
+        -Encoding utf8 | ConvertFrom-FixtureJson
     $record.acceptance_owner = 'C:\private\acceptance-owner'
     Write-JsonFixture -Path $unsafeAcceptanceOwner.RecordPath -Value $record
     Assert-Rejected `
@@ -1069,7 +1178,7 @@ try {
     $record = Get-Content `
         -LiteralPath $oversizedAcceptanceOwner.RecordPath `
         -Raw `
-        -Encoding utf8 | ConvertFrom-Json
+        -Encoding utf8 | ConvertFrom-FixtureJson
     $record.acceptance_owner = 'o' * 129
     Write-JsonFixture -Path $oversizedAcceptanceOwner.RecordPath -Value $record
     Assert-Rejected `
@@ -1082,13 +1191,13 @@ try {
     $manifest = Get-Content `
         -LiteralPath $unsafeEvidenceOwner.EvidencePath `
         -Raw `
-        -Encoding utf8 | ConvertFrom-Json
+        -Encoding utf8 | ConvertFrom-FixtureJson
     $manifest.evidence_owner = "evidence`nowner"
     Write-JsonFixture -Path $unsafeEvidenceOwner.EvidencePath -Value $manifest
     $record = Get-Content `
         -LiteralPath $unsafeEvidenceOwner.RecordPath `
         -Raw `
-        -Encoding utf8 | ConvertFrom-Json
+        -Encoding utf8 | ConvertFrom-FixtureJson
     $record.evidence_manifest_sha256 = (
         Get-FileHash -LiteralPath $unsafeEvidenceOwner.EvidencePath -Algorithm SHA256
     ).Hash
@@ -1103,7 +1212,7 @@ try {
     $record = Get-Content `
         -LiteralPath $sameOwnerIdentity.RecordPath `
         -Raw `
-        -Encoding utf8 | ConvertFrom-Json
+        -Encoding utf8 | ConvertFrom-FixtureJson
     $record.acceptance_owner = 'independent-evidence-owner'
     Write-JsonFixture -Path $sameOwnerIdentity.RecordPath -Value $record
     Assert-Rejected `
@@ -1114,11 +1223,11 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'identity-drift')
     $manifest = Get-Content -LiteralPath $identityDrift.EvidencePath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $manifest.commit = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     Write-JsonFixture -Path $identityDrift.EvidencePath -Value $manifest
     $record = Get-Content -LiteralPath $identityDrift.RecordPath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $record.evidence_manifest_sha256 = (
         Get-FileHash -LiteralPath $identityDrift.EvidencePath -Algorithm SHA256
     ).Hash
@@ -1129,7 +1238,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'extra-field')
     $record = Get-Content -LiteralPath $extraField.RecordPath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $record | Add-Member -NotePropertyName unexpected -NotePropertyValue $true
     Write-JsonFixture -Path $extraField.RecordPath -Value $record
     Assert-Rejected -Fixture $extraField -Description 'acceptance record extra field'
@@ -1171,11 +1280,11 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'non-https')
     $manifest = Get-Content -LiteralPath $nonHttps.EvidencePath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $manifest.categories[0].artifact_url = 'http://evidence.example/not-https.json'
     Write-JsonFixture -Path $nonHttps.EvidencePath -Value $manifest
     $record = Get-Content -LiteralPath $nonHttps.RecordPath -Raw -Encoding utf8 |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $record.evidence_manifest_sha256 = (
         Get-FileHash -LiteralPath $nonHttps.EvidencePath -Algorithm SHA256
     ).Hash
@@ -1188,13 +1297,13 @@ try {
     $manifest = Get-Content `
         -LiteralPath $duplicateArtifactUrl.EvidencePath `
         -Raw `
-        -Encoding utf8 | ConvertFrom-Json
+        -Encoding utf8 | ConvertFrom-FixtureJson
     $manifest.categories[1].artifact_url = $manifest.categories[0].artifact_url
     Write-JsonFixture -Path $duplicateArtifactUrl.EvidencePath -Value $manifest
     $record = Get-Content `
         -LiteralPath $duplicateArtifactUrl.RecordPath `
         -Raw `
-        -Encoding utf8 | ConvertFrom-Json
+        -Encoding utf8 | ConvertFrom-FixtureJson
     $record.evidence_manifest_sha256 = (
         Get-FileHash `
             -LiteralPath $duplicateArtifactUrl.EvidencePath `
@@ -1258,7 +1367,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'artifact-unknown-field')
     $categoryName = 'clean_install_smoke'
     $artifactPath = Join-Path $artifactUnknownField.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details | Add-Member -NotePropertyName password -NotePropertyValue 'forbidden'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $artifactUnknownField -Category $categoryName
@@ -1269,7 +1378,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'clean-install-wrong-host')
     $categoryName = 'clean_install_smoke'
     $artifactPath = Join-Path $cleanInstallWrongHost.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.runner.os = 'Linux'
     $document.details.runner.rust_host = 'x86_64-unknown-linux-gnu'
     Write-JsonFixture -Path $artifactPath -Value $document
@@ -1281,7 +1390,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'clean-install-version-drift')
     $categoryName = 'clean_install_smoke'
     $artifactPath = Join-Path $cleanInstallVersionDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.cli_identity.version = '0.3.0-beta.2'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $cleanInstallVersionDrift -Category $categoryName
@@ -1292,7 +1401,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'clean-install-byte-drift')
     $categoryName = 'clean_install_smoke'
     $artifactPath = Join-Path $cleanInstallByteDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.cli_identity.sha256 = 'D' * 64
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $cleanInstallByteDrift -Category $categoryName
@@ -1305,7 +1414,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'clean-install-daemon-byte-drift')
     $categoryName = 'clean_install_smoke'
     $artifactPath = Join-Path $cleanInstallDaemonByteDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.daemon_identity.sha256 = 'D' * 64
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $cleanInstallDaemonByteDrift -Category $categoryName
@@ -1318,7 +1427,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'clean-install-protocol-mismatch')
     $categoryName = 'clean_install_smoke'
     $artifactPath = Join-Path $cleanInstallProtocolMismatch.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.daemon_identity.ipc_min = 8
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $cleanInstallProtocolMismatch -Category $categoryName
@@ -1329,7 +1438,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'clean-install-storage-mismatch')
     $categoryName = 'clean_install_smoke'
     $artifactPath = Join-Path $cleanInstallStorageMismatch.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.cli_identity.storage_contract = 'vault-storage read=v4 write=v4'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $cleanInstallStorageMismatch -Category $categoryName
@@ -1342,7 +1451,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'clean-install-cleanup-gap')
     $categoryName = 'clean_install_smoke'
     $artifactPath = Join-Path $cleanInstallCleanupGap.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.cleanup_passed = $false
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $cleanInstallCleanupGap -Category $categoryName
@@ -1353,7 +1462,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'artifact-type-confusion')
     $categoryName = 'native_transfer_real_host'
     $artifactPath = Join-Path $artifactTypeConfusion.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.test_counts.passed = '4'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $artifactTypeConfusion -Category $categoryName
@@ -1364,7 +1473,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'native-matrix-gap')
     $categoryName = 'native_transfer_real_host'
     $artifactPath = Join-Path $nativeMatrixGap.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.cases = @($document.details.cases | Select-Object -First 7)
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nativeMatrixGap -Category $categoryName
@@ -1375,7 +1484,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'native-fault-gap')
     $categoryName = 'native_transfer_real_host'
     $artifactPath = Join-Path $nativeFaultGap.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.fault_cases = @($document.details.fault_cases | Select-Object -First 10)
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nativeFaultGap -Category $categoryName
@@ -1385,7 +1494,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-resume-drift')
     $artifactPath = Join-Path $nativeResumeDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.fault_cases[0].resume_percent = 24
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nativeResumeDrift -Category $categoryName
@@ -1395,7 +1504,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-lost-ack-lie')
     $artifactPath = Join-Path $nativeLostAckLie.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $lostAck = @($document.details.fault_cases | Where-Object { $_.scenario -ceq 'lost_ack' })[0]
     $lostAck.confirmed_advanced_without_ack = $true
     Write-JsonFixture -Path $artifactPath -Value $document
@@ -1406,7 +1515,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-unknown-cleanup-lie')
     $artifactPath = Join-Path $nativeUnknownCleanupLie.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $unknownCleanup = @(
         $document.details.fault_cases |
             Where-Object { $_.scenario -ceq 'unknown_cleanup' }
@@ -1441,7 +1550,7 @@ try {
             -Destination (Join-Path $temporaryRoot $terminalMutation.name)
         $artifactPath = Join-Path $mutatedFixture.Root "$categoryName.evidence"
         $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 |
-            ConvertFrom-Json
+            ConvertFrom-FixtureJson
         $fault = @(
             $document.details.fault_cases |
                 Where-Object { $_.scenario -ceq $terminalMutation.scenario }
@@ -1458,7 +1567,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-registry-drift')
     $artifactPath = Join-Path $nativeRegistryDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.registry_window.active_global = 49
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nativeRegistryDrift -Category $categoryName
@@ -1469,7 +1578,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'native-helper-byte-drift')
     $categoryName = 'native_transfer_real_host'
     $artifactPath = Join-Path $nativeHelperByteDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.components.helper.sha256 = 'D' * 64
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nativeHelperByteDrift -Category $categoryName
@@ -1481,7 +1590,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-cli-byte-drift')
     $artifactPath = Join-Path $nativeCliByteDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.components.cli.sha256 = 'D' * 64
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nativeCliByteDrift -Category $categoryName
@@ -1493,7 +1602,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-helper-size-drift')
     $artifactPath = Join-Path $nativeHelperSizeDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.components.helper.binary_size = (
         [long]$document.details.components.helper.binary_size + 1
     )
@@ -1507,7 +1616,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-cli-size-type-confusion')
     $artifactPath = Join-Path $nativeCliSizeTypeConfusion.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.components.cli.binary_size = "$($script:releaseCliSize)"
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nativeCliSizeTypeConfusion -Category $categoryName
@@ -1519,7 +1628,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-daemon-size-missing')
     $artifactPath = Join-Path $nativeDaemonSizeMissing.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.components.daemon.PSObject.Properties.Remove('binary_size')
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nativeDaemonSizeMissing -Category $categoryName
@@ -1531,7 +1640,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-cli-size-negative')
     $artifactPath = Join-Path $nativeCliSizeNegative.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.components.cli.binary_size = -1
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nativeCliSizeNegative -Category $categoryName
@@ -1543,7 +1652,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-helper-name-drift')
     $artifactPath = Join-Path $nativeHelperNameDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.components.helper.name = 'SERCTL-XFER'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nativeHelperNameDrift -Category $categoryName
@@ -1555,7 +1664,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-daemon-identity-drift')
     $artifactPath = Join-Path $nativeDaemonIdentityDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.components.daemon.version = (
         [string]$document.details.components.daemon.version
     ).Replace('IPC v9..=v9', 'IPC v8..=v8')
@@ -1569,7 +1678,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-fixed-payload-digest-drift')
     $artifactPath = Join-Path $fixedPayloadDigestDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.cases[0].sha256 = 'F' * 64
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $fixedPayloadDigestDrift -Category $categoryName
@@ -1582,7 +1691,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'native-runner-tuple-drift')
     $categoryName = 'native_transfer_real_host'
     $artifactPath = Join-Path $nativeRunnerDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.runner.rust_host = 'x86_64-pc-windows-gnu'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nativeRunnerDrift -Category $categoryName
@@ -1593,7 +1702,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'fabricated-performance-ratio')
     $categoryName = 'native_transfer_real_host'
     $artifactPath = Join-Path $fabricatedPerformanceRatio.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.performance.throughput_ratio_percent = 91
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $fabricatedPerformanceRatio -Category $categoryName
@@ -1606,7 +1715,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'non-integer-performance-ratio')
     $categoryName = 'native_transfer_real_host'
     $artifactPath = Join-Path $nonIntegerPerformanceRatio.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.performance.throughput_ratio_percent = 'NaN'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $nonIntegerPerformanceRatio -Category $categoryName
@@ -1619,7 +1728,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'overflow-performance-input')
     $categoryName = 'native_transfer_real_host'
     $artifactPath = Join-Path $overflowPerformanceInput.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.performance.native_p50_bytes_per_second = [decimal]::MaxValue
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $overflowPerformanceInput -Category $categoryName
@@ -1631,7 +1740,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'native-raw-performance-summary-drift')
     $artifactPath = Join-Path $rawPerformanceSummaryDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.performance.native_samples[2].elapsed_microseconds = 900000
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $rawPerformanceSummaryDrift -Category $categoryName
@@ -1644,7 +1753,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-matrix-gap')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleMatrixGap.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.mixed_triples_rejected = 5
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundleMatrixGap -Category $categoryName
@@ -1656,7 +1765,7 @@ try {
             -Destination (Join-Path $temporaryRoot "whole-bundle-$component-byte-drift")
         $categoryName = 'whole_bundle_upgrade_rollback'
         $artifactPath = Join-Path $wholeBundleByteDrift.Root "$categoryName.evidence"
-        $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+        $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
         $document.details.candidate_files.$component = '9' * 64
         Write-JsonFixture -Path $artifactPath -Value $document
         Update-FixtureBindings -Fixture $wholeBundleByteDrift -Category $categoryName
@@ -1670,7 +1779,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-runner-tuple-drift')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleRunnerDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.runner.os = 'Linux'
     $document.details.runner.rust_host = 'x86_64-unknown-linux-gnu'
     Write-JsonFixture -Path $artifactPath -Value $document
@@ -1684,7 +1793,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-predecessor-version-drift')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundlePredecessorDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.predecessor_version = '0.3.0-beta.1'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundlePredecessorDrift -Category $categoryName
@@ -1697,7 +1806,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-candidate-version-drift')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleCandidateDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.candidate_version = '1.0.0-beta.1'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundleCandidateDrift -Category $categoryName
@@ -1710,7 +1819,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-descriptor-identity-drift')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleDescriptorIdentityDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.descriptor_daemon_identity = 'serctl_daemon 1.0.0-beta IPC v9'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundleDescriptorIdentityDrift -Category $categoryName
@@ -1723,7 +1832,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-descriptor-sha-drift')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleDescriptorShaDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.descriptor_daemon_sha256 = '9' * 64
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundleDescriptorShaDrift -Category $categoryName
@@ -1736,7 +1845,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-storage-gap')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleStorageGap.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.v8_unknown_audit_fields_rejected_before_write = $false
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundleStorageGap -Category $categoryName
@@ -1749,7 +1858,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-activation-observation-missing')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleActivationObservationMissing.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.PSObject.Properties.Remove('beta2_transient_runtime_activation_observed')
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundleActivationObservationMissing -Category $categoryName
@@ -1762,7 +1871,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-activation-observation-replaced')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleActivationObservationReplaced.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.beta2_transient_runtime_activation_observed = 'false'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundleActivationObservationReplaced -Category $categoryName
@@ -1775,7 +1884,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-runtime-cleanup-gap')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleRuntimeCleanupGap.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.beta2_runtime_state_cleaned_after_rejection = $false
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundleRuntimeCleanupGap -Category $categoryName
@@ -1788,7 +1897,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-outer-gate-gap')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleOuterGateGap.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.beta2_destructive_writer_blocked_before_mutation = $false
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundleOuterGateGap -Category $categoryName
@@ -1801,7 +1910,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-storage-marker-gap')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleStorageMarkerGap.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.candidate_storage_marker_verified = $false
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundleStorageMarkerGap -Category $categoryName
@@ -1814,7 +1923,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'whole-bundle-recovery-set-gap')
     $categoryName = 'whole_bundle_upgrade_rollback'
     $artifactPath = Join-Path $wholeBundleRecoverySetGap.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.matching_recovery_media_restored = $false
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $wholeBundleRecoverySetGap -Category $categoryName
@@ -1827,7 +1936,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'interop-runner-tuple-drift')
     $categoryName = 'openssh_dropbear_interop'
     $artifactPath = Join-Path $interopRunnerDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.runner.os = 'Windows'
     $document.details.runner.rust_host = 'x86_64-pc-windows-msvc'
     Write-JsonFixture -Path $artifactPath -Value $document
@@ -1839,7 +1948,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'interop-aggregate-context-drift')
     $categoryName = 'openssh_dropbear_interop'
     $artifactPath = Join-Path $interopAggregateContextDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.evidence_context_sha256 = 'D' * 64
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $interopAggregateContextDrift -Category $categoryName
@@ -1851,7 +1960,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'interop-operation-context-drift')
     $artifactPath = Join-Path $interopOperationContextDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.case_receipts[0].operation_context_sha256 = 'E' * 64
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $interopOperationContextDrift -Category $categoryName
@@ -1863,7 +1972,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'interop-summary-injection')
     $artifactPath = Join-Path $interopSummaryInjection.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details | Add-Member -NotePropertyName summary -NotePropertyValue ([ordered]@{
         passed = $true; result = 'completed'
     })
@@ -1878,7 +1987,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'interop-duplicate')
     $categoryName = 'openssh_dropbear_interop'
     $artifactPath = Join-Path $interopDuplicate.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.implementations = @(
         $document.details.implementations[0],
         $document.details.implementations[1],
@@ -1894,7 +2003,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'interop-case-gap')
     $artifactPath = Join-Path $interopCaseGap.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.case_receipts = @(
         $document.details.case_receipts |
             Where-Object { $_.case_id -cne 'OpenSSH_tunnel_dynamic' }
@@ -1907,7 +2016,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'interop-extra-case')
     $artifactPath = Join-Path $interopExtraCase.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $extraContextSha256 = Get-OperationContextFixtureSha256 `
         -Category 'openssh_dropbear_interop' `
         -CaseId 'OpenSSH_tunnel_extra'
@@ -1926,14 +2035,14 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'interop-tunnel-misclassified')
     $artifactPath = Join-Path $interopTunnelMisclassified.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $entry = @(
         $document.details.case_receipts |
             Where-Object { $_.case_id -ceq 'OpenSSH_tunnel_dynamic' }
     )[0]
     $receiptBytes = [Convert]::FromBase64String([string]$entry.receipt_base64)
     $receipt = [System.Text.UTF8Encoding]::new($false, $true).GetString($receiptBytes) |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $receipt.result_code = 'outcome_unknown'
     $receiptBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(
         ($receipt | ConvertTo-Json -Depth 6 -Compress) + "`n"
@@ -1950,14 +2059,14 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'interop-child-context-drift')
     $artifactPath = Join-Path $interopContextDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $entry = @(
         $document.details.case_receipts |
             Where-Object { $_.case_id -ceq 'OpenSSH_directory' }
     )[0]
     $receiptBytes = [Convert]::FromBase64String([string]$entry.receipt_base64)
     $receipt = [System.Text.UTF8Encoding]::new($false, $true).GetString($receiptBytes) |
-        ConvertFrom-Json
+        ConvertFrom-FixtureJson
     $receipt.context_sha256 = 'D' * 64
     $receiptBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(
         ($receipt | ConvertTo-Json -Depth 6 -Compress) + "`n"
@@ -1974,7 +2083,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'interop-receipt-reuse')
     $artifactPath = Join-Path $interopReceiptReuse.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.case_receipts[1].receipt_sha256 = (
         [string]$document.details.case_receipts[0].receipt_sha256
     )
@@ -1986,7 +2095,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'interop-protected-receipt-byte-drift')
     $artifactPath = Join-Path $interopReceiptByteDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.case_receipts[0].receipt_base64 = (
         [string]$document.details.case_receipts[0].receipt_base64
     ).Substring(0, ([string]$document.details.case_receipts[0].receipt_base64).Length - 4) + 'AAAA'
@@ -2000,7 +2109,7 @@ try {
         -Source $baseline.Root `
         -Destination (Join-Path $temporaryRoot 'interop-component-drift')
     $artifactPath = Join-Path $interopComponentDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.components.helper.version = (
         [string]$document.details.components.helper.version
     ).Replace('transfer protocol v1', 'transfer protocol v2')
@@ -2015,7 +2124,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'artifact-absolute-path')
     $categoryName = 'openssh_dropbear_interop'
     $artifactPath = Join-Path $artifactAbsolutePath.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.runner.label = 'C:\\private\\runner'
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $artifactAbsolutePath -Category $categoryName
@@ -2032,7 +2141,7 @@ try {
             -Source $baseline.Root `
             -Destination (Join-Path $temporaryRoot "retained-$unsafeName")
         $artifactPath = Join-Path $unsafeFixture.Root 'openssh_dropbear_interop.evidence'
-        $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+        $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
         $document.details.runner.label = [string]$unsafeRetainedValues[$unsafeName]
         Write-JsonFixture -Path $artifactPath -Value $document
         Update-FixtureBindings -Fixture $unsafeFixture -Category 'openssh_dropbear_interop'
@@ -2044,7 +2153,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'artifact-false-outcome')
     $categoryName = 'windows_privileged_acl'
     $artifactPath = Join-Path $artifactFalseOutcome.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.observer_read_denied = $false
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $artifactFalseOutcome -Category $categoryName
@@ -2055,7 +2164,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'acl-candidate-byte-drift')
     $categoryName = 'windows_privileged_acl'
     $artifactPath = Join-Path $aclCandidateByteDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.candidate_cli_sha256 = 'D' * 64
     Write-JsonFixture -Path $artifactPath -Value $document
     Update-FixtureBindings -Fixture $aclCandidateByteDrift -Category $categoryName
@@ -2068,7 +2177,7 @@ try {
         -Destination (Join-Path $temporaryRoot 'acl-runner-tuple-drift')
     $categoryName = 'windows_privileged_acl'
     $artifactPath = Join-Path $aclRunnerDrift.Root "$categoryName.evidence"
-    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $document = Get-Content -LiteralPath $artifactPath -Raw -Encoding utf8 | ConvertFrom-FixtureJson
     $document.details.runner.os = 'Linux'
     $document.details.runner.rust_host = 'x86_64-unknown-linux-gnu'
     Write-JsonFixture -Path $artifactPath -Value $document

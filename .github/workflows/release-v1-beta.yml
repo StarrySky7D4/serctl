@@ -894,12 +894,14 @@ jobs:
     needs: [preflight, parser-fuzz, attest]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # This environment must require independent reviewers and prevent
-    # self-review. Its variables identify a create-new external acceptance
+    # Single-maintainer governance: require StarrySky7D4's manual approval,
+    # permit self-review, and disable administrator bypass. Keep the legacy
+    # independent-review environment untouched for immutable older tags.
+    # Its variables identify a create-new external acceptance
     # record produced only after exact-artifact host, upgrade, privilege, and
     # rollback validation. Without that environment configuration publication
     # fails closed instead of following tag push automatically.
-    environment: v1-beta-external-acceptance
+    environment: v1-beta-maintainer-acceptance
     permissions:
       contents: write
       attestations: read
@@ -1033,6 +1035,8 @@ jobs:
             -Destination $recordPath `
             -MaxBytes 65536
           $manifestPlanJson = ./scripts/Get-ExternalAcceptanceDownloadPlan.ps1 `
+            -GovernanceMode single-maintainer `
+            -MaintainerLogin StarrySky7D4 `
             -Phase manifest `
             -AcceptanceRecordPath $recordPath `
             -AcceptanceRecordSha256 $env:ACCEPTANCE_RECORD_SHA256 `
@@ -1053,6 +1057,8 @@ jobs:
             throw 'external evidence manifest SHA-256 mismatch'
           }
           $artifactPlanJson = ./scripts/Get-ExternalAcceptanceDownloadPlan.ps1 `
+            -GovernanceMode single-maintainer `
+            -MaintainerLogin StarrySky7D4 `
             -Phase artifacts `
             -AcceptanceRecordPath $recordPath `
             -AcceptanceRecordSha256 $env:ACCEPTANCE_RECORD_SHA256 `
@@ -1083,6 +1089,8 @@ jobs:
           # The verifier rehashes the complete downloaded release set, then derives the
           # accepted CLI, daemon and helper digests from its platform provenance files.
           ./scripts/Test-ExternalAcceptanceEvidence.ps1 `
+            -GovernanceMode single-maintainer `
+            -MaintainerLogin StarrySky7D4 `
             -AcceptanceRecordPath $recordPath `
             -AcceptanceRecordSha256 $env:ACCEPTANCE_RECORD_SHA256 `
             -AcceptanceRecordUrl $env:ACCEPTANCE_RECORD_URL `
