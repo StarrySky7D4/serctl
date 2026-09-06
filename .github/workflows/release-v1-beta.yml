@@ -772,85 +772,85 @@ jobs:
       # re-expanded by the action after the snapshot check and could attest an
       # injected non-release file before the publish job rejects the artifact.
       - name: Attest SHA256SUMS
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/SHA256SUMS
           show-summary: true
 
       - name: Attest aggregate release provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/release-provenance.json
           show-summary: true
 
       - name: Attest Linux x86_64 xfer symbols
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64-xfer-symbols.tar.gz
           show-summary: true
 
       - name: Attest Linux x86_64 platform provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64.provenance.json
           show-summary: true
 
       - name: Attest Linux x86_64 xfer runtime
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64-xfer.tar.gz
           show-summary: true
 
       - name: Attest CLI CycloneDX JSON SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-cli.sbom.cdx.json
           show-summary: true
 
       - name: Attest CLI CycloneDX XML SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-cli.sbom.cdx.xml
           show-summary: true
 
       - name: Attest daemon CycloneDX JSON SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-daemon.sbom.cdx.json
           show-summary: true
 
       - name: Attest daemon CycloneDX XML SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-daemon.sbom.cdx.xml
           show-summary: true
 
       - name: Attest xfer CycloneDX JSON SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-xfer.sbom.cdx.json
           show-summary: true
 
       - name: Attest xfer CycloneDX XML SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-xfer.sbom.cdx.xml
           show-summary: true
 
       - name: Attest Windows x86_64 symbols
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64-symbols.zip
           show-summary: true
 
       - name: Attest Windows x86_64 platform provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64.provenance.json
           show-summary: true
 
       - name: Attest Windows x86_64 runtime
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64.zip
           show-summary: true
