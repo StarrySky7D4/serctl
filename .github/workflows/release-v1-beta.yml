@@ -310,7 +310,7 @@ jobs:
 
       - name: Upload Windows release inputs
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-input-windows-${{ needs.preflight.outputs.commit }}
           path: dist/*
@@ -389,7 +389,7 @@ jobs:
 
       - name: Upload Linux transfer-helper release inputs
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-input-linux-${{ needs.preflight.outputs.commit }}
           path: dist/*
@@ -453,21 +453,21 @@ jobs:
           }
 
       - name: Download Windows inputs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.windows-bundle.outputs.artifact_id }}
           path: target/v1-beta-release-input/windows
           digest-mismatch: error
 
       - name: Download Linux transfer-helper inputs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.linux-helper-bundle.outputs.artifact_id }}
           path: target/v1-beta-release-input/linux
           digest-mismatch: error
 
       - name: Download exact-tag parser fuzz success receipt
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.parser-fuzz.outputs.artifact_id }}
           path: target/v1-beta-parser-fuzz-receipt
@@ -772,85 +772,85 @@ jobs:
       # re-expanded by the action after the snapshot check and could attest an
       # injected non-release file before the publish job rejects the artifact.
       - name: Attest SHA256SUMS
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/SHA256SUMS
           show-summary: true
 
       - name: Attest aggregate release provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/release-provenance.json
           show-summary: true
 
       - name: Attest Linux x86_64 xfer symbols
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64-xfer-symbols.tar.gz
           show-summary: true
 
       - name: Attest Linux x86_64 platform provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64.provenance.json
           show-summary: true
 
       - name: Attest Linux x86_64 xfer runtime
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-linux-x86_64-xfer.tar.gz
           show-summary: true
 
       - name: Attest CLI CycloneDX JSON SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-cli.sbom.cdx.json
           show-summary: true
 
       - name: Attest CLI CycloneDX XML SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-cli.sbom.cdx.xml
           show-summary: true
 
       - name: Attest daemon CycloneDX JSON SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-daemon.sbom.cdx.json
           show-summary: true
 
       - name: Attest daemon CycloneDX XML SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-daemon.sbom.cdx.xml
           show-summary: true
 
       - name: Attest xfer CycloneDX JSON SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-xfer.sbom.cdx.json
           show-summary: true
 
       - name: Attest xfer CycloneDX XML SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-serctl-xfer.sbom.cdx.xml
           show-summary: true
 
       - name: Attest Windows x86_64 symbols
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64-symbols.zip
           show-summary: true
 
       - name: Attest Windows x86_64 platform provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64.provenance.json
           show-summary: true
 
       - name: Attest Windows x86_64 runtime
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-dist/serctl-${{ needs.preflight.outputs.version }}-windows-x86_64.zip
           show-summary: true
@@ -868,7 +868,7 @@ jobs:
 
       - name: Upload the attested release set
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: serctl-${{ needs.preflight.outputs.version }}-attested-release
           path: |
@@ -936,14 +936,14 @@ jobs:
           }
 
       - name: Download the attested release set
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.attest.outputs.artifact_id }}
           path: release-dist
           digest-mismatch: error
 
       - name: Download retained parser fuzz success receipt independently
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.parser-fuzz.outputs.artifact_id }}
           path: target/v1-beta-publish-parser-fuzz-receipt
