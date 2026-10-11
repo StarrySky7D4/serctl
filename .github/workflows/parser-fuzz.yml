@@ -105,7 +105,7 @@ jobs:
 
       - name: Upload bounded crash and timeout inputs
         if: failure() && steps.bound_failure_artifacts.outcome == 'success'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: parser-fuzz-${{ matrix.target }}-failures
           path: fuzz/artifacts/${{ matrix.target }}/
@@ -180,7 +180,7 @@ jobs:
 
       - name: Upload retained exact-tag fuzz success receipt
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: parser-fuzz-success-${{ inputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/parser-fuzz-success.json
